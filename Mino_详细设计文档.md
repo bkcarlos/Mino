@@ -1,7 +1,7 @@
 # Mino 详细设计文档
 
 > 零拷贝共享内存、动态 Schema、跨机传输与数据录制的工程化设计  
-> 版本：v0.5（详细设计稿，按文档审查意见修订；新增 15.3 传输能力模型与 16.7 非网络 Fabric Driver）  
+> 版本：v0.5（详细设计稿，按文档审查意见修订；新增 15.3、16.7、双路由策略、9.9 MPMC 骨架与 11.2.1 引用 Pin）  
 > 上位文档：[Mino 架构设计文档](./Mino_架构设计文档.md)
 
 ## 1. 文档说明
@@ -76,6 +76,13 @@
 | rec_schema_ref | Recording Session 内的 Schema 引用，Session 内单调不复用（见 17.3） |
 | 半开连接 | TCP 连接对端无响应但未关闭的故障形态，区别于「半包」（单帧被拆分传输） |
 | Fabric Driver | 以共享内存窗口/信箱为原语的非网络 Transport Driver 实现（IPCF、PCIe NTB、CXL 等），见 15.3、16.7 |
+| 路由策略（RoutePolicy） | Topic 级配置，决定远端目标节点集合如何产生：`kDiscovery`（自动发现）或 `kStatic`（显式配置），见 14.2、15.2 |
+| 自动发现路由（Discovery Routing） | 订阅驱动路由：Registry 按 Subscriber 注册汇总订阅节点集合，无订阅者的节点不产生流量；新订阅者从注册切点开始接收 |
+| 静态路由（Static Routing） | 配置驱动路由：Topic 元数据显式给出目标节点列表，发布即按配置扇出，与订阅发现解耦 |
+| 订阅节点集合 | kDiscovery 下某 Topic 当前有活跃 Subscriber 的远端节点集合，由 Node Registry 维护并带版本号推送 |
+| Route Set / route_set_version | kStatic 下静态路由表及其版本号；版本变化触发 Route Handle 失效重建（14.3、15.2） |
+| 通用 MPMC 骨架 | SHM Index Ring 的跨进程并发骨架：64 位 Slot Sequence + 游标 CAS 仲裁，槽位携带 ShmHandle 引用而非数据本体；Channel 语义（9.4~9.7）在其上叠加，见 9.9 |
+| 引用 Pin / Counted Borrow | 对象级长持有引用（`ShmSharedPtr`）：从 Borrow 显式 Transfer 获得，延迟已 Retire Payload 的内存复用；崩溃安全由 Lease/Recovery 兜底，见 11.2.1、ADR-0013 |
 
 ---
 
@@ -103,6 +110,9 @@
 | Segment Commit v1 | Length/CRC/Trailer/Commit Marker + Sync | PROPOSED |
 | Telemetry v1 | 分阶段、有界采样、Sidecar Event | PROPOSED |
 | Transport 扩展 | Driver 抽象 + Fabric 扩展点（ADR-0012） | PROPOSED |
+| Pub/Sub 路由 | 双策略：自动发现（订阅驱动）+ 显式配置静态路由（14.2、15.2） | PROPOSED |
+| 通用 MPMC 骨架 | SHM Index Ring 并发骨架：Vyukov 有界算法，Handle 引用语义（9.9） | PROPOSED |
+| 对象级引用 Pin | Lease 绑定引用计数（`ShmSharedPtr`，ADR-0013）：Reclaim 条件追加无存活 Pin | PROPOSED |
 
 ### 2.1 故障模型
 
@@ -649,7 +659,7 @@ public:
 
 ### 8.4 回收
 
-`Retire` 表示不再产生新 Borrow（现存 Borrow 可能仍存活）；`Reclaim` 只能在所有有效 Borrow 释放后清除 Bitmap。恢复扫描看到 RETIRED 状态时，必须确认不存在有效 Borrow 后才能 Reclaim。Generation 在复用时递增，并定义回绕测试；Generation 不能替代正确的生命周期协议。
+`Retire` 表示不再产生新 Borrow（现存 Borrow 可能仍存活）；`Reclaim` 只能在「无有效 Borrow ∧ 无存活 Pin（11.2.1）」后清除 Bitmap。恢复扫描看到 RETIRED 状态时，必须确认两个条件同时成立后才能 Reclaim。Generation 在复用时递增，并定义回绕测试；Generation 不能替代正确的生命周期协议。
 
 ### 8.5 大对象
 
@@ -798,7 +808,7 @@ ABORTED ──(Consumer 遇到 Tombstone 直接推进, CAS acq_rel)──▶ FRE
 RETIRED ──(Consumer 推进 Cursor 越过后，由 Channel 回收线程或下次 Reserve 扫描 CAS)──▶ FREE
 ```
 
-- Producer 通过经过验证的有界队列算法预留逻辑位置；
+- Producer 通过通用 MPMC 骨架（9.9）预留逻辑位置；
 - Reservation 记录 Owner Process/Publisher Identity、Owner Epoch 和 Reservation Timestamp；
 - 每个 Slot 使用 64 位 Sequence 区分预留、提交和回绕；Cursor 保存逻辑 Sequence 而非物理索引，物理位置为 `sequence % capacity`；Ring 满判定为 `producer_sequence - min_consumer_sequence >= capacity`；
 - Consumer 遇到未完成 Slot 时，先检查 Owner Lease，不能仅因超时就判定崩溃；
@@ -852,6 +862,47 @@ enum class QueueFullPolicy {
 | `kDropNewest` | ✓ | ✓（丢弃后所有 Subscriber 跳过该 Slot，记录 Gap 指标） | ✓ |
 | `kDropOldest` | ✓ | ✓（强制推进最慢 Subscriber Cursor，记录 `broadcast_gap` 指标；被越过 Slot 的 Payload 仅在无 Borrow 时可复用） | ✓ |
 | `kSample` | ✓ | ✓（按统一采样率，所有 Subscriber 看到相同子集） | ✗（破坏每条消息恰好消费一次的语义） |
+
+### 9.9 通用 MPMC 骨架（SHM Index Ring 并发骨架）
+
+通用 MPMC 骨架是所有跨进程 Channel（9.4~9.7）共享的并发骨架，是 ADR-0003「公共 Ring 逻辑共享、语义分离」的载体。骨架本体位于 SHM Region 内，由多进程共享；它只回答一个问题——**多生产者多消费者在同一共享 Ring 上的有界预留、推进与回绕如何并发正确**，不回答任何消费语义问题。
+
+**存储布局（SHM Region 内）**：
+
+```text
+Control Block（64B 对齐）
+  enqueue_pos / dequeue_pos   游标分离 Cache Line（9.4 约定）
+  magic + layout_version      Init/Attach 校验
+  elem_size + elem_align      槽位内容 ABI 校验（防止不同编译配置的进程错配）
+  capacity                    2 的幂
+Slot Array（同 Region，capacity 个定长槽位）
+  per-slot 64 位 Sequence     并发元数据：空闲 / 已提交 / 回绕周期判别
+  定长存储位                  承载 IndexSlot（9.2）或裸 ShmHandle
+```
+
+**引用语义（零拷贝根基）**：槽位携带的是对 Central Slab 中 Payload 的**引用**（`ShmHandle` 或内嵌 Handle 的 IndexSlot），骨架从不移动数据本体；控制块与槽位内**不得出现进程虚拟地址指针**，跨进程寻址一律使用 Region Offset/Handle（与 4.2、INV-09 同源约束）。
+
+**算法**：Vyukov 有界骨架——容量 2 的幂，物理槽位 = `sequence % capacity`；满判定 `producer_sequence - min_consumer_sequence >= capacity`（与 9.5 公式一致）；发布经 Slot Sequence 的 acquire 读 / release 写（「数据先于状态可见」，同 9.3 WRITING→READY）；游标 CAS 仅用 relaxed 做竞争仲裁，正确性由 Slot Sequence 保证。
+
+**生命周期**：
+
+- **Init**：Region Owner 建链时原地初始化控制块与全部 Slot Sequence，最后写 magic（magic 落位前结构不得被使用）；
+- **Attach**：映射方校验 magic、layout_version、elem ABI 后附着；校验失败拒绝附着并告警；
+- 骨架不涉及元素回收：Payload 生命周期由 10.1 状态机与 Lease 管理；进程退出不「析构」骨架，异常后的恢复扫描见 12 章。
+
+**职责边界**：
+
+| 骨架保证 | 骨架不保证（由上层提供） |
+|---|---|
+| 有界 MPMC 预留仲裁、推进、回绕区分、满/空判定的并发正确性 | 消费语义：Broadcast 每订阅者一份（9.6）/ Work Queue 竞争认领（9.7） |
+| Slot Sequence 发布序（9.3 内存序） | 进程崩溃恢复：Owner Epoch、Lease、ABORTED Tombstone（9.5、12） |
+| 跨进程原子可见性（前提见下） | 阻塞等待与 QueueFullPolicy 丢弃策略（9.8） |
+
+**跨进程前提**：单拷贝原子操作在同一映射区对所有共享进程正确（无锁原子，x86-64 基线由 V-12 Litmus 验证，AArch64 由 V-13 验证后启用）；各进程映射基址可不同，结构内仅有 Offset 语义字段。
+
+**进程内实例化**：同一骨架算法可实例化为纯进程内队列（如 Bridge Encode/Batch Queue，16.1），此时无跨进程恢复需求、元素可为任意可移动类型——这是骨架的附带使用场景，不改变其 SHM 引用语义的设计定位。
+
+验证登记见 26 章 V-26。
 
 ---
 
@@ -1005,6 +1056,38 @@ public:
 - Borrow 期间 Payload 不得回收；
 - Subscriber 崩溃由 Lease 失效和恢复流程解除责任。
 
+### 11.2.1 Transfer 与对象级引用 Pin（ShmSharedPtr）
+
+需要跨 Callback、跨线程或跨 Channel 长持有单条消息时，通过显式 Transfer 将 Borrow 升级为对象级引用 Pin（ADR-0013）：
+
+```cpp
+template <typename T>
+class ShmSharedPtr {           // 对象级引用 Pin 的进程内句柄
+public:
+    const T* get() const noexcept;
+    const MessageMetadata& metadata() const noexcept;
+
+    ShmSharedPtr(ShmSharedPtr&&) noexcept;
+    ShmSharedPtr(const ShmSharedPtr&);   // 拷贝 = 同一进程内新增一个 Pin
+    ~ShmSharedPtr();                     // 释放本进程持有的 Pin
+};
+
+// 唯一获取途径：从有效 Borrow 升级；失败返回 kResourceExhausted（Pin 配额满）
+Result<ShmSharedPtr<T>> BorrowedMessage<T>::Transfer();
+```
+
+语义约束：
+
+- **回收充分条件**：Payload 可 Reclaim 当且仅当「已 Retired ∧ 无有效 Borrow ∧ 无存活 Pin」（8.4）；Pin 只延迟已 Retire 对象的内存复用，不阻止 Retire、不阻塞 Channel 推进；
+- **计数器位置**：位于 Slab Header/Sidecar，不内嵌 Base Slot（ADR-0003）；每对象一个 32 位 Pin 计数；
+- **崩溃安全**：Pin 的释放不依赖析构——获取 Pin 时持有者在 Channel 侧登记 `(process_identity, object_handle, pin_epoch)`，进程被 Kill 由 Lease 失效检测，Recovery 扫描清除该进程全部 Pin 份额（12 章）；析构只是正常路径的及时释放；
+- **ABA 防护**：获取 Pin 必须校验 Handle Generation；已 Reclaim 对象的旧 Handle 不得再 Pin 成功（Generation 已递增）；
+- **有界配额**：per-object Pin 上限（默认 64）与 per-process Pin 上限（默认 4096）双重限制，超出返回 `kResourceExhausted` 并导出 `mino_pin_acquire_denied_total`，不得无限累积；配额占用纳入 20.4 节点资源预算；
+- **只读**：与 Borrow 相同，Pin 持有期间对象不可变；
+- **监控**：`mino_pin_outstanding`、`mino_pin_oldest_age_seconds` 必须导出；超过配置阈值的「老 Pin」触发诊断告警（疑似业务泄漏）。
+
+Transfer 后原 `BorrowedMessage` 立即等效析构（ACK 责任一并解除）；Channel 层视为该 Subscriber 已完成本条消息，后续生命周期由 Pin 独立承担。
+
 Runtime Core 禁止异常跨 API/线程边界传播。若构建配置启用 C++ Exception，Poll Wrapper 必须捕获 Callback 异常、转换为 Status 并执行配置的 ACK 策略：
 
 - Broadcast 首版 Callback 返回即 ACK，不提供自动重试；业务失败通过新消息或业务补偿处理；
@@ -1069,8 +1152,9 @@ struct SubscriberLease {
 2. CAS Lease State 为 EVICTING；
 3. 阻止新 Borrow；
 4. 清理该 Subscriber 的 ACK 责任；
-5. 推进可回收边界；
-6. 标记 EVICTED。
+5. 清除该进程持有的全部对象级引用 Pin（11.2.1）；
+6. 推进可回收边界；
+7. 标记 EVICTED。
 
 ### 12.3 Publisher 崩溃
 
@@ -1371,6 +1455,20 @@ enum class ChannelKind : uint8_t {
     kWorkQueue,
 };
 
+// Pub/Sub 路由策略：决定远端目标节点集合如何产生（语义见 15.2）
+enum class RoutePolicy : uint8_t {
+    kDiscovery = 0,  // 自动发现：按订阅注册动态计算目标节点集合（默认）
+    kStatic = 1,     // 显式配置：固定发布到 static_routes 指定的节点
+};
+
+// 静态路由条目：目标节点粒度，不指定到具体进程；
+// 到达目标节点后按该节点本地订阅情况投递
+struct StaticRouteEntry {
+    NodeId target_node;
+    // 该路由可选的传输约束（如强制 Fabric 通道）；空值表示由策略引擎选择
+    std::optional<TransportKind> preferred_transport;
+};
+
 enum class Reliability : uint8_t {
     kBestEffort,
     kReliableOrdered,   // At-least-once + 接收端去重 + 来源内有序
@@ -1394,6 +1492,9 @@ struct TopicMetadata {
     DeliveryPolicy delivery;
     QueueFullPolicy queue_full_policy;
     SchemaIdentity schema;
+    RoutePolicy route_policy;              // Pub/Sub 路由策略，创建时指定，默认 kDiscovery
+    std::vector<StaticRouteEntry> static_routes;  // 仅 kStatic 时非空，见 15.2
+    uint64_t route_set_version;            // static_routes 的版本，随 14.3 配置更新递增
     uint32_t capacity;
     uint32_t max_publishers;
     uint32_t max_subscribers;
@@ -1447,6 +1548,13 @@ struct RouteRequest {
 };
 ```
 
+目标节点集合的来源由 Topic 的 `RoutePolicy`（14.2）决定：
+
+- **自动发现（kDiscovery，默认）**：订阅驱动路由。Subscriber 向 Node Registry 注册后，Registry 汇总出该 Topic 的**订阅节点集合**（有活跃 Subscriber 的远端节点）；Transport Switcher 按此集合扇出。新 Subscriber 从注册切点之后的消息开始接收，不追溯历史（与 9.6 Broadcast `join_sequence` 一致）；某节点最后一个 Subscriber 注销后，该节点从集合中移除，Bridge 停止向其发送——无订阅者的节点不产生网络流量；
+- **显式配置（kStatic）**：配置驱动路由。目标节点集合就是 Topic 元数据中的 `static_routes`（携带 `route_set_version`），发布即按配置扇出，**与订阅发现无关**。到达目标节点后按该节点本地订阅情况投递：有 Subscriber 则正常交付，无 Subscriber 则消息在该节点按 Topic 策略丢弃或进入有限缓存等待订阅者（默认丢弃并导出 `mino_route_static_undeliverable_total` 指标，不因无订阅者而静默成功）。
+
+典型 kStatic 场景：录制/回放节点固定接收、跨 Trust Domain 的确定性通道（如 IPCF 固定域间链路）、启动期拓扑即确定的车载网络。kStatic 目标节点必须存在于 Topic ACL 允许集合内（20.3 校验），否则配置被拒绝。
+
 ### 15.2 选择流程
 
 1. 查询 Topic 和目标 Node；
@@ -1456,6 +1564,9 @@ struct RouteRequest {
 5. 检查 Driver 能力和 Payload 上限；
 6. 返回不可变 Route Handle；
 7. Route 失效时刷新，不在每条消息执行重型发现逻辑。
+
+路由集合刷新时机：kDiscovery 由订阅注册/注销/Lease 失效触发（Registry 推送变更，带订阅集合版本号）；kStatic 仅在 `route_set_version` 变化时重建（14.3 两阶段切换），运行期与订阅者增减完全解耦。Route Handle 缓存以版本号为失效依据，不做逐消息查询。
+
 
 ### 15.3 Driver 接口
 
@@ -2430,6 +2541,24 @@ topics:
 
 平铺字段是 17.15 嵌套结构的简写，映射规则见 17.15。`backpressure_topology` 与 `mode` 的合法组合见 17.2 矩阵。
 
+显式配置路由（kStatic）示例：
+
+```yaml
+topics:
+  chassis/vehicle_state:
+    schema: mino.chassis.VehicleState@2
+    channel: broadcast
+    capacity: 4096
+    route_policy: static            # discovery（默认）/ static
+    static_routes:                  # 仅 static 时必填：固定发布的目标节点
+      - node: zone-front-01
+      - node: zone-rear-01
+      - node: recorder-01
+        preferred_transport: fabric # 可选：强制经 IPCF 类 Fabric 通道
+```
+
+`static_routes` 以节点为粒度，不含进程；Topic 创建时写入 Registry，`route_set_version` 随变更递增（14.3）。
+
 ### 20.3 校验
 
 配置加载时检查：
@@ -2441,6 +2570,7 @@ topics:
 - Recording 策略是否与“不丢”要求冲突（含 17.2 背压拓扑 × 落盘模式非法组合）；
 - Driver 能力；
 - ACL；
+- `route_policy: static` 时 `static_routes` 非空、节点已注册或声明为可离线加入、目标节点在 Topic ACL 允许集合内；`route_policy: discovery` 时不得携带 `static_routes`；
 - 数值乘加溢出。
 
 ### 20.4 节点级资源预算
@@ -2978,6 +3108,7 @@ D 系列与架构文档 P0~P6 路线图的对应关系：D0 完成 P0 的 ADR �
 ### D1：SHM 基础
 
 - Status/Result；
+- SHM 通用 MPMC 骨架（9.9）；
 - Platform SHM；
 - SuperBlock/Region；
 - Handle Resolver；
@@ -3033,10 +3164,10 @@ D 系列与架构文档 P0~P6 路线图的对应关系：D0 完成 P0 的 ADR �
 
 ## 25. 关键不变量
 
-实现和评审必须持续验证以下不变量（INV-01~INV-31，供测试与验收条款引用）：
+实现和评审必须持续验证以下不变量（INV-01~INV-32，供测试与验收条款引用）：
 
 1. **INV-01** READY Slot 引用的 Payload 已完整构建并可见；
-2. **INV-02** 任意有效 Borrow 存在时 Payload 不会复用；
+2. **INV-02** 任意有效 Borrow 或存活 Pin 存在时 Payload 不会复用；
 3. **INV-03** Handle Resolver 不返回 Region 边界外地址；
 4. **INV-04** Generation、Sequence 和 Epoch 分别承担明确的复用检测职责；
 5. **INV-05** Broadcast 的有效 Subscriber 都拥有独立 Cursor；
@@ -3065,7 +3196,8 @@ D 系列与架构文档 P0~P6 路线图的对应关系：D0 完成 P0 的 ADR �
 28. **INV-28** 同一 RW Region 的参与进程属于同一 Trust Domain；
 29. **INV-29** Telemetry Buffer 或 Exporter 饱和不会阻塞或改变业务消息语义；
 30. **INV-30** 跨节点单向延迟只在 Clock Quality 满足阈值时进入正常 Histogram；
-31. **INV-31** 任何损坏输入在解引用或分配前被限制和校验。
+31. **INV-31** 任何损坏输入在解引用或分配前被限制和校验；
+32. **INV-32** Pin 计数不内嵌 Base Slot；进程失效后其 Pin 份额最终被 Recovery 清除，不永久阻塞 Reclaim。
 
 ---
 
@@ -3100,6 +3232,8 @@ D 系列与架构文档 P0~P6 路线图的对应关系：D0 完成 P0 的 ADR �
 | V-23 | P1 | Telemetry 开销与准确性 | ADR-0009 | | P4 | Off/Counter/Sampled 对比、Clock Quality 和 Histogram 校验 |
 | V-24 | P2 | Topic Partition 阈值 | — | | P5 | 单 Writer 饱和曲线 |
 | V-25 | P2 | UDP/RDMA/Fabric | ADR-0012 | | P5 | 驱动专项设计与硬件验证 |
+| V-26 | P1 | 通用 MPMC 骨架（9.9） | ADR-0003 | | P1 | 跨进程守恒/回绕/满空判定测试、Init/Attach 协议测试，依赖 V-12 原子 Litmus；进程内算法原型已过守恒与 TSAN |
+| V-27 | P1 | 对象级引用 Pin（11.2.1） | ADR-0013 | | P1 | Pin 热路径开销 Benchmark、Lease 失效清除时延、Pin 耗尽阻塞模型、Recovery 清除竞态测试 |
 
 ---
 

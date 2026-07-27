@@ -3,7 +3,7 @@
 > 零拷贝共享内存与跨机通信统一框架  
 > Unified Framework for Zero-Copy Shared Memory and Cross-Node Communication  
 > **Mino = Minimal Overhead**  
-> 版本：v0.14（设计评审稿，按文档审查意见修订；补充非网络 Fabric 传输扩展）  
+> 版本：v0.14（设计评审稿，按文档审查意见修订；补充 Fabric 扩展、双路由策略、MPMC 骨架与引用 Pin）  
 > 状态：概念设计完成；动态 Schema、数据存储、故障语义与传输性能指标方案已补充，关键协议待原型验证
 
 ## 1. 文档概述
@@ -98,7 +98,7 @@ Mino 通过统一的类型系统、发布订阅 API 和数据生命周期模型�
 - 不允许共享对象包含裸指针、虚函数表或进程私有句柄；
 - 不将共享内存镜像作为跨 CPU 架构的网络格式；
 - 第一阶段不提供无限容量容器或通用垃圾回收器；
-- 不在首版中直接实现通用 MPMC、分布式一致性日志、Exactly-once 或跨 Recorder 的持久化可靠消息系统；
+- 不在首版中提供通用消息队列产品、分布式一致性日志、Exactly-once 或跨 Recorder 的持久化可靠消息系统；
 - 首版存储能力定位为 Schema 持久化、消息录制与回放，不等同于分布式消息数据库；
 - 不允许多个磁盘 Writer 并发修改同一个活动 Segment；
 - 首版不提供 Coordinator/Recorder 自动主备，不承诺跨节点 Exactly-once；
@@ -195,6 +195,7 @@ Mino 通过统一的类型系统、发布订阅 API 和数据生命周期模型�
 
 - Runtime、Schema Compiler、`minoc` 和 `mino` 运维工具统一使用 C++；
 - 项目使用 Bazel + Bzlmod，固定 Bazel/Bazelisk 版本；
+- 通用 MPMC 骨架（详设 9.9）独立为可复用组件：SHM Index Ring 的并发骨架，槽位携带 Handle 引用而非数据本体，供各 Channel 语义共享；
 - Schema Compiler 拆分为 Parser、Semantic、Descriptor、Layout、Compatibility、Runtime Compiler 和 CodeGen Targets；
 - Runtime 可以依赖 Runtime Compiler，但不依赖 C++ CodeGen；
 - `minoc` 复用同一 Compiler Library，并通过 Bazel 自定义 Rule 生成静态类型代码；
@@ -360,7 +361,7 @@ Slot 应保持固定尺寸，并按 64 字节 Cache Line 对齐。v1 字段布�
 | MPSC | 多生产者、单消费者 | 每 Slot Sequence，CAS 预留 |
 | SPMC 广播 | 每个订阅者都收到消息 | 每订阅者独立 Cursor |
 | 竞争消费 | 多消费者中只有一个处理消息 | 共享消费 Cursor |
-| MPMC | 多生产者、多消费者 | 采用经过验证的有界队列算法 |
+| MPMC | 多生产者、多消费者 | SHM 通用 MPMC 骨架：per-slot Sequence + 游标 CAS 仲裁，Handle 引用语义（见详设 9.9） |
 
 ### 5.4 SPMC 语义修正
 
@@ -697,6 +698,8 @@ Remote RingBuffer
 Remote Subscriber
 ```
 
+Bridge 的目标节点集合由 Topic 路由策略产生：自动发现（订阅驱动）或显式配置静态路由，见 9.2。
+
 ### 8.5 录制与回放流程
 
 ```text
@@ -777,11 +780,19 @@ Transport Switcher 的输入包括：
 - 当前通道健康状态；
 - Driver 能力描述（`TransportCapabilities`：传输形态、单帧/重组上限、共享窗口支持等，见详设 15.3）。
 
+远端目标节点集合的产生支持两种 **路由策略（RoutePolicy）**，按 Topic 配置（详设 14.2、15.2）：
+
+- **自动发现（Discovery Routing，默认）**：订阅驱动路由。Subscriber 注册到 Node Registry 后，Registry 汇总该 Topic 的**订阅节点集合**并带版本号推送；无订阅者的节点不产生网络流量，新订阅者从注册切点开始接收，不追溯历史；
+- **显式配置（Static Routing）**：配置驱动路由。Topic 元数据显式给出**静态路由表（Route Set）**——固定发布的目标节点列表（如 `zone-front-01`、`recorder-01`），发布即按配置扇出，与订阅者注册/注销解耦。到达目标节点后按该节点本地订阅情况投递；无订阅者时按 Topic 策略丢弃或有限缓存，并导出指标，不静默成功。
+
+静态路由适用于录制节点固定接收、跨 Trust Domain 确定性通道（如 IPCF 固定域间链路）、启动期拓扑即确定的车载网络等场景。两种策略的 Route Handle 均以版本号为失效依据，不在消息热路径执行发现查询。
+
 ### 9.3 Topic 策略
 
 | 策略项 | 可选值 |
 |---|---|
 | 传输驱动 | SHM / TCP / UDP / RDMA / Fabric（IPCF 等，见详设 15.3、16.7） |
+| 路由策略 | 自动发现（默认）/ 显式配置静态路由（目标节点列表，见 9.2） |
 | 交付语义 | 可靠有序 / 尽力而为 / 最新值 |
 | 队列满行为 | 阻塞 / 丢最新 / 丢最旧 / 降采样 |
 | 批处理 | 关闭 / 按数量 / 按时间窗口 |
@@ -875,6 +886,7 @@ FREE
 | 方案 | 优点 | 代价与风险 | 适用场景 |
 |---|---|---|---|
 | 原子引用计数 | 直观、及时回收 | 热点原子更新；进程崩溃可能泄漏 | 订阅者少 |
+| Lease 绑定引用 Pin | 对象级长持有；崩溃由 Lease 兜底 | Reclaim 多一个判定条件；需配额防泄漏 | Transfer/Replay/Inspector/跨 Channel relay（ADR-0013） |
 | Epoch/RCU | 读取路径轻量 | 延迟回收；需要进程失效检测 | 读多写少 |
 | ACK 位图 | 可精确识别未完成订阅者 | 订阅者数有上限 | 固定订阅者集合 |
 | 租约与扫描 | 可处理异常退出 | 恢复逻辑复杂 | 强健性要求高 |
@@ -888,7 +900,8 @@ FREE
 - Slot 或消息元数据保存 ACK 位图；
 - 每个订阅者维护心跳和租约；
 - Coordinator 剔除失效订阅者；
-- 所有有效订阅者完成后回收 Payload。
+- 所有有效订阅者完成后回收 Payload；
+- 对象级长持有（Transfer/Replay/Inspector/跨 Channel relay）使用 Lease 绑定引用 Pin（ADR-0013），Reclaim 条件追加「无存活 Pin」；热路径回收不引入引用计数。
 
 后续在订阅者规模扩大或读路径原子竞争明显时，再评估 Epoch/RCU。
 
@@ -1188,6 +1201,7 @@ IDL 的完整规范由 ADR-0011 与详细设计 13.2 冻结。首版概要：
 - SuperBlock；
 - `ShmHandle`；
 - Central Slab Allocator；
+- 通用 MPMC 骨架（详设 9.9）；
 - SPSC RingBuffer；
 - 首版 Broadcast Channel；
 - Subscriber 租约；
