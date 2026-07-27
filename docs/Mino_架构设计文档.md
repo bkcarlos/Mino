@@ -199,7 +199,7 @@ Mino 通过统一的类型系统、发布订阅 API 和数据生命周期模型�
 - Schema Compiler 拆分为 Parser、Semantic、Descriptor、Layout、Compatibility、Runtime Compiler 和 CodeGen Targets；
 - Runtime 可以依赖 Runtime Compiler，但不依赖 C++ CodeGen；
 - `minoc` 复用同一 Compiler Library，并通过 Bazel 自定义 Rule 生成静态类型代码；
-- 关键协议决策记录在 `docs/adr/`，按 PROPOSED、ACCEPTED、VALIDATED、FROZEN 状态推进。
+- 关键协议决策记录在 `docs/adr/`（仓库根目录下），按 PROPOSED、ACCEPTED、VALIDATED、FROZEN 状态推进。
 
 ---
 
@@ -1190,7 +1190,7 @@ IDL 的完整规范由 ADR-0011 与详细设计 13.2 冻结。首版概要：
 - Producer/Subscriber ID 复用和队列空洞协议确认；
 - Local、Remote、Buffered、Written、Durable 保证矩阵确认；
 - Telemetry 开销预算和跨节点时钟规则确认；
-- **以上决策对应的 ADR-0002~0007、0009、0011 全部达到 ACCEPTED 状态**（ADR 是决策状态的唯一权威，见 docs/adr/README.md）。
+- **以上决策对应的 ADR-0002~0007、0009、0011 全部达到 ACCEPTED 状态**（ADR 是决策状态的唯一权威，见 [adr/README.md](./adr/README.md)）。
 
 ### 阶段 P1：C++ Runtime
 
@@ -1376,7 +1376,7 @@ IDL 的完整规范由 ADR-0011 与详细设计 13.2 冻结。首版概要：
 
 ## 19. 风险与待决策事项
 
-下表为摘要视图。每一项的权威状态以 `docs/adr/` 中对应 ADR 的状态字段为准；完整的决策与验证登记（含 Owner、目标关闭阶段、验证产物）见《详细设计文档》第 26 章。
+下表为摘要视图。每一项的权威状态以 [adr/](./adr/) 中对应 ADR 的状态字段为准；完整的决策与验证登记（含 Owner、目标关闭阶段、验证产物）见《详细设计文档》第 26 章。
 
 | 优先级 | 待决策事项 | 建议 |
 |---|---|---|
