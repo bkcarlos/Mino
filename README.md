@@ -97,6 +97,7 @@ Mino/
 |---|---|
 | [架构设计文档](docs/Mino_架构设计文档.md) | 设计目标、总体架构、SHM 布局与寻址、Index RingBuffer 协议、Slab 内存池、IDL、端到端流程、故障恢复、安全、可观测性、性能目标与实施路线图 |
 | [详细设计文档](docs/Mino_详细设计文档.md) | Bazel 工程边界、部署拓扑、公共 API 与错误模型、Channel/Allocator/生命周期、静态与动态 Schema、Registry/Bridge、Recorder/Storage、测试要求 |
+| [开发计划](docs/Mino_开发计划.md) | D0~D6 阶段工作分解、关键路径、里程碑、验证跟踪、团队配置与风险管理 |
 | [ADR 目录](docs/adr/) | 关键协议决策：平台基线、Handle 布局、Channel 语义、Canonical Wire、Schema Identity、Delivery/Ack、Segment Commit、Recorder 背压、Telemetry、SHM 信任域、IDL 字段标识、Transport Driver Fabric、SHM 引用 Pin |
 
 ADR 按 `PROPOSED → ACCEPTED → VALIDATED → FROZEN` 状态推进，冻结后的不兼容变更必须创建新 ADR 和协议版本。
