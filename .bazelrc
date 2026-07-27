@@ -1,0 +1,83 @@
+# Mino Bazel configuration.
+# See docs/Mino_详细设计文档.md section 3.4.
+
+###############################################################################
+# Common
+###############################################################################
+
+common --enable_bzlmod
+
+# C++20 for all C++ compilation.
+build --cxxopt=-std=c++20
+
+# Warning policy: identical for CI and local builds.
+build --cxxopt=-Wall
+build --cxxopt=-Wextra
+build --cxxopt=-Werror
+
+# Better diagnostics.
+build --copt=-fno-omit-frame-pointer
+
+# Do not fail builds on output paths differing between machines.
+build --strip=never
+
+###############################################################################
+# debug (default-friendly)
+###############################################################################
+
+build:debug --compilation_mode=dbg
+build:debug --copt=-g
+build:debug --copt=-O0
+
+###############################################################################
+# release (reproducible)
+###############################################################################
+
+build:release --compilation_mode=opt
+build:release --copt=-O2
+build:release --copt=-DNDEBUG
+# Reproducible builds: no debug info (removes embedded comp_dir paths),
+# no stamps, and redact date/time macros. -g0 keeps this portable across
+# GCC, Clang, and Apple Clang (-ffile-prefix-map with a bare path is not
+# accepted by Apple Clang).
+build:release --copt=-g0
+build:release --copt=-Wno-builtin-macro-redefined
+build:release --copt=-D__DATE__=\"redacted\"
+build:release --copt=-D__TIME__=\"redacted\"
+build:release --copt=-D__TIMESTAMP__=\"redacted\"
+build:release --stamp=false
+
+###############################################################################
+# Sanitizers
+#
+# Sanitizer configs are mutually exclusive: ASAN/UBSAN/TSAN must never be
+# combined in a single build or test process. Pick exactly one.
+###############################################################################
+
+build:asan --copt=-fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --copt=-g
+build:asan --linkopt=-fsanitize=address
+# NOTE: leak detection (detect_leaks) is left at the platform default -
+# LSan is enabled by default on Linux but unsupported on macOS.
+
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --copt=-fno-omit-frame-pointer
+build:ubsan --copt=-g
+build:ubsan --linkopt=-fsanitize=undefined
+build:ubsan --test_env=UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+# TSAN is incompatible with ASAN and UBSAN. Never pass --config=tsan together
+# with --config=asan or --config=ubsan.
+build:tsan --copt=-fsanitize=thread
+build:tsan --copt=-fno-omit-frame-pointer
+build:tsan --copt=-g
+build:tsan --linkopt=-fsanitize=thread
+
+###############################################################################
+# coverage
+###############################################################################
+
+build:coverage --collect_code_coverage
+build:coverage --copt=--coverage
+build:coverage --linkopt=--coverage

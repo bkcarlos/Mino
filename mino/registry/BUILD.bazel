@@ -1,0 +1,2 @@
+# Registry and coordinator.
+package(default_visibility = ["//visibility:private"])

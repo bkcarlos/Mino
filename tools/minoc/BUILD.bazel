@@ -1,0 +1,2 @@
+# minoc: Mino IDL schema compiler (runs on the exec platform).
+package(default_visibility = ["//visibility:private"])

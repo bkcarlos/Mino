@@ -1,6 +1,6 @@
 # ADR-0009：传输性能 Telemetry
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：按传输阶段统计 Counter/Gauge/Histogram，提供 Off、Counters-only、Sampled、Full Debug 四级。
 - 约束：采样消息才携带 Trace Context；事件写入有界 Sidecar；Exporter 不阻塞数据路径；跨节点单向延迟依赖 Clock Quality。
 - 待验证：准确性、Clock Jump、Exporter 故障和 Off/On 性能开销。
@@ -20,3 +20,11 @@
 - 正面：开销可分级购买（Counters-only ≤1% 目标）；采样消息携带 Trace Context 使低速率下仍可还原端到端链路；Clock Quality 门槛防止误导性跨节点延迟进入统计。
 - 负面：四级模式与采样传播增加配置与协议面（flags 位 + PerfTraceContext）；Sidecar 溢出时需要丢弃策略与指标。
 - 跟进：Off/Counter/Sampled 开销对比与 Clock Jump 测试（详设 26 章 V-23）。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | Telemetry 模型与详设 21.5 一致：Off/Counters-only/Sampled/Full Debug 四级对应 PerfTelemetryMode，开销预算 ≤1%/≤2% 明确为原型验收目标；时钟规则清晰（Wall Clock + Clock Quality，uncertainty 超限停发单向 E2E，跳变/负延迟样本计数丢弃，INV-30）；Counter/Histogram 固定容量、热路径无全局锁，采样消息才携带 PerfTraceContext，Sidecar 有界且溢出丢弃不影响业务（INV-29）；可支撑 D6 开发。遗留验证项：V-23（Off/Counter/Sampled 开销对比、Clock Quality 与 Histogram 校验）在对应阶段关闭。 |

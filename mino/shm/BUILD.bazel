@@ -1,0 +1,2 @@
+# Shared-memory subsystem. See region/, allocator/, channel/, recovery/.
+package(default_visibility = ["//visibility:private"])

@@ -1,0 +1,2 @@
+# Bridge and network protocol.
+package(default_visibility = ["//visibility:private"])

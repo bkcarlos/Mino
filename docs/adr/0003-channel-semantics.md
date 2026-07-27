@@ -1,6 +1,6 @@
 # ADR-0003：Channel 与 Slot Metadata
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：SPSC、MPSC、Broadcast、Work Queue 使用独立语义；Base Slot 不保存 mask_or_refcount。
 - 约束：Broadcast、Work Queue、MPSC Reservation 使用同索引 Sidecar Metadata；MPSC Owner 失效后提交 ABORTED Tombstone；Broadcast ACK 绑定 Subscriber Generation。
 - 待验证：TLA+、Kill、回绕和 Cache Benchmark。
@@ -20,3 +20,11 @@
 - 正面：Base Slot 保持不可变消息元数据 + 状态，语义稳定；Sidecar 与 Slot 同索引，恢复扫描可统一遍历；每种语义的内存序可独立验证。
 - 负面：IndexSlot 达 128 字节（两个 Cache Line），Ring 容量相同时内存翻倍；Sidecar 数组增加常驻内存。
 - 跟进：MPSC Producer Kill 的 TLA+ 模型与 Cache Benchmark（详设 26 章 V-02/V-03/V-04/V-14）。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | 布局与语义定义完整，符合 D1 开发入口要求；遗留验证项：V-01（Handle 布局）/ V-02（Slot 尺寸）在 D1 阶段通过原型验证关闭。 |

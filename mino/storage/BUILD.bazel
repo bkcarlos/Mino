@@ -1,0 +1,2 @@
+# Recorder, storage, replay.
+package(default_visibility = ["//visibility:private"])

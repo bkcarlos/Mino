@@ -1,0 +1,28 @@
+# V-12: Linux x86-64 原子 ABI Litmus Test（ADR-0001 / 详设 26 章）
+#
+# 验证共享原子在 Linux x86-64 基线上的 lock-free 属性与跨进程内存序。
+# 详见 README.md。
+
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "atomic_abi_test",
+    srcs = ["atomic_abi_test.cc"],
+    # 128-bit lock-free 原子（std::atomic<__int128>）在 x86-64 上依赖
+    # CMPXCHG16B 指令，需 -mcx16 使编译器内联生成（否则回退 libatomic 锁）。
+    # 限定 x86_64 平台注入，AArch64 等平台不加。
+    copts = select({
+        "@platforms//cpu:x86_64": ["-mcx16"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "@platforms//os:linux": [
+            "-lrt",      # glibc < 2.34 的 shm_open 需要
+            "-latomic",  # 无 -mcx16 环境下 16B CAS 回退 libatomic
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "@googletest//:gtest_main",
+    ],
+)

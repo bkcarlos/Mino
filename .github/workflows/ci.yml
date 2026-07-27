@@ -1,0 +1,97 @@
+# Mino CI（开发计划 D0-03）
+#
+# 触发：push 到 master/main + pull_request
+# 矩阵：debug / release / asan / ubsan / tsan 五配置（sanitizer 互斥，分 job 运行）
+# 缓存：actions/cache 缓存 Bazel output base 与 repository cache
+# Lint：buildifier 检查 BUILD 文件格式（可选）
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# 同一分支的新 push 自动取消进行中的旧运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 构建 + 测试矩阵：五配置分 job（sanitizer 之间互斥，禁止同进程叠加）
+  # -------------------------------------------------------------------------
+  build-test:
+    name: ${{ matrix.config }} (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [debug, release, asan, ubsan, tsan]
+
+    env:
+      CC: gcc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ gcc libatomic1
+
+      # Bazelisk 读取 .bazelversion 锁定 Bazel 版本，保证构建可复现。
+      # 该 action 同时缓存下载的 Bazel 发行版。
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@v3
+
+      # 缓存 Bazel output base（~/.cache/bazel）：含外部分析仓库与构建产物。
+      # key 含配置名避免跨 sanitizer 配置产物互相污染。
+      - name: Cache Bazel output base
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ matrix.config }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ matrix.config }}-
+            bazel-${{ runner.os }}-
+
+      - name: Build (bazel build //...)
+        run: bazel build --config=${{ matrix.config }} //...
+
+      - name: Test (bazel test //...)
+        run: bazel test --config=${{ matrix.config }} //... --test_output=errors
+
+      # V-12 Litmus 报告：显式运行并输出全部日志，作为 Lock-free 验证证据归档
+      - name: V-12 Atomic ABI Litmus report
+        if: matrix.config == 'debug' || matrix.config == 'release'
+        run: |
+          bazel test --config=${{ matrix.config }} \
+            //tests/litmus:atomic_abi_test \
+            --test_output=all --nocache_test_results
+
+  # -------------------------------------------------------------------------
+  # Lint：buildifier 检查 BUILD / .bzl / WORKSPACE 文件格式（可选）
+  # 直接下载 bazelbuild/buildtools 官方 release 二进制，不依赖第三方 action
+  # -------------------------------------------------------------------------
+  lint:
+    name: buildifier
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install buildifier
+        run: |
+          curl -sSL -o buildifier \
+            https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64
+          chmod +x buildifier
+          ./buildifier --version
+
+      - name: Run buildifier (check mode)
+        run: ./buildifier --mode=check -r .

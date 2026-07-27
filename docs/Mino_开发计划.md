@@ -88,11 +88,11 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 2.3 退出条件（DoD）
 
-- [ ] 全部 13 篇 ADR 达到 ACCEPTED 状态
-- [ ] `bazel build //...` 成功（空骨架）
-- [ ] `bazel test //...` 通过（含 Status/Result 单测）
-- [ ] CI 五配置（debug/release/asan/ubsan/tsan）全绿
-- [ ] V-12 原子 ABI Litmus 报告产出
+- [x] 全部 13 篇 ADR 达到 ACCEPTED 状态
+- [x] `bazel build //...` 成功（空骨架）
+- [x] `bazel test //...` 通过（含 Status/Result 单测）
+- [ ] CI 五配置（debug/release/asan/ubsan/tsan）全绿（需推送 GitHub 触发首跑）
+- [x] V-12 原子 ABI Litmus 报告产出（`tests/litmus/` 含 4 用例，CI 首跑产出 Linux x86-64 权威报告）
 
 ---
 

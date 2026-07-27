@@ -1,6 +1,6 @@
 # ADR-0012：Transport Driver 抽象与非网络 Fabric 扩展
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：跨节点传输统一经 `TransportDriver` 抽象路由；以 `TransportKind`（Network / RDMA / SharedFabric）、`TransportCapabilities` 与 Union 型 `EndpointDescriptor` 描述传输形态、能力与端点；共享窗口类 Fabric（IPCF、PCIe NTB、CXL 共享内存池等）作为 Driver 的一种实现形态接入，可选择性实现 `FabricWindowDriver` 扩展接口。
 - 约束：非网络 Fabric 跨 Trust Domain 传输仍必须走 Canonical Wire（详设 16.2 帧格式），不得传本机 SHM Offset（INV-09 对 Fabric 同样成立）；可靠性与去重统一复用详设 16.5；DeliveryStage 语义不变；同一 Trust Domain 两端必须走本地 SHM 路径而非 Fabric Driver。
 - 待验证：具体 Fabric 驱动（IPCF Channel、NTB 窗口）的能力映射、窗口容量与背压参数、跨域复位恢复测试（详设 26 章 V-25）。
@@ -23,3 +23,11 @@
 - 正面：新传输形态只需实现 `TransportDriver`（必要时加 `FabricWindowDriver`）并在 Node Registry 注册端点元数据即可接入，协议语义、可靠性、确认与观测体系零改动；策略引擎依据 `TransportCapabilities` 统一在网络与 Fabric 间路由。
 - 负面：`EndpointDescriptor` Union 化使端点解析多一层判别；窗口类传输引入新的资源枯竭模式（满窗），背压与复位语义需在 16.7 显式约束。
 - 跟进：详设 15.3 接口定义、16.7 语义边界；IPCF 等具体驱动归属路线图 P5（详设 24 章 D6）；验证登记 V-25。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | Transport Driver 与 Fabric 语义边界定义完整，TransportKind/TransportCapabilities/EndpointDescriptor/FabricWindowDriver 与详设 15.3 完全一致；Canonical Wire 约束（INV-09）、可靠性复用 16.5、DeliveryStage 语义不变、同一 Trust Domain 走本地 SHM 等约束与详设 16.7 逐项对齐；备选方案论证充分，可支撑 D2/D4 开发；遗留验证项：V-25（UDP/RDMA/Fabric 驱动专项）在 P5 阶段关闭。 |

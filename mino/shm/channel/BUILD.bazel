@@ -1,0 +1,2 @@
+# Channel models (SPSC, MPSC, broadcast, work queue).
+package(default_visibility = ["//visibility:private"])

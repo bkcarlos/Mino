@@ -1,0 +1,2 @@
+# Observability (metrics, logging, tracing).
+package(default_visibility = ["//visibility:private"])

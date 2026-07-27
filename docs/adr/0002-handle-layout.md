@@ -1,6 +1,6 @@
 # ADR-0002：ShmHandle v1 布局
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：Handle 使用 64-bit Offset、32-bit Generation、32-bit Region ID，总计 16 字节。
 - 约束：Region ID 持久分配且永不复用；Generation 回绕前 Drain/迁移；Attach 校验 Region UUID/Epoch。
 - 待验证：动态字段空间开销、Cache 影响和回绕故障测试。
@@ -20,3 +20,11 @@
 - 正面：16 字节对齐友好，两字段即可检测陈旧引用；Region ID 永不复用简化跨 Region 混淆防护。
 - 负面：Generation 回绕前必须 Drain/迁移，需要额外的运维状态（DRAINING）；128 位 Handle 使 IndexSlot 增至两个 Cache Line（见 ADR-0003）。
 - 跟进：原型验证空间开销与回绕故障路径后进入 VALIDATED（详设 26 章 V-01）。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | 布局与语义定义完整，符合 D1 开发入口要求；遗留验证项：V-01（Handle 布局）/ V-02（Slot 尺寸）在 D1 阶段通过原型验证关闭。 |

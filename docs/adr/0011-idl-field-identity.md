@@ -1,6 +1,6 @@
 # ADR-0011：IDL Field Identity
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：生产 Schema 强制显式 Field ID；已发布 ID 永不复用，删除后 Reserved；首版禁止直接和间接递归类型。
 - 约束：Canonical Digest 覆盖传递类型依赖闭包，Import 文件路径不参与 Digest；Unknown Field 有界保留或 Wire Passthrough。
 - 待验证：Parser、Compatibility、Golden Vector 和 N/N-1 测试。
@@ -20,3 +20,11 @@ Field ID 是 Wire Format 的唯一字段身份。源码顺序自动分配在字�
 - 正面：Wire 身份与源码排版解耦；Reserved 机制使误删字段可被编译期拒绝；Digest 闭包规则使依赖升级可审计。
 - 负面：IDL 编写多一步显式编号；递归结构需要业务侧改用 ID 引用模式（数据库式外键）。
 - 跟进：Parser/Compatibility/Golden Vector 测试（详设 26 章 V-07）。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | IDL Field Identity 定义完整，显式 Field ID、Reserved 字段、递归禁止、Canonical Digest 闭包规则均与详设 §13.2 一致，可实现且可支撑 D2/D3 开发；遗留验证项：V-07（IDL Field ID）在 P0 阶段关闭。 |

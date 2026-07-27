@@ -1,0 +1,25 @@
+# Bazel outputs
+bazel-*
+
+# Caches and local state
+.cache/
+.bazelrc.local
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store

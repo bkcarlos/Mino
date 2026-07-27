@@ -1,0 +1,7 @@
+# Mino 根包
+#
+# 工程骨架按《Mino 详细设计文档》3.1 推进，D0 阶段仅包含最小骨架与
+# V-12 原子 ABI Litmus Test（//tests/litmus）。后续模块（//mino/...）
+# 按开发计划 D1~D6 逐步填充。
+
+package(default_visibility = ["//visibility:public"])

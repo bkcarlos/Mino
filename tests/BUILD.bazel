@@ -1,0 +1,7 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+cc_test(
+    name = "sanity_test",
+    srcs = ["sanity_test.cc"],
+    deps = ["@googletest//:gtest_main"],
+)

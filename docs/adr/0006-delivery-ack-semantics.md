@@ -1,6 +1,6 @@
 # ADR-0006：Delivery 与 ACK 语义
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：区分 Local Published、Remote Accepted、Recorder Buffered、Storage Written、Storage Durable。
 - 约束：默认 Publish 成功只表示 Local Published；多目标显式选择 ALL/ANY/QUORUM；Receipt 返回逐目标状态；Deadline 不撤销消息。
 - 非目标：首版不承诺跨节点 Exactly-once。
@@ -20,3 +20,11 @@
 - 正面：应用按需购买保证强度；默认路径零额外延迟；逐目标 Receipt 使部分失败可诊断。
 - 负面：API 复杂度上移（DeliveryStage/CompletionPolicy/Deadline 三要素）；At-least-once 使上层必须容忍重复或配置去重。
 - 跟进：多目标 Receipt 故障注入与端到端测试（详设 26 章 V-09）。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | Delivery/Ack 语义定义完整，五级 DeliveryStage、Receipt 协议（CompletionPolicy/Route Snapshot/有界 Table）、ACK 绑定 Subscriber Generation 均与详设 §2.2/§9.6/§10.5/§12.2 一致，可支撑 D2/D3 开发；遗留验证项：V-09（Delivery/Ack）在 P0 阶段关闭。 |

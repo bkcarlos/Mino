@@ -1,6 +1,6 @@
 # ADR-0013：SHM 对象级引用 Pin（Lease 绑定引用计数）
 
-- 状态：PROPOSED
+- 状态：ACCEPTED
 - 决策：在 Channel 级回收（Cursor + ACK Bitmap）之外，增加对象级引用 Pin 机制（`ShmSharedPtr` / Counted Borrow）：对单个 Payload 的跨 Callback、跨线程、跨 Channel 长持有引用。Reclaim 的充分条件修订为「已 Retired ∧ 无有效 Borrow ∧ 无存活 Pin」。
 - 约束：计数器不内嵌 Base Slot（遵守 ADR-0003），位于 Slab Header/Sidecar；Pin 的崩溃安全不依赖析构（跨进程无 RAII 保证），而由持有者 Lease 保证——进程死亡由 Lease 失效检测，Recovery 清除其 Pin 份额；Pin 获取必须校验 Handle Generation，防止 ABA 复活；Pin 总数有界（per-object 与 per-process 双上限），超出拒绝而非累积。
 - 待验证：Pin 获取/释放热路径开销、Lease 失效到 Pin 清除的时延、Pin 耗尽对 Channel 回收的阻塞模型、Recovery 清除协议竞态测试（详设 26 章 V-27）。
@@ -27,3 +27,11 @@
 - 正面：Transfer/Replay/Inspector/跨 Channel relay 获得零拷贝长持有能力；崩溃安全复用 Lease 体系，无新故障模式；ADR-0003 的热路径决策保持不动。
 - 负面：Reclaim 判定多一个条件，Channel 回收线程需扫描 Pin 表；Pin 泄漏（业务忘释放 + Lease 尚存）会阻塞对应 Payload 回收，需要指标与配额兜底。
 - 跟进：详设 11.2 Transfer 语义、8.4 回收条件修订、Pin 表容量纳入 20.4 节点资源预算；验证登记 V-27。
+
+---
+
+## 评审记录
+
+| 日期 | 评审人 | 结论 | 说明 |
+|---|---|---|---|
+| 2026-07-27 | Mino 架构评审 Agent | ACCEPTED | SHM 引用 Pin 机制定义完整：计数器位于 Slab Header/Sidecar（ADR-0003/INV-32），Reclaim 充分条件与详设 8.4 一致，崩溃安全由 Lease/Recovery 体系兜底（详设 12.2 步骤 5），ABA 防护与有界配额（per-object 64 / per-process 4096）与详设 11.2.1 完全对齐；Transfer 语义、监控指标要求明确；备选方案论证充分，可支撑 D2/D4 开发；遗留验证项：V-27（Pin 热路径开销、Lease 失效清除时延、Pin 耗尽阻塞模型、Recovery 竞态）在 P1 阶段关闭。 |

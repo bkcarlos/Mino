@@ -1,0 +1,32 @@
+# Common utilities: Status, Result<T>.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "status",
+    srcs = ["status.cc"],
+    hdrs = ["status.h"],
+)
+
+cc_library(
+    name = "result",
+    hdrs = ["result.h"],
+    deps = [":status"],
+)
+
+cc_test(
+    name = "status_test",
+    srcs = ["status_test.cc"],
+    deps = [
+        ":status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "result_test",
+    srcs = ["result_test.cc"],
+    deps = [
+        ":result",
+        "@googletest//:gtest_main",
+    ],
+)
