@@ -1,0 +1,24 @@
+# Mino process configuration.
+# Application code uses the Mino logging facade; spdlog is the default backend.
+
+[logging]
+level = "info"
+pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [thread %t] [%s:%#] %v"
+flush_on = "error"
+flush_interval_ms = 1000
+
+[logging.console]
+enabled = true
+
+[logging.file]
+enabled = false
+path = "logs/mino.log"
+
+[logging.rotation]
+max_size_bytes = 10485760
+max_files = 5
+
+[logging.async]
+enabled = false
+queue_size = 8192
+thread_count = 1

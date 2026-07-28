@@ -1,0 +1,35 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "logging_config",
+    srcs = [
+        "logging_config.cc",
+        "toml_config.cc",
+    ],
+    hdrs = [
+        "logging_config.h",
+        "toml_config.h",
+    ],
+    # toml++ 3.4's generated single header uses the pre-C++23 spaced literal
+    # operator spelling, which newer Clang deprecates under the project-wide
+    # -Werror policy.
+    copts = ["-Wno-deprecated-literal-operator"],
+    deps = [
+        "//mino/common/logging:logger",
+        "//mino/common/logging:logging",
+        "//mino/common/logging:spdlog_backend",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@tomlplusplus//:tomlplusplus",
+    ],
+)
+
+cc_test(
+    name = "logging_config_test",
+    srcs = ["logging_config_test.cc"],
+    deps = [
+        ":logging_config",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)

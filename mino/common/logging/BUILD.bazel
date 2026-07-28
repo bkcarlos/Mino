@@ -1,0 +1,47 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "logger",
+    hdrs = ["logger.h"],
+)
+
+cc_library(
+    name = "logging",
+    srcs = ["logging.cc"],
+    hdrs = ["logging.h"],
+    copts = ["-std=c++20"],
+    deps = [":logger"],
+)
+
+cc_library(
+    name = "spdlog_backend",
+    srcs = ["spdlog_backend.cc"],
+    hdrs = ["spdlog_backend.h"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":logger",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@spdlog//:spdlog",
+    ],
+)
+
+cc_test(
+    name = "logging_test",
+    srcs = ["logging_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":logging",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "spdlog_backend_test",
+    srcs = ["spdlog_backend_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":spdlog_backend",
+        "@googletest//:gtest_main",
+    ],
+)
