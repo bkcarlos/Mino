@@ -112,7 +112,9 @@ public:
     // Publishes slot `slot` with a valid header + CRC.
     void MakePublished(uint32_t slot) {
         auto* h = Slab(slot);
-        std::memset(h, 0, sizeof(*h));
+        // Value-initialization initializes every member (scalar and atomic);
+        // a prior memset would trip GCC's -Wclass-memaccess on the
+        // non-trivially-copyable type.
         new (h) Inspector::SlabHeaderView();
         h->magic = Inspector::kSlabMagic;
         h->header_version = 1;
@@ -131,7 +133,7 @@ public:
     // Bitmap occupied but object_state never published.
     void MakeOrphan(uint32_t slot) {
         auto* h = Slab(slot);
-        std::memset(h, 0, sizeof(*h));
+        // See MakePublished: value-initialization replaces the memset.
         new (h) Inspector::SlabHeaderView();
         h->magic = Inspector::kSlabMagic;
         h->generation = 4;
