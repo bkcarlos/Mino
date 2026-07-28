@@ -14,6 +14,79 @@ cc_library(
     ],
 )
 
+# D2-01: IndexSlot ABI (design doc 9.2, ADR-0003). The fixed 128-byte
+# control-plane record carried by every channel ring slot, plus the
+# channel-specific sidecar metadata types (broadcast / work queue / MPSC
+# reservation) and the immutable-metadata CRC.
+cc_library(
+    name = "index_slot",
+    srcs = ["index_slot.cc"],
+    hdrs = ["index_slot.h"],
+    deps = [
+        "//mino/abi:shm_abi",
+    ],
+)
+
+cc_test(
+    name = "index_slot_test",
+    srcs = ["index_slot_test.cc"],
+    deps = [
+        ":index_slot",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# D2-07: QueueFullPolicy (design doc 9.8). The policy applied when a
+# producer publishes into a full channel; shared by SPSC / MPSC /
+# broadcast / work queue.
+cc_library(
+    name = "queue_full_policy",
+    hdrs = ["queue_full_policy.h"],
+)
+
+# D2-02: SPSC channel (design doc 9.3, 9.4). Single-producer /
+# single-consumer channel with cache-line-separated cursors, built on the
+# IndexSlot ABI. Header-only: it is a non-owning view over shared memory.
+cc_library(
+    name = "spsc",
+    hdrs = ["spsc_channel.h"],
+    deps = [
+        ":index_slot",
+        ":queue_full_policy",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "spsc_channel_test",
+    srcs = ["spsc_channel_test.cc"],
+    deps = [
+        ":index_slot",
+        ":queue_full_policy",
+        ":spsc",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# INV-01 (cross-process): fork + MAP_SHARED long-wrap test. Fast (a few
+# seconds), part of the default `bazel test //...` run, same style as
+# mpmc_ring_xproc_test (V-26).
+cc_test(
+    name = "spsc_channel_xproc_test",
+    srcs = ["spsc_channel_xproc_test.cc"],
+    deps = [
+        ":index_slot",
+        ":queue_full_policy",
+        ":spsc",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "mpmc_ring_test",
     srcs = ["mpmc_ring_test.cc"],
