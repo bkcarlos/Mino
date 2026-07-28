@@ -1,0 +1,234 @@
+// Copyright 2026 The Mino Authors
+//
+// Licensed under the GNU Lesser General Public License, Version 3.0 (the
+// "License"); you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.gnu.org/licenses/lgpl-3.0.txt
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+#ifndef MINO_SHM_REGION_SUPERBLOCK_H_
+#define MINO_SHM_REGION_SUPERBLOCK_H_
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+#include "mino/common/checked_arithmetic.h"
+#include "mino/platform/process_identity.h"
+
+namespace mino {
+
+// ---------------------------------------------------------------------------
+// SuperBlock (design doc section 6.4)
+// ---------------------------------------------------------------------------
+//
+// The SuperBlock is the fixed-layout header at offset 0 of every shared-memory
+// Region. It is partitioned so that immutable, CRC-protected "disk-style"
+// fields never share a cache line with high-frequency cross-process atomic
+// fields (design doc section 6.4).
+//
+// Cross-process fields (region_epoch, clean_shutdown, state, recovery_*) are
+// plain integers in the layout and are accessed exclusively through
+// std::atomic_ref at runtime. This keeps the struct standard-layout (so
+// offsetof/static_assert are well-defined) while still giving atomic access
+// semantics on the shared mapping (design doc section 6.6). The object is
+// explicitly constructed by the Region initialization flow (memset + field
+// stores) before any other process maps it.
+//
+// All cross-process references inside the Region use Offset semantics; no raw
+// pointers are stored here.
+
+// Constants.
+inline constexpr uint32_t kSuperBlockMagic = 0x4D494E4F;  // "MINO"
+inline constexpr uint16_t kRegionLayoutVersion = 1;
+// Byte-order detector: stored at Create; a reader on a different-endian host
+// observes a byte-swapped value and rejects the Region (first version only
+// supports the native little-endian layout).
+inline constexpr uint32_t kByteOrderNative = 0x01020304;
+// Total SuperBlock size in bytes (4 cache lines).
+inline constexpr uint32_t kSuperBlockSize = 256;
+// Default page size assumed at Create; validated against the host at Attach.
+inline constexpr uint32_t kDefaultPageSize = 4096;
+
+// RegionState is the persisted lifecycle state (design doc section 6.1).
+// ABSENT is implicit (no Region object exists), so it is not stored.
+enum class RegionState : uint32_t {
+    kInitializing = 1,
+    kActive = 2,
+    kClosed = 3,
+    kDirty = 4,
+    kRecovering = 5,
+    kQuarantined = 6,
+};
+
+struct SuperBlock {
+    // ---- Immutable Header partition (cache lines 0-1: bytes [0,128)) ----
+    // Written once at Create and protected by immutable_crc32. Never modified
+    // afterwards, so readers can validate it without synchronization.
+    uint32_t magic;              // 0
+    uint16_t layout_version;     // 4
+    uint16_t header_size;        // 6
+    uint64_t region_size;        // 8
+    uint32_t byte_order;         // 16
+    uint32_t page_size;          // 20
+    uint64_t region_uuid_lo;     // 24
+    uint64_t region_uuid_hi;     // 32
+    uint64_t directory_offset;   // 40
+    uint64_t allocator_offset;   // 48
+    uint64_t data_offset;        // 56
+    uint64_t data_size;          // 64
+    uint32_t region_id;          // 72 (immutable; assigned at Create)
+    uint32_t immutable_rsv0;     // 76
+    uint32_t immutable_crc32;    // 80  CRC over bytes [0, 80)
+    uint32_t immutable_rsv1;     // 84
+    std::byte immutable_pad[40]; // 88..128
+
+    // ---- Lifecycle Control partition (cache line 2: bytes [128,192)) ----
+    // Cross-process atomics; access via the *Ref()/Load* helpers below.
+    uint64_t region_epoch;        // 128
+    uint32_t clean_shutdown;      // 136 (boolean)
+    uint32_t state;               // 140 (RegionState)
+    uint64_t recovery_lease_ns;   // 144 (monotonic lease expiry; the mutex)
+    uint64_t recovery_epoch;      // 152 (takeover generation counter)
+    ProcessIdentity recovery_owner;  // 160..192 (informational owner identity)
+
+    // ---- Feature/Compatibility partition (cache line 3: bytes [192,256)) ----
+    uint64_t feature_flags;          // 192
+    uint32_t minimum_reader_version; // 200
+    uint32_t compat_rsv;             // 204
+    std::byte compat_pad[48];        // 208..256
+};
+
+// ---- Layout pinning (shared-memory ABI must be fixed) ----
+static_assert(sizeof(SuperBlock) == kSuperBlockSize,
+              "SuperBlock must be exactly 256 bytes");
+static_assert(alignof(SuperBlock) == 8, "SuperBlock must be 8-byte aligned");
+static_assert(std::is_standard_layout_v<SuperBlock>);
+static_assert(std::is_trivially_copyable_v<SuperBlock>);
+
+static_assert(offsetof(SuperBlock, magic) == 0);
+static_assert(offsetof(SuperBlock, layout_version) == 4);
+static_assert(offsetof(SuperBlock, header_size) == 6);
+static_assert(offsetof(SuperBlock, region_size) == 8);
+static_assert(offsetof(SuperBlock, byte_order) == 16);
+static_assert(offsetof(SuperBlock, page_size) == 20);
+static_assert(offsetof(SuperBlock, region_uuid_lo) == 24);
+static_assert(offsetof(SuperBlock, region_uuid_hi) == 32);
+static_assert(offsetof(SuperBlock, directory_offset) == 40);
+static_assert(offsetof(SuperBlock, allocator_offset) == 48);
+static_assert(offsetof(SuperBlock, data_offset) == 56);
+static_assert(offsetof(SuperBlock, data_size) == 64);
+static_assert(offsetof(SuperBlock, region_id) == 72);
+static_assert(offsetof(SuperBlock, immutable_crc32) == 80);
+// Cross-partition boundaries must land on cache-line boundaries.
+static_assert(offsetof(SuperBlock, region_epoch) == 128);
+static_assert(offsetof(SuperBlock, clean_shutdown) == 136);
+static_assert(offsetof(SuperBlock, state) == 140);
+static_assert(offsetof(SuperBlock, recovery_lease_ns) == 144);
+static_assert(offsetof(SuperBlock, recovery_epoch) == 152);
+static_assert(offsetof(SuperBlock, recovery_owner) == 160);
+static_assert(offsetof(SuperBlock, feature_flags) == 192);
+static_assert(offsetof(SuperBlock, minimum_reader_version) == 200);
+
+// ---------------------------------------------------------------------------
+// CRC32 (IEEE 802.3, reflected, polynomial 0xEDB88320)
+// ---------------------------------------------------------------------------
+//
+// Used to protect the SuperBlock immutable header and (in later milestones)
+// Slab immutable headers. The 256-entry table is built once per process on
+// first use (thread-safe via a function-local static initializer).
+
+namespace detail {
+
+// Builds and returns the CRC32 lookup table. Constructed exactly once
+// (thread-safe function-local static).
+inline const uint32_t* Crc32Table() {
+    struct Table {
+        uint32_t entries[256];
+        Table() {
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k) {
+                    c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                }
+                entries[i] = c;
+            }
+        }
+    };
+    static const Table table;
+    return table.entries;
+}
+
+}  // namespace detail
+
+// Computes CRC32 over [data, data+len) with the standard seed/xorout.
+inline uint32_t Crc32(const void* data, size_t len, uint32_t seed = 0) {
+    const uint32_t* table = detail::Crc32Table();
+    const auto* p = static_cast<const unsigned char*>(data);
+    uint32_t crc = seed ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------------------
+// SuperBlock helpers
+// ---------------------------------------------------------------------------
+
+// Computes the CRC over the immutable header fields [0, immutable_crc32).
+// This range is fixed and excludes the CRC field itself and all mutable
+// lifecycle/feature fields.
+inline uint32_t SuperBlockImmutableCrc(const SuperBlock& sb) {
+    return Crc32(&sb, offsetof(SuperBlock, immutable_crc32));
+}
+
+// Cross-process atomic accessors. Loads are safe on a const SuperBlock (they
+// only read); stores require a mutable SuperBlock mapped read-write.
+inline uint64_t LoadRegionEpoch(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint64_t&>(sb.region_epoch))
+        .load(std::memory_order_acquire);
+}
+inline void StoreRegionEpoch(SuperBlock& sb, uint64_t v) {
+    std::atomic_ref(sb.region_epoch).store(v, std::memory_order_release);
+}
+
+inline uint32_t LoadState(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint32_t&>(sb.state))
+        .load(std::memory_order_acquire);
+}
+inline void StoreState(SuperBlock& sb, RegionState v) {
+    std::atomic_ref(sb.state)
+        .store(static_cast<uint32_t>(v), std::memory_order_release);
+}
+inline RegionState LoadRegionState(const SuperBlock& sb) {
+    return static_cast<RegionState>(LoadState(sb));
+}
+
+inline bool LoadCleanShutdown(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint32_t&>(sb.clean_shutdown))
+               .load(std::memory_order_acquire) != 0;
+}
+inline void StoreCleanShutdown(SuperBlock& sb, bool v) {
+    std::atomic_ref(sb.clean_shutdown)
+        .store(v ? 1u : 0u, std::memory_order_release);
+}
+
+inline uint64_t LoadRecoveryLeaseNs(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint64_t&>(sb.recovery_lease_ns))
+        .load(std::memory_order_acquire);
+}
+inline uint64_t LoadRecoveryEpoch(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint64_t&>(sb.recovery_epoch))
+        .load(std::memory_order_acquire);
+}
+
+}  // namespace mino
+
+#endif  // MINO_SHM_REGION_SUPERBLOCK_H_

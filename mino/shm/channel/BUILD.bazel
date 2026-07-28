@@ -1,2 +1,48 @@
 # Channel models (SPSC, MPSC, broadcast, work queue).
-package(default_visibility = ["//visibility:private"])
+#
+# mpmc_ring is the generic MPMC skeleton (design doc 9.9): the bounded
+# Vyukov ring shared by every cross-process channel implementation. It is
+# header-only because the element type is a template parameter.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "mpmc_ring",
+    hdrs = ["mpmc_ring.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "mpmc_ring_test",
+    srcs = ["mpmc_ring_test.cc"],
+    deps = [
+        ":mpmc_ring",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Long-running stress test: excluded from the default CI run. Execute
+# explicitly (ideally under --config=tsan) with e.g.
+#   bazel test //mino/shm/channel:mpmc_ring_stress_test \
+#       --test_timeout=3600 --test_env=MPMC_STRESS_DURATION_SEC=60
+cc_test(
+    name = "mpmc_ring_stress_test",
+    srcs = ["mpmc_ring_stress_test.cc"],
+    # manual: skipped by wildcard builds/tests (bazel test //...), must be
+    # requested explicitly. large: tells Bazel to allow a long runtime when
+    # it is requested.
+    tags = [
+        "manual",
+        "large",
+    ],
+    deps = [
+        ":mpmc_ring",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -1,2 +1,34 @@
-# mino: Mino CLI tool.
+# mino: Mino CLI tool (D1-11 Inspector + recovery entry point).
 package(default_visibility = ["//visibility:private"])
+
+cc_library(
+    name = "inspector",
+    srcs = ["inspector.cc"],
+    hdrs = ["inspector.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "inspector_test",
+    srcs = ["inspector_test.cc"],
+    deps = [
+        ":inspector",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "mino",
+    srcs = ["main.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":inspector",
+        "//mino/common:status",
+        "//mino/shm/recovery:scanner",
+    ],
+)

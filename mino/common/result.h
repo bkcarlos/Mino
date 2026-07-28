@@ -179,11 +179,16 @@ private:
 // Example:
 //   MINO_ASSIGN_OR_RETURN(auto handle, channel.Reserve());
 //   // use handle
-#define MINO_ASSIGN_OR_RETURN(lhs, rexpr)                                \
-    auto _result_##__LINE__ = (rexpr);                                   \
-    if (!_result_##__LINE__.ok()) {                                      \
-        return _result_##__LINE__.status();                              \
-    }                                                                    \
-    lhs = std::move(_result_##__LINE__).value()
+//
+// The temporary name is uniquified with __LINE__ via two-level indirection
+// so that the line number macro expands before token pasting.
+#define MINO_DETAIL_CONCAT_INNER_(a, b) a##b
+#define MINO_DETAIL_CONCAT_(a, b) MINO_DETAIL_CONCAT_INNER_(a, b)
+#define MINO_ASSIGN_OR_RETURN(lhs, rexpr)                                 \
+    auto MINO_DETAIL_CONCAT_(_result_, __LINE__) = (rexpr);               \
+    if (!MINO_DETAIL_CONCAT_(_result_, __LINE__).ok()) {                  \
+        return MINO_DETAIL_CONCAT_(_result_, __LINE__).status();          \
+    }                                                                     \
+    lhs = std::move(MINO_DETAIL_CONCAT_(_result_, __LINE__)).value()
 
 #endif  // MINO_COMMON_RESULT_H_

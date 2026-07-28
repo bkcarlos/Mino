@@ -1,2 +1,121 @@
-# Central Slab Allocator.
-package(default_visibility = ["//visibility:private"])
+# Central Slab Allocator (design doc section 8).
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "slab_header",
+    hdrs = ["slab_header.h"],
+)
+
+cc_library(
+    name = "class_table",
+    srcs = ["class_table.cc"],
+    hdrs = ["class_table.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "bitmap",
+    srcs = ["bitmap.cc"],
+    hdrs = ["bitmap.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "generation_array",
+    srcs = ["generation_array.cc"],
+    hdrs = ["generation_array.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "central_slab",
+    srcs = ["central_slab.cc"],
+    hdrs = ["central_slab.h"],
+    deps = [
+        ":bitmap",
+        ":class_table",
+        ":generation_array",
+        ":slab_header",
+        "//mino/abi:shm_abi",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "large_object_pool",
+    srcs = ["large_object_pool.cc"],
+    hdrs = ["large_object_pool.h"],
+    deps = [
+        ":generation_array",
+        ":slab_header",
+        "//mino/abi:shm_abi",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "slab_header_test",
+    srcs = ["slab_header_test.cc"],
+    deps = [
+        ":slab_header",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "class_table_test",
+    srcs = ["class_table_test.cc"],
+    deps = [
+        ":class_table",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "bitmap_test",
+    srcs = ["bitmap_test.cc"],
+    deps = [
+        ":bitmap",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "generation_array_test",
+    srcs = ["generation_array_test.cc"],
+    deps = [
+        ":generation_array",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "central_slab_test",
+    srcs = ["central_slab_test.cc"],
+    deps = [
+        ":central_slab",
+        "//mino/abi:shm_abi",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "large_object_pool_test",
+    srcs = ["large_object_pool_test.cc"],
+    deps = [
+        ":large_object_pool",
+        "//mino/abi:shm_abi",
+        "@googletest//:gtest_main",
+    ],
+)

@@ -1,2 +1,93 @@
-# Shared memory Region lifecycle.
-package(default_visibility = ["//visibility:private"])
+# Shared memory Region lifecycle: SuperBlock, Region, Recovery, HandleResolver.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "superblock",
+    hdrs = ["superblock.h"],
+    deps = [
+        "//mino/common:checked_arithmetic",
+        "//mino/platform:process_identity",
+    ],
+)
+
+# The Region lifecycle and the Recovery Owner protocol are compiled into a
+# single library because they are mutually dependent at the source level:
+# region.cc drives recovery on Attach, while recovery.cc reads the Region's
+# SuperBlock. Keeping them together avoids a Bazel target cycle.
+cc_library(
+    name = "region",
+    srcs = [
+        "recovery.cc",
+        "region.cc",
+    ],
+    hdrs = [
+        "recovery.h",
+        "region.h",
+    ],
+    deps = [
+        ":superblock",
+        "//mino/common:checked_arithmetic",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+    ],
+)
+
+cc_library(
+    name = "handle_resolver",
+    srcs = ["handle_resolver.cc"],
+    hdrs = ["handle_resolver.h"],
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/abi:shm_abi",
+        "//mino/common:checked_arithmetic",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:slab_header",
+    ],
+)
+
+cc_test(
+    name = "region_test",
+    srcs = ["region_test.cc"],
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/common:status",
+        "//mino/platform:shared_memory",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "recovery_test",
+    srcs = ["recovery_test.cc"],
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "handle_resolver_test",
+    srcs = ["handle_resolver_test.cc"],
+    deps = [
+        ":handle_resolver",
+        ":region",
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:slab_header",
+        "@googletest//:gtest_main",
+    ],
+)

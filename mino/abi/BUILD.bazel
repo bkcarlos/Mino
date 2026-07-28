@@ -1,2 +1,8 @@
-# ABI-stable shared-memory structures. Filled in by later milestones.
-package(default_visibility = ["//visibility:private"])
+# ABI-stable shared-memory structures (handles, slab headers).
+package(default_visibility = ["//visibility:public"])
+
+# Header-only ABI: fixed-layout structures shared across process boundaries.
+cc_library(
+    name = "shm_abi",
+    hdrs = ["shm_handle.h"],
+)

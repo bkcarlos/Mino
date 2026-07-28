@@ -13,6 +13,25 @@ cc_library(
     deps = [":status"],
 )
 
+cc_library(
+    name = "ids",
+    hdrs = ["ids.h"],
+)
+
+cc_library(
+    name = "checked_arithmetic",
+    hdrs = ["checked_arithmetic.h"],
+)
+
+cc_test(
+    name = "ids_test",
+    srcs = ["ids_test.cc"],
+    deps = [
+        ":ids",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "status_test",
     srcs = ["status_test.cc"],

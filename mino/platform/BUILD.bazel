@@ -1,2 +1,37 @@
-# Platform abstraction (shared memory, process identity). Filled in by D1-02.
-package(default_visibility = ["//visibility:private"])
+# Platform abstraction (shared memory, process identity).
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "process_identity",
+    srcs = ["process_identity.cc"],
+    hdrs = ["process_identity.h"],
+)
+
+cc_library(
+    name = "shared_memory",
+    srcs = ["shared_memory.cc"],
+    hdrs = ["shared_memory.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "shared_memory_test",
+    srcs = ["shared_memory_test.cc"],
+    deps = [
+        ":shared_memory",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "process_identity_test",
+    srcs = ["process_identity_test.cc"],
+    deps = [
+        ":process_identity",
+        "@googletest//:gtest_main",
+    ],
+)

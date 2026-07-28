@@ -1,2 +1,37 @@
-# Crash recovery scanner.
+# Crash recovery scanner (D1-09).
 package(default_visibility = ["//visibility:private"])
+
+cc_library(
+    name = "scanner",
+    srcs = ["scanner.cc"],
+    hdrs = ["scanner.h"],
+    visibility = [
+        "//mino/shm:__pkg__",
+        "//tools/mino:__pkg__",
+    ],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "scanner_test",
+    srcs = ["scanner_test.cc"],
+    deps = [
+        ":scanner",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# V-11: cross-process Recovery Owner contention tests (fork + MAP_SHARED).
+cc_test(
+    name = "double_owner_test",
+    srcs = ["double_owner_test.cc"],
+    deps = [
+        ":scanner",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
