@@ -130,7 +130,9 @@ public:
     // Simulates a fully published object (valid magic + CRC).
     void MakePublished(uint32_t cls, uint32_t slot) {
         auto* h = Header(cls, slot);
-        std::memset(h, 0, sizeof(*h));
+        // Value-initialization both zero-initializes the scalar members and
+        // default-constructs the atomic members; a prior memset would trip
+        // GCC's -Wclass-memaccess on the non-trivially-copyable type.
         new (h) RecoveryScanner::SlabHeaderPrefix();
         h->magic = RecoveryScanner::kSlabMagic;
         h->header_version = 1;
@@ -152,7 +154,7 @@ public:
     // Simulates a crashed allocator: bitmap bit set, no valid state.
     void MakeOrphan(uint32_t cls, uint32_t slot, uint32_t raw_state = 0) {
         auto* h = Header(cls, slot);
-        std::memset(h, 0, sizeof(*h));
+        // See MakePublished: value-initialization replaces the memset.
         new (h) RecoveryScanner::SlabHeaderPrefix();
         h->magic = RecoveryScanner::kSlabMagic;
         h->generation = 3;
