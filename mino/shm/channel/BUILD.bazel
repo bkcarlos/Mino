@@ -123,8 +123,8 @@ cc_test(
     # requested explicitly. large: tells Bazel to allow a long runtime when
     # it is requested.
     tags = [
-        "manual",
         "large",
+        "manual",
     ],
     deps = [
         ":mpmc_ring",

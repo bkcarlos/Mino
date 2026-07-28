@@ -22,7 +22,7 @@ cc_library(
         ":logger",
         "//mino/common:result",
         "//mino/common:status",
-        "@spdlog//:spdlog",
+        "@spdlog",
     ],
 )
 

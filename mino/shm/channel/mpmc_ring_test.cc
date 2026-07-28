@@ -83,10 +83,16 @@ static_assert(std::is_trivially_copyable_v<MpmcRing<uint64_t>>,
 
 // 64-byte-aligned shared-memory stand-in. The ring contract requires the
 // region base to be control-block aligned.
-template <uint64_t kCapacity, typename T>
+//
+// The allocation is sized for the ring ABI that Init will use. Tests that
+// Init with an element ABI different from T's (e.g. a padded elem_size)
+// must pass that ABI via kElemSize/kElemAlign, otherwise Init writes past
+// the allocation (caught by ASAN).
+template <uint64_t kCapacity, typename T,
+          uint32_t kElemSize = sizeof(T), uint32_t kElemAlign = alignof(T)>
 struct RingFixture {
     static constexpr uint64_t kBytes =
-        MpmcRing<T>::RequiredSize(kCapacity, sizeof(T), alignof(T));
+        MpmcRing<T>::RequiredSize(kCapacity, kElemSize, kElemAlign);
 
     RingFixture() : storage(static_cast<unsigned char*>(
                         ::operator new(kBytes, std::align_val_t(64)))) {
@@ -243,7 +249,10 @@ TEST(MpmcRingAttachTest, AttachRejectsUnsupportedLayoutVersion) {
 }
 
 TEST(MpmcRingAttachTest, AttachRejectsAbiMismatch) {
-    U64Fixture<8> f;
+    // The fixture is sized for the 16-byte-element ABI initialized below
+    // (384B), not for the uint64_t ABI used by the attach attempt (320B).
+    RingFixture<8, uint64_t, 16, 8> f;
+
     // Initialize the region as a ring of 16-byte, 8-aligned elements...
     auto init = MpmcRing<uint64_t>::Init(f.storage, 8, 16, 8);
     ASSERT_TRUE(init.ok());
@@ -365,8 +374,8 @@ TEST(MpmcRingBasicTest, DataConsistencyAcrossManyValues) {
 TEST(MpmcRingBasicTest, PaddedElementAbiRoundTrips) {
     // Init with a padded element ABI (elem_size > sizeof(T)) still reads and
     // writes the element correctly; only the leading sizeof(T) bytes carry
-    // meaning.
-    U64Fixture<4> f;
+    // meaning. The fixture is sized for the padded ABI (288B).
+    RingFixture<4, uint64_t, 16, 8> f;
     auto ring = MpmcRing<uint64_t>::Init(f.storage, 4, 16, 8);
     ASSERT_TRUE(ring.ok());
     auto attached = MpmcRing<uint64_t>::Attach(f.storage);

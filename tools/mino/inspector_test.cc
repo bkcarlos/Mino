@@ -20,7 +20,7 @@
 #include <cstring>
 #include <new>
 #include <sstream>
-#include <vector>
+#include <memory>
 
 #include <gtest/gtest.h>
 
@@ -55,8 +55,11 @@ public:
         offset += 8 * Inspector::kIndexSlotSize;
 
         size_ = offset;
-        memory_.resize(size_);
-        std::memset(memory_.data(), 0, size_);
+        // 64-byte-aligned allocation: the views placed inside carry
+        // cache-line-aligned atomics (UBSAN rejects placement-new on a
+        // merely 16-aligned heap pointer).
+        memory_.reset(new (std::align_val_t(64)) std::byte[size_]);
+        std::memset(memory_.get(), 0, size_);
 
         // Initialize the ring control block (8 slots, 128-byte elements).
         auto* control = RingControl();
@@ -80,29 +83,29 @@ public:
         return layout;
     }
 
-    std::byte* base() { return memory_.data(); }
+    std::byte* base() { return memory_.get(); }
     uint64_t size() const { return size_; }
 
     Inspector::RingControlView* RingControl() {
         return reinterpret_cast<Inspector::RingControlView*>(
-            memory_.data() + ring_control_offset_);
+            memory_.get() + ring_control_offset_);
     }
 
-    Inspector::IndexSlotView* RingSlot(uint64_t index) {
+    Inspector::IndexSlotView* RingSlot(uint32_t index) {
         return reinterpret_cast<Inspector::IndexSlotView*>(
-            memory_.data() + ring_slots_offset_ +
+            memory_.get() + ring_slots_offset_ +
             index * Inspector::kIndexSlotSize);
     }
 
     Inspector::SlabHeaderView* Slab(uint32_t slot) {
         return reinterpret_cast<Inspector::SlabHeaderView*>(
-            memory_.data() + class_.slots_offset +
+            memory_.get() + class_.slots_offset +
             static_cast<uint64_t>(slot) * class_.slot_stride);
     }
 
     void SetBitmap(uint32_t slot) {
         auto* word = reinterpret_cast<std::atomic<uint64_t>*>(
-            memory_.data() + class_.bitmap_offset);
+            memory_.get() + class_.bitmap_offset);
         word->fetch_or(1ULL << slot, std::memory_order_acq_rel);
     }
 
@@ -140,7 +143,7 @@ public:
     void MakeInconsistent(uint32_t slot) {
         MakePublished(slot);
         auto* word = reinterpret_cast<std::atomic<uint64_t>*>(
-            memory_.data() + class_.bitmap_offset);
+            memory_.get() + class_.bitmap_offset);
         word->fetch_and(~(1ULL << slot), std::memory_order_acq_rel);
     }
 
@@ -182,7 +185,13 @@ public:
 private:
     static uint64_t Align64(uint64_t v) { return (v + 63) & ~uint64_t{63}; }
 
-    std::vector<std::byte> memory_;
+    struct AlignedDeleter {
+        void operator()(std::byte* p) const {
+            ::operator delete[](p, std::align_val_t(64));
+        }
+    };
+
+    std::unique_ptr<std::byte[], AlignedDeleter> memory_;
     uint64_t size_ = 0;
     uint64_t ring_control_offset_ = 0;
     uint64_t ring_slots_offset_ = 0;

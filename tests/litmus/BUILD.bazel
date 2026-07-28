@@ -17,7 +17,7 @@ cc_test(
     }),
     linkopts = select({
         "@platforms//os:linux": [
-            "-lrt",      # glibc < 2.34 的 shm_open 需要
+            "-lrt",  # glibc < 2.34 的 shm_open 需要
             "-latomic",  # 无 -mcx16 环境下 16B CAS 回退 libatomic
         ],
         "//conditions:default": [],

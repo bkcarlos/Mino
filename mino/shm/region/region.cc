@@ -15,7 +15,7 @@
 #include "mino/shm/region/region.h"
 
 #include <atomic>
-#include <cstring>
+#include <new>
 #include <random>
 #include <utility>
 
@@ -167,9 +167,11 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
                           SharedMemorySegment::Create(shm_opts));
 
     // Initialize the SuperBlock (6.1: INITIALIZING). Zero the header region
-    // first so all padding/reserved fields are deterministic.
-    auto* sb = static_cast<SuperBlock*>(segment.base());
-    std::memset(sb, 0, sizeof(SuperBlock));
+    // first so all padding/reserved fields are deterministic. Placement
+    // value-initialization is used instead of memset: SuperBlock is not
+    // trivially default-constructible (ProcessIdentity has default member
+    // initializers), and GCC rejects memset on it with -Wclass-memaccess.
+    auto* sb = new (segment.base()) SuperBlock();
 
     sb->magic = kSuperBlockMagic;
     sb->layout_version = kRegionLayoutVersion;

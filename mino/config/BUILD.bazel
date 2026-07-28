@@ -15,12 +15,12 @@ cc_library(
     # -Werror policy.
     copts = ["-Wno-deprecated-literal-operator"],
     deps = [
-        "//mino/common/logging:logger",
-        "//mino/common/logging:logging",
-        "//mino/common/logging:spdlog_backend",
         "//mino/common:result",
         "//mino/common:status",
-        "@tomlplusplus//:tomlplusplus",
+        "//mino/common/logging",
+        "//mino/common/logging:logger",
+        "//mino/common/logging:spdlog_backend",
+        "@tomlplusplus",
     ],
 )
 
