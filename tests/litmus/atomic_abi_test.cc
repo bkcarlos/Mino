@@ -221,19 +221,24 @@ TEST(AtomicAbiLockFreeTest, AtomicInt128IsLockFree) {
 #if MINO_HAS_ATOMIC_I128
   // V-12 的本职是「验证并报告」lock-free 能力，而不是让构建失败：
   // 在 TSAN/ASAN 下 libstdc++ 把 128 位原子 lower 为运行时调用
-  //（__tsan_atomic* / libatomic），is_always_lock_free 编译期为 false，且
-  // fetch_add 根本没有声明（上一个 CI 错误：no member named 'fetch_add'）。
-  // 因此用 if constexpr 在编译期分派：仅 lock-free 工具链（debug/release
-  // + cx16）才实例化 std::atomic<u128> 并验证 RMW；非 lock-free 路径根本
-  // 不声明该对象，只做报告与 SKIP。
+  //（__tsan_atomic* / libatomic），is_always_lock_free 编译期为 false。
+  // 注意：即便 lock-free，libstdc++ 对 128 位原子也不提供 fetch_add 等算术
+  // RMW（只为 ≤64 位整型特化提供），128 位只支持 load/store/CAS/exchange。
+  // 因此这里用 if constexpr 在编译期分派：仅 lock-free 工具链（debug/
+  // release + cx16）才实例化 std::atomic<u128> 并验证 CAS；非 lock-free
+  // 路径根本不声明该对象，只做报告与 SKIP。
   if constexpr (std::atomic<unsigned __int128>::is_always_lock_free) {
     using u128 = unsigned __int128;
     std::atomic<u128> value{0};
-    // 基本 RMW 行为
-    EXPECT_EQ(value.fetch_add(1, std::memory_order_seq_cst),
-              static_cast<u128>(0));
-    u128 expected = 1;
-    u128 desired = (static_cast<u128>(1) << 64) | 0x2a;
+    // 128 位原子无 fetch_add，用 CAS 完成等效的原子更新验证。每次 CAS 前
+    // 显式重置 expected：CAS 无论成败都会覆写 expected，跨调用复用同一
+    // 变量会引入工具链相关的歧义。
+    u128 expected = 0;
+    ASSERT_TRUE(value.compare_exchange_strong(expected, static_cast<u128>(1),
+                                              std::memory_order_seq_cst));
+    EXPECT_EQ(value.load(std::memory_order_seq_cst), static_cast<u128>(1));
+    const u128 desired = (static_cast<u128>(1) << 64) | 0x2a;
+    expected = 1;
     EXPECT_TRUE(value.compare_exchange_strong(expected, desired,
                                               std::memory_order_seq_cst));
     EXPECT_EQ(value.load(std::memory_order_seq_cst), desired);
