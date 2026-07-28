@@ -91,3 +91,19 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "cross_process_handle_test",
+    srcs = ["cross_process_handle_test.cc"],
+    deps = [
+        ":handle_resolver",
+        ":region",
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:slab_header",
+        "@googletest//:gtest_main",
+    ],
+)

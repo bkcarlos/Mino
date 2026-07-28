@@ -7,6 +7,11 @@
 
 common --enable_bzlmod
 
+# Use the BCR git mirror instead of https://bcr.bazel.build: the local Java
+# TLS stack fails the handshake with bcr.bazel.build (curl is unaffected).
+# The mirror serves identical content and keeps MODULE.bazel.lock stable.
+common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main
+
 # C++20 for all C++ compilation.
 build --cxxopt=-std=c++20
 

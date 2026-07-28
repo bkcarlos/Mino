@@ -136,8 +136,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 3.4 退出条件（DoD）
 
-- [ ] 不同进程映射不同虚拟地址时 Handle 正确解析（INV-03，缺跨进程双映射测试，单进程全项校验已通过）
-- [ ] MPMC 骨架跨进程守恒/回绕/满空判定测试通过（V-26，进程内多线程守恒/回绕/满空已通过，缺跨进程验证）
+- [x] 不同进程映射不同虚拟地址时 Handle 正确解析（INV-03，`//mino/shm/region:cross_process_handle_test`：子进程 MAP_FIXED 占坑强制异地址 Attach，解析/payload/stale 拒绝全验，TSAN 通过）
+- [x] MPMC 骨架跨进程守恒/回绕/满空判定测试通过（V-26，`//mino/shm/channel:mpmc_ring_xproc_test`：2P2C fork 进程 10000 条零丢失零重复（~156 次回绕）、满 kResourceExhausted/空 kWouldBlock 跨进程传播）
 - [x] Slab 分配/回收在 TSAN 下无数据竞争（`bazel test --config=tsan //...` 23/23 通过，2026-07-28 macOS arm64）
 - [ ] Kill 压力测试（≥1 小时）：恢复扫描报告孤儿 Slab = 0，可用空间恢复基线（需专门长跑环境）
 - [x] 恢复扫描器双 Owner 竞争测试通过（V-11，`//mino/shm/recovery:double_owner_test` fork 双进程竞争/Kill 接管/Lease 失效单赢家）

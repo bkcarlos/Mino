@@ -25,6 +25,20 @@ cc_test(
     ],
 )
 
+# V-26: cross-process MPMC ring tests (fork + MAP_SHARED): conservation,
+# wraparound and full/empty probing across process boundaries. Fast (a few
+# seconds), so it is part of the default `bazel test //...` run.
+cc_test(
+    name = "mpmc_ring_xproc_test",
+    srcs = ["mpmc_ring_xproc_test.cc"],
+    deps = [
+        ":mpmc_ring",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # Long-running stress test: excluded from the default CI run. Execute
 # explicitly (ideally under --config=tsan) with e.g.
 #   bazel test //mino/shm/channel:mpmc_ring_stress_test \
