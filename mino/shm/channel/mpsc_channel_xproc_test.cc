@@ -42,6 +42,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -356,6 +357,78 @@ TEST_F(MpscChannelXprocTest, ProducerCrashLeavesOrphanThenRecoveryReclaims) {
     EXPECT_TRUE(channel_->IsEmpty())
         << "tombstone must be skipped, leaving the queue empty";
 #endif
+}
+
+// A PAUSED (SIGSTOP) but still-alive producer must NEVER be reclaimed, no
+// matter how far past the lease its reservation ages (design doc 9.5: "暂停但
+// 仍有效的 Producer 不得被误回收"; recovery must not judge a crash by timeout
+// alone). IsOwnerAlive() reports a stopped process as alive (its /proc entry
+// still exists on Linux; non-Linux probes conservatively report alive), so the
+// scanner skips it. Once SIGCONT resumes the producer it Commits normally and
+// the queue flows again — proof the slot was left intact.
+TEST_F(MpscChannelXprocTest, PausedProducerIsNeverReclaimedThenResumes) {
+    // Child: Reserve seq 0, then park until the parent signals it via the
+    // shared barrier. While parked (first stopped with SIGSTOP, then continued
+    // but still pre-Commit) its reservation sits in kWriting.
+    const pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        auto ch = MpscChannel::Attach(shared_->channel_storage);
+        if (!ch.ok()) {
+            _exit(kChildApiError);
+        }
+        const MpscChannel::ProducerIdentity owner = MakeIdentity(1);
+        auto res = ch->Reserve(owner);
+        if (!res.ok()) {
+            _exit(kChildApiError);
+        }
+        FillSlot(*res, 0xCC);
+        // Tell the parent the reservation is held, then raise SIGSTOP on
+        // itself: the parent will SIGCONT after its recovery scan. The
+        // Reservation stays live across the stop/continue (no destructor).
+        shared_->barrier.store(1, std::memory_order_release);
+        raise(SIGSTOP);
+        // Resumed: finish the publication and exit cleanly.
+        if (!std::move(*res).Commit().ok()) {
+            _exit(kChildApiError);
+        }
+        _exit(kChildOk);
+    }
+
+    // Wait until the child holds the reservation, then give it a moment to
+    // actually stop itself (SIGSTOP delivery is asynchronous).
+    while (shared_->barrier.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Recovery scan with a long-expired lease: the child is alive (merely
+    // stopped), so IsOwnerAlive() is true on every platform and the scanner
+    // must reclaim NOTHING.
+    const uint64_t aborted =
+        channel_->AbortOrphanedReservations(NowNs(), /*lease_ns=*/1);
+    EXPECT_EQ(aborted, 0u)
+        << "a paused-but-alive producer must never be reclaimed";
+    // The consumer is still wedged behind the live reservation: no tombstone
+    // was stamped, so the ordered prefix cannot advance.
+    {
+        auto blocked = channel_->Poll();
+        ASSERT_FALSE(blocked.ok());
+        EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+    }
+
+    // Resume the child; it Commits seq 0 and exits. The queue now flows,
+    // proving the slot was never reclaimed out from under the live owner.
+    ASSERT_EQ(kill(pid, SIGCONT), 0) << "SIGCONT failed: " << strerror(errno);
+    WaitChild(pid);
+    {
+        auto borrow = channel_->Poll();
+        ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+        EXPECT_EQ(borrow->slot()->sequence_num, 0u);
+        EXPECT_EQ(borrow->slot()->msg_type, 0x3000u + 0xCCu);
+        ASSERT_TRUE(std::move(*borrow).Ack().ok());
+    }
+    EXPECT_TRUE(channel_->IsEmpty());
 }
 
 }  // namespace

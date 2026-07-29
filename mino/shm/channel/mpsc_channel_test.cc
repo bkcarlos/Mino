@@ -389,5 +389,68 @@ TEST(MpscChannelTest, ReservationDestructorAborts) {
     EXPECT_TRUE(ch->IsEmpty());
 }
 
+// Recovery must never reclaim a reservation whose owner is still alive, no
+// matter how far past the lease it has aged (design doc 9.5: "暂停但仍有效的
+// Producer 不得被误回收"; never judge a crash by timeout alone). Here the
+// owner is this very process — IsOwnerAlive() is trivially true on every
+// platform — so even a zero-length lease reclaims nothing. The reservation is
+// deliberately leaked (never destructed) so it stays in kWriting rather than
+// being RAII-aborted, simulating a live-but-stalled producer.
+TEST(MpscChannelTest, LiveOwnerIsNeverReclaimedDespiteExpiredLease) {
+    constexpr uint64_t kCap = 64;
+    ChannelFixture<kCap> fixture;
+    auto ch = MpscChannel::Init(fixture.storage, kCap);
+    ASSERT_TRUE(ch.ok());
+    const auto id = MakeIdentity(1);
+
+    auto res = ch->Reserve(id);
+    ASSERT_TRUE(res.ok());
+    FillSlot(*res, 7);
+    // Leak the Reservation so its destructor never aborts the slot; it stays
+    // kWriting with this (alive) process as the recorded owner.
+    auto* leaked = new MpscChannel::Reservation(std::move(*res));
+    (void)leaked;
+
+    // lease_ns=0 selects the default, but pass an explicitly tiny lease: the
+    // owner is alive, so the liveness check (not the lease) decides, and the
+    // scan must reclaim nothing.
+    const uint64_t aborted = ch->AbortOrphanedReservations(
+        /*now_ns=*/UINT64_MAX / 2, /*lease_ns=*/1);
+    EXPECT_EQ(aborted, 0u)
+        << "a live owner must never be reclaimed, lease notwithstanding";
+
+    // The consumer is wedged behind the live kWriting slot: no tombstone.
+    auto blocked = ch->Poll();
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+}
+
+// The lease is the FIRST gate: a reservation younger than the lease is never
+// reclaimed, even before owner liveness is consulted. This protects a
+// live-but-slow producer inside its legitimate Reserve -> Commit window
+// (design doc 9.5). A huge lease makes the fresh reservation look young.
+TEST(MpscChannelTest, UnexpiredLeaseProtectsFreshReservation) {
+    constexpr uint64_t kCap = 64;
+    ChannelFixture<kCap> fixture;
+    auto ch = MpscChannel::Init(fixture.storage, kCap);
+    ASSERT_TRUE(ch.ok());
+    const auto id = MakeIdentity(1);
+
+    auto res = ch->Reserve(id);
+    ASSERT_TRUE(res.ok());
+    FillSlot(*res, 8);
+    auto* leaked = new MpscChannel::Reservation(std::move(*res));
+    (void)leaked;
+
+    // now_ns=0 makes now - reservation_timestamp underflow to a huge value in
+    // unsigned arithmetic; pass a lease of UINT64_MAX so the reservation is
+    // always "younger than the lease" regardless of its real timestamp.
+    const uint64_t aborted = ch->AbortOrphanedReservations(
+        /*now_ns=*/0, /*lease_ns=*/UINT64_MAX);
+    EXPECT_EQ(aborted, 0u)
+        << "an unexpired lease must protect the reservation before liveness "
+           "is even consulted";
+}
+
 }  // namespace
 }  // namespace mino
