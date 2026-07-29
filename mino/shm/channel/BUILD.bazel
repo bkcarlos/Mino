@@ -136,6 +136,53 @@ cc_test(
     ],
 )
 
+# D2-05: Broadcast channel (design doc 9.6). Single-publisher / N-subscriber
+# fan-out with per-subscriber cursors, per-slot AckBitmap sidecars bound to a
+# seqlock-style subscriber-set snapshot, and cache-line-separated subscriber
+# slots. Header-only: a non-owning view over shared memory.
+cc_library(
+    name = "broadcast",
+    hdrs = ["broadcast_channel.h"],
+    deps = [
+        ":index_slot",
+        ":queue_full_policy",
+        ":spsc",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "broadcast_channel_test",
+    srcs = ["broadcast_channel_test.cc"],
+    deps = [
+        ":broadcast",
+        ":index_slot",
+        ":queue_full_policy",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# D2-05 (cross-process): fork + MAP_SHARED broadcast tests. Fan-out
+# conservation (1 publisher process x 3 subscriber processes over many wrap
+# cycles) and publisher-crash tombstone skipping across a process boundary.
+cc_test(
+    name = "broadcast_channel_xproc_test",
+    srcs = ["broadcast_channel_xproc_test.cc"],
+    deps = [
+        ":broadcast",
+        ":index_slot",
+        ":queue_full_policy",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "mpmc_ring_test",
     srcs = ["mpmc_ring_test.cc"],

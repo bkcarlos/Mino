@@ -156,9 +156,9 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 |---|---|---|---|---|
 | D2-01 | IndexSlot ABI 定稿 ✅ | 128B 显式 Padding + static_assert、Sidecar 分离、不可变 CRC（`//mino/shm/channel:index_slot`，详设 9.2） | D1-06 | 2d |
 | D2-02 | SPSC Channel ✅ | `//mino/shm/channel:spsc`：单 Producer/Consumer Cursor、Cache Line 分离、发布协议状态机（详设 9.4） | D2-01 | 3d |
-| D2-03 | MPSC Channel | `//mino/shm/channel:mpsc`：Reservation/Owner Epoch/ABORTED Tombstone（详设 9.5） | D2-01 | 5d |
-| D2-04 | MPSC Producer Crash 恢复 | Owner Lease 失效 → ABORTED → Journal 回收 → 队列推进（详设 9.5、12.3） | D2-03 | 3d |
-| D2-05 | Broadcast Channel | `//mino/shm/channel:broadcast`：独立 Cursor、ACK Bitmap、Subscriber Set Snapshot（详设 9.6） | D2-01 | 5d |
+| D2-03 | MPSC Channel ✅ | `//mino/shm/channel:mpsc`：Reservation/Owner Epoch/ABORTED Tombstone（详设 9.5） | D2-01 | 5d |
+| D2-04 | MPSC Producer Crash 恢复 ✅ | Owner Lease 失效 → ABORTED → Journal 回收 → 队列推进（详设 9.5、12.3） | D2-03 | 3d |
+| D2-05 | Broadcast Channel ✅ | `//mino/shm/channel:broadcast`：独立 Cursor、ACK Bitmap、Subscriber Set Snapshot（详设 9.6） | D2-01 | 5d |
 | D2-06 | Broadcast Membership | 注册/注销/Lease 失效与 ACK 责任清理、Generation 绑定（详设 9.6、12.2） | D2-05 | 3d |
 | D2-07 | QueueFullPolicy ✅ | kBlock/kFail/kDropNewest/kDropOldest/kSample 策略实现（`//mino/shm/channel:queue_full_policy` + SPSC 策略执行，详设 9.8） | D2-02 | 2d |
 | D2-08 | Subscriber Lease | Lease 注册/心跳/失效/剔除流程（详设 12.2） | D2-06 | 3d |
