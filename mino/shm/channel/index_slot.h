@@ -91,13 +91,30 @@ struct alignas(64) IndexSlot {
     std::atomic<uint32_t> state{0};
     uint32_t flags = 0;
 
+    // -- MPSC Vyukov sequence (NOT covered by the CRC) -----------------------
+    //
+    // Per-slot Vyukov sequence used only by the MPSC channel (design doc 9.5).
+    // It is a numerically unique era number (not modulo capacity) that
+    // distinguishes the three protocol phases of a physical slot across wraps:
+    //   turn == pos        -> slot is free for the producer claiming cursor pos
+    //   turn == pos + 1    -> slot is READY for the consumer reading pos
+    //   turn == pos + cap  -> slot has been consumed and is free for the next
+    //                         era (pos + capacity)
+    // This is what makes the producer's cursor CAS and the slot occupation
+    // race-free: a producer wrapping around observes turn != pos and knows the
+    // slot is still occupied by the previous era, even if `state` (a modulo
+    // capacity value) happens to look reusable. `sequence_num` cannot serve
+    // this purpose because it is business data covered by the immutable CRC.
+    // SPSC initializes it for layout consistency but never reads it.
+    std::atomic<uint64_t> turn{0};  // offset 72
+
     // -- Explicit padding to 128 bytes (two cache lines) --------------------
     //
-    // Fields above occupy 72 bytes (msg_type..flags with the ShmHandle at
+    // Fields above occupy 80 bytes (msg_type..turn with the ShmHandle at
     // offset 40). Padding pins the ABI so the compiler cannot introduce
     // layout drift; any field change must adjust this array to keep the
     // total at exactly 128.
-    unsigned char padding_[128 - 72] = {};
+    unsigned char padding_[128 - 80] = {};
 };
 
 // Slot lifecycle states (design doc 9.3 / 9.5). The producer transitions
@@ -147,7 +164,8 @@ static_assert(offsetof(IndexSlot, payload_len) == 56);
 static_assert(offsetof(IndexSlot, immutable_metadata_crc) == 60);
 static_assert(offsetof(IndexSlot, state) == 64);
 static_assert(offsetof(IndexSlot, flags) == 68);
-static_assert(offsetof(IndexSlot, padding_) == 72);
+static_assert(offsetof(IndexSlot, turn) == 72);
+static_assert(offsetof(IndexSlot, padding_) == 80);
 
 // ---------------------------------------------------------------------------
 // Slot lifecycle states (design doc 9.3 / 9.5)

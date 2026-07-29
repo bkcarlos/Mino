@@ -76,6 +76,23 @@ cc_test(
     ],
 )
 
+# V-03 (cross-process): fork + MAP_SHARED MPSC tests. Conservation (2P x 1C,
+# ~62 wrap cycles, ordered prefix INV-17) and producer-crash recovery (orphan
+# reservation reclaimed via /proc liveness + lease, Linux-only). Fast, part
+# of the default `bazel test //...` run.
+cc_test(
+    name = "mpsc_channel_xproc_test",
+    srcs = ["mpsc_channel_xproc_test.cc"],
+    deps = [
+        ":index_slot",
+        ":mpsc",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # D2-02: SPSC channel (design doc 9.3, 9.4). Single-producer /
 # single-consumer channel with cache-line-separated cursors, built on the
 # IndexSlot ABI. Header-only: it is a non-owning view over shared memory.

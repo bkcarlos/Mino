@@ -250,6 +250,9 @@ public:
             std::memset(s.padding_, 0, sizeof(s.padding_));
             s.state.store(static_cast<uint32_t>(SlotState::kFree),
                           std::memory_order_relaxed);
+            // Initialized for layout consistency with MPSC; SPSC never reads
+            // it (single producer needs no era discrimination).
+            s.turn.store(i, std::memory_order_relaxed);
         }
 
         // Publish: release so every plain/relaxed write above is visible to

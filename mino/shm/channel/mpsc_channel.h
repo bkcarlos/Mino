@@ -17,24 +17,29 @@
 // Multiple producers publish into a single strictly-ordered ring consumed by
 // one consumer.
 //
-// Reservation protocol (Vyukov-style probe-then-claim, design doc 9.5):
+// Reservation protocol (Vyukov per-slot turn sequence, design doc 9.5):
 //   - reservation_cursor hands out logical sequences; physical slot for
-//     sequence s is slots[s % capacity], and the slot's current "era" is the
-//     cycle in which it was last claimed;
-//   - a slot is CLAIMABLE iff its state is kFree (never used) or kRetired
-//     (previous era fully consumed). The claimer first PROBES the slot's
-//     state; only if claimable does it CAS reservation_cursor forward. This
-//     ordering is the key invariant: the cursor is advanced only after the
-//     slot is known free, so a handed-out sequence ALWAYS owns its slot —
-//     there is no "phantom sequence" that consumed the cursor but lost the
-//     slot (which would wedge the ordered commit prefix);
-//   - a probe that finds kReady (unconsumed message) reports a full queue;
-//     kReserved/kWriting (a holder that has not finished) or kAborted (an
-//     unconsumed tombstone) reports kWouldBlock and leaves recovery to
-//     AbortOrphanedReservations() — the claimer never stamps a foreign slot.
-//   Commit/Abort stamp the slot and set the per-sequence commit bit; the
-//   committed prefix advances strictly in order, so the consumer sees a
-//   gapless logical sequence (INV-17).
+//     sequence s is slots[s % capacity];
+//   - each slot carries a numerically-unique (non-modular) `turn` value that
+//     identifies its protocol era: turn == pos means the slot is free for the
+//     producer claiming cursor pos; turn == pos + 1 means the slot is READY
+//     for the consumer reading pos; turn == pos + capacity means the slot was
+//     consumed and is free for the next era (pos + capacity);
+//   - a slot is CLAIMABLE iff slot[pos % capacity].turn == pos. Because turn
+//     is not modular, a producer that wraps the ring always observes
+//     turn != pos on a slot still occupied by a previous era, so the cursor
+//     CAS and the slot occupation are race-free without any modular-ABA
+//     window (the reason `state` alone, being capacity-modular, could not be
+//     used to distinguish eras);
+//   - the cursor is advanced (CAS) only after the turn probe reports the
+//     slot free, so a handed-out sequence ALWAYS owns its slot — there is no
+//     "phantom sequence" that consumed the cursor but lost the slot (which
+//     would wedge the ordered commit prefix);
+//   - commit publishes state kReady (release) then turn = pos + 1 (release);
+//     the consumer polls turn == cons + 1 for readiness, so half-written
+//     slots are invisible without an ordered commit bitmap;
+//   - retire/Ack publishes turn = cons + capacity (release), freeing the
+//     slot for the next era.
 //
 // Crash recovery (design doc 9.5, 12.3): every reservation binds its owner
 // through the MpscReservationMeta sidecar. AbortOrphanedReservations()
@@ -82,7 +87,11 @@ public:
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4D50'5343ULL;  // "MINOMPSC"
-    static constexpr uint32_t kLayoutVersion = 1;
+    // v3: per-slot Vyukov `turn` (IndexSlot offset 72) replaces state-based
+    // probing for era discrimination, eliminating the modular-ABA window
+    // between the cursor CAS and slot occupation. v2 dropped the ordered
+    // commit bitmap; v1 introduced the bitmap-based ordered prefix.
+    static constexpr uint32_t kLayoutVersion = 3;
 
     // Default producer lease (design doc 9.5). 30 s tolerates long pauses
     // (SIGSTOP, scheduling) without wedging the queue for minutes.
@@ -105,44 +114,34 @@ public:
         alignas(kCacheLineSize) std::atomic<uint64_t> reservation_cursor{0};
         unsigned char pad1[kCacheLineSize - 8] = {};
 
-        // -- Line 2: committed cursor (bitmap-driven prefix) ----------------
+        // -- Line 2: consumer cursor (single logical writer) ----------------
         //
-        // Prefix of the logical sequence that is fully published (READY or
-        // ABORTED). Advances strictly in order by scanning the commit
-        // bitmap; the consumer polls against this, never against
-        // reservation_cursor, so half-written slots are invisible.
-        alignas(kCacheLineSize) std::atomic<uint64_t> committed_cursor{0};
+        // The read position and the recovery window's lower bound. Advanced
+        // only by the consumer (Poll/Ack) or by a producer acting for
+        // kDropOldest; every writer uses CAS so the cursor stays monotonic
+        // even when the two race. There is no separate committed cursor: the
+        // consumer gates readiness on each slot's kReady state + sequence
+        // number directly, so half-written slots are invisible without an
+        // ordered commit bitmap (which suffered a cross-era ABA on wrap).
+        alignas(kCacheLineSize) std::atomic<uint64_t> consumer_cursor{0};
         unsigned char pad2[kCacheLineSize - 8] = {};
 
-        // -- Line 3: consumer cursor (single writer: the consumer) ----------
-        alignas(kCacheLineSize) std::atomic<uint64_t> consumer_cursor{0};
+        // -- Line 3: reserved for future use --------------------------------
+        alignas(kCacheLineSize) std::atomic<uint64_t> reserved2{0};
         unsigned char pad3[kCacheLineSize - 8] = {};
-
-        // -- Line 4..: per-sequence commit bits ------------------------------
-        //
-        // Bit (seq & mask) records "logical sequence seq finished". Bit
-        // ownership is tied to the logical sequence, not the physical slot:
-        // the advance scan clears a bit exactly once per era before the slot
-        // can be re-claimed for its next sequence, so no ABA is possible.
-        alignas(kCacheLineSize) std::atomic<uint64_t> commit_bits[1];  // tail
     };
 
-    static constexpr uint64_t CommitWordCount(uint64_t capacity) {
-        return capacity / 64;  // capacity >= 64 (validated), power of two
-    }
-
     // IndexSlot requires 64-byte alignment, so the slot array must start on
-    // a 64-byte boundary. The commit bitmap tail is only (capacity/64)*8
-    // bytes, which is not a multiple of 64 for every capacity; round the
-    // slot-array offset up to the next cache line.
+    // a 64-byte boundary. The control block is an integral number of cache
+    // lines, so the slot array begins immediately after it, already aligned.
     static constexpr uint64_t AlignUp64(uint64_t n) {
         return (n + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
     }
 
     // Byte offset of the IndexSlot array from the control-block base.
     static constexpr uint64_t SlotsOffset(uint64_t capacity) {
-        return AlignUp64(offsetof(ControlBlock, commit_bits) +
-                         CommitWordCount(capacity) * 8);
+        (void)capacity;  // Layout no longer depends on capacity.
+        return AlignUp64(sizeof(ControlBlock));
     }
 
     // Byte offset of the MpscReservationMeta sidecar array. capacity *
@@ -153,7 +152,7 @@ public:
     }
 
     // Total bytes the channel occupies in shared memory: control block
-    // (fixed part + commit bitmap, padded) + IndexSlot array + sidecar array.
+    // (padded to a cache line) + IndexSlot array + sidecar array.
     static constexpr uint64_t RequiredSize(uint64_t capacity) {
         return MetasOffset(capacity) + capacity * sizeof(MpscReservationMeta);
     }
@@ -192,13 +191,8 @@ public:
         control->capacity = capacity;
         control->reserved1 = 0;
         control->reservation_cursor.store(0, std::memory_order_relaxed);
-        control->committed_cursor.store(0, std::memory_order_relaxed);
         control->consumer_cursor.store(0, std::memory_order_relaxed);
-
-        const uint64_t words = CommitWordCount(capacity);
-        for (uint64_t i = 0; i < words; ++i) {
-            control->commit_bits[i].store(0, std::memory_order_relaxed);
-        }
+        control->reserved2.store(0, std::memory_order_relaxed);
 
         IndexSlot* slots = SlotsOf(shm_base, capacity);
         for (uint64_t i = 0; i < capacity; ++i) {
@@ -217,6 +211,8 @@ public:
             std::memset(s.padding_, 0, sizeof(s.padding_));
             s.state.store(static_cast<uint32_t>(SlotState::kFree),
                           std::memory_order_relaxed);
+            // Vyukov: slot i is initially free for cursor position i.
+            s.turn.store(i, std::memory_order_relaxed);
         }
 
         MpscReservationMeta* metas = MetasOf(shm_base, capacity);
@@ -514,7 +510,10 @@ public:
         bool active_ = false;
     };
 
-    // Polls the next ready message. Returns:
+    // Polls the next ready message. Readiness is gated on the per-slot
+    // Vyukov turn: slot[cons % capacity].turn == cons + 1 means the producer
+    // committed this exact sequence; anything else means empty or wedged.
+    // Returns:
     //   an active Borrow : a message is available.
     //   kWouldBlock      : the committed prefix has not advanced past the
     //                      consumer cursor (empty, or wedged behind an
@@ -527,32 +526,44 @@ public:
     Result<Borrow> Poll() noexcept {
         while (true) {
             const uint64_t cons = control_->consumer_cursor.load(
-                std::memory_order_relaxed);
-            const uint64_t committed = control_->committed_cursor.load(
                 std::memory_order_acquire);
-            if (cons == committed) {
+            const uint64_t reserved = control_->reservation_cursor.load(
+                std::memory_order_acquire);
+            if (cons == reserved) {
                 return Status::Error(StatusCode::kWouldBlock,
-                                     "MPSC queue empty (or wedged behind an "
-                                     "unresolved reservation)");
+                                     "MPSC queue empty");
             }
             IndexSlot* slot = &slots_[cons & mask_];
+            // Acquire: pairs with the producer's release commit (turn = cons
+            // + 1) so the fields we snapshot below are fully visible.
+            const uint64_t turn = slot->turn.load(std::memory_order_acquire);
             const uint32_t state =
                 slot->state.load(std::memory_order_acquire);
 
             if (state == static_cast<uint32_t>(SlotState::kAborted)) {
-                // Release: pairs with the producer's acquire probe in
-                // TryReserveAfterSpaceCheck so this retire happens-before the
-                // slot is reused for a new era.
-                slot->state.store(static_cast<uint32_t>(SlotState::kRetired),
-                                  std::memory_order_release);
-                control_->consumer_cursor.store(cons + 1,
-                                                std::memory_order_release);
+                // Tombstone: retire (advance turn past this slot for the next
+                // era) and skip. The producer that aborted never bumped turn,
+                // so we do it here on the slot's behalf.
+                slot->turn.store(cons + capacity_, std::memory_order_release);
+                AdvanceConsumerPast(cons);
                 continue;
             }
-            if (state != static_cast<uint32_t>(SlotState::kReady)) {
+            if (turn != cons + 1 ||
+                state != static_cast<uint32_t>(SlotState::kReady)) {
+                // Slot is reserved but not yet committed (turn still == cons,
+                // state kReserved/kWriting) or already reclaimed: either the
+                // producer is still working or it stalled/crashed. This is
+                // the ordered-prefix wedge: the consumer may not skip ahead,
+                // so report kWouldBlock and let the caller run
+                // AbortOrphanedReservations() if it persists.
                 return Status::Error(StatusCode::kWouldBlock,
-                                     "MPSC slot not yet ready");
+                                     "MPSC slot not yet ready (wedged behind "
+                                     "an unresolved reservation)");
             }
+            // turn == cons + 1 && state == kReady: the producer's release
+            // commit published every field covered by this acquire, so the
+            // snapshot below is safe. The sequence check is a belt-and-suspend
+            // guard; turn already discriminates eras exactly.
             if (slot->sequence_num.load(std::memory_order_acquire) != cons) {
                 RetireAndAdvance(slot, cons);
                 return Status::Error(StatusCode::kCorruption,
@@ -573,8 +584,8 @@ public:
     // Crash recovery (design doc 9.5 / 12.3)
     // -----------------------------------------------------------------------
 
-    // Scans the reserved-but-unfinished window
-    // [committed_cursor, reservation_cursor) and stamps ABORTED tombstones
+    // Scans the reserved-but-unconsumed window
+    // [consumer_cursor, reservation_cursor) and stamps ABORTED tombstones
     // on slots whose owner is dead AND whose reservation is older than
     // `lease_ns` relative to `now_ns`. Returns the number of tombstones
     // stamped. Idempotent; safe to run concurrently with producers and with
@@ -586,12 +597,12 @@ public:
         if (lease_ns == 0) {
             lease_ns = kDefaultProducerLeaseNs;
         }
-        const uint64_t committed =
-            control_->committed_cursor.load(std::memory_order_acquire);
+        const uint64_t consumed =
+            control_->consumer_cursor.load(std::memory_order_acquire);
         const uint64_t reserved =
             control_->reservation_cursor.load(std::memory_order_acquire);
         uint64_t aborted = 0;
-        for (uint64_t seq = committed; seq < reserved; ++seq) {
+        for (uint64_t seq = consumed; seq < reserved; ++seq) {
             const uint64_t phys = seq & mask_;
             IndexSlot* slot = &slots_[phys];
             const uint32_t state =
@@ -621,11 +632,7 @@ public:
                     std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 continue;
             }
-            SetCommitBit(seq);
             ++aborted;
-        }
-        if (aborted != 0) {
-            AdvanceCommittedCursor();
         }
         return aborted;
     }
@@ -634,12 +641,16 @@ public:
     // Observers
     // -----------------------------------------------------------------------
 
+    // Approximate (not linearizable): the queue has no outstanding
+    // reservations once the consumer has caught up to the reservation
+    // cursor. A wedged-but-nonempty queue (a stalled reservation ahead of the
+    // consumer) reports not-empty here even though Poll() would block.
     bool IsEmpty() const noexcept {
-        const uint64_t committed =
-            control_->committed_cursor.load(std::memory_order_acquire);
+        const uint64_t reserved =
+            control_->reservation_cursor.load(std::memory_order_acquire);
         const uint64_t cons =
             control_->consumer_cursor.load(std::memory_order_acquire);
-        return committed == cons;
+        return reserved == cons;
     }
 
     bool IsFull() const noexcept {
@@ -647,13 +658,14 @@ public:
             control_->reservation_cursor.load(std::memory_order_acquire));
     }
 
-    // Number of messages currently visible to the consumer.
+    // Approximate upper bound on messages not yet consumed (includes any
+    // wedged unfinished reservations). Not linearizable.
     uint64_t Size() const noexcept {
-        const uint64_t committed =
-            control_->committed_cursor.load(std::memory_order_acquire);
+        const uint64_t reserved =
+            control_->reservation_cursor.load(std::memory_order_acquire);
         const uint64_t cons =
             control_->consumer_cursor.load(std::memory_order_acquire);
-        return committed - cons;
+        return reserved - cons;
     }
 
     uint64_t capacity() const noexcept { return capacity_; }
@@ -686,13 +698,13 @@ private:
 
     // kDropOldest (design doc 9.8): forcibly retire the oldest unconsumed
     // slot and advance the consumer cursor past it. Only a kReady slot is a
-    // safe victim: it is already committed (committed_cursor has passed it),
-    // so retiring it keeps consumer_cursor <= committed_cursor. Retiring a
-    // kReserved/kWriting slot would advance the consumer past an unfinished
-    // sequence and corrupt the ordered prefix. A consumer holding a Borrow of
-    // the victim keeps a valid snapshot; its late Ack reports kNotFound. The
-    // payload is NOT reclaimed here (only after no borrows remain). The CAS
-    // keeps the cursor monotonic against concurrent producers.
+    // safe victim: its producer already finished, so retiring it cannot skip
+    // an unfinished sequence. Retiring a kReserved/kWriting slot would
+    // advance the consumer past an unfinished sequence and corrupt the
+    // ordered prefix, so those are left for recovery instead. A consumer
+    // holding a Borrow of the victim keeps a valid snapshot; its late Ack
+    // reports kNotFound. The payload is NOT reclaimed here (only after no
+    // borrows remain).
     void TryForceDropOldest() noexcept {
         const uint64_t cons =
             control_->consumer_cursor.load(std::memory_order_acquire);
@@ -703,27 +715,29 @@ private:
         }
         // Release: pairs with the producer's acquire probe so the consumer's
         // prior reads of this slot happen-before its reuse in a new era.
-        oldest->state.store(static_cast<uint32_t>(SlotState::kRetired),
-                            std::memory_order_release);
-        uint64_t expected = cons;
-        control_->consumer_cursor.compare_exchange_strong(
-            expected, cons + 1, std::memory_order_acq_rel,
-            std::memory_order_relaxed);
+        oldest->turn.store(cons + capacity_, std::memory_order_release);
+        AdvanceConsumerPast(cons);
     }
 
-    // Vyukov-style probe-then-claim. Probes the slot for the current cursor
-    // position and only advances the cursor once the slot is known claimable,
-    // so a handed-out sequence always owns its slot (no phantom sequence).
+    // Vyukov per-slot-turn probe-then-claim. Probes slot[res % capacity].turn
+    // for the current cursor position `res`; only when turn == res (the slot
+    // is free for this exact era) does it CAS the cursor forward, so a
+    // handed-out sequence always owns its slot (no phantom sequence).
+    //
+    // `turn` is numerically unique across eras (not modulo capacity), so a
+    // producer wrapping the ring that finds a slot still occupied by a
+    // previous era observes turn < res and reports full/wedged — it can never
+    // mistake the slot for free. This is what makes the cursor CAS and the
+    // slot occupation race-free.
     //
     // Returns:
     //   an active Reservation : slot claimed and in state kWriting.
-    //   kResourceExhausted    : the slot holds an unconsumed kReady message
-    //                         (the queue is genuinely full; kDropOldest may
-    //                         forcibly retire it).
-    //   kWouldBlock           : the slot is held by an unfinished reservation
-    //                         (kReserved/kWriting) or an unconsumed tombstone
-    //                         (kAborted); run AbortOrphanedReservations() to
-    //                         reclaim a stalled holder.
+    //   kResourceExhausted    : turn < res because the previous-era message
+    //                         is unconsumed (state kReady) — the queue is
+    //                         genuinely full; kDropOldest may forcibly retire.
+    //   kWouldBlock           : turn < res because a previous-era holder is
+    //                         unfinished (kReserved/kWriting) or an unconsumed
+    //                         tombstone (kAborted); run recovery.
     Result<Reservation> TryReserveAfterSpaceCheck(
         const ProducerIdentity& owner) noexcept {
         for (;;) {
@@ -731,35 +745,48 @@ private:
                 std::memory_order_acquire);
             const uint64_t phys = res & mask_;
             IndexSlot* slot = &slots_[phys];
-            const uint32_t state = slot->state.load(std::memory_order_acquire);
+            // Acquire: pairs with the consumer's release retire (turn = pos +
+            // capacity) so we observe the fully-retired slot, and with the
+            // previous era's release commit (turn = pos_prev + 1) so we never
+            // act on a half-published slot.
+            const uint64_t turn = slot->turn.load(std::memory_order_acquire);
 
-            if (state == static_cast<uint32_t>(SlotState::kReady)) {
-                // Genuine backpressure: the previous-era message in this slot
-                // has not been consumed yet (consumer_cursor has not passed
-                // it), i.e. reservation_cursor - consumer_cursor >= capacity.
-                return Status::Error(StatusCode::kResourceExhausted,
-                                     "MPSC queue full");
+            if (turn > res) {
+                // Another producer already claimed `res` (or a later sequence
+                // mapping to this physical slot); the cursor moved on. Re-read
+                // the cursor and retry.
+                continue;
             }
-            if (state == static_cast<uint32_t>(SlotState::kReserved) ||
-                state == static_cast<uint32_t>(SlotState::kWriting)) {
-                // A previous-era holder reserved but never finished (stalled
-                // or crashed). Never stamp a foreign slot from here: recovery
-                // owns that decision (it checks owner liveness + lease).
-                return Status::Error(
-                    StatusCode::kWouldBlock,
-                    "MPSC slot held by an unfinished reservation; recovery "
-                    "required");
-            }
-            if (state == static_cast<uint32_t>(SlotState::kAborted)) {
-                // Tombstone not yet retired by the consumer; retry once the
-                // consumer cursor advances past it.
+            if (turn < res) {
+                // The slot is still occupied by a previous era. Distinguish
+                // genuine backpressure from a wedge using the business state
+                // (which the previous era published with release before
+                // bumping turn, so an acquire read is consistent).
+                const uint32_t state =
+                    slot->state.load(std::memory_order_acquire);
+                if (state == static_cast<uint32_t>(SlotState::kReady)) {
+                    // Genuine backpressure: previous-era message unconsumed.
+                    return Status::Error(StatusCode::kResourceExhausted,
+                                         "MPSC queue full");
+                }
+                if (state == static_cast<uint32_t>(SlotState::kReserved) ||
+                    state == static_cast<uint32_t>(SlotState::kWriting)) {
+                    // Previous-era holder reserved but never finished. Never
+                    // stamp a foreign slot from here: recovery owns that
+                    // decision (it checks owner liveness + lease).
+                    return Status::Error(
+                        StatusCode::kWouldBlock,
+                        "MPSC slot held by an unfinished reservation; recovery "
+                        "required");
+                }
+                // kAborted tombstone not yet retired by the consumer; retry
+                // once the consumer cursor advances past it.
                 return Status::Error(StatusCode::kWouldBlock,
                                      "MPSC slot holds an unconsumed tombstone");
             }
 
-            // state is kFree or kRetired: the slot is claimable. Claim the
-            // sequence by advancing the cursor; only on success do we own the
-            // slot for this era.
+            // turn == res: the slot is free for this era. Claim the sequence
+            // by advancing the cursor; only on success do we own the slot.
             uint64_t expected = res;
             if (!control_->reservation_cursor.compare_exchange_weak(
                     expected, res + 1, std::memory_order_acq_rel,
@@ -767,13 +794,13 @@ private:
                 continue;  // Another producer claimed res; re-probe.
             }
 
-            // We own sequence `res` and slot `phys` for this era. Between the
-            // probe and the successful cursor CAS no one else can transition a
-            // kFree/kRetired slot to an occupied state (consumers only retire
-            // kReady/kAborted, recovery only touches kReserved/kWriting, and
-            // another producer can only reach this same physical slot by first
-            // claiming this very cursor value). So a plain store publishes the
-            // reservation; no second CAS is needed and none can fail.
+            // We own sequence `res` and slot `phys` for this era (the cursor
+            // CAS serialized us against every other producer for this exact
+            // cursor value, and the turn probe guaranteed the slot was free).
+            // Publish the claim with RELEASE stores: the kWriting store must
+            // be visible to a wrapping producer's acquire probe so it reads
+            // turn < its pos and reports full/wedged instead of reusing the
+            // slot. sequence_num is published by the same release.
             MpscReservationMeta& meta = metas_[phys];
             meta.owner_process_id = owner.owner.process_id;
             meta.owner_process_epoch = owner.owner.process_epoch;
@@ -781,79 +808,52 @@ private:
             meta.reservation_timestamp_ns = MonotonicNowNs();
             slot->sequence_num.store(res, std::memory_order_relaxed);
             slot->state.store(static_cast<uint32_t>(SlotState::kWriting),
-                              std::memory_order_relaxed);
+                              std::memory_order_release);
             return Reservation(this, slot, res);
         }
     }
 
-    // Seals the CRC, publishes READY, sets the commit bit and feeds the
-    // ordered-prefix scan.
+    // Seals the CRC and publishes READY. Two release-stores form the
+    // publication point: `state` (business state) then `turn` (protocol
+    // sequence). The consumer's Poll acquire-loads turn == cons + 1, which
+    // orders it after every field the producer wrote. No separate commit
+    // bitmap is needed.
     Status CommitSlot(IndexSlot* slot, uint64_t sequence) noexcept {
         SealIndexSlotImmutableCrc(*slot);
         slot->state.store(static_cast<uint32_t>(SlotState::kReady),
                           std::memory_order_release);
-        SetCommitBit(sequence);
-        AdvanceCommittedCursor();
+        // Vyukov: mark the slot ready for the consumer reading `sequence`.
+        slot->turn.store(sequence + 1, std::memory_order_release);
         return Status::Ok();
     }
 
-    // Stamps an ABORTED tombstone, sets the commit bit and feeds the scan.
+    // Stamps an ABORTED tombstone. The consumer retires and skips it
+    // transparently in Poll() (it advances turn past the slot there).
     Status AbortSlot(IndexSlot* slot, uint64_t sequence) noexcept {
+        (void)sequence;
         uint32_t expected = static_cast<uint32_t>(SlotState::kWriting);
         slot->state.compare_exchange_strong(
             expected, static_cast<uint32_t>(SlotState::kAborted),
             std::memory_order_acq_rel, std::memory_order_relaxed);
-        SetCommitBit(sequence);
-        AdvanceCommittedCursor();
         return Status::Ok();
     }
 
-    void SetCommitBit(uint64_t sequence) noexcept {
-        control_->commit_bits[(sequence & mask_) / 64].fetch_or(
-            uint64_t{1} << ((sequence & mask_) % 64),
-            std::memory_order_acq_rel);
-    }
-
-    void ClearCommitBit(uint64_t sequence) noexcept {
-        control_->commit_bits[(sequence & mask_) / 64].fetch_and(
-            ~(uint64_t{1} << ((sequence & mask_) % 64)),
-            std::memory_order_acq_rel);
-    }
-
-    bool TestCommitBit(uint64_t sequence) const noexcept {
-        return (control_->commit_bits[(sequence & mask_) / 64].load(
-                    std::memory_order_acquire) >>
-                ((sequence & mask_) % 64)) &
-               uint64_t{1};
-    }
-
-    // Advances the committed prefix across every consecutively-finished
-    // slot. Idempotent; concurrent scanners publish monotonic values only.
-    void AdvanceCommittedCursor() noexcept {
-        while (true) {
-            const uint64_t committed =
-                control_->committed_cursor.load(std::memory_order_acquire);
-            const uint64_t reserved = control_->reservation_cursor.load(
-                std::memory_order_acquire);
-            if (committed >= reserved || !TestCommitBit(committed)) {
-                return;
-            }
-            ClearCommitBit(committed);
-            uint64_t expected = committed;
-            if (!control_->committed_cursor.compare_exchange_strong(
-                    expected, committed + 1, std::memory_order_acq_rel,
-                    std::memory_order_relaxed)) {
-                continue;  // A peer scanner advanced; re-read and retry.
-            }
-        }
-    }
-
-    void RetireAndAdvance(IndexSlot* slot, uint64_t cons) noexcept {
-        // Release: pairs with the producer's acquire probe so the consumer's
-        // prior reads of this slot happen-before its reuse in a new era.
-        slot->state.store(static_cast<uint32_t>(SlotState::kRetired),
-                          std::memory_order_release);
+    // Advance the consumer cursor past `cons`. The consumer is the only
+    // logical writer of this cursor in the steady state (kDropOldest is the
+    // sole producer-side exception and uses CAS itself), so a plain release
+    // store is correct and keeps the read position and recovery lower bound
+    // in lock-step.
+    void AdvanceConsumerPast(uint64_t cons) noexcept {
         control_->consumer_cursor.store(cons + 1, std::memory_order_release);
+    }
+
+    // Retire slot `cons` and advance the consumer cursor. The turn release
+    // marks the physical slot free for the NEXT era (cons + capacity): a
+    // producer probing that position observes turn == its pos and may claim.
+    // This pairs with the producer's acquire probe.
+    void RetireAndAdvance(IndexSlot* slot, uint64_t cons) noexcept {
+        slot->turn.store(cons + capacity_, std::memory_order_release);
+        AdvanceConsumerPast(cons);
     }
 
     Status AckSlot(uint64_t sequence) noexcept {
