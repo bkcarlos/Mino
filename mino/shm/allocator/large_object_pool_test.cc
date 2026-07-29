@@ -18,6 +18,7 @@
 
 #include <cstring>
 #include <memory>
+#include <new>
 #include <set>
 
 #include "mino/abi/shm_handle.h"
@@ -33,11 +34,20 @@ constexpr uint32_t kSegmentSize = 64u * 1024u;   // 64 KiB
 
 class LargeObjectPoolTest : public ::testing::Test {
 protected:
-    std::unique_ptr<std::byte[]> region_;
+    // 64-byte-aligned allocation: LargePoolSuperblock placed at the base
+    // carries cache-line-aligned atomics (UBSAN rejects placement-new on a
+    // merely 16-aligned heap pointer, which is what glibc malloc returns).
+    struct AlignedDeleter {
+        void operator()(std::byte* p) const {
+            ::operator delete[](p, std::align_val_t(64));
+        }
+    };
+
+    std::unique_ptr<std::byte[], AlignedDeleter> region_;
     LargeObjectPool pool_;
 
     void SetUp() override {
-        region_ = std::make_unique<std::byte[]>(kPoolSize);
+        region_.reset(new (std::align_val_t(64)) std::byte[kPoolSize]);
         std::memset(region_.get(), 0, kPoolSize);
         auto result = LargeObjectPool::Create(region_.get(), kPoolSize,
                                               kMaxObject, kSegmentSize);

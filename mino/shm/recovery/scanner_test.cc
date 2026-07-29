@@ -74,7 +74,12 @@ public:
         }
 
         size_ = offset;
-        memory_ = std::make_unique<std::byte[]>(size_);
+        // 64-byte-aligned allocation: sections are aligned via Align64 on top
+        // of this base, so the base itself must be 64-aligned. RecoveryOwner-
+        // State and the SlabHeaderPrefix views carry cache-line-aligned
+        // atomics (UBSAN rejects placement-new on a merely 16-aligned heap
+        // pointer, which is what glibc malloc returns).
+        memory_.reset(new (std::align_val_t(64)) std::byte[size_]);
         std::memset(memory_.get(), 0, size_);
 
         RecoveryOwner::Initialize(RecoveryState());
@@ -225,7 +230,13 @@ public:
 private:
     static uint64_t Align64(uint64_t v) { return (v + 63) & ~uint64_t{63}; }
 
-    std::unique_ptr<std::byte[]> memory_;
+    struct AlignedDeleter {
+        void operator()(std::byte* p) const {
+            ::operator delete[](p, std::align_val_t(64));
+        }
+    };
+
+    std::unique_ptr<std::byte[], AlignedDeleter> memory_;
     uint64_t size_ = 0;
     uint64_t recovery_offset_ = 0;
     uint64_t class_table_offset_ = 0;

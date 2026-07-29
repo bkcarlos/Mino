@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <set>
 #include <thread>
 #include <vector>
@@ -46,12 +47,21 @@ constexpr uint64_t kRegionSize = 1u << 20;  // 1 MiB, plenty for the test
 
 class CentralSlabTest : public ::testing::Test {
 protected:
-    // Zero-initialized region backing store, cache-line aligned.
-    std::unique_ptr<std::byte[]> region_;
+    // Zero-initialized region backing store. 64-byte-aligned allocation:
+    // AllocatorSuperblock placed at the base carries cache-line-aligned
+    // atomics (UBSAN rejects placement-new on a merely 16-aligned heap
+    // pointer, which is what glibc malloc returns).
+    struct AlignedDeleter {
+        void operator()(std::byte* p) const {
+            ::operator delete[](p, std::align_val_t(64));
+        }
+    };
+
+    std::unique_ptr<std::byte[], AlignedDeleter> region_;
     CentralSlabAllocator alloc_;
 
     void SetUp() override {
-        region_ = std::make_unique<std::byte[]>(kRegionSize);
+        region_.reset(new (std::align_val_t(64)) std::byte[kRegionSize]);
         std::memset(region_.get(), 0, kRegionSize);
         auto result =
             CentralSlabAllocator::Create(region_.get(), kRegionSize, TestConfig());

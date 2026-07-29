@@ -5,6 +5,7 @@
 
 #include "mino/common/logging/spdlog_backend.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -50,10 +51,11 @@ public:
     }
 
     ~SpdlogLogger() override {
-        {
-            std::lock_guard lock(flush_mutex_);
-            stop_flush_ = true;
-        }
+        // Signal stop with a plain atomic store: taking flush_mutex_ here
+        // would race the flush thread's condition_variable relock of the same
+        // mutex (TSAN reports it as a double lock + data race), and the
+        // predicate only needs atomicity, not the mutex.
+        stop_flush_.store(true, std::memory_order_release);
         flush_cv_.notify_all();
         if (flush_thread_.joinable()) {
             flush_thread_.join();
@@ -94,8 +96,9 @@ public:
 private:
     void FlushLoop() noexcept {
         std::unique_lock lock(flush_mutex_);
-        while (!flush_cv_.wait_for(lock, flush_interval_,
-                                   [this] { return stop_flush_; })) {
+        while (!flush_cv_.wait_for(lock, flush_interval_, [this] {
+            return stop_flush_.load(std::memory_order_acquire);
+        })) {
             lock.unlock();
             Flush();
             lock.lock();
@@ -118,7 +121,7 @@ private:
     std::chrono::milliseconds flush_interval_;
     std::mutex flush_mutex_;
     std::condition_variable flush_cv_;
-    bool stop_flush_ = false;
+    std::atomic<bool> stop_flush_{false};
     std::thread flush_thread_;
 };
 
