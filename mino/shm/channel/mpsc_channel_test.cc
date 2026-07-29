@@ -409,7 +409,6 @@ TEST(MpscChannelTest, LiveOwnerIsNeverReclaimedDespiteExpiredLease) {
     // Leak the Reservation so its destructor never aborts the slot; it stays
     // kWriting with this (alive) process as the recorded owner.
     auto* leaked = new MpscChannel::Reservation(std::move(*res));
-    (void)leaked;
 
     // lease_ns=0 selects the default, but pass an explicitly tiny lease: the
     // owner is alive, so the liveness check (not the lease) decides, and the
@@ -423,6 +422,11 @@ TEST(MpscChannelTest, LiveOwnerIsNeverReclaimedDespiteExpiredLease) {
     auto blocked = ch->Poll();
     ASSERT_FALSE(blocked.ok());
     EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+
+    // Reclaim the leaked Reservation now that the assertions are done (its
+    // destructor aborts the slot, which no longer matters); this keeps the
+    // LeakSanitizer-clean contract without weakening the live-owner test.
+    delete leaked;
 }
 
 // The lease is the FIRST gate: a reservation younger than the lease is never
@@ -440,7 +444,6 @@ TEST(MpscChannelTest, UnexpiredLeaseProtectsFreshReservation) {
     ASSERT_TRUE(res.ok());
     FillSlot(*res, 8);
     auto* leaked = new MpscChannel::Reservation(std::move(*res));
-    (void)leaked;
 
     // now_ns=0 makes now - reservation_timestamp underflow to a huge value in
     // unsigned arithmetic; pass a lease of UINT64_MAX so the reservation is
@@ -450,6 +453,10 @@ TEST(MpscChannelTest, UnexpiredLeaseProtectsFreshReservation) {
     EXPECT_EQ(aborted, 0u)
         << "an unexpired lease must protect the reservation before liveness "
            "is even consulted";
+
+    // Reclaim the leaked Reservation after the assertion (see the live-owner
+    // test above); keeps LeakSanitizer clean.
+    delete leaked;
 }
 
 }  // namespace
