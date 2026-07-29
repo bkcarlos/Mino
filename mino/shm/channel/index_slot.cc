@@ -109,7 +109,9 @@ IndexSlotSnapshot SnapshotIndexSlot(const IndexSlot& slot) noexcept {
     s.schema_short_id = slot.schema_short_id;
     s.schema_layout_version = slot.schema_layout_version;
     s.reserved0 = slot.reserved0;
-    s.sequence_num = slot.sequence_num;
+    // The caller already acquired `state == kReady`, so the producer's writes
+    // are visible; a relaxed load of the (now atomic) sequence is sufficient.
+    s.sequence_num = slot.sequence_num.load(std::memory_order_relaxed);
     s.timestamp_ns = slot.timestamp_ns;
     s.payload = slot.payload;
     s.payload_len = slot.payload_len;

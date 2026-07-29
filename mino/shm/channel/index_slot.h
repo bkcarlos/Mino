@@ -73,7 +73,13 @@ struct alignas(64) IndexSlot {
     uint32_t schema_layout_version = 0;
     uint32_t reserved0 = 0;  // must be 0
 
-    uint64_t sequence_num = 0;
+    // Atomic even though it is CRC-covered "immutable" metadata: a producer
+    // writes it when claiming a slot for a new era while the consumer may
+    // still be reading the slot from the previous era (it checks the sequence
+    // against the consumer cursor before trusting the rest). The field is
+    // 8 bytes and stays at offset 24, so the frozen layout/ABI is unchanged
+    // (std::atomic<uint64_t> is lock-free and layout-compatible here).
+    std::atomic<uint64_t> sequence_num{0};
     uint64_t timestamp_ns = 0;
 
     ShmHandle payload;
@@ -299,11 +305,17 @@ static_assert(sizeof(WorkQueueSlotMeta) == 16);
 // MPSC reservation sidecar (design doc 9.2 / 9.5). Binds a reserved slot to
 // its owner identity so crash recovery can distinguish a live-but-slow
 // producer from a dead one before stamping the ABORTED tombstone.
+//
+// `owner_process_id` is the OS PID (used for /proc liveness, design doc 9.5);
+// `owner_process_epoch` distinguishes PID reuse (design doc 4.3). The slot's
+// logical sequence is NOT stored here: it already lives in
+// IndexSlot::sequence_num (CRC-covered), so a redundant copy would only risk
+// divergence. Recovery reads the sequence from the slot, not the sidecar.
 struct MpscReservationMeta {
+    uint64_t owner_process_id = 0;
     uint64_t owner_process_epoch = 0;
     uint64_t owner_publisher_id = 0;
     uint64_t reservation_timestamp_ns = 0;
-    uint64_t reservation_sequence = 0;
 };
 
 static_assert(std::is_standard_layout_v<MpscReservationMeta>);

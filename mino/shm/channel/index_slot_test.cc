@@ -63,7 +63,7 @@ void FillSlot(IndexSlot& slot) {
     slot.schema_short_id = 0x0123456789ABCDEFULL;
     slot.schema_layout_version = 7;
     slot.reserved0 = 0;
-    slot.sequence_num = 42;
+    slot.sequence_num.store(42, std::memory_order_relaxed);
     slot.timestamp_ns = 1'700'000'000'000'000'000ULL;
     slot.payload.offset = 0x1000;
     slot.payload.generation = 9;
@@ -133,7 +133,11 @@ TEST(IndexSlotCrcTest, EveryImmutableFieldIsCovered) {
     expect_changes([](IndexSlot& s) { s.schema_short_id ^= 1; });
     expect_changes([](IndexSlot& s) { s.schema_layout_version ^= 1; });
     expect_changes([](IndexSlot& s) { s.reserved0 ^= 1; });
-    expect_changes([](IndexSlot& s) { s.sequence_num ^= 1; });
+    expect_changes([](IndexSlot& s) {
+        s.sequence_num.store(s.sequence_num.load(std::memory_order_relaxed) ^
+                                 1,
+                             std::memory_order_relaxed);
+    });
     expect_changes([](IndexSlot& s) { s.timestamp_ns ^= 1; });
     expect_changes([](IndexSlot& s) { s.payload.offset ^= 1; });
     expect_changes([](IndexSlot& s) { s.payload.generation ^= 1; });
@@ -149,7 +153,7 @@ TEST(IndexSlotCrcTest, KnownVector) {
     slot.schema_version = 0x00010002u;  // 1.2
     slot.schema_short_id = 0xA5A5A5A5A5A5A5A5ULL;
     slot.schema_layout_version = 1;
-    slot.sequence_num = 7;
+    slot.sequence_num.store(7, std::memory_order_relaxed);
     slot.timestamp_ns = 123456789;
     slot.payload.offset = 0x800;
     slot.payload.generation = 1;

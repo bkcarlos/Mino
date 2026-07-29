@@ -241,7 +241,7 @@ public:
             s.schema_short_id = 0;
             s.schema_layout_version = 0;
             s.reserved0 = 0;
-            s.sequence_num = i;
+            s.sequence_num.store(i, std::memory_order_relaxed);
             s.timestamp_ns = 0;
             s.payload = ShmHandle{};
             s.payload_len = 0;
@@ -474,8 +474,9 @@ public:
         // has already advanced past this physical slot's previous occupant.
         // Assign the logical sequence now: it IS the producer position, so
         // the consumer's ABA check (slot.sequence_num == consumer_cursor) is
-        // exact across wraps (INV-01).
-        slot->sequence_num = prod;
+        // exact across wraps (INV-01). Single producer: a relaxed store is
+        // enough; the kReady release-store publishes it to the consumer.
+        slot->sequence_num.store(prod, std::memory_order_relaxed);
         slot->state.store(static_cast<uint32_t>(SlotState::kWriting),
                           std::memory_order_relaxed);
         return Reservation(this, slot);
@@ -493,7 +494,7 @@ public:
                                  "SPSC queue full");
         }
         IndexSlot* slot = &slots_[prod & mask_];
-        slot->sequence_num = prod;
+        slot->sequence_num.store(prod, std::memory_order_relaxed);
         slot->state.store(static_cast<uint32_t>(SlotState::kWriting),
                           std::memory_order_relaxed);
         return Reservation(this, slot);
@@ -611,8 +612,9 @@ public:
             }
             // ABA guard: the slot's logical sequence must match our cursor.
             // A mismatch, like a CRC failure, is corruption: skip the slot
-            // (never livelock on it) and report.
-            if (slot->sequence_num != cons) {
+            // (never livelock on it) and report. The acquire on `state` above
+            // already published the sequence, so a relaxed load suffices.
+            if (slot->sequence_num.load(std::memory_order_relaxed) != cons) {
                 RetireAndAdvance(slot, cons);
                 return Status::Error(
                     StatusCode::kCorruption,

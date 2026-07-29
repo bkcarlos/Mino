@@ -44,6 +44,38 @@ cc_library(
     hdrs = ["queue_full_policy.h"],
 )
 
+# D2-03/D2-04: MPSC channel (design doc 9.5). Multi-producer / single-
+# consumer strictly-ordered ring with Vyukov probe-then-claim reservation,
+# an ordered commit bitmap (INV-17), owner-identity sidecars, and crash
+# recovery via AbortOrphanedReservations(). Header-only: a non-owning view
+# over shared memory.
+cc_library(
+    name = "mpsc",
+    hdrs = ["mpsc_channel.h"],
+    deps = [
+        ":index_slot",
+        ":queue_full_policy",
+        ":spsc",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+    ],
+)
+
+cc_test(
+    name = "mpsc_channel_test",
+    srcs = ["mpsc_channel_test.cc"],
+    deps = [
+        ":index_slot",
+        ":mpsc",
+        ":queue_full_policy",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # D2-02: SPSC channel (design doc 9.3, 9.4). Single-producer /
 # single-consumer channel with cache-line-separated cursors, built on the
 # IndexSlot ABI. Header-only: it is a non-owning view over shared memory.
