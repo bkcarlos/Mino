@@ -49,7 +49,7 @@ static_assert(offsetof(IndexSlot, flags) == 68);
 
 static_assert(sizeof(BroadcastSlotMeta) == 16);
 static_assert(sizeof(WorkQueueSlotMeta) == 16);
-static_assert(sizeof(MpscReservationMeta) == 32);
+static_assert(sizeof(MpscReservationMeta) == 48);
 
 // ---------------------------------------------------------------------------
 // Immutable CRC: seal / verify round-trip

@@ -179,6 +179,69 @@ TEST_F(CentralSlabTest, HeaderCrcIsValidAfterAllocate) {
     EXPECT_TRUE(VerifyImmutableHeader(header));
 }
 
+TEST_F(CentralSlabTest, BuildLifecyclePublishesPayload) {
+    auto handle = alloc_.Allocate(Request(sizeof(uint64_t)));
+    ASSERT_TRUE(handle.ok());
+
+    auto build = alloc_.BeginBuild(*handle);
+    ASSERT_TRUE(build.ok()) << build.status().ToString();
+    EXPECT_EQ(build->object_size, sizeof(uint64_t));
+    EXPECT_EQ(build->type_id, TypeId{7u});
+    EXPECT_EQ(build->schema_short_id, 0x1234u);
+    EXPECT_EQ(build->layout_version, 1u);
+    ASSERT_NE(build->data, nullptr);
+    *static_cast<uint64_t*>(build->data) = 0xAABBCCDDu;
+
+    auto building = alloc_.Inspect(*handle);
+    ASSERT_TRUE(building.ok());
+    EXPECT_EQ(building->state, ObjectState::kBuilding);
+
+    ASSERT_TRUE(alloc_.Publish(*handle).ok());
+    auto published = alloc_.Inspect(*handle);
+    ASSERT_TRUE(published.ok());
+    EXPECT_EQ(published->state, ObjectState::kPublished);
+    EXPECT_EQ(*static_cast<const uint64_t*>(published->data), 0xAABBCCDDu);
+}
+
+TEST_F(CentralSlabTest, BeginBuildIsExclusive) {
+    auto handle = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(handle.ok());
+    ASSERT_TRUE(alloc_.BeginBuild(*handle).ok());
+
+    auto duplicate = alloc_.BeginBuild(*handle);
+    ASSERT_FALSE(duplicate.ok());
+    EXPECT_EQ(duplicate.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST_F(CentralSlabTest, AbortReclaimsUnpublishedObject) {
+    auto first = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(alloc_.BeginBuild(*first).ok());
+    ASSERT_TRUE(alloc_.Abort(*first).ok());
+
+    auto gone = alloc_.Inspect(*first);
+    ASSERT_FALSE(gone.ok());
+    EXPECT_EQ(gone.status().code(), StatusCode::kNotFound);
+
+    auto second = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(second.ok());
+    EXPECT_EQ(second->offset, first->offset);
+    EXPECT_EQ(second->generation, first->generation + 1);
+}
+
+TEST_F(CentralSlabTest, PublishedObjectCannotBeAborted) {
+    auto handle = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(handle.ok());
+    ASSERT_TRUE(alloc_.BeginBuild(*handle).ok());
+    ASSERT_TRUE(alloc_.Publish(*handle).ok());
+
+    const Status abort = alloc_.Abort(*handle);
+    ASSERT_FALSE(abort.ok());
+    EXPECT_EQ(abort.code(), StatusCode::kInvalidArgument);
+    ASSERT_TRUE(alloc_.Retire(*handle).ok());
+    ASSERT_TRUE(alloc_.Reclaim(*handle).ok());
+}
+
 TEST_F(CentralSlabTest, ExhaustionReturnsResourceExhausted) {
     // Class 0 has 8 slots; the 9th small allocation must fail.
     for (int i = 0; i < 8; ++i) {

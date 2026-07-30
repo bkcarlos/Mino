@@ -46,6 +46,7 @@ cc_library(
         ":generation_array",
         ":slab_header",
         "//mino/abi:shm_abi",
+        "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
     ],

@@ -87,11 +87,10 @@ public:
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4D50'5343ULL;  // "MINOMPSC"
-    // v3: per-slot Vyukov `turn` (IndexSlot offset 72) replaces state-based
-    // probing for era discrimination, eliminating the modular-ABA window
-    // between the cursor CAS and slot occupation. v2 dropped the ordered
-    // commit bitmap; v1 introduced the bitmap-based ordered prefix.
-    static constexpr uint32_t kLayoutVersion = 3;
+    // v4: reservation sidecars carry the owner's full process incarnation so
+    // recovery detects PID reuse by start time. v3 introduced per-slot Vyukov
+    // `turn`; v2 dropped the ordered commit bitmap.
+    static constexpr uint32_t kLayoutVersion = 4;
 
     // Default producer lease (design doc 9.5). 30 s tolerates long pauses
     // (SIGSTOP, scheduling) without wedging the queue for minutes.
@@ -802,8 +801,10 @@ private:
             // turn < its pos and reports full/wedged instead of reusing the
             // slot. sequence_num is published by the same release.
             MpscReservationMeta& meta = metas_[phys];
+            meta.owner_node_id = owner.owner.node_id;
             meta.owner_process_id = owner.owner.process_id;
             meta.owner_process_epoch = owner.owner.process_epoch;
+            meta.owner_start_time_ns = owner.owner.start_time_ns;
             meta.owner_publisher_id = owner.publisher_id;
             meta.reservation_timestamp_ns = MonotonicNowNs();
             slot->sequence_num.store(res, std::memory_order_relaxed);
@@ -881,29 +882,17 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
     }
 
-    // True iff the recorded owner could still publish. A process that no
-    // longer exists can never publish again. The OS PID lives in
-    // MpscReservationMeta::owner_process_id (ProcessIdentity::process_id);
-    // owner_process_epoch distinguishes PID reuse (design doc 4.3 / 12.4).
-    // The scanner's lease check bounds the residual window where a recycled
-    // PID looks alive to a /proc probe.
+    // True iff the exact recorded process incarnation could still publish.
+    // IsProcessIdentityAlive compares Linux process start time in addition to
+    // PID, so PID reuse cannot indefinitely protect an orphaned reservation.
     static bool IsOwnerAlive(const MpscReservationMeta& meta) noexcept {
-#if defined(__linux__)
-        const uint32_t pid = static_cast<uint32_t>(meta.owner_process_id);
-        if (pid != 0) {
-            char path[32];
-            std::snprintf(path, sizeof(path), "/proc/%u", pid);
-            if (::access(path, F_OK) != 0) {
-                return false;  // No such process: definitively dead.
-            }
-        }
-#else
-        (void)meta;  // No /proc on this platform: lease is the only signal.
-#endif
-        // The process exists (or the platform has no /proc): it may be
-        // alive-but-paused, so the lease timeout remains the deciding
-        // factor (design doc 9.5).
-        return true;
+        const ProcessIdentity owner{
+            .node_id = meta.owner_node_id,
+            .process_id = meta.owner_process_id,
+            .process_epoch = meta.owner_process_epoch,
+            .start_time_ns = meta.owner_start_time_ns,
+        };
+        return IsProcessIdentityAlive(owner);
     }
 
     ControlBlock* control_ = nullptr;

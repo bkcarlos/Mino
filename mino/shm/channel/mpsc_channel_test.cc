@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -41,8 +42,8 @@ namespace {
 
 static_assert(std::is_trivially_copyable_v<MpscChannel>,
               "MpscChannel must be a trivially copyable view");
-static_assert(sizeof(MpscReservationMeta) == 32,
-              "MPSC sidecar must stay 32 bytes");
+static_assert(sizeof(MpscReservationMeta) == 48,
+              "MPSC sidecar carries the full process incarnation");
 
 // ---------------------------------------------------------------------------
 // Fixture: 64-byte-aligned shared-memory stand-in
@@ -358,6 +359,75 @@ TEST(MpscChannelTest, MultiProducerConcurrentConservation) {
     EXPECT_EQ(consumed, kTotal);
     EXPECT_EQ(produced.load(), kTotal);
     EXPECT_TRUE(ch->IsEmpty());
+}
+
+TEST(MpscChannelTest, PublisherConcurrencyMatrix) {
+    constexpr uint64_t kCapacity = 256;
+    constexpr uint64_t kPerProducer = 16;
+    constexpr std::array<int, 5> kPublisherCounts = {1, 2, 8, 32, 128};
+    ChannelFixture<kCapacity> fixture;
+
+    for (const int publisher_count : kPublisherCounts) {
+        auto ch = MpscChannel::Init(fixture.storage, kCapacity);
+        ASSERT_TRUE(ch.ok()) << "publishers=" << publisher_count;
+        const uint64_t total =
+            static_cast<uint64_t>(publisher_count) * kPerProducer;
+        std::atomic<bool> start{false};
+        std::atomic<uint64_t> failures{0};
+        std::vector<std::thread> producers;
+        producers.reserve(static_cast<size_t>(publisher_count));
+        for (int p = 0; p < publisher_count; ++p) {
+            producers.emplace_back([&, p]() {
+                const auto identity = MakeIdentity(static_cast<uint64_t>(p + 1));
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (uint64_t i = 0; i < kPerProducer; ++i) {
+                    MpscChannel::Reservation reservation;
+                    for (;;) {
+                        auto attempt = ch->TryReserve(identity);
+                        if (attempt.ok()) {
+                            reservation = std::move(*attempt);
+                            break;
+                        }
+                        const StatusCode code = attempt.status().code();
+                        if (code != StatusCode::kResourceExhausted &&
+                            code != StatusCode::kWouldBlock) {
+                            failures.fetch_add(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        std::this_thread::yield();
+                    }
+                    FillSlot(reservation, static_cast<uint32_t>(p));
+                    if (!std::move(reservation).Commit().ok()) {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+
+        start.store(true, std::memory_order_release);
+        uint64_t consumed = 0;
+        while (consumed < total) {
+            auto borrow = ch->Poll();
+            if (!borrow.ok()) {
+                ASSERT_EQ(borrow.status().code(), StatusCode::kWouldBlock);
+                std::this_thread::yield();
+                continue;
+            }
+            EXPECT_EQ(borrow->slot()->sequence_num, consumed)
+                << "publishers=" << publisher_count;
+            ASSERT_TRUE(std::move(*borrow).Ack().ok());
+            ++consumed;
+        }
+        for (auto& producer : producers) {
+            producer.join();
+        }
+        EXPECT_EQ(failures.load(std::memory_order_relaxed), 0u)
+            << "publishers=" << publisher_count;
+        EXPECT_TRUE(ch->IsEmpty());
+    }
 }
 
 // Destroying a live Reservation without Commit() must stamp an ABORTED

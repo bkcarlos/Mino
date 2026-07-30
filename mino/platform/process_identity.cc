@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#include <csignal>
 #include <random>
 #include <string>
 
@@ -171,6 +173,54 @@ uint64_t RandomEpochComponent() {
     return hi | lo;
 }
 
+#if defined(__linux__)
+bool ReadLinuxProcessStartTimeNs(uint64_t process_id,
+                                 uint64_t* start_time_ns) noexcept {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%llu/stat",
+                  static_cast<unsigned long long>(process_id));
+    FILE* f = std::fopen(path, "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char buf[4096];
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    if (n == 0) {
+        return false;
+    }
+    buf[n] = '\0';
+    const char* close_paren = std::strrchr(buf, ')');
+    if (close_paren == nullptr) {
+        return false;
+    }
+    const char* p = close_paren + 1;
+    while (*p == ' ') {
+        ++p;
+    }
+    char tail[3500];
+    std::snprintf(tail, sizeof(tail), "%s", p);
+    char* saveptr = nullptr;
+    int field_index = 0;
+    for (char* tok = strtok_r(tail, " ", &saveptr); tok != nullptr;
+         tok = strtok_r(nullptr, " ", &saveptr), ++field_index) {
+        if (field_index != 19) {
+            continue;
+        }
+        const uint64_t ticks = std::strtoull(tok, nullptr, 10);
+        const long ticks_per_sec = ::sysconf(_SC_CLK_TCK);
+        if (ticks_per_sec <= 0) {
+            return false;
+        }
+        const uint64_t rate = static_cast<uint64_t>(ticks_per_sec);
+        *start_time_ns = (ticks / rate) * 1000000000ull +
+                         (ticks % rate) * (1000000000ull / rate);
+        return true;
+    }
+    return false;
+}
+#endif
+
 ProcessIdentity ComputeCurrentIdentity() {
     ProcessIdentity id;
     id.node_id = ReadNodeId();
@@ -200,6 +250,31 @@ ProcessIdentity ComputeCurrentIdentity() {
 }
 
 }  // namespace
+
+bool IsProcessIdentityAlive(const ProcessIdentity& identity) noexcept {
+    if (identity.IsZero() || identity.process_id == 0) {
+        return false;
+    }
+    const ProcessIdentity& current = ProcessIdentity::Current();
+    if (identity.process_id == current.process_id) {
+        return identity == current;
+    }
+#if defined(__linux__)
+    if (identity.node_id != 0 && current.node_id != 0 &&
+        identity.node_id != current.node_id) {
+        return false;
+    }
+    uint64_t observed_start_ns = 0;
+    return ReadLinuxProcessStartTimeNs(identity.process_id,
+                                       &observed_start_ns) &&
+           observed_start_ns == identity.start_time_ns;
+#elif MINO_HAS_POSIX
+    const int rc = ::kill(static_cast<pid_t>(identity.process_id), 0);
+    return rc == 0 || errno == EPERM;
+#else
+    return true;
+#endif
+}
 
 const ProcessIdentity& ProcessIdentity::Current() {
     // A fork inherits function-local statics. Cache the PID alongside the

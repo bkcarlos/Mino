@@ -157,17 +157,17 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D2-01 | IndexSlot ABI 定稿 ✅ | 128B 显式 Padding + static_assert、Sidecar 分离、不可变 CRC（`//mino/shm/channel:index_slot`，详设 9.2） | D1-06 | 2d |
 | D2-02 | SPSC Channel ✅ | `//mino/shm/channel:spsc`：单 Producer/Consumer Cursor、Cache Line 分离、发布协议状态机（详设 9.4） | D2-01 | 3d |
 | D2-03 | MPSC Channel ✅ | `//mino/shm/channel:mpsc`：Reservation/Owner Epoch/ABORTED Tombstone（详设 9.5） | D2-01 | 5d |
-| D2-04 | MPSC Producer Crash 恢复 ✅ | Owner Lease 失效 → ABORTED → Journal 回收 → 队列推进（详设 9.5、12.3） | D2-03 | 3d |
+| D2-04 | MPSC Producer Crash 恢复 ⚠️ | Reservation Owner 失效 → ABORTED → 队列推进已完成；Builder Allocation Journal/构建阶段孤儿回收仍待补齐（详设 9.5、12.3） | D2-03 | 3d |
 | D2-05 | Broadcast Channel ✅ | `//mino/shm/channel:broadcast`：独立 Cursor、ACK Bitmap、Subscriber Set Snapshot（详设 9.6） | D2-01 | 5d |
-| D2-06 | Broadcast Membership | 注册/注销/Lease 失效与 ACK 责任清理、Generation 绑定（详设 9.6、12.2） | D2-05 | 3d |
+| D2-06 | Broadcast Membership ✅ | 注册/注销/Lease 失效与 ACK 责任清理、Generation 绑定（详设 9.6、12.2） | D2-05 | 3d |
 | D2-07 | QueueFullPolicy ✅ | kBlock/kFail/kDropNewest/kDropOldest/kSample 策略实现（`//mino/shm/channel:queue_full_policy` + SPSC 策略执行，详设 9.8） | D2-02 | 2d |
-| D2-08 | Subscriber Lease | Lease 注册/心跳/失效/剔除流程（详设 12.2） | D2-06 | 3d |
-| D2-09 | 静态 Publisher API | `Publisher<T>`：Allocate/Build/Validate/Reserve/Commit（详设 10.1、10.3） | D2-02 | 3d |
-| D2-10 | 静态 Subscriber API | `Subscriber<T>` + `BorrowedMessage<T>`：Poll/ACK/Cursor 推进（详设 11.1~11.3） | D2-02 | 3d |
-| D2-11 | ShmSharedPtr（引用 Pin） | Transfer/Pin 计数/配额/崩溃清除（详设 11.2.1、ADR-0013） | D2-10 | 3d |
-| D2-12 | Delivery Receipt 框架 | Outstanding Table、Target Snapshot、Completion Policy（详设 10.5） | D2-09 | 3d |
+| D2-08 | Subscriber Lease ✅ | Lease 注册/心跳/失效/剔除流程（`//mino/runtime:subscriber_lease`，独立 Lease Epoch + ProcessIdentity 复核 + Pin Cleanup，详设 12.2） | D2-06 | 3d |
+| D2-09 | 静态 Publisher API ✅ | `Publisher<T>`：Allocate/Build/Validate/Reserve/Commit，覆盖 SPSC/MPSC/Broadcast（`//mino/runtime:publisher`，详设 10.1、10.3） | D2-02 | 3d |
+| D2-10 | 静态 Subscriber API ✅ | `Subscriber<T>` + `BorrowedMessage<T>`：Poll/ACK/Cursor 推进与析构 ACK（`//mino/runtime:subscriber`，详设 11.1~11.3） | D2-02 | 3d |
+| D2-11 | ShmSharedPtr（引用 Pin） ✅ | `//mino/runtime:shm_shared_ptr`：Transfer/Pin 计数、per-object/per-process 配额、Lease Owner 崩溃清除（详设 11.2.1、ADR-0013） | D2-10 | 3d |
+| D2-12 | Delivery Receipt 框架 ✅ | `//mino/runtime:delivery_receipt`：有界 Outstanding Table、Target Snapshot、kAll/kAny/kQuorum 与逐目标状态（详设 10.5） | D2-09 | 3d |
 | D2-13 | Kill/暂停/PID 复用压力测试 | Publisher 各点 Kill、Subscriber Kill、慢 Subscriber、Lease 误判边界 | 全部 | 持续 |
-| D2-14 | TLA+ 模型验证 | MPSC Reservation、Broadcast Membership、Lease Eviction 形式化建模 | D2-04, D2-06 | 5d |
+| D2-14 | TLA+ 模型验证 ✅ | `docs/formal/`：MPSC Reservation、Broadcast Membership、Lease Eviction；TLC 穷举通过并映射 INV-17/INV-18/INV-32 | D2-04, D2-06 | 5d |
 
 ### 4.2 并行工作流
 
@@ -188,11 +188,11 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 ### 4.4 退出条件（DoD）
 
 - [x] SPSC 长时间回绕无 ABA、无重复/漏消费（INV-01，`spsc_channel_test` 10000 次回绕 + `spsc_channel_xproc_test` fork 双进程 20000 条 ~312 次回绕零丢失零重复）
-- [ ] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17）
-- [ ] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18）
+- [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
+- [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
 - [ ] Publisher/Subscriber 随机 Kill ≥1 小时后恢复扫描无孤儿（P1 退出条件）
-- [ ] ASAN/UBSAN/TSAN 全部通过
-- [ ] TLA+ 模型不变量与 INV 对应（V-03、V-04）
+- [x] ASAN/UBSAN/TSAN 全部通过（D2 Runtime/Channel/Allocator/ProcessIdentity 共 15 targets，本地三配置各 15/15）
+- [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；TLC 检查通过）
 
 ---
 

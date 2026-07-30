@@ -1,0 +1,413 @@
+// Copyright 2026 The Mino Authors
+//
+// Licensed under the GNU Lesser General Public License, Version 3.0.
+
+#ifndef MINO_RUNTIME_PUBLISHER_H_
+#define MINO_RUNTIME_PUBLISHER_H_
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+#include "mino/common/result.h"
+#include "mino/common/status.h"
+#include "mino/runtime/deadline.h"
+#include "mino/runtime/delivery_receipt.h"
+#include "mino/runtime/message_traits.h"
+#include "mino/runtime/shm_shared_ptr.h"
+#include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/channel/broadcast_channel.h"
+#include "mino/shm/channel/mpsc_channel.h"
+#include "mino/shm/channel/queue_full_policy.h"
+#include "mino/shm/channel/spsc_channel.h"
+
+namespace mino {
+
+template <typename T>
+class Publisher;
+
+// Exclusive construction window for one fixed-layout SHM object. An active
+// builder owns an unpublished allocator slot; destruction follows the RAII
+// abort path so validation/reservation failures cannot leak allocations.
+template <typename T>
+class MessageBuilder {
+public:
+    MessageBuilder() noexcept = default;
+    MessageBuilder(const MessageBuilder&) = delete;
+    MessageBuilder& operator=(const MessageBuilder&) = delete;
+
+    MessageBuilder(MessageBuilder&& other) noexcept { MoveFrom(other); }
+
+    MessageBuilder& operator=(MessageBuilder&& other) noexcept {
+        if (this != &other) {
+            AbortIfActive();
+            MoveFrom(other);
+        }
+        return *this;
+    }
+
+    ~MessageBuilder() { AbortIfActive(); }
+
+    T* get() noexcept { return value_; }
+    const T* get() const noexcept { return value_; }
+    T* operator->() noexcept { return value_; }
+    const T* operator->() const noexcept { return value_; }
+    T& operator*() noexcept { return *value_; }
+    const T& operator*() const noexcept { return *value_; }
+
+    bool active() const noexcept { return active_; }
+    ShmHandle handle() const noexcept { return handle_; }
+
+private:
+    friend class Publisher<T>;
+
+    MessageBuilder(CentralSlabAllocator* allocator, ShmHandle handle,
+                   T* value) noexcept
+        : allocator_(allocator), handle_(handle), value_(value), active_(true) {}
+
+    Status Abort() noexcept {
+        if (!active_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "message builder is not active");
+        }
+        active_ = false;
+        std::destroy_at(value_);
+        value_ = nullptr;
+        CentralSlabAllocator* allocator = allocator_;
+        allocator_ = nullptr;
+        return allocator->Abort(handle_);
+    }
+
+    void Disarm() noexcept {
+        active_ = false;
+        allocator_ = nullptr;
+        value_ = nullptr;
+    }
+
+    void AbortIfActive() noexcept {
+        if (active_) {
+            Abort().ok();
+        }
+    }
+
+    void MoveFrom(MessageBuilder& other) noexcept {
+        allocator_ = other.allocator_;
+        handle_ = other.handle_;
+        value_ = other.value_;
+        active_ = other.active_;
+        other.allocator_ = nullptr;
+        other.value_ = nullptr;
+        other.active_ = false;
+    }
+
+    CentralSlabAllocator* allocator_ = nullptr;
+    ShmHandle handle_;
+    T* value_ = nullptr;
+    bool active_ = false;
+};
+
+struct PublisherOptions {
+    QueueFullPolicy queue_full_policy = QueueFullPolicy::kFail;
+    uint32_t sample_rate = 1;
+};
+
+// D2-09 fixed-layout Publisher facade over an SPSC Channel. The public type is
+// intentionally independent of D3 Schema internals: StaticMessageTraits<T> is
+// the seam future CodeGen specializes.
+template <typename T>
+class Publisher {
+public:
+    Publisher(CentralSlabAllocator& allocator, SpscChannel& channel,
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator), channel_(&channel), options_(options) {
+        ValidateStaticContract();
+    }
+
+    Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
+              MpscChannel::ProducerIdentity producer_identity,
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          mpsc_identity_(producer_identity),
+          options_(options) {
+        ValidateStaticContract();
+    }
+
+    Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
+              ShmPinTable& pins, PublisherOptions options = {}) noexcept
+        : allocator_(&allocator), channel_(&channel), options_(options) {
+        channel.SetPayloadRetireObserver(&ShmPinTable::RetirePayloadCallback,
+                                         &pins);
+        ValidateStaticContract();
+    }
+
+    Result<MessageBuilder<T>> Allocate(
+        Deadline deadline = Deadline::Infinite()) noexcept {
+        if (deadline.expired()) {
+            return Status::Error(StatusCode::kTimeout,
+                                 "publisher allocation deadline expired");
+        }
+        AllocationRequest request;
+        request.object_size = sizeof(T);
+        request.type_id = StaticMessageTraits<T>::type_id;
+        request.schema = SchemaIdentity{
+            .short_id = StaticMessageTraits<T>::schema_short_id,
+            .layout_version = StaticMessageTraits<T>::layout_version,
+        };
+        request.alignment = alignof(T);
+
+        MINO_ASSIGN_OR_RETURN(ShmHandle handle, allocator_->Allocate(request));
+        Result<MutableBuildView> build = allocator_->BeginBuild(handle);
+        if (!build.ok()) {
+            allocator_->Abort(handle).ok();
+            return build.status();
+        }
+        if (build->capacity < sizeof(T) || build->object_size != sizeof(T) ||
+            build->data == nullptr) {
+            allocator_->Abort(handle).ok();
+            return Status::Error(StatusCode::kCorruption,
+                                 "allocator returned an invalid build view");
+        }
+        T* value = std::construct_at(static_cast<T*>(build->data));
+        return MessageBuilder<T>(allocator_, handle, value);
+    }
+
+    // Publishes locally. Success means kLocalPublished only. A policy-driven
+    // DropNewest/Sample outcome is normalized to success and counted, matching
+    // the Runtime error contract rather than exposing Channel kDegraded.
+    Status PublishLocal(MessageBuilder<T>&& builder,
+                        Deadline deadline = Deadline::Infinite()) noexcept {
+        return PublishLocalImpl(builder, deadline, nullptr);
+    }
+
+    Result<DeliveryReceipt> Publish(
+        MessageBuilder<T>&& builder, OutstandingReceiptTable& receipts,
+        const PublisherReceiptIdentity& publisher_identity,
+        std::span<const DeliveryTarget> target_snapshot,
+        const DeliveryRequirement& requirement,
+        Deadline deadline = Deadline::Infinite()) noexcept {
+        uint64_t source_sequence = 0;
+        const Status local = PublishLocalImpl(builder, deadline,
+                                              &source_sequence);
+        if (!local.ok()) {
+            return local;
+        }
+        return receipts.Create(publisher_identity, source_sequence,
+                               target_snapshot, requirement);
+    }
+
+    Status Abort(MessageBuilder<T>&& builder) noexcept {
+        if (!builder.active() || builder.allocator_ != allocator_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "builder does not belong to this publisher");
+        }
+        return builder.Abort();
+    }
+
+    uint64_t published_count() const noexcept {
+        return published_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t dropped_count() const noexcept {
+        return dropped_count_.load(std::memory_order_relaxed);
+    }
+
+private:
+    Status PublishLocalImpl(MessageBuilder<T>& builder, Deadline deadline,
+                            uint64_t* source_sequence) noexcept {
+        if (!builder.active() || builder.allocator_ != allocator_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "builder does not belong to this publisher");
+        }
+        if (deadline.expired()) {
+            return AbortWith(builder, Status::Error(
+                StatusCode::kTimeout, "publish deadline expired"));
+        }
+
+        const Status validation = StaticMessageTraits<T>::Validate(*builder);
+        if (!validation.ok()) {
+            return AbortWith(builder, validation);
+        }
+
+        if (std::holds_alternative<SpscChannel*>(channel_)) {
+            return FinishPublish(builder, ReserveSpsc(deadline),
+                                 source_sequence);
+        }
+        if (std::holds_alternative<MpscChannel*>(channel_)) {
+            return FinishPublish(builder, ReserveMpsc(deadline), source_sequence);
+        }
+        return FinishPublish(builder, ReserveBroadcast(deadline),
+                             source_sequence);
+    }
+
+    static constexpr void ValidateStaticContract() noexcept {
+        static_assert(kHasStaticMessageTraits<T>,
+                      "StaticMessageTraits<T> must be specialized");
+        static_assert(std::is_standard_layout_v<T>,
+                      "SHM messages must have standard layout");
+        static_assert(std::is_trivially_copyable_v<T>,
+                      "D2 fixed-layout messages must be trivially copyable");
+        static_assert(std::is_trivially_default_constructible_v<T>,
+                      "D2 fixed-layout messages must be trivially default constructible");
+        static_assert(std::is_trivially_destructible_v<T>,
+                      "D2 fixed-layout messages must be trivially destructible");
+    }
+
+    template <typename Reservation>
+    Status FinishPublish(MessageBuilder<T>& builder,
+                         Result<Reservation> reservation,
+                         uint64_t* source_sequence) noexcept {
+        if (!reservation.ok()) {
+            if (reservation.status().code() == StatusCode::kDegraded) {
+                const Status abort = builder.Abort();
+                if (!abort.ok()) {
+                    return abort;
+                }
+                dropped_count_.fetch_add(1, std::memory_order_relaxed);
+                return Status::Ok();
+            }
+            return AbortWith(builder, reservation.status());
+        }
+
+        const Status published = allocator_->Publish(builder.handle_);
+        if (!published.ok()) {
+            return AbortWith(builder, published);
+        }
+
+        IndexSlot* slot = reservation->slot();
+        slot->msg_type = StaticMessageTraits<T>::message_type;
+        slot->schema_version = StaticMessageTraits<T>::schema_version;
+        slot->schema_short_id = StaticMessageTraits<T>::schema_short_id;
+        slot->schema_layout_version = StaticMessageTraits<T>::layout_version;
+        slot->reserved0 = 0;
+        slot->timestamp_ns = MonotonicNowNs();
+        slot->payload = builder.handle_;
+        slot->payload_len = sizeof(T);
+        slot->flags = StaticMessageTraits<T>::index_flags;
+
+        const uint64_t committed_sequence =
+            slot->sequence_num.load(std::memory_order_relaxed);
+        const Status committed = std::move(*reservation).Commit();
+        if (!committed.ok()) {
+            allocator_->Retire(builder.handle_).ok();
+            allocator_->Reclaim(builder.handle_).ok();
+            builder.Disarm();
+            return committed;
+        }
+        builder.Disarm();
+        if constexpr (std::is_same_v<Reservation,
+                                     BroadcastChannel::Reservation>) {
+            std::get<BroadcastChannel*>(channel_)->CollectGarbage();
+        }
+        if (source_sequence != nullptr) {
+            *source_sequence = committed_sequence;
+        }
+        published_count_.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok();
+    }
+
+    Result<SpscChannel::Reservation> ReserveSpsc(Deadline deadline) noexcept {
+        SpscChannel* channel = std::get<SpscChannel*>(channel_);
+        if (options_.queue_full_policy != QueueFullPolicy::kBlock) {
+            return channel->Reserve(options_.queue_full_policy,
+                                    options_.sample_rate);
+        }
+        for (;;) {
+            Result<SpscChannel::Reservation> reservation = channel->TryReserve();
+            if (reservation.ok()) {
+                return reservation;
+            }
+            if (reservation.status().code() != StatusCode::kWouldBlock) {
+                return reservation.status();
+            }
+            if (deadline.expired()) {
+                return Status::Error(StatusCode::kTimeout,
+                                     "publish blocked until deadline");
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    Result<MpscChannel::Reservation> ReserveMpsc(Deadline deadline) noexcept {
+        MpscChannel* channel = std::get<MpscChannel*>(channel_);
+        if (options_.queue_full_policy != QueueFullPolicy::kBlock) {
+            return channel->Reserve(mpsc_identity_, options_.queue_full_policy,
+                                    options_.sample_rate);
+        }
+        for (;;) {
+            Result<MpscChannel::Reservation> reservation =
+                channel->TryReserve(mpsc_identity_);
+            if (reservation.ok()) {
+                return reservation;
+            }
+            const StatusCode code = reservation.status().code();
+            if (code != StatusCode::kWouldBlock &&
+                code != StatusCode::kResourceExhausted) {
+                return reservation.status();
+            }
+            if (deadline.expired()) {
+                return Status::Error(StatusCode::kTimeout,
+                                     "publish blocked until deadline");
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    Result<BroadcastChannel::Reservation> ReserveBroadcast(
+        Deadline deadline) noexcept {
+        BroadcastChannel* channel = std::get<BroadcastChannel*>(channel_);
+        if (options_.queue_full_policy == QueueFullPolicy::kDropOldest) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "Runtime Broadcast requires Borrow tracking before DropOldest");
+        }
+        if (options_.queue_full_policy != QueueFullPolicy::kBlock) {
+            return channel->Reserve(options_.queue_full_policy,
+                                    options_.sample_rate);
+        }
+        for (;;) {
+            Result<BroadcastChannel::Reservation> reservation =
+                channel->TryReserve();
+            if (reservation.ok()) {
+                return reservation;
+            }
+            if (reservation.status().code() != StatusCode::kWouldBlock) {
+                return reservation.status();
+            }
+            if (deadline.expired()) {
+                return Status::Error(StatusCode::kTimeout,
+                                     "publish blocked until deadline");
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    static Status AbortWith(MessageBuilder<T>& builder,
+                            const Status& original) noexcept {
+        const Status abort = builder.Abort();
+        return abort.ok() ? original : abort;
+    }
+
+    static uint64_t MonotonicNowNs() noexcept {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    }
+
+    CentralSlabAllocator* allocator_;
+    std::variant<SpscChannel*, MpscChannel*, BroadcastChannel*> channel_;
+    MpscChannel::ProducerIdentity mpsc_identity_{};
+    PublisherOptions options_;
+    std::atomic<uint64_t> published_count_{0};
+    std::atomic<uint64_t> dropped_count_{0};
+};
+
+}  // namespace mino
+
+#endif  // MINO_RUNTIME_PUBLISHER_H_

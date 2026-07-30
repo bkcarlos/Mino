@@ -1,2 +1,142 @@
 # Runtime (bus, publisher, subscriber).
-package(default_visibility = ["//visibility:private"])
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "runtime_types",
+    hdrs = [
+        "deadline.h",
+        "message.h",
+        "message_traits.h",
+    ],
+    deps = [
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+cc_library(
+    name = "publisher",
+    hdrs = ["publisher.h"],
+    deps = [
+        ":delivery_receipt",
+        ":runtime_types",
+        ":shm_shared_ptr",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:queue_full_policy",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_library(
+    name = "subscriber",
+    hdrs = ["subscriber.h"],
+    deps = [
+        ":runtime_types",
+        ":shm_shared_ptr",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_library(
+    name = "subscriber_lease",
+    srcs = ["subscriber_lease.cc"],
+    hdrs = ["subscriber_lease.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/channel:broadcast",
+    ],
+)
+
+cc_library(
+    name = "delivery_receipt",
+    srcs = ["delivery_receipt.cc"],
+    hdrs = ["delivery_receipt.h"],
+    deps = [
+        ":runtime_types",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+    ],
+)
+
+cc_test(
+    name = "delivery_receipt_test",
+    srcs = ["delivery_receipt_test.cc"],
+    deps = [
+        ":delivery_receipt",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "shm_shared_ptr",
+    srcs = ["shm_shared_ptr.cc"],
+    hdrs = ["shm_shared_ptr.h"],
+    deps = [
+        ":runtime_types",
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_test(
+    name = "shm_shared_ptr_test",
+    srcs = ["shm_shared_ptr_test.cc"],
+    deps = [
+        ":shm_shared_ptr",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "subscriber_lease_test",
+    srcs = ["subscriber_lease_test.cc"],
+    deps = [
+        ":subscriber_lease",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/channel:broadcast",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "publisher_subscriber_test",
+    srcs = ["publisher_subscriber_test.cc"],
+    deps = [
+        ":delivery_receipt",
+        ":publisher",
+        ":shm_shared_ptr",
+        ":subscriber",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:spsc",
+        "@googletest//:gtest_main",
+    ],
+)

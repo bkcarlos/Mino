@@ -18,11 +18,16 @@
 // full detection, all five QueueFullPolicy states, abort tombstones,
 // corruption, wraparound, empty membership, and concurrent publisher vs.
 // subscribers.
+// D2-06 broadcast membership tests (design doc 9.6 / 12.2): lease heartbeat
+// renewal, stale-generation heartbeat rejection, lease-expiry eviction with
+// generation-bound ACK cleanup, paused-but-alive tolerance, and post-evict
+// slot reuse.
 
 #include "mino/shm/channel/broadcast_channel.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -143,10 +148,14 @@ void Publish(BroadcastChannel& ch, uint32_t tag) {
     ASSERT_TRUE(std::move(res.value()).Commit().ok());
 }
 
+// Monotonic clock used throughout the membership tests: registration,
+// heartbeat and eviction all quote the same time source (design doc 12.2).
+uint64_t NowNs() { return BroadcastChannel::MonotonicNowNs(); }
+
 // Registers subscriber `id`; fails the test on error.
 BroadcastChannel::SubscriberHandle Register(BroadcastChannel& ch,
                                             uint32_t id) {
-    auto sub = ch.RegisterSubscriber(SubscriberId{id});
+    auto sub = ch.RegisterSubscriber(SubscriberId{id}, NowNs());
     EXPECT_TRUE(sub.ok()) << sub.status().ToString();
     return sub.ValueOr(BroadcastChannel::SubscriberHandle{SubscriberId{0}, 0});
 }
@@ -396,7 +405,7 @@ TEST(BroadcastSnapshotBindingTest, SlotBindsVersionAndMembershipAtCommit) {
 // Unregister semantics
 // ---------------------------------------------------------------------------
 
-TEST(BroadcastUnregisterTest, DepartedSubscriberBitsBlockRetirement) {
+TEST(BroadcastUnregisterTest, UnregisterDrainsAckAndAllowsRetirement) {
     ChannelFixture<8> f;
     auto ch = BroadcastChannel::Init(f.storage, 8);
     ASSERT_TRUE(ch.ok());
@@ -404,14 +413,14 @@ TEST(BroadcastUnregisterTest, DepartedSubscriberBitsBlockRetirement) {
     auto b = Register(*ch, 1);
 
     Publish(*ch, 5);  // bitmap 0b11
-    {  // Subscriber 0 acks, then unregisters without draining the window.
+    {  // Subscriber 0 acks, then unregisters.
         auto borrow = ch->Poll(a);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
     }
     ASSERT_TRUE(ch->UnregisterSubscriber(a.id, a.generation).ok());
-    // Membership bit cleared; the departed subscriber's set_version stays as
-    // a historical record.
+    // Membership bit cleared; unregister also drains any outstanding ACK
+    // responsibility before making the ID reusable.
     EXPECT_EQ(f.control()->current_membership.load(), 0b10u);
 
     {  // Subscriber 1 acks: the bitmap drains to 0 and the slot retires.
@@ -424,7 +433,7 @@ TEST(BroadcastUnregisterTest, DepartedSubscriberBitsBlockRetirement) {
     }
 }
 
-TEST(BroadcastUnregisterTest, StaleAcksPrimitiveReclaimsDepartedBits) {
+TEST(BroadcastUnregisterTest, UnregisterReclaimsOutstandingBitsAtomically) {
     ChannelFixture<8> f;
     auto ch = BroadcastChannel::Init(f.storage, 8);
     ASSERT_TRUE(ch.ok());
@@ -432,26 +441,21 @@ TEST(BroadcastUnregisterTest, StaleAcksPrimitiveReclaimsDepartedBits) {
     auto b = Register(*ch, 1);
 
     Publish(*ch, 5);  // bitmap 0b11 on slot 0
-    // Subscriber 1 unregisters WITHOUT acking: its bit stays set, and the
-    // frozen cursor (0) holds the GC window open from below.
+    // Subscriber 1 unregisters WITHOUT acking. D2-06 teardown owns cleanup:
+    // it blocks ID reuse in kEvicting, removes future membership, clears the
+    // old generation's outstanding bit, then returns the slot to kFree.
     ASSERT_TRUE(ch->UnregisterSubscriber(b.id, b.generation).ok());
+    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b01u);
     {
         auto borrow = ch->Poll(a);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
     }
-    // Bit 0 cleared, bit 1 still set: the slot cannot retire yet.
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b10u);
-    ch->CollectGarbage();
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kReady));
-
-    // The D2-06 primitive clears the departed subscriber's leftover bit.
-    EXPECT_EQ(ch->ClearStaleAcks(b.id), 1u);
     EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
     EXPECT_EQ(f.slots()[0].state.load(),
               static_cast<uint32_t>(SlotState::kRetired));
-    // Idempotent: nothing left to clear.
+
+    // Cleanup is complete and idempotent before Unregister returns.
     EXPECT_EQ(ch->ClearStaleAcks(b.id), 0u);
     // Out-of-range id is a no-op.
     EXPECT_EQ(ch->ClearStaleAcks(SubscriberId{64}), 0u);
@@ -1111,6 +1115,300 @@ TEST(BroadcastThreadTest, ConcurrentRegisterUnregisterDuringPublish) {
     EXPECT_GT(published.load(std::memory_order_acquire), 0u);
     // Every membership bit cleared by the churn; version kept counting.
     EXPECT_EQ(f.control()->current_membership.load(), 0u);
+}
+
+TEST(BroadcastThreadTest, SubscriberConcurrencyMatrix) {
+    constexpr uint64_t kCapacity = 64;
+    constexpr uint64_t kMessages = 256;
+    constexpr std::array<uint32_t, 4> kSubscriberCounts = {1, 2, 8, 16};
+    ChannelFixture<kCapacity> fixture;
+
+    for (const uint32_t subscriber_count : kSubscriberCounts) {
+        auto channel = BroadcastChannel::Init(fixture.storage, kCapacity);
+        ASSERT_TRUE(channel.ok()) << "subscribers=" << subscriber_count;
+        std::vector<BroadcastChannel::SubscriberHandle> handles;
+        handles.reserve(subscriber_count);
+        for (uint32_t id = 0; id < subscriber_count; ++id) {
+            handles.push_back(Register(*channel, id));
+        }
+
+        std::atomic<bool> start{false};
+        std::atomic<uint64_t> failures{0};
+        std::thread publisher([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (uint64_t i = 0; i < kMessages; ++i) {
+                auto reservation = channel->Reserve(QueueFullPolicy::kBlock);
+                if (!reservation.ok()) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                FillSlot(*reservation, static_cast<uint32_t>(i));
+                reservation->slot()->payload_len = static_cast<uint32_t>(i);
+                if (!std::move(*reservation).Commit().ok()) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+
+        std::vector<std::thread> subscribers;
+        subscribers.reserve(subscriber_count);
+        for (uint32_t id = 0; id < subscriber_count; ++id) {
+            subscribers.emplace_back([&, id]() {
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (uint64_t sequence = 0; sequence < kMessages; ++sequence) {
+                    Result<BroadcastChannel::Borrow> borrow =
+                        channel->Poll(handles[id]);
+                    while (!borrow.ok() &&
+                           borrow.status().code() == StatusCode::kWouldBlock) {
+                        std::this_thread::yield();
+                        borrow = channel->Poll(handles[id]);
+                    }
+                    if (!borrow.ok() ||
+                        borrow->slot()->sequence_num != sequence ||
+                        !std::move(*borrow).Ack().ok()) {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+
+        start.store(true, std::memory_order_release);
+        publisher.join();
+        for (auto& subscriber : subscribers) {
+            subscriber.join();
+        }
+        EXPECT_EQ(failures.load(std::memory_order_relaxed), 0u)
+            << "subscribers=" << subscriber_count;
+        channel->CollectGarbage();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D2-06: lease heartbeat + stale-subscriber eviction (design doc 12.2)
+// ---------------------------------------------------------------------------
+//
+// These tests drive a virtual timeline: every timestamp is passed explicitly
+// to RegisterSubscriber / Heartbeat / EvictStaleSubscribers, so expiry is
+// exact and the tests never depend on wall-clock progress.
+
+constexpr uint64_t kT0 = 1'000'000'000;   // arbitrary virtual origin
+constexpr uint64_t kLease = 1'000'000;    // 1 ms lease
+
+TEST(BroadcastLeaseTest, FreshHeartbeatSurvivesEviction) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto sub = ch->RegisterSubscriber(SubscriberId{0}, kT0);
+    ASSERT_TRUE(sub.ok());
+
+    // Well past the lease, but the subscriber keeps renewing: never evicted.
+    // This is the "paused but alive" guarantee at the membership layer.
+    for (int i = 1; i <= 5; ++i) {
+        const uint64_t now = kT0 + static_cast<uint64_t>(i) * kLease;
+        ASSERT_TRUE(ch->Heartbeat(*sub, now).ok());
+        EXPECT_EQ(ch->EvictStaleSubscribers(now, kLease), 0u)
+            << "a renewed lease must never be evicted (round " << i << ")";
+    }
+    EXPECT_EQ(f.subs()[0].state.load(),
+              static_cast<uint32_t>(BroadcastChannel::SubscriberState::kActive));
+    EXPECT_EQ(f.control()->current_membership.load(), 0b1u);
+}
+
+TEST(BroadcastLeaseTest, ExpiredLeaseIsEvictedAndMembershipCleared) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto sub = ch->RegisterSubscriber(SubscriberId{3}, kT0);
+    ASSERT_TRUE(sub.ok());
+    EXPECT_EQ(f.control()->current_membership.load(), 1u << 3);
+
+    // Exactly at the lease boundary the subscriber is still safe (the check
+    // is `now - heartbeat >= lease`, so one nanosecond short survives).
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + kLease - 1, kLease), 0u);
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + kLease, kLease), 1u);
+
+    EXPECT_EQ(f.subs()[3].state.load(),
+              static_cast<uint32_t>(BroadcastChannel::SubscriberState::kFree));
+    EXPECT_EQ(f.control()->current_membership.load(), 0u);
+    // The evicted handle can no longer drive the channel.
+    EXPECT_EQ(ch->Poll(*sub).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(ch->Heartbeat(*sub, kT0 + kLease).code(), StatusCode::kNotFound);
+    // Idempotent: a second scan finds nothing left to evict.
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + 10 * kLease, kLease), 0u);
+}
+
+// Eviction must drain the departed subscriber's ACK responsibility, or the
+// slots it never acked would pin the GC window forever (design doc 12.2
+// step 4).
+TEST(BroadcastLeaseTest, EvictionDrainsAckResponsibilityAndRetires) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto alive = ch->RegisterSubscriber(SubscriberId{0}, kT0);
+    auto doomed = ch->RegisterSubscriber(SubscriberId{1}, kT0);
+    ASSERT_TRUE(alive.ok() && doomed.ok());
+
+    Publish(*ch, 1);
+    Publish(*ch, 2);
+    // Only the surviving subscriber acks; `doomed` owes both bits.
+    for (int i = 0; i < 2; ++i) {
+        auto borrow = ch->Poll(*alive);
+        ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+        ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
+    }
+    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b10u)
+        << "the doomed subscriber still owes its ack";
+    EXPECT_NE(f.slots()[0].state.load(),
+              static_cast<uint32_t>(SlotState::kRetired));
+
+    // `alive` keeps its lease; `doomed` lets it lapse.
+    const uint64_t now = kT0 + kLease;
+    ASSERT_TRUE(ch->Heartbeat(*alive, now).ok());
+    EXPECT_EQ(ch->EvictStaleSubscribers(now, kLease), 1u);
+
+    // Its bits are gone and the fully-acked slots retire.
+    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
+    EXPECT_EQ(f.metas()[1].ack_bitmap.bits.load(), 0u);
+    EXPECT_EQ(f.slots()[0].state.load(),
+              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.slots()[1].state.load(),
+              static_cast<uint32_t>(SlotState::kRetired));
+    // The survivor is untouched.
+    EXPECT_EQ(f.subs()[0].state.load(),
+              static_cast<uint32_t>(BroadcastChannel::SubscriberState::kActive));
+}
+
+// 12.2: "Lease 失效清理必须校验 Generation，不能误清理复用后的新
+// Subscriber". After eviction the slot may be re-registered; the stale handle
+// must not renew, poll or unregister the new incarnation, and the new
+// subscriber must receive messages normally.
+TEST(BroadcastLeaseTest, EvictionThenReRegisterIsGenerationBound) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto stale = ch->RegisterSubscriber(SubscriberId{2}, kT0);
+    ASSERT_TRUE(stale.ok());
+
+    const uint64_t evict_at = kT0 + kLease;
+    ASSERT_EQ(ch->EvictStaleSubscribers(evict_at, kLease), 1u);
+
+    // Same id, fresh incarnation.
+    auto fresh = ch->RegisterSubscriber(SubscriberId{2}, evict_at);
+    ASSERT_TRUE(fresh.ok());
+    EXPECT_GT(fresh->generation, stale->generation);
+
+    // The stale handle is inert against the new incarnation.
+    EXPECT_EQ(ch->Heartbeat(*stale, evict_at).code(), StatusCode::kNotFound);
+    EXPECT_EQ(ch->Poll(*stale).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(ch->UnregisterSubscriber(stale->id, stale->generation).code(),
+              StatusCode::kNotFound);
+
+    // The new incarnation works and is protected by its own fresh lease.
+    Publish(*ch, 7);
+    EXPECT_EQ(ch->EvictStaleSubscribers(evict_at, kLease), 0u);
+    auto borrow = ch->Poll(*fresh);
+    ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+    EXPECT_EQ(borrow.value()->msg_type, 0x4000u + 7u);
+    ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
+}
+
+// Eviction is the release valve for a wedged publisher: a subscriber that
+// stops acking eventually makes the channel full, and evicting it must free
+// the window again (the slowest-cursor full rule stops counting it).
+TEST(BroadcastLeaseTest, EvictingStalledSubscriberUnblocksPublisher) {
+    constexpr uint64_t kCap = 8;
+    ChannelFixture<kCap> f;
+    auto ch = BroadcastChannel::Init(f.storage, kCap);
+    ASSERT_TRUE(ch.ok());
+    auto stalled = ch->RegisterSubscriber(SubscriberId{0}, kT0);
+    ASSERT_TRUE(stalled.ok());
+
+    // Fill the ring; the stalled subscriber never polls.
+    for (uint32_t i = 0; i < kCap; ++i) {
+        Publish(*ch, i);
+    }
+    auto full = ch->TryReserve();
+    ASSERT_FALSE(full.ok());
+    EXPECT_EQ(full.status().code(), StatusCode::kWouldBlock);
+
+    // Evicting the stalled subscriber drains its acks, retires the slots and
+    // removes its frozen cursor from the fullness computation.
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + kLease, kLease), 1u);
+    EXPECT_EQ(f.control()->current_membership.load(), 0u);
+    auto freed = ch->TryReserve();
+    ASSERT_TRUE(freed.ok()) << freed.status().ToString();
+    ASSERT_TRUE(std::move(freed.value()).Abort().ok());
+}
+
+TEST(BroadcastLeaseTest, HeartbeatValidatesIdAndGeneration) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto sub = ch->RegisterSubscriber(SubscriberId{0}, kT0);
+    ASSERT_TRUE(sub.ok());
+
+    // Out-of-range id.
+    BroadcastChannel::SubscriberHandle bad_id{
+        SubscriberId{kBroadcastMaxSubscribers}, sub->generation};
+    EXPECT_EQ(ch->Heartbeat(bad_id, kT0).code(), StatusCode::kNotFound);
+    // Never-registered id.
+    BroadcastChannel::SubscriberHandle unregistered{SubscriberId{9}, 1};
+    EXPECT_EQ(ch->Heartbeat(unregistered, kT0).code(), StatusCode::kNotFound);
+    // Wrong generation on a live id.
+    BroadcastChannel::SubscriberHandle wrong_gen{sub->id,
+                                                 sub->generation + 1};
+    EXPECT_EQ(ch->Heartbeat(wrong_gen, kT0).code(), StatusCode::kNotFound);
+    // The genuine handle still works.
+    EXPECT_TRUE(ch->Heartbeat(*sub, kT0).ok());
+}
+
+// A scan over a channel with no subscribers (or only free slots) must be a
+// cheap no-op, and must never disturb the publisher.
+TEST(BroadcastLeaseTest, EvictionOnEmptyMembershipIsNoOp) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + 10 * kLease, kLease), 0u);
+    Publish(*ch, 1);
+    EXPECT_EQ(ch->EvictStaleSubscribers(kT0 + 10 * kLease, kLease), 0u);
+    EXPECT_EQ(f.control()->current_membership.load(), 0u);
+}
+
+// Mixed population: some renew, some lapse. Exactly the lapsed ones go, and
+// the survivors keep their cursors and ack responsibility intact.
+TEST(BroadcastLeaseTest, EvictsOnlyExpiredAmongMany) {
+    ChannelFixture<8> f;
+    auto ch = BroadcastChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+    auto a = ch->RegisterSubscriber(SubscriberId{0}, kT0);
+    auto b = ch->RegisterSubscriber(SubscriberId{1}, kT0);
+    auto c = ch->RegisterSubscriber(SubscriberId{2}, kT0);
+    ASSERT_TRUE(a.ok() && b.ok() && c.ok());
+
+    const uint64_t now = kT0 + kLease;
+    ASSERT_TRUE(ch->Heartbeat(*a, now).ok());
+    ASSERT_TRUE(ch->Heartbeat(*c, now).ok());
+    // Only `b` lapsed.
+    EXPECT_EQ(ch->EvictStaleSubscribers(now, kLease), 1u);
+    EXPECT_EQ(f.control()->current_membership.load(), 0b101u);
+
+    // Survivors still receive; the publish snapshot excludes the evicted one.
+    Publish(*ch, 42);
+    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b101u);
+    for (auto* sub : {&*a, &*c}) {
+        auto borrow = ch->Poll(*sub);
+        ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+        EXPECT_EQ(borrow.value()->msg_type, 0x4000u + 42u);
+        ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
+    }
+    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
 }
 
 }  // namespace

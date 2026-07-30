@@ -305,6 +305,76 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
     return handle;
 }
 
+Result<MutableBuildView> CentralSlabAllocator::BeginBuild(ShmHandle handle) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+
+    SlabHeader& header = HeaderAt(slot_index);
+    if (!VerifyImmutableHeader(header)) {
+        return Status::Error(StatusCode::kCorruption,
+                             "immutable header CRC mismatch");
+    }
+    uint32_t expected = static_cast<uint32_t>(ObjectState::kAllocated);
+    if (!header.object_state.compare_exchange_strong(
+            expected, static_cast<uint32_t>(ObjectState::kBuilding),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "slot is not available for exclusive build");
+    }
+
+    MutableBuildView view;
+    view.handle = handle;
+    view.capacity = header.capacity;
+    view.object_size = header.object_size;
+    view.type_id = TypeId{header.type_id};
+    view.schema_short_id = header.schema_short_id;
+    view.layout_version = header.layout_version;
+    view.data = reinterpret_cast<std::byte*>(&header) + sizeof(SlabHeader);
+    return view;
+}
+
+Status CentralSlabAllocator::Publish(ShmHandle handle) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+
+    SlabHeader& header = HeaderAt(slot_index);
+    if (!VerifyImmutableHeader(header)) {
+        return Status::Error(StatusCode::kCorruption,
+                             "immutable header CRC mismatch");
+    }
+    uint32_t expected = static_cast<uint32_t>(ObjectState::kBuilding);
+    if (!header.object_state.compare_exchange_strong(
+            expected, static_cast<uint32_t>(ObjectState::kPublished),
+            std::memory_order_release, std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "slot is not in kBuilding state");
+    }
+    return Status::Ok();
+}
+
+Status CentralSlabAllocator::Abort(ShmHandle handle) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+
+    SlabHeader& header = HeaderAt(slot_index);
+    for (;;) {
+        const uint32_t state =
+            header.object_state.load(std::memory_order_acquire);
+        if (state == static_cast<uint32_t>(ObjectState::kAborting)) {
+            break;
+        }
+        if (state != static_cast<uint32_t>(ObjectState::kAllocated) &&
+            state != static_cast<uint32_t>(ObjectState::kBuilding)) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "only unpublished objects may be aborted");
+        }
+        uint32_t expected = state;
+        if (header.object_state.compare_exchange_weak(
+                expected, static_cast<uint32_t>(ObjectState::kAborting),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    return Reclaim(handle);
+}
+
 Status CentralSlabAllocator::Retire(ShmHandle handle) {
     MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
 
@@ -377,6 +447,7 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
     view.object_size = header.object_size;
     view.type_id = TypeId{header.type_id};
     view.schema_short_id = header.schema_short_id;
+    view.layout_version = header.layout_version;
     view.data = reinterpret_cast<const std::byte*>(&header) + sizeof(SlabHeader);
     return view;
 }

@@ -88,6 +88,12 @@ static_assert(sizeof(ProcessIdentity) == 32,
 static_assert(std::is_trivially_copyable_v<ProcessIdentity>);
 static_assert(std::is_standard_layout_v<ProcessIdentity>);
 
+// Returns true only when the recorded process incarnation is still alive.
+// Linux validates both PID existence and /proc start time, so a recycled PID
+// cannot impersonate the old owner. Other POSIX platforms conservatively use
+// kill(pid, 0), except that the current process is always compared exactly.
+bool IsProcessIdentityAlive(const ProcessIdentity& identity) noexcept;
+
 }  // namespace mino
 
 #endif  // MINO_PLATFORM_PROCESS_IDENTITY_H_

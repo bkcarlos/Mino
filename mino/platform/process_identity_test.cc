@@ -93,6 +93,17 @@ TEST(ProcessIdentityTest, EpochUniqueAcrossProcesses) {
 #endif
 }
 
+TEST(ProcessIdentityTest, LivenessValidatesProcessIncarnation) {
+    const ProcessIdentity current = ProcessIdentity::Current();
+    EXPECT_TRUE(IsProcessIdentityAlive(current));
+
+    ProcessIdentity recycled = current;
+    recycled.process_epoch ^= 1u;
+    EXPECT_FALSE(IsProcessIdentityAlive(recycled));
+
+    EXPECT_FALSE(IsProcessIdentityAlive(ProcessIdentity{}));
+}
+
 TEST(ProcessIdentityTest, EqualityOperators) {
     ProcessIdentity a;
     a.node_id = 1;

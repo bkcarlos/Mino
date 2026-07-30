@@ -13,6 +13,9 @@
 // the License.
 
 // D2-05: Broadcast channel (design doc 9.6).
+// D2-06: Broadcast membership (design doc 9.6 / 12.2): subscriber heartbeat
+// lease, stale-subscriber eviction with generation binding and ACK-responsibility
+// cleanup.
 //
 // Single publisher / N subscriber fan-out over shared memory. Every active
 // subscriber receives every published message exactly once; each subscriber
@@ -47,6 +50,7 @@
 #define MINO_SHM_CHANNEL_BROADCAST_CHANNEL_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -62,12 +66,16 @@ namespace mino {
 
 class BroadcastChannel {
 public:
+    using PayloadRetireObserver = void (*)(ShmHandle, void*) noexcept;
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "BroadcastChannel requires lock-free 64-bit atomics");
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4252'4443ULL;  // "MINOBRDC"
-    static constexpr uint32_t kLayoutVersion = 1;
+    // v2: D2-06 adds heartbeat generation binding and a kRegistering state
+    // inside SubscriberSlot's existing padding; total sizes/offsets outside
+    // that padding stay unchanged, but attach must reject the v1 protocol.
+    static constexpr uint32_t kLayoutVersion = 2;
     static constexpr uint32_t kMaxSubscribers = kBroadcastMaxSubscribers;  // 64
 
     // -----------------------------------------------------------------------
@@ -122,12 +130,16 @@ public:
     // cursor lives on its own cache line (the owning subscriber is the only
     // steady-state writer; the publisher reads it for the full check, and
     // kDropOldest CAS-advances it). The registration fields live on the
-    // second cache line: they change only at (un)register time but are read
-    // on every Poll, so they must not share a line with the cursor.
+    // second cache line: they change only at (un)register/evict time but are
+    // read on every Poll, so they must not share a line with the cursor.
+    // heartbeat_ns (D2-06, design doc 12.2 SubscriberLease) rides the same
+    // line: it is written only by the owning subscriber's Heartbeat and read
+    // only by the eviction scan, both off the Poll hot path.
     enum class SubscriberState : uint32_t {
         kFree = 0,
         kActive = 1,
         kEvicting = 2,
+        kRegistering = 3,
     };
 
     struct alignas(kCacheLineSize) SubscriberSlot {
@@ -135,18 +147,37 @@ public:
         alignas(kCacheLineSize) std::atomic<uint64_t> cursor{0};
         unsigned char pad0[kCacheLineSize - 8] = {};
 
-        // -- Line B: registration metadata ----------------------------------
+        // -- Line B: registration metadata + lease heartbeat ----------------
         alignas(kCacheLineSize) std::atomic<uint64_t> subscriber_set_version{0};
         std::atomic<uint64_t> generation{0};
         std::atomic<uint32_t> state{0};  // SubscriberState
         uint32_t reserved0 = 0;
-        unsigned char pad1[kCacheLineSize - 8 - 8 - 4 - 4] = {};
+        // Last Heartbeat timestamp (ns, caller-supplied monotonic clock).
+        // Written relaxed by the owning subscriber only; read by
+        // EvictStaleSubscribers. Meaningful only while state != kFree.
+        std::atomic<uint64_t> heartbeat_ns{0};
+        // Generation that authored heartbeat_ns. A stale Heartbeat racing an
+        // eviction/re-registration may write late, but the new generation will
+        // never trust that timestamp (D2-06 generation-bound lease cleanup).
+        std::atomic<uint64_t> heartbeat_generation{0};
+        unsigned char pad1[kCacheLineSize - 8 - 8 - 4 - 4 - 8 - 8] = {};
     };
 
     static_assert(sizeof(SubscriberSlot) == 2 * kCacheLineSize,
                   "SubscriberSlot must occupy exactly two cache lines");
     static_assert(alignof(SubscriberSlot) == kCacheLineSize);
     static_assert(std::is_standard_layout_v<SubscriberSlot>);
+    static_assert(offsetof(SubscriberSlot, cursor) == 0,
+                  "subscriber cursor must start the slot's first cache line");
+    static_assert(offsetof(SubscriberSlot, subscriber_set_version) ==
+                      kCacheLineSize,
+                  "registration metadata must start the second cache line");
+    static_assert(offsetof(SubscriberSlot, heartbeat_ns) ==
+                      kCacheLineSize + 8 + 8 + 4 + 4,
+                  "heartbeat must pack into the line-B padding (D2-06)");
+    static_assert(offsetof(SubscriberSlot, heartbeat_generation) ==
+                      kCacheLineSize + 8 + 8 + 4 + 4 + 8,
+                  "heartbeat generation must remain in line B");
 
     // -----------------------------------------------------------------------
     // Layout offsets
@@ -264,6 +295,9 @@ public:
                 static_cast<uint32_t>(SubscriberState::kFree),
                 std::memory_order_relaxed);
             subs[i].reserved0 = 0;
+            subs[i].heartbeat_ns.store(0, std::memory_order_relaxed);
+            subs[i].heartbeat_generation.store(0,
+                                               std::memory_order_relaxed);
         }
 
         // Publish: release so every plain/relaxed write above is visible to
@@ -326,19 +360,29 @@ public:
     // messages published from now on (no history replay). Id reuse is safe:
     // the generation is bumped on every registration and validated on Poll.
     //
+    // `now_ns` seeds the lease heartbeat (D2-06, design doc 12.2): the
+    // registration instant is the subscriber's first proof of liveness, so
+    // the eviction lease starts counting from here. Callers obtain it from a
+    // monotonic clock (see MonotonicNowNs()); passing it in keeps the
+    // channel testable and lets the Coordinator layer share one time source.
+    //
     // Errors:
     //   kResourceExhausted : id >= kMaxSubscribers.
     //   kAlreadyExists     : id is currently registered (state kActive).
-    Result<SubscriberHandle> RegisterSubscriber(SubscriberId id) noexcept {
+    Result<SubscriberHandle> RegisterSubscriber(SubscriberId id,
+                                                uint64_t now_ns) noexcept {
         if (id.value >= kMaxSubscribers) {
             return Status::Error(
                 StatusCode::kResourceExhausted,
                 "subscriber id exceeds kBroadcastMaxSubscribers");
         }
         SubscriberSlot& sub = subs_[id.value];
+        // Claim a private transitional state first. Publishing kActive before
+        // generation/cursor initialization would let a stale handle from the
+        // previous incarnation pass validation during this window.
         uint32_t expected = static_cast<uint32_t>(SubscriberState::kFree);
         if (!sub.state.compare_exchange_strong(
-                expected, static_cast<uint32_t>(SubscriberState::kActive),
+                expected, static_cast<uint32_t>(SubscriberState::kRegistering),
                 std::memory_order_acq_rel, std::memory_order_relaxed)) {
             return Status::Error(StatusCode::kAlreadyExists,
                                  "subscriber id already registered");
@@ -351,6 +395,9 @@ public:
         const uint64_t generation =
             sub.generation.load(std::memory_order_relaxed) + 1;
         sub.generation.store(generation, std::memory_order_relaxed);
+        sub.heartbeat_ns.store(now_ns, std::memory_order_relaxed);
+        sub.heartbeat_generation.store(generation,
+                                       std::memory_order_relaxed);
 
         // Membership CAS: the publisher or another registrar may be flipping
         // other bits concurrently; CAS keeps each bit flip atomic. set_version
@@ -366,40 +413,55 @@ public:
             control_->set_version.fetch_add(1, std::memory_order_acq_rel) + 1;
         // Bind this registration to the exact set version it produced: the
         // next publish snapshot will carry at least this version.
-        sub.subscriber_set_version.store(version, std::memory_order_release);
+        sub.subscriber_set_version.store(version, std::memory_order_relaxed);
+        // Final release publication: Poll/Ack/Heartbeat that acquire kActive
+        // now observe the fully initialized cursor, generation and lease.
+        sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                        std::memory_order_release);
         return SubscriberHandle{id, generation};
+    }
+
+    // Convenience overload seeding the lease from the channel's own
+    // monotonic clock. Call sites that do not exercise lease expiry (the
+    // common case) stay free of time plumbing; the explicit overload above
+    // remains for the Coordinator (D2-08) and for tests that drive time.
+    Result<SubscriberHandle> RegisterSubscriber(SubscriberId id) noexcept {
+        return RegisterSubscriber(id, MonotonicNowNs());
     }
 
     // Unregisters the subscriber. The generation must match the handle
     // returned at registration: a stale handle cannot unregister a
-    // re-registered (live) subscriber. Outstanding ack_bitmap bits of the
-    // departed subscriber stay set: they are excluded from new publishes
-    // (the membership bit is cleared) and can be reclaimed from a full
-    // window via ClearStaleAcks().
+    // re-registered (live) subscriber.
+    //
+    // Normal unregister follows the same teardown protocol as lease eviction:
+    // ACTIVE -> EVICTING first blocks new Poll/Ack/Heartbeat and prevents ID
+    // reuse; only then is the membership bit removed and every outstanding ACK
+    // responsibility drained. The slot returns to FREE last, so a new
+    // generation can never overlap cleanup of the old one (design doc 9.6 /
+    // 12.2: generation-bound removal).
     Status UnregisterSubscriber(SubscriberId id, uint64_t generation) noexcept {
         if (id.value >= kMaxSubscribers) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "subscriber id out of range");
         }
         SubscriberSlot& sub = subs_[id.value];
-        if (sub.state.load(std::memory_order_acquire) !=
-            static_cast<uint32_t>(SubscriberState::kActive)) {
-            return Status::Error(StatusCode::kNotFound,
-                                 "subscriber is not registered");
-        }
         if (sub.generation.load(std::memory_order_acquire) != generation) {
             return Status::Error(StatusCode::kNotFound,
                                  "subscriber generation mismatch (stale handle)");
         }
+        uint32_t expected = static_cast<uint32_t>(SubscriberState::kActive);
+        if (!sub.state.compare_exchange_strong(
+                expected, static_cast<uint32_t>(SubscriberState::kEvicting),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber is not registered");
+        }
+
+        RemoveMembershipBit(id.value);
+        ClearStaleAcks(id);
+        sub.heartbeat_ns.store(0, std::memory_order_relaxed);
         sub.state.store(static_cast<uint32_t>(SubscriberState::kFree),
                         std::memory_order_release);
-        uint64_t membership =
-            control_->current_membership.load(std::memory_order_acquire);
-        while (!control_->current_membership.compare_exchange_weak(
-            membership, membership & ~(uint64_t{1} << id.value),
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        }
-        control_->set_version.fetch_add(1, std::memory_order_acq_rel);
         return Status::Ok();
     }
 
@@ -432,6 +494,165 @@ public:
         }
         CollectGarbage();
         return cleared;
+    }
+
+    // Monotonic clock in nanoseconds for lease bookkeeping (D2-06). The
+    // timestamp never enters the SHM ABI as a cross-process absolute value:
+    // eviction only compares heartbeat_ns against a now_ns supplied by the
+    // caller, and the Coordinator layer (D2-08) owns the authoritative time
+    // source. Same rationale as MpscChannel::MonotonicNowNs: durations, not
+    // wall-clock agreement, are what matters.
+    static uint64_t MonotonicNowNs() noexcept {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    }
+
+    // Renews the subscriber's lease (D2-06, design doc 12.2 SubscriberLease).
+    // `now_ns` must come from the same monotonic clock family as the now_ns
+    // passed to RegisterSubscriber/EvictStaleSubscribers (see
+    // MonotonicNowNs()). The timestamp is tagged with the handle generation:
+    // if a stale Heartbeat races eviction and writes after ID reuse, the new
+    // generation ignores it rather than inheriting the old lease proof.
+    //
+    // Errors:
+    //   kNotFound : the subscriber is not registered or the generation does
+    //               not match (a stale handle must never renew a
+    //               re-registered subscriber's lease — the eviction cleanup
+    //               is generation-bound, so its liveness proof is too).
+    Status Heartbeat(SubscriberHandle sub, uint64_t now_ns) noexcept {
+        if (sub.id.value >= kMaxSubscribers) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber id out of range");
+        }
+        SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive) ||
+            ss.generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(
+                StatusCode::kNotFound,
+                "subscriber not registered or stale generation");
+        }
+        ss.heartbeat_ns.store(now_ns, std::memory_order_relaxed);
+        ss.heartbeat_generation.store(sub.generation,
+                                      std::memory_order_release);
+        // Eviction may have won immediately after our first validation. In
+        // that case this heartbeat is rejected; its generation tag prevents
+        // the late stores above from becoming valid for a future incarnation.
+        if (ss.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive) ||
+            ss.generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(
+                StatusCode::kNotFound,
+                "subscriber was evicted while renewing its lease");
+        }
+        return Status::Ok();
+    }
+
+    // Lease-expiry eviction orchestration (D2-06; design doc 12.2 steps
+    // 2/3/4/7 landed at the channel layer). Scans all kMaxSubscribers slots
+    // and evicts every subscriber whose state is kActive and whose heartbeat
+    // is at least `lease_ns` old relative to `now_ns`. Returns the number of
+    // subscribers evicted. Idempotent; safe to run concurrently with
+    // publishers, subscribers and other scanners (CAS arbitration
+    // throughout).
+    //
+    // Per expired slot the sequence is:
+    //   a. CAS state kActive -> kEvicting (12.2 step 2). A lost CAS means a
+    //      concurrent Unregister/eviction already owns the transition: skip.
+    //   b. Record the slot's generation. The cleanup below is bound to the
+    //      exact registration being evicted, so a late Heartbeat/Ack quoting
+    //      a stale handle can never disturb a subscriber that re-registers
+    //      into this slot afterwards (12.2: Lease 失效清理必须校验
+    //      Generation).
+    //   c. Clear the membership bit and bump set_version (12.2 step 3): new
+    //      publishes stop carrying its ack responsibility, and the full
+    //      check (MinActiveCursor) immediately stops counting its frozen
+    //      cursor. Done BEFORE ClearStaleAcks so no publish between (c) and
+    //      (d) can re-arm its bit.
+    //   d. ClearStaleAcks(id) (12.2 step 4): drain its outstanding ack bits
+    //      in the current window so fully-acked slots can retire.
+    //   e. state -> kFree: the eviction is complete and the slot may be
+    //      reused. Design doc 12.2 step 7's EVICTED terminal state is a
+    //      Coordinator-level (D2-08) record; at the channel layer the slot
+    //      simply returns to kFree.
+    //
+    // A paused-but-alive subscriber (fresh heartbeat) is never evicted here.
+    // Unlike MPSC crash recovery (design doc 9.5: never judge a crash by
+    // timeout alone), the broadcast channel deliberately decides on the
+    // heartbeat alone: process-liveness revalidation (12.2 step 1) is layered
+    // above in the D2-08 Coordinator, which chooses when (and whether) to
+    // call this scan. The channel only enforces the lease arithmetic.
+    uint64_t EvictStaleSubscribers(uint64_t now_ns, uint64_t lease_ns) noexcept {
+        uint64_t evicted = 0;
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            SubscriberSlot& sub = subs_[id];
+            if (sub.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive)) {
+                continue;
+            }
+            const uint64_t generation =
+                sub.generation.load(std::memory_order_acquire);
+            const uint64_t heartbeat_generation =
+                sub.heartbeat_generation.load(std::memory_order_acquire);
+            const uint64_t heartbeat =
+                sub.heartbeat_ns.load(std::memory_order_acquire);
+            // A generation mismatch means a late stale-heartbeat write raced
+            // ID reuse. Conservatively keep the subscriber: only a heartbeat
+            // explicitly authored by this generation may drive its eviction.
+            if (heartbeat_generation != generation ||
+                now_ns - heartbeat < lease_ns) {
+                continue;
+            }
+            // (a) Claim the transition. acq_rel arbitrates with a concurrent
+            // Unregister and makes Poll/Ack/Heartbeat reject new work.
+            uint32_t expected = static_cast<uint32_t>(SubscriberState::kActive);
+            if (!sub.state.compare_exchange_strong(
+                    expected,
+                    static_cast<uint32_t>(SubscriberState::kEvicting),
+                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                continue;
+            }
+            // Heartbeat may have renewed immediately before our CAS but after
+            // the first read. Re-check while owning kEvicting: if that same
+            // generation published a fresh timestamp, hand the slot back to
+            // kActive and let it live. A Heartbeat that starts after our CAS
+            // observes kEvicting and fails, so this is the final race window.
+            const uint64_t claimed_heartbeat_generation =
+                sub.heartbeat_generation.load(std::memory_order_acquire);
+            const uint64_t claimed_heartbeat =
+                sub.heartbeat_ns.load(std::memory_order_acquire);
+            if (claimed_heartbeat_generation != generation ||
+                now_ns - claimed_heartbeat < lease_ns) {
+                sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                                std::memory_order_release);
+                continue;
+            }
+            // (b) The cleanup below is bound to the exact registration being
+            // evicted without needing to re-read the generation: holding
+            // kEvicting blocks re-registration (the Register CAS requires
+            // kFree), and every subscriber-facing entry point (Poll / Ack /
+            // Heartbeat) validates the generation, so a stale handle of the
+            // evicted registration can never renew or ack into a subscriber
+            // that re-registers this slot later (12.2: Lease 失效清理必须校验
+            // Generation).
+            // (c) Drop the membership bit before touching ack bits: the
+            // publisher snapshots membership at Commit, so from the next
+            // publish on this subscriber owes nothing. Same CAS + release
+            // bump discipline as UnregisterSubscriber.
+            RemoveMembershipBit(id);
+            // (d) Drain its outstanding ack responsibility and retire every
+            // slot that was waiting only on it.
+            ClearStaleAcks(SubscriberId{id});
+            // (e) Eviction complete: back to kFree for reuse. Release so the
+            // membership/bit cleanup above is visible to whoever re-registers
+            // the slot (its Register CAS acquires).
+            sub.heartbeat_ns.store(0, std::memory_order_relaxed);
+            sub.state.store(static_cast<uint32_t>(SubscriberState::kFree),
+                            std::memory_order_release);
+            ++evicted;
+        }
+        return evicted;
     }
 
     // -----------------------------------------------------------------------
@@ -858,6 +1079,16 @@ public:
         return AckSlot(sub.id, seq);
     }
 
+    // Installs a process-local notification invoked exactly when this facade
+    // wins a kReady -> kRetired transition. The callback pointer is never
+    // stored in shared memory; every attached Runtime process configures its
+    // own facade. The payload Handle is captured before the slot can be reused.
+    void SetPayloadRetireObserver(PayloadRetireObserver observer,
+                                  void* context) noexcept {
+        payload_retire_observer_ = observer;
+        payload_retire_context_ = context;
+    }
+
     // -----------------------------------------------------------------------
     // Garbage collection
     // -----------------------------------------------------------------------
@@ -901,10 +1132,15 @@ public:
                 // if it wins, the publisher's CAS observes kRetired and
                 // moves on. A plain store could clobber a fresh kReady with
                 // kRetired and wedge every subscriber at that cursor.
+                const ShmHandle payload = slot->payload;
                 uint32_t expected = static_cast<uint32_t>(SlotState::kReady);
-                slot->state.compare_exchange_strong(
-                    expected, static_cast<uint32_t>(SlotState::kRetired),
-                    std::memory_order_acq_rel, std::memory_order_relaxed);
+                if (slot->state.compare_exchange_strong(
+                        expected, static_cast<uint32_t>(SlotState::kRetired),
+                        std::memory_order_acq_rel, std::memory_order_relaxed) &&
+                    payload_retire_observer_ != nullptr && !payload.IsNull()) {
+                    payload_retire_observer_(payload,
+                                             payload_retire_context_);
+                }
             }
         }
     }
@@ -959,6 +1195,19 @@ private:
     static SubscriberSlot* SubsOf(void* shm_base, uint64_t capacity) noexcept {
         return reinterpret_cast<SubscriberSlot*>(
             static_cast<unsigned char*>(shm_base) + SubsOffset(capacity));
+    }
+
+    // Removes one subscriber from future publication snapshots and advances
+    // the logical set version. Callers must first own that SubscriberSlot in
+    // kEvicting, which prevents generation reuse until ACK cleanup completes.
+    void RemoveMembershipBit(uint32_t id) noexcept {
+        uint64_t membership =
+            control_->current_membership.load(std::memory_order_acquire);
+        while (!control_->current_membership.compare_exchange_weak(
+            membership, membership & ~(uint64_t{1} << id),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+        control_->set_version.fetch_add(1, std::memory_order_acq_rel);
     }
 
     // Full iff `prod` - oldest active subscriber cursor >= capacity. With
@@ -1154,6 +1403,8 @@ private:
     SubscriberSlot* subs_ = nullptr;
     uint64_t capacity_ = 0;
     uint64_t mask_ = 0;
+    PayloadRetireObserver payload_retire_observer_ = nullptr;
+    void* payload_retire_context_ = nullptr;
 };
 
 static_assert(std::is_trivially_copyable_v<BroadcastChannel>,

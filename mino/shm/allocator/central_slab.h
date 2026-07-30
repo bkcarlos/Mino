@@ -34,6 +34,7 @@
 #include <cstdint>
 
 #include "mino/abi/shm_handle.h"
+#include "mino/common/ids.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/shm/allocator/bitmap.h"
@@ -43,12 +44,7 @@
 
 namespace mino {
 
-// Strong ID wrapper for type_id (design doc 5.2).
-struct TypeId {
-    uint32_t value = 0;
 
-    friend bool operator==(const TypeId&, const TypeId&) = default;
-};
 
 // Schema identity carried by an AllocationRequest. Only the short id is
 // stored in the Slab Header; the full digest is resolved via the Registry
@@ -80,7 +76,21 @@ struct SlabView {
     uint32_t object_size = 0;  // Size requested at allocation time.
     TypeId type_id;
     uint64_t schema_short_id = 0;
+    uint32_t layout_version = 0;
     const void* data = nullptr;  // Slot payload address in this process.
+};
+
+// MutableBuildView is the allocator-owned exclusive write window returned by
+// BeginBuild(). It is valid only while the object remains kBuilding and must
+// not be retained after Publish(), Abort(), Retire(), or Reclaim().
+struct MutableBuildView {
+    ShmHandle handle;
+    uint32_t capacity = 0;
+    uint32_t object_size = 0;
+    TypeId type_id;
+    uint64_t schema_short_id = 0;
+    uint32_t layout_version = 0;
+    void* data = nullptr;
 };
 
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
@@ -122,6 +132,21 @@ public:
     // set but whose object_state is not a legally published state never had
     // its generation exposed; recovery may safely clear the bit.
     Result<ShmHandle> Allocate(const AllocationRequest& request);
+
+    // Claims exclusive construction ownership and transitions an object from
+    // kAllocated to kBuilding. The returned writable view is process-local;
+    // only the Handle and object bytes live in shared memory.
+    Result<MutableBuildView> BeginBuild(ShmHandle handle);
+
+    // Publishes a completely built object. Release ordering guarantees that a
+    // reader which observes kPublished with acquire ordering sees all payload
+    // writes performed through the MutableBuildView.
+    Status Publish(ShmHandle handle);
+
+    // Aborts an unpublished allocation (kAllocated or kBuilding), transitions
+    // it through kAborting, and returns the slot to the allocator. Published
+    // objects must instead follow Retire() -> Reclaim().
+    Status Abort(ShmHandle handle);
 
     // Marks the slot Retired: no new Borrow will be produced, but existing
     // Borrows stay valid (design doc 8.4). Fails with kNotFound if the

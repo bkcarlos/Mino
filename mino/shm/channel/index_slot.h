@@ -324,20 +324,22 @@ static_assert(sizeof(WorkQueueSlotMeta) == 16);
 // its owner identity so crash recovery can distinguish a live-but-slow
 // producer from a dead one before stamping the ABORTED tombstone.
 //
-// `owner_process_id` is the OS PID (used for /proc liveness, design doc 9.5);
-// `owner_process_epoch` distinguishes PID reuse (design doc 4.3). The slot's
-// logical sequence is NOT stored here: it already lives in
+// The full process incarnation fields are stored so recovery can compare both
+// PID and process start time; a recycled PID cannot keep an old reservation
+// alive. The slot's logical sequence is NOT stored here: it already lives in
 // IndexSlot::sequence_num (CRC-covered), so a redundant copy would only risk
 // divergence. Recovery reads the sequence from the slot, not the sidecar.
 struct MpscReservationMeta {
+    uint64_t owner_node_id = 0;
     uint64_t owner_process_id = 0;
     uint64_t owner_process_epoch = 0;
+    uint64_t owner_start_time_ns = 0;
     uint64_t owner_publisher_id = 0;
     uint64_t reservation_timestamp_ns = 0;
 };
 
 static_assert(std::is_standard_layout_v<MpscReservationMeta>);
-static_assert(sizeof(MpscReservationMeta) == 32);
+static_assert(sizeof(MpscReservationMeta) == 48);
 
 }  // namespace mino
 
