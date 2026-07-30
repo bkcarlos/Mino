@@ -148,6 +148,21 @@ void Publish(BroadcastChannel& ch, uint32_t tag) {
     ASSERT_TRUE(std::move(res.value()).Commit().ok());
 }
 
+struct BlockingRetireObserverContext {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    ShmHandle observed_payload{};
+};
+
+void BlockingRetireObserver(ShmHandle payload, void* opaque) noexcept {
+    auto* context = static_cast<BlockingRetireObserverContext*>(opaque);
+    context->observed_payload = payload;
+    context->entered.store(true, std::memory_order_release);
+    while (!context->release.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
 // Monotonic clock used throughout the membership tests: registration,
 // heartbeat and eviction all quote the same time source (design doc 12.2).
 uint64_t NowNs() { return BroadcastChannel::MonotonicNowNs(); }
@@ -351,6 +366,76 @@ TEST(BroadcastAckBitmapTest, BitsClearedPerSubscriberAndSlotRetires) {
     ch->CollectGarbage();
     EXPECT_EQ(f.slots()[0].state.load(),
               static_cast<uint32_t>(SlotState::kRetired));
+}
+
+TEST(BroadcastAckBitmapTest, RetiringSlotBlocksPublisherReuse) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto sub = Register(*ch, 0);
+    BlockingRetireObserverContext observer;
+    ch->SetPayloadRetireObserver(&BlockingRetireObserver, &observer);
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+    auto borrow = ch->Poll(sub);
+    ASSERT_TRUE(borrow.ok());
+
+    std::atomic<bool> ack_ok{false};
+    std::thread collector([&]() {
+        ack_ok.store(std::move(borrow.value()).Ack().ok(),
+                     std::memory_order_release);
+    });
+
+    for (uint32_t i = 0;
+         i < 2000 && !observer.entered.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!observer.entered.load(std::memory_order_acquire)) {
+        observer.release.store(true, std::memory_order_release);
+        collector.join();
+        FAIL() << "retire observer was not invoked";
+        return;
+    }
+    ASSERT_EQ(f.slots()[0].state.load(std::memory_order_acquire),
+              static_cast<uint32_t>(SlotState::kRetiring));
+
+    std::atomic<bool> publisher_started{false};
+    std::atomic<bool> reservation_acquired{false};
+    std::atomic<bool> publish_ok{false};
+    std::thread publisher([&]() {
+        publisher_started.store(true, std::memory_order_release);
+        auto res = ch->Reserve(QueueFullPolicy::kBlock);
+        if (!res.ok()) {
+            return;
+        }
+        reservation_acquired.store(true, std::memory_order_release);
+        FillSlot(res.value(), 4);
+        publish_ok.store(std::move(res.value()).Commit().ok(),
+                         std::memory_order_release);
+    });
+
+    while (!publisher_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(reservation_acquired.load(std::memory_order_acquire));
+    EXPECT_EQ(f.slots()[0].state.load(std::memory_order_acquire),
+              static_cast<uint32_t>(SlotState::kRetiring));
+    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 0u);
+    EXPECT_EQ(f.slots()[0].payload.offset, 0x6000u);
+
+    observer.release.store(true, std::memory_order_release);
+    collector.join();
+    publisher.join();
+
+    EXPECT_TRUE(ack_ok.load(std::memory_order_acquire));
+    EXPECT_TRUE(reservation_acquired.load(std::memory_order_acquire));
+    EXPECT_TRUE(publish_ok.load(std::memory_order_acquire));
+    EXPECT_EQ(observer.observed_payload.offset, 0x6000u);
+    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 4u);
+    EXPECT_EQ(f.slots()[0].payload.offset, 0x6040u);
 }
 
 TEST(BroadcastAckBitmapTest, PublicAckApiClearsBitAndAdvancesCursor) {

@@ -72,10 +72,10 @@ public:
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4252'4443ULL;  // "MINOBRDC"
-    // v2: D2-06 adds heartbeat generation binding and a kRegistering state
-    // inside SubscriberSlot's existing padding; total sizes/offsets outside
-    // that padding stay unchanged, but attach must reject the v1 protocol.
-    static constexpr uint32_t kLayoutVersion = 2;
+    // v3: kRetiring gives GC exclusive ownership while it captures the payload
+    // Handle and invokes the process-local retire observer. v2 added heartbeat
+    // generation binding and kRegistering membership state.
+    static constexpr uint32_t kLayoutVersion = 3;
     static constexpr uint32_t kMaxSubscribers = kBroadcastMaxSubscribers;  // 64
 
     // -----------------------------------------------------------------------
@@ -835,22 +835,23 @@ public:
         // no active subscribers). Assign the logical sequence now: it IS the
         // publisher position, making each subscriber's ABA check
         // (slot.sequence_num == its cursor) exact across wraps (INV-01).
-        slot->sequence_num.store(prod, std::memory_order_relaxed);
-        // Claim the slot with a CAS, not a plain store: a concurrent
-        // CollectGarbage retire (kReady -> kRetired) on the previous era
-        // must not be clobbered blindly. Exactly one transition out of
-        // kReady wins: if the GC wins, the CAS is retried and moves
-        // kRetired -> kWriting; if we win, the GC's CAS fails and it skips
-        // the slot. Every reachable state (kFree on a fresh slot, kReady /
-        // kRetired after a consumed era, kAborted tombstone, kWriting from
-        // an orphaned reservation reclaimed by a new publisher owner)
-        // transitions into kWriting, so the loop can only spin against a GC
-        // retire and always terminates.
-        uint32_t expected = slot->state.load(std::memory_order_relaxed);
-        while (!slot->state.compare_exchange_weak(
-            expected, static_cast<uint32_t>(SlotState::kWriting),
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        // Claim the slot before changing any immutable field. kRetiring means
+        // GC owns the previous era while it captures the payload Handle; wait
+        // until it publishes kRetired rather than racing those reads.
+        uint32_t expected = slot->state.load(std::memory_order_acquire);
+        for (;;) {
+            if (expected == static_cast<uint32_t>(SlotState::kRetiring)) {
+                detail::SpinPause();
+                expected = slot->state.load(std::memory_order_acquire);
+                continue;
+            }
+            if (slot->state.compare_exchange_weak(
+                    expected, static_cast<uint32_t>(SlotState::kWriting),
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
         }
+        slot->sequence_num.store(prod, std::memory_order_relaxed);
         return Reservation(this, slot, prod);
     }
 
@@ -864,13 +865,21 @@ public:
                                  "broadcast channel full");
         }
         IndexSlot* slot = &slots_[prod & mask_];
-        slot->sequence_num.store(prod, std::memory_order_relaxed);
-        // Same CAS claim as Reserve(): must not clobber a racing GC retire.
-        uint32_t expected = slot->state.load(std::memory_order_relaxed);
-        while (!slot->state.compare_exchange_weak(
-            expected, static_cast<uint32_t>(SlotState::kWriting),
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        // Same ownership protocol as Reserve(), but preserve the non-blocking
+        // contract when a concurrent GC temporarily owns the physical slot.
+        uint32_t expected = slot->state.load(std::memory_order_acquire);
+        for (;;) {
+            if (expected == static_cast<uint32_t>(SlotState::kRetiring)) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "broadcast slot is being retired");
+            }
+            if (slot->state.compare_exchange_weak(
+                    expected, static_cast<uint32_t>(SlotState::kWriting),
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
         }
+        slot->sequence_num.store(prod, std::memory_order_relaxed);
         return Reservation(this, slot, prod);
     }
 
@@ -1080,9 +1089,10 @@ public:
     }
 
     // Installs a process-local notification invoked exactly when this facade
-    // wins a kReady -> kRetired transition. The callback pointer is never
-    // stored in shared memory; every attached Runtime process configures its
-    // own facade. The payload Handle is captured before the slot can be reused.
+    // wins a kReady -> kRetiring transition for the expected slot era. The
+    // callback pointer is never stored in shared memory; every attached Runtime
+    // process configures its own facade. The payload Handle is captured before
+    // the slot can be reused.
     void SetPayloadRetireObserver(PayloadRetireObserver observer,
                                   void* context) noexcept {
         payload_retire_observer_ = observer;
@@ -1123,24 +1133,33 @@ public:
                 continue;
             }
             if (metas_[phys].ack_bitmap.AllAcked()) {
-                // CAS, not a plain store: the publisher may be concurrently
-                // recycling this physical slot for the next era (every active
-                // cursor has passed it, so reclaim is legal) and its Reserve
-                // also claims with a CAS. Exactly one transition out of
-                // kReady wins: if our CAS fails, the publisher moved the
-                // slot on (kWriting) and the new era retires normally later;
-                // if it wins, the publisher's CAS observes kRetired and
-                // moves on. A plain store could clobber a fresh kReady with
-                // kRetired and wedge every subscriber at that cursor.
-                const ShmHandle payload = slot->payload;
+                // Claim a transient kRetiring state before reading payload.
+                // Reserve/TryReserve explicitly wait on this state, so no
+                // producer can overwrite immutable fields until the observer
+                // has consumed the old era's Handle.
                 uint32_t expected = static_cast<uint32_t>(SlotState::kReady);
-                if (slot->state.compare_exchange_strong(
-                        expected, static_cast<uint32_t>(SlotState::kRetired),
-                        std::memory_order_acq_rel, std::memory_order_relaxed) &&
-                    payload_retire_observer_ != nullptr && !payload.IsNull()) {
+                if (!slot->state.compare_exchange_strong(
+                        expected, static_cast<uint32_t>(SlotState::kRetiring),
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                    continue;
+                }
+                // The producer may have completed an entire recycle between
+                // the optimistic sequence check above and our CAS (READY has
+                // the same value in every era). Revalidate while kRetiring
+                // excludes all immutable-field writers; never retire a newer
+                // era using an older sidecar observation.
+                if (slot->sequence_num.load(std::memory_order_relaxed) != seq) {
+                    slot->state.store(static_cast<uint32_t>(SlotState::kReady),
+                                      std::memory_order_release);
+                    continue;
+                }
+                const ShmHandle payload = slot->payload;
+                if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
                     payload_retire_observer_(payload,
                                              payload_retire_context_);
                 }
+                slot->state.store(static_cast<uint32_t>(SlotState::kRetired),
+                                  std::memory_order_release);
             }
         }
     }

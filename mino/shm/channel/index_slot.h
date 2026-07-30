@@ -128,6 +128,10 @@ enum class SlotState : uint32_t {
     kReady = 3,
     kRetired = 4,
     kAborted = 5,
+    // Broadcast-only transient ownership: GC has claimed a fully-ACKed slot
+    // and may read its immutable payload Handle before publishing kRetired.
+    // Publishers must not recycle a slot while it is kRetiring.
+    kRetiring = 6,
 };
 
 // IndexSlot flag bits (design doc 9.2). Bits 2..31 are reserved and must be
