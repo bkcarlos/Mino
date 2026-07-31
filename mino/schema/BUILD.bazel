@@ -194,6 +194,7 @@ cc_library(
         ":parser",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/schema/codegen:artifact_codec",
     ],
 )
 
@@ -296,8 +297,10 @@ cc_test(
     srcs = ["registry_test.cc"],
     deps = [
         ":canonical",
+        ":layout",
         ":registry",
         "//mino/common:status",
+        "//mino/schema/codegen:artifact_codec",
         "@googletest//:gtest_main",
     ],
 )

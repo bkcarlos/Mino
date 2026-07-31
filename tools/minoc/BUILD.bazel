@@ -50,7 +50,45 @@ cc_library(
     name = "sample_generated",
     srcs = ["tests/generated/sample.generated.cc"],
     hdrs = ["tests/generated/sample.generated.h"],
-    deps = ["//mino/runtime:runtime_types"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+mino_cc_codegen(
+    name = "canonical_wire_codegen",
+    src = "//tools/minoc/tests/testdata:canonical_wire.mino",
+    out_descriptor = "tests/generated/canonical_wire.descriptor",
+    out_header = "tests/generated/canonical_wire.generated.h",
+    out_source = "tests/generated/canonical_wire.generated.cc",
+)
+
+cc_library(
+    name = "canonical_wire_generated",
+    srcs = ["tests/generated/canonical_wire.generated.cc"],
+    hdrs = ["tests/generated/canonical_wire.generated.h"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+cc_test(
+    name = "canonical_wire_generated_test",
+    srcs = ["tests/canonical_wire_generated_test.cc"],
+    deps = [
+        ":canonical_wire_generated",
+        "//mino/schema:compiler",
+        "//mino/runtime:publisher",
+        "//mino/schema:dynamic_value",
+        "//mino/schema:wire",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:spsc",
+        "@googletest//:gtest_main",
+    ],
 )
 
 cc_test(
@@ -75,7 +113,11 @@ cc_library(
     name = "mangling_generated",
     srcs = ["tests/generated/mangling.generated.cc"],
     hdrs = ["tests/generated/mangling.generated.h"],
-    deps = ["//mino/runtime:runtime_types"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
 )
 
 cc_test(
@@ -102,7 +144,11 @@ cc_library(
     name = "sensor_frame_generated",
     srcs = ["tests/generated/sensor_frame.generated.cc"],
     hdrs = ["tests/generated/sensor_frame.generated.h"],
-    deps = ["//mino/runtime:runtime_types"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
 )
 
 cc_test(

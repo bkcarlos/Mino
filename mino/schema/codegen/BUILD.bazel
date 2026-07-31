@@ -1,16 +1,24 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
-    name = "code_generator",
-    srcs = [
-        "artifact_codec.cc",
-        "code_generator.cc",
-    ],
-    hdrs = [
-        "artifact_codec.h",
-        "code_generator.h",
-    ],
+    name = "artifact_codec",
+    srcs = ["artifact_codec.cc"],
+    hdrs = ["artifact_codec.h"],
     deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:descriptor",
+        "//mino/schema:layout",
+    ],
+)
+
+cc_library(
+    name = "code_generator",
+    srcs = ["code_generator.cc"],
+    hdrs = ["code_generator.h"],
+    deps = [
+        ":artifact_codec",
         "//mino/common:result",
         "//mino/common:status",
         "//mino/schema:canonical",
@@ -21,7 +29,11 @@ cc_library(
 
 cc_test(
     name = "code_generator_test",
-    srcs = ["code_generator_test.cc"],
+    srcs = [
+        "code_generator_test.cc",
+        "testdata/golden.generated.cc",
+        "testdata/golden.generated.h",
+    ],
     data = [
         "testdata/golden.descriptor",
         "testdata/golden.generated.cc",
@@ -29,9 +41,13 @@ cc_test(
         "testdata/golden.mino",
     ],
     deps = [
+        ":artifact_codec",
         ":code_generator",
         "//mino/schema:compiler",
+        "//mino/runtime:runtime_types",
         "//mino/schema:layout",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
         "@googletest//:gtest_main",
     ],
 )

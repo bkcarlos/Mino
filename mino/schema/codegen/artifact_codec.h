@@ -64,10 +64,20 @@ Result<std::string> EncodeDescriptorArtifact(
     const CompiledSchema& schema,
     std::span<const LayoutPlan> layouts) noexcept;
 
-// Fully decodes the artifact, reconstructs every AggregateDescriptor, reruns
-// Canonicalizer, and rejects digest, identity, semantic, layout, or trailing
-// byte tampering. The decoded descriptors/layouts are suitable for a future
-// Registry bytes ingestion path.
+// Decodes a MINODSC2 artifact, reconstructs every descriptor, reruns
+// Canonicalizer and LayoutPlanner, and rejects inconsistent checksums,
+// identities, semantics, canonical layouts, unresolved or mismatched declared
+// dependencies, and trailing bytes. The checksum provides corruption detection,
+// not authenticity.
+//
+// external_descriptors supplies dependency candidates that are referenced by
+// the artifact but not embedded in it. Artifact types are always considered as
+// candidates. The overload without a closure therefore accepts only artifacts
+// whose exact descriptor closures are self-contained.
+Result<DecodedDescriptorArtifact> DecodeAndValidate(
+    std::string_view bytes,
+    std::span<const std::shared_ptr<const SchemaDescriptor>>
+        external_descriptors) noexcept;
 Result<DecodedDescriptorArtifact> DecodeAndValidate(
     std::string_view bytes) noexcept;
 

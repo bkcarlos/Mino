@@ -22,11 +22,11 @@ inline constexpr size_t kMaxCanonicalPayloadBytes = 16u << 10;
 // condition: malformed data is reported as a Status and no exception escapes.
 //
 // FuzzIdl returns OK, InvalidArgument, or ResourceExhausted for input outcomes.
-// FuzzDescriptor validates the codegen text artifact locally because the public
-// registry byte codec is currently Unsupported; it returns OK, InvalidArgument,
-// or ResourceExhausted. FuzzCanonicalPayload returns OK, Corruption,
-// SchemaMismatch, or ResourceExhausted. Internal indicates a harness/API bug,
-// not a malformed-input outcome.
+// FuzzDescriptor exercises both MINODSC2 DecodeAndValidate and the Registry byte
+// API; malformed inputs may also report Corruption or SchemaMismatch.
+// FuzzCanonicalPayload returns OK, Corruption, SchemaMismatch, or
+// ResourceExhausted. Internal indicates a harness/API bug, not a malformed-input
+// outcome.
 Status FuzzIdl(std::span<const std::byte> input) noexcept;
 Status FuzzDescriptor(std::span<const std::byte> input) noexcept;
 Status FuzzCanonicalPayload(std::span<const std::byte> input) noexcept;

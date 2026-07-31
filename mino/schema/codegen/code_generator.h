@@ -21,6 +21,9 @@ struct CodeGeneratorOptions {
     // independent of the host path used to write the header.
     std::string header_include;
     size_t max_output_bytes = 16u << 20;
+    // Enabled by default for minoc. Tests and specialized embedding tools may
+    // disable wire support when only the fixed SHM façade is required.
+    bool emit_wire_adapter = true;
     // Complete local+import descriptor closure. Required whenever a generated
     // type references an imported user-defined type; generation rejects an
     // incomplete or identity-conflicting closure.

@@ -35,19 +35,17 @@ inline constexpr uint64_t kDefaultRecoveryLeaseMs = 5000;
 // (design doc section 6.5). At most one process may recover a given Region at
 // a time.
 //
-// Mutual exclusion is provided by a single 64-bit CAS on the SuperBlock
-// recovery_lease_ns field: the lease holds a monotonic expiry timestamp and is
-// "held" iff it is in the future. Acquiring is an atomic
-// compare_exchange from an expired value to a fresh future value, so exactly
-// one racing process wins. recovery_epoch is incremented on every acquisition
-// to record the takeover generation (section 6.5 step 5), and recovery_owner
-// records the owner's ProcessIdentity for diagnostics.
+// recovery_lease_ns is the liveness/admission token. recovery_epoch allocates
+// a unique generation for each acquisition, while recovery_fence_word is the
+// authoritative mutation/commit fence: takeover and final commit CAS the same
+// {epoch, phase} word, so a replaced owner cannot publish ACTIVE/QUARANTINED.
+// recovery_owner records ProcessIdentity for diagnostics only.
 class RecoveryOwner {
 public:
     RecoveryOwner(const RecoveryOwner&) = delete;
     RecoveryOwner& operator=(const RecoveryOwner&) = delete;
-    RecoveryOwner(RecoveryOwner&&) noexcept = default;
-    RecoveryOwner& operator=(RecoveryOwner&&) noexcept = default;
+    RecoveryOwner(RecoveryOwner&& other) noexcept;
+    RecoveryOwner& operator=(RecoveryOwner&& other) noexcept;
 
     // Attempts to acquire Recovery Ownership of `region` for `owner`.
     //
@@ -70,15 +68,34 @@ public:
     // Same as RenewLease but with an explicit extension.
     Status RenewLease(uint64_t lease_duration_ms);
 
-    // Releases ownership: clears the owner identity and expires the lease so
-    // another process may acquire. Safe to call once; subsequent calls are
-    // no-ops.
+    // Releases ownership with a CAS from this object's exact lease token to
+    // zero. A stale owner cannot clear a replacement owner's lease. The
+    // informational recovery_owner field is not cleared because doing so after
+    // lease publication could erase a newly acquired owner's identity.
     Status Release();
 
-    // True while this object holds the lease and it has not expired.
+    // True while this object holds its exact lease token and acquisition epoch.
     bool IsOwner() const;
 
+    // True only while the SuperBlock commit fence is exactly
+    // {epoch_at_acquire, RECOVERING}. Scanner mutation and final commit use this
+    // stronger predicate rather than lease ownership alone.
+    bool HoldsRecoveryFence() const;
+    uint64_t epoch() const noexcept { return epoch_at_acquire_; }
+
+    // Linearizes takeover by replacing the exact observed fence with this
+    // owner's {epoch, RECOVERING} word. Commit races and takeover races resolve
+    // on the same atomic word.
+    Status ClaimRecoveryFence(uint64_t expected_fence);
+
+    // Linearizes final recovery commit. Only RECOVERING -> ACTIVE/QUARANTINED
+    // for this exact epoch is accepted; a replacement owner's claim makes a
+    // stale commit fail deterministically.
+    Status CommitRecoveryFence(RecoveryFencePhase phase);
+
 private:
+    void ResetMovedFrom() noexcept;
+
     RecoveryOwner() = default;
 
     SuperBlock* sb_ = nullptr;  // not owned
@@ -93,16 +110,18 @@ private:
 // (design doc sections 6.1 and 6.5):
 //
 //   1. If the Region is clean, mark it ACTIVE/in-use and return OK.
-//   2. If dirty, acquire Recovery Ownership, run recovery, publish a new
+//   2. If explicitly dirty, acquire Recovery Ownership, run recovery, publish a new
 //      Region Epoch, then transition to ACTIVE (in that order, per 6.5 step 6).
 //   3. If another process is already recovering, wait up to
 //      `wait_timeout_ms` for it to finish, then re-check.
 //   4. If recovery cannot complete reliably, transition to QUARANTINED.
 //
-// The deep consistency scanning (orphan slabs, bitmap reconciliation) is a
-// later milestone (D1-09, //mino/shm/recovery:scanner); this function performs
-// the ownership, epoch, and state-machine protocol that makes recovery
-// single-writer and crash-safe.
+// If CentralSlabAllocator metadata is present, this function runs the real
+// allocator-backed RecoveryScanner while holding this Region's SuperBlock
+// RecoveryOwner. Corruption quarantines the Region before it can become ACTIVE.
+// ACTIVE + clean_shutdown=false is not sufficient proof of a crash because the
+// current SuperBlock has no live-service lease; that ambiguous state is fenced
+// with kWouldBlock rather than running destructive repair.
 Status RecoverRegionForAttach(SharedMemoryRegion& region,
                               const ProcessIdentity& self,
                               uint64_t wait_timeout_ms);

@@ -112,8 +112,14 @@ bool IsAllowed(HarnessKind harness, StatusCode code) {
     if (code == StatusCode::kOk || code == StatusCode::kResourceExhausted) {
         return true;
     }
-    if (harness == HarnessKind::kIdl || harness == HarnessKind::kDescriptor) {
+    if (harness == HarnessKind::kIdl) {
         return code == StatusCode::kInvalidArgument;
+    }
+    if (harness == HarnessKind::kDescriptor) {
+        return code == StatusCode::kInvalidArgument ||
+               code == StatusCode::kCorruption ||
+               code == StatusCode::kSchemaMismatch ||
+               code == StatusCode::kUnsupported;
     }
     return code == StatusCode::kCorruption ||
            code == StatusCode::kSchemaMismatch;
@@ -194,15 +200,17 @@ TEST(GoldenVectorTest, CanonicalSchemaAndWireAreStable) {
 }
 
 TEST(DescriptorHarnessTest,
-     DocumentsRegistryByteCodecGapAndRejectsCppObjectBytes) {
+     RegistersMinodsc2AndRejectsCppObjectBytes) {
     const auto artifact = Bytes(ReadFile(
         "mino/schema/fuzz/testdata/codegen_golden.descriptor"));
     EXPECT_TRUE(FuzzDescriptor(artifact).ok());
 
     SchemaRegistry registry;
     auto artifact_registration = registry.RegisterDescriptor(artifact);
-    ASSERT_FALSE(artifact_registration.ok());
-    EXPECT_EQ(artifact_registration.status().code(), StatusCode::kUnsupported);
+    ASSERT_TRUE(artifact_registration.ok())
+        << artifact_registration.status().ToString();
+    EXPECT_EQ((*artifact_registration)->aggregate().full_name(),
+              "golden.Telemetry");
 
     const std::string idl =
         ReadFile("mino/schema/fuzz/testdata/canonical_payload.mino");
@@ -212,7 +220,7 @@ TEST(DescriptorHarnessTest,
     EXPECT_FALSE(FuzzDescriptor(abi_bytes).ok());
     auto abi_registration = registry.RegisterDescriptor(abi_bytes);
     ASSERT_FALSE(abi_registration.ok());
-    EXPECT_EQ(abi_registration.status().code(), StatusCode::kUnsupported);
+    EXPECT_EQ(abi_registration.status().code(), StatusCode::kInvalidArgument);
 }
 
 TEST(FuzzHarnessTest, ExplicitLimitsRejectOversizedInputs) {
@@ -240,7 +248,7 @@ TEST(FuzzCorpusTest, DeterministicMutationsOnlyReturnDefinedStatuses) {
         Bytes({0x00, 0xff, 0x7f, 0x22, 0x5c}),
     };
     const std::array<std::vector<std::byte>, 4> descriptor_seeds = {
-        Bytes(golden_descriptor), Bytes(""), Bytes("mino-descriptor-v1\n"),
+        Bytes(golden_descriptor), Bytes(""), Bytes("MINODSC2"),
         Bytes({0x00, 0xff, 0x0a, 0x39}),
     };
     const std::array<std::vector<std::byte>, 5> payload_seeds = {

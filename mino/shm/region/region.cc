@@ -194,8 +194,13 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     StoreState(*sb, RegionState::kInitializing);
     std::atomic_ref(sb->recovery_lease_ns)
         .store(0, std::memory_order_relaxed);
-    std::atomic_ref(sb->recovery_epoch).store(0, std::memory_order_relaxed);
+    // Recovery fencing starts at the same generation as Region Epoch. Every
+    // acquisition advances recovery_epoch; a successful commit publishes that
+    // generation as the new Region Epoch, making crash replay idempotent.
+    std::atomic_ref(sb->recovery_epoch).store(1, std::memory_order_relaxed);
     sb->recovery_owner = ProcessIdentity{};
+    StoreRecoveryFence(
+        *sb, EncodeRecoveryFence(/*epoch=*/1, RecoveryFencePhase::kActive));
 
     // Seal the immutable header with its CRC (covers fields [0, 80)).
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
@@ -351,8 +356,16 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     // Steps 10-11: check clean_shutdown / region_epoch and, if dirty, run the
     // recovery flow. Skipped for read-only attaches (they cannot recover).
     if (!options.read_only) {
-        MINO_RETURN_IF_ERROR(RecoverRegionForAttach(
-            region, region.owner_identity_, options.recovery_wait_timeout_ms));
+        Status recovery = RecoverRegionForAttach(
+            region, region.owner_identity_, options.recovery_wait_timeout_ms);
+        if (!recovery.ok()) {
+            // A failed attach must only unmap; it must not call Detach(), which
+            // would falsely publish clean_shutdown/CLOSED and overwrite the
+            // lifecycle state selected by the recovery state machine.
+            region.detached_ = true;
+            (void)region.segment_->Close();
+            return recovery;
+        }
     }
 
     return region;

@@ -105,6 +105,20 @@ struct MutableBuildView {
     void* data = nullptr;
 };
 
+// Describes the allocator and data sub-regions of a real SharedMemoryRegion.
+// Keeping this type in the allocator package avoids a dependency from the
+// allocator onto the Region implementation while still allowing both layers to
+// share one concrete metadata layout.
+struct RegionAllocatorStorage {
+    void* region_base = nullptr;
+    uint64_t region_size = 0;
+    uint64_t allocator_offset = 0;
+    uint64_t allocator_size = 0;
+    uint64_t data_offset = 0;
+    uint64_t data_size = 0;
+    uint32_t region_id = 0;
+};
+
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
 // Region following the strict 9-step protocol of design doc 8.3.
 //
@@ -113,6 +127,7 @@ struct MutableBuildView {
 // processes) yield equivalent allocators.
 class CentralSlabAllocator {
 public:
+    static constexpr uint64_t kMetadataHeaderSize = 64;
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "CentralSlabAllocator requires lock-free 64-bit atomics");
     // Initializes a fresh allocator in the shared memory at `shm_base`.
@@ -123,10 +138,34 @@ public:
                                                uint64_t data_region_size,
                                                const ClassTableConfig& config);
 
+    // Initializes allocator metadata in the Region allocator sub-region and
+    // places all SlabHeader/payload slots in the Region data sub-region.
+    // Returned Handles are relative to region_base and carry region_id.
+    static Result<CentralSlabAllocator> CreateInRegion(
+        const RegionAllocatorStorage& storage,
+        const ClassTableConfig& config);
+
     // Attaches to an existing allocator previously initialized with Create().
     // Validates the superblock magic, metadata version and generation array
     // consistency.
     static Result<CentralSlabAllocator> Attach(void* shm_base);
+
+    // Bounds-checked attach used by recovery. Unlike the legacy overload this
+    // never trusts allocator metadata before proving that all metadata and slot
+    // extents fit inside available_size.
+    static Result<CentralSlabAllocator> Attach(void* shm_base,
+                                               uint64_t available_size);
+
+    // Region-aware attach. Restores Region-relative Handle offsets while using
+    // the same persisted allocator metadata as Attach().
+    static Result<CentralSlabAllocator> AttachInRegion(
+        const RegionAllocatorStorage& storage);
+
+    // Probes the allocator sub-region without duplicating allocator magic in
+    // Region/Recovery. A zero first word means "not initialized"; a non-zero,
+    // non-allocator word is reported as corruption.
+    static Result<bool> HasAllocatorMetadata(const void* shm_base,
+                                             uint64_t available_size);
 
     // Allocates one object following design doc 8.3 steps 1-9:
     //   1. checked-align the request size;
@@ -215,6 +254,18 @@ public:
     bool ReadSlotByIndex(uint32_t slot_index, SlabHeader* header_out,
                          const void** data_out) const;
 
+    // Minimal real-metadata recovery adapter. These methods deliberately expose
+    // observations and narrowly-scoped idempotent repairs rather than bitmap or
+    // metadata pointers, so RecoveryScanner cannot grow a second allocator ABI.
+    bool IsSlotOccupiedForRecovery(uint32_t slot_index) const noexcept;
+    uint32_t AuthoritativeGenerationForRecovery(
+        uint32_t slot_index) const noexcept;
+    uint16_t ClassIdForRecovery(uint32_t slot_index) const noexcept;
+    Status ClearSlotForRecovery(uint32_t slot_index,
+                                uint32_t expected_state);
+    Status ClearStaleStateForRecovery(uint32_t slot_index,
+                                      uint32_t expected_state);
+
     // Default-constructible so the facade can be stored by value (e.g. in
     // test fixtures); Create()/Attach() are the only supported ways to
     // build a usable allocator.
@@ -228,6 +279,13 @@ private:
 
     static Result<Layout> ComputeLayout(const ClassTable& table,
                                         uint64_t data_region_size);
+    static Result<CentralSlabAllocator> CreateWithStorage(
+        void* shm_base, uint64_t available_size, uint64_t metadata_capacity,
+        uint64_t slot_area_offset, uint64_t slot_capacity,
+        uint32_t region_id, uint64_t handle_offset_bias,
+        const ClassTableConfig& config);
+    static Result<CentralSlabAllocator> AttachWithBias(
+        void* shm_base, uint64_t available_size, uint64_t handle_offset_bias);
 
     // Resolves a handle to (slot_index, header, payload) with full
     // validation. `require_live` additionally demands the bitmap bit set and
@@ -254,6 +312,7 @@ private:
     uint64_t data_region_size_ = 0;
     uint32_t region_id_ = 0;
     uint64_t slot_stride_ = 0;  // sizeof(SlabHeader) + max slot payload align
+    uint64_t handle_offset_bias_ = 0;  // allocator base -> Region base offset.
     std::atomic<uint64_t>* next_transaction_id_ = nullptr;
     ReclaimGuard reclaim_guard_ = nullptr;
     void* reclaim_guard_context_ = nullptr;

@@ -5,6 +5,7 @@
 #include "mino/schema/codegen/code_generator.h"
 
 #include "mino/schema/codegen/artifact_codec.h"
+#include "mino/schema/codegen/testdata/golden.generated.h"
 
 #include <array>
 #include <cstdlib>
@@ -81,6 +82,34 @@ TEST(CodeGeneratorTest, MatchesGoldenHeaderSourceAndDescriptor) {
               Read("mino/schema/codegen/testdata/golden.descriptor"));
 }
 
+
+
+TEST(CodeGeneratorTest, FullProductionGoldenCompilesWithRuntimeContract) {
+    static_assert(std::is_trivially_default_constructible_v<golden::Telemetry>);
+    static_assert(std::is_trivially_copyable_v<golden::Telemetry>);
+    static_assert(mino::kHasStaticMessageTraits<golden::Telemetry>);
+    EXPECT_EQ(mino::StaticMessageTraits<golden::Telemetry>::index_flags,
+              mino::kIndexSlotFlagHasChildSlabs);
+
+    golden::Telemetry value;
+    golden::TelemetryBuilder builder(value);
+    builder.set_sequence(1u);
+    ASSERT_TRUE(builder.set_payload({.element_size = 1u}));
+    ASSERT_TRUE(builder.set_samples({.element_size = 8u}));
+    auto encoded = golden::TelemetryWireAdapter::Encode(value);
+    EXPECT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+    const std::array non_empty_label = {
+        std::byte{0x08}, std::byte{0x01},
+        std::byte{0x12}, std::byte{0x01}, std::byte{0x78},
+        std::byte{0x1a}, std::byte{0x00},
+        std::byte{0x22}, std::byte{0x01}, std::byte{0x00},
+    };
+    auto unsupported = golden::TelemetryWireAdapter::Decode(non_empty_label);
+    ASSERT_FALSE(unsupported.ok());
+    EXPECT_EQ(unsupported.status().code(), StatusCode::kUnsupported);
+}
+
 TEST(CodeGeneratorTest, SameInputIsByteForByteDeterministic) {
     const std::string idl =
         Read("mino/schema/codegen/testdata/golden.mino");
@@ -153,7 +182,8 @@ message Root { vector<ext.Point3D> points = 1 [max_capacity = 4]; }
     ASSERT_TRUE(generated.ok()) << generated.status().ToString();
     EXPECT_NE(generated->header.find("value.element_size != 48u"),
               std::string::npos);
-    auto decoded = DecodeAndValidate(generated->descriptor);
+    auto decoded =
+        DecodeAndValidate(generated->descriptor, dependency->types());
     ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
     ASSERT_EQ(decoded->types[0].descriptor->dependencies().size(), 1u);
     EXPECT_EQ(decoded->types[0].descriptor->dependencies()[0].full_name(),

@@ -20,6 +20,7 @@
 
 #include "mino/common/status.h"
 #include "mino/schema/canonical.h"
+#include "mino/schema/codegen/artifact_codec.h"
 #include "mino/schema/lexer.h"
 #include "mino/schema/parser.h"
 
@@ -536,10 +537,36 @@ Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
 Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
     std::span<const std::byte> descriptor_bytes) noexcept {
     try {
-        static_cast<void>(descriptor_bytes);
-        return Status::Error(
-            StatusCode::kUnsupported,
-            "byte descriptor codec is not yet versioned; use the structured API");
+        const std::string_view bytes = descriptor_bytes.empty()
+                                           ? std::string_view{}
+                                           : std::string_view(
+                                                 reinterpret_cast<const char*>(
+                                                     descriptor_bytes.data()),
+                                                 descriptor_bytes.size());
+        std::vector<SchemaHandle> external_descriptors;
+        {
+            std::shared_lock lock(mutex_);
+            external_descriptors.reserve(by_digest_.size());
+            for (const auto& [digest, descriptor] : by_digest_) {
+                static_cast<void>(digest);
+                external_descriptors.push_back(descriptor);
+            }
+        }
+        auto decoded =
+            codegen::DecodeAndValidate(bytes, external_descriptors);
+        if (!decoded.ok()) return decoded.status();
+        if (decoded->types.empty()) {
+            return Invalid("descriptor artifact contains no types");
+        }
+
+        std::vector<SchemaHandle> descriptors;
+        descriptors.reserve(decoded->types.size());
+        for (auto& type : decoded->types) {
+            descriptors.push_back(std::move(type.descriptor));
+        }
+        auto registered = RegisterDescriptors(descriptors);
+        if (!registered.ok()) return registered.status();
+        return (*registered)[0];
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {

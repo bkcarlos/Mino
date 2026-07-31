@@ -12,7 +12,11 @@ namespace {
 TEST(GeneratedCodeTest, BuilderAccessorAndTraitsUsePlannedLayout) {
     static_assert(std::is_standard_layout_v<minoc_test::Sample>);
     static_assert(std::is_trivially_copyable_v<minoc_test::Sample>);
+    static_assert(std::is_trivially_default_constructible_v<minoc_test::Sample>);
     static_assert(mino::kHasStaticMessageTraits<minoc_test::Sample>);
+    static_assert(
+        mino::StaticMessageTraits<minoc_test::Sample>::index_flags ==
+        mino::kIndexSlotFlagHasChildSlabs);
 
     minoc_test::Sample object;
     minoc_test::SampleBuilder builder(object);
@@ -53,6 +57,25 @@ TEST(GeneratedCodeTest, BuilderAccessorAndTraitsUsePlannedLayout) {
     EXPECT_FALSE(builder.set_payload({.length = 33,
                                       .capacity = 33,
                                       .element_size = 1}));
+}
+
+TEST(GeneratedCodeTest, WireAdapterRejectsUnresolvedNonEmptyShmStorage) {
+    minoc_test::Sample object;
+    minoc_test::SampleBuilder builder(object);
+    builder.set_sequence(7);
+    ASSERT_TRUE(builder.set_label({.offset = 128,
+                                   .generation = 1,
+                                   .region_id = 2,
+                                   .length = 1,
+                                   .capacity = 1,
+                                   .element_size = 1}));
+    ASSERT_TRUE(builder.set_payload({.element_size = 1}));
+    ASSERT_TRUE(builder.set_samples({.element_size = 8}));
+    ASSERT_TRUE(minoc_test::SampleAccessor(object).valid());
+
+    auto encoded = minoc_test::SampleWireAdapter::Encode(object);
+    ASSERT_FALSE(encoded.ok());
+    EXPECT_EQ(encoded.status().code(), mino::StatusCode::kUnsupported);
 }
 
 TEST(GeneratedCodeTest, AccessorBoundsAndWalkerStructuralChecksAreSafe) {

@@ -10,10 +10,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
+#include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "mino/runtime/message_traits.h"
+#include "mino/shm/channel/index_slot.h"
+#include "mino/schema/wire.h"
 
 namespace golden {
 
@@ -49,7 +56,7 @@ struct alignas(8) Telemetry final {
     static constexpr std::array<std::uint8_t, 32> kSchemaDigest = {
         0xbe, 0x3e, 0xf5, 0x05, 0x70, 0x16, 0x71, 0xa9, 0xb9, 0xa6, 0xed, 0x61, 0xf4, 0x19, 0x0f, 0xed, 0xf2, 0xbe, 0x83, 0xad, 0xfe, 0xb4, 0x10, 0xa4, 0x06, 0x7f, 0xd8, 0x7c, 0x74, 0xcc, 0xe5, 0x2f
     };
-    std::array<std::byte, kObjectSize> storage{};
+    std::array<std::byte, kObjectSize> storage;
 };
 
 class TelemetryAccessor {
@@ -85,6 +92,10 @@ public:
     }
     bool active() const noexcept { return LoadByte(168) == 1; }
 
+    TelemetryVariableMetadata unknown_fields() const noexcept {
+        return ReadVariable(176u);
+    }
+
     bool valid() const noexcept {
         if (data_ == nullptr || size_ < Telemetry::kObjectSize || layout_version() != Telemetry::kLayoutVersion || header_size() != 32u ||
             schema_short_id() != Telemetry::kSchemaShortId || object_size() != Telemetry::kFixedAreaSize ||
@@ -96,7 +107,7 @@ public:
         if (true && !ValidateVector(samples(), 8u, 8u)) return false;
         if (!has_active() && !IsZero(168u, 1u)) return false;
         if (has_active() && LoadByte(168u) > 1u) return false;
-        if (!ValidateUnknown(ReadVariable(176u))) return false;
+        if (!ValidateUnknown(unknown_fields())) return false;
         return true;
     }
 
@@ -233,6 +244,21 @@ private:
     std::byte* data_;
 };
 
+// Canonical Wire adapter for fixed scalars and empty variable values.
+// Non-empty variables, nested values, and unknown fields require SHM
+// resolution/allocation and are rejected explicitly with kUnsupported.
+class TelemetryWireAdapter final {
+public:
+    static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(
+        const Telemetry& value) noexcept;
+    static ::mino::Result<std::vector<std::byte>> Encode(
+        const Telemetry& value,
+        const ::mino::schema::WireLimits& limits = {}) noexcept;
+    static ::mino::Result<Telemetry> Decode(
+        std::span<const std::byte> bytes,
+        const ::mino::schema::WireLimits& limits = {}) noexcept;
+};
+
 }  // namespace golden
 
 namespace mino {
@@ -243,7 +269,7 @@ template <> struct StaticMessageTraits<::golden::Telemetry> {
     static constexpr std::uint32_t schema_version = ::golden::Telemetry::kSchemaVersion;
     static constexpr std::uint64_t schema_short_id = ::golden::Telemetry::kSchemaShortId;
     static constexpr std::uint32_t layout_version = ::golden::Telemetry::kLayoutVersion;
-    static constexpr std::uint32_t index_flags = 0;
+    static constexpr std::uint32_t index_flags = ::mino::kIndexSlotFlagHasChildSlabs;
     static Status Validate(const ::golden::Telemetry& value) noexcept {
         return ::golden::TelemetryAccessor(value).valid() ? Status::Ok() :
             Status::Error(StatusCode::kSchemaMismatch, "invalid generated SHM object");

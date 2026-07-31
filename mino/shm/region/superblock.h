@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "mino/common/checked_arithmetic.h"
 #include "mino/platform/process_identity.h"
@@ -46,7 +47,7 @@ namespace mino {
 
 // Constants.
 inline constexpr uint32_t kSuperBlockMagic = 0x4D494E4F;  // "MINO"
-inline constexpr uint16_t kRegionLayoutVersion = 1;
+inline constexpr uint16_t kRegionLayoutVersion = 2;
 // Byte-order detector: stored at Create; a reader on a different-endian host
 // observes a byte-swapped value and rejects the Region (first version only
 // supports the native little-endian layout).
@@ -102,7 +103,8 @@ struct SuperBlock {
     uint64_t feature_flags;          // 192
     uint32_t minimum_reader_version; // 200
     uint32_t compat_rsv;             // 204
-    std::byte compat_pad[48];        // 208..256
+    uint64_t recovery_fence_word;    // 208: atomic_ref<{epoch, phase}>.
+    std::byte compat_pad[40];        // 216..256
 };
 
 // ---- Layout pinning (shared-memory ABI must be fixed) ----
@@ -135,6 +137,10 @@ static_assert(offsetof(SuperBlock, recovery_epoch) == 152);
 static_assert(offsetof(SuperBlock, recovery_owner) == 160);
 static_assert(offsetof(SuperBlock, feature_flags) == 192);
 static_assert(offsetof(SuperBlock, minimum_reader_version) == 200);
+static_assert(offsetof(SuperBlock, recovery_fence_word) == 208);
+static_assert(offsetof(SuperBlock, recovery_fence_word) %
+                  std::atomic_ref<uint64_t>::required_alignment ==
+              0);
 
 // ---------------------------------------------------------------------------
 // CRC32 (IEEE 802.3, reflected, polynomial 0xEDB88320)
@@ -227,6 +233,47 @@ inline uint64_t LoadRecoveryLeaseNs(const SuperBlock& sb) {
 inline uint64_t LoadRecoveryEpoch(const SuperBlock& sb) {
     return std::atomic_ref(const_cast<uint64_t&>(sb.recovery_epoch))
         .load(std::memory_order_acquire);
+}
+
+// recovery_fence_word is the authoritative recovery commit record. The state
+// field remains the externally visible lifecycle mirror, but RECOVERING commit
+// and takeover are linearized by CAS on this single word.
+enum class RecoveryFencePhase : uint64_t {
+    kUnset = 0,
+    kRecovering = 1,
+    kActive = 2,
+    kQuarantined = 3,
+};
+inline constexpr uint64_t kRecoveryFencePhaseBits = 2;
+inline constexpr uint64_t kMaxRecoveryFenceEpoch =
+    std::numeric_limits<uint64_t>::max() >> kRecoveryFencePhaseBits;
+
+constexpr uint64_t EncodeRecoveryFence(uint64_t epoch,
+                                       RecoveryFencePhase phase) {
+    return (epoch << kRecoveryFencePhaseBits) |
+           static_cast<uint64_t>(phase);
+}
+constexpr uint64_t RecoveryFenceEpoch(uint64_t word) {
+    return word >> kRecoveryFencePhaseBits;
+}
+constexpr RecoveryFencePhase RecoveryFencePhaseOf(uint64_t word) {
+    return static_cast<RecoveryFencePhase>(
+        word & ((uint64_t{1} << kRecoveryFencePhaseBits) - 1));
+}
+inline uint64_t LoadRecoveryFence(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint64_t&>(sb.recovery_fence_word))
+        .load(std::memory_order_acquire);
+}
+inline void StoreRecoveryFence(SuperBlock& sb, uint64_t word) {
+    std::atomic_ref(sb.recovery_fence_word)
+        .store(word, std::memory_order_release);
+}
+inline bool CompareExchangeRecoveryFence(SuperBlock& sb, uint64_t* expected,
+                                         uint64_t desired) {
+    return std::atomic_ref(sb.recovery_fence_word)
+        .compare_exchange_strong(*expected, desired,
+                                 std::memory_order_acq_rel,
+                                 std::memory_order_acquire);
 }
 
 }  // namespace mino

@@ -8,9 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -40,22 +43,7 @@ message Payload {
 }
 )idl";
 
-constexpr std::string_view kDescriptorSeed =
-    "mino-descriptor-v1\n"
-    "encoding length-delimited-utf8-decimal\n"
-    "type_count 1\n"
-    "type 6:fuzz.M\n"
-    "kind message\n"
-    "digest 0000000000000000000000000000000000000000000000000000000000000000\n"
-    "short_id 0\n"
-    "schema_version 0\n"
-    "layout_version 1\n"
-    "layout header_size=32 presence_offset=32 presence_words=0 fixed_offset=32 "
-    "fixed_size=0 object_size=32 alignment=8 max_child_bytes=0 "
-    "max_dynamic_children=0\n"
-    "dependency_count 0\n"
-    "field_count 0\n"
-    "end_type\n";
+
 
 constexpr std::array<uint8_t, 26> kWireSeed = {
     0x08, 0x01, 0x10, 0xac, 0x02, 0x1d, 0x12, 0x34, 0x56,
@@ -88,6 +76,18 @@ std::vector<std::byte> StringBytes(std::string_view text) {
     return std::vector<std::byte>(bytes.begin(), bytes.end());
 }
 
+std::vector<std::byte> DescriptorBytes() {
+    std::ifstream input(
+        "mino/schema/fuzz/testdata/codegen_golden.descriptor",
+        std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot read MINODSC2 fuzz seed");
+    }
+    const std::string artifact(std::istreambuf_iterator<char>(input),
+                               std::istreambuf_iterator<char>());
+    return StringBytes(artifact);
+}
+
 std::vector<std::byte> WireBytes() {
     std::vector<std::byte> bytes;
     bytes.reserve(kWireSeed.size());
@@ -114,7 +114,7 @@ int main() try {
     if (seed == 0) seed = kDefaultSeed;
 
     const std::array<std::vector<std::byte>, 3> corpus = {
-        StringBytes(kIdlSeed), StringBytes(kDescriptorSeed), WireBytes()};
+        StringBytes(kIdlSeed), DescriptorBytes(), WireBytes()};
     const std::array<size_t, 3> limits = {
         kMaxIdlInputBytes, kMaxDescriptorInputBytes,
         kMaxCanonicalPayloadBytes};

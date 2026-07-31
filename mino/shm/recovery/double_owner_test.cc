@@ -110,6 +110,37 @@ TEST_F(DoubleOwnerTest, SingleProcessAcquireRelease) {
     EXPECT_TRUE(owner.IsIdle());
 }
 
+TEST_F(DoubleOwnerTest, LegacyOwnerPidIsDiagnosticOnly) {
+    RecoveryOwner owner(&block_->owner_state,
+                        static_cast<uint64_t>(getpid()));
+    ASSERT_TRUE(owner.TryAcquire().ok());
+    block_->owner_state.owner_pid.store(999999, std::memory_order_release);
+    EXPECT_TRUE(owner.IsOwner());
+    EXPECT_TRUE(owner.RenewLease().ok());
+    owner.Release();
+    EXPECT_TRUE(owner.IsIdle());
+}
+
+TEST_F(DoubleOwnerTest, StaleLegacyOwnerCannotReleaseReplacementLease) {
+    const uint64_t pid = static_cast<uint64_t>(getpid());
+    RecoveryOwner first(&block_->owner_state, pid);
+    ASSERT_TRUE(first.TryAcquire().ok());
+
+    // Force the first token to be expired, then let a replacement with the same
+    // diagnostic PID acquire a distinct lease token.
+    block_->owner_state.lease_deadline_ns.store(1,
+                                                std::memory_order_release);
+    RecoveryOwner second(&block_->owner_state, pid);
+    ASSERT_TRUE(second.TryAcquire().ok());
+    const uint64_t replacement_token = second.LeaseDeadlineNs();
+    first.Release();
+    EXPECT_EQ(block_->owner_state.lease_deadline_ns.load(
+                  std::memory_order_acquire),
+              replacement_token);
+    EXPECT_TRUE(second.IsOwner());
+    second.Release();
+}
+
 TEST_F(DoubleOwnerTest, TwoProcessesRaceExactlyOneWins) {
     // Both children block on the barrier, then race TryAcquire exactly once.
     for (int i = 0; i < 2; ++i) {

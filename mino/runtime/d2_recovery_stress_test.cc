@@ -2,17 +2,22 @@
 //
 // Licensed under the GNU Lesser General Public License, Version 3.0.
 
+#include <gtest/gtest.h>
+
+#if defined(__unix__) || defined(__APPLE__)
+
 #include "mino/runtime/allocation_journal.h"
 #include "mino/runtime/publisher.h"
 #include "mino/runtime/subscriber.h"
 #include "mino/runtime/subscriber_lease.h"
 
-#include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -20,10 +25,17 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <limits>
 #include <new>
 #include <optional>
+#include <random>
+#include <sstream>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "mino/common/status.h"
 #include "mino/platform/process_identity.h"
@@ -104,6 +116,92 @@ constexpr std::array<CrashScenario, 13> kScenarios = {
     CrashScenario::kJournalFinalizingTagged,
 };
 
+constexpr uint64_t kDefaultStressSeconds = 1;
+using StressClock = std::chrono::steady_clock;
+using StressDeadline = StressClock::time_point;
+constexpr auto kDeterministicWatchdog = std::chrono::seconds(30);
+constexpr auto kMinimumCleanupReserve = std::chrono::milliseconds(250);
+constexpr auto kMaximumCleanupReserve = std::chrono::milliseconds(2000);
+constexpr auto kEstimatedMinimumRoundBudget = std::chrono::milliseconds(75);
+constexpr auto kElapsedUpperSlack = std::chrono::seconds(1);
+
+constexpr std::chrono::milliseconds CleanupReserveFor(
+    std::chrono::milliseconds configured_duration) {
+    if (configured_duration <= std::chrono::milliseconds::zero()) {
+        return std::chrono::milliseconds::zero();
+    }
+    auto reserve = configured_duration / 2;
+    if (reserve < kMinimumCleanupReserve) {
+        reserve = kMinimumCleanupReserve;
+    }
+    if (reserve > kMaximumCleanupReserve) {
+        reserve = kMaximumCleanupReserve;
+    }
+    return std::min(reserve, configured_duration);
+}
+
+static_assert(CleanupReserveFor(std::chrono::seconds(1)) ==
+              std::chrono::milliseconds(500));
+static_assert(CleanupReserveFor(std::chrono::milliseconds::zero()) ==
+              std::chrono::milliseconds::zero());
+
+enum class Interruption : uint8_t {
+    kSigkill,
+    kSigstopThenKill,
+    kSigstopThenContinue,
+};
+
+struct StressRound {
+    bool pid_incarnation = false;
+    bool mutate_epoch = false;
+    CrashScenario scenario = CrashScenario::kJournalInitializingTagged;
+    Interruption interruption = Interruption::kSigkill;
+};
+
+const char* ScenarioName(CrashScenario scenario) {
+    switch (scenario) {
+        case CrashScenario::kJournalInitializingTagged:
+            return "journal-initializing-tagged";
+        case CrashScenario::kJournalBuildingPublished:
+            return "journal-building-published";
+        case CrashScenario::kJournalAllocationPublished:
+            return "journal-allocation-published";
+        case CrashScenario::kJournalHandleAppended:
+            return "journal-handle-appended";
+        case CrashScenario::kMpscClaimTagged:
+            return "mpsc-claim-tagged";
+        case CrashScenario::kMpscOwnerPublished:
+            return "mpsc-owner-published";
+        case CrashScenario::kMpscCursorAdvanced:
+            return "mpsc-cursor-advanced";
+        case CrashScenario::kMpscWritingPublished:
+            return "mpsc-writing-published";
+        case CrashScenario::kMpscReadyPublished:
+            return "mpsc-ready-published";
+        case CrashScenario::kMpscTurnPublished:
+            return "mpsc-turn-published";
+        case CrashScenario::kJournalReclaimTagged:
+            return "journal-reclaim-tagged";
+        case CrashScenario::kJournalReclaimProgress:
+            return "journal-reclaim-progress";
+        case CrashScenario::kJournalFinalizingTagged:
+            return "journal-finalizing-tagged";
+    }
+    return "unknown-crash-point";
+}
+
+const char* InterruptionName(Interruption interruption) {
+    switch (interruption) {
+        case Interruption::kSigkill:
+            return "SIGKILL";
+        case Interruption::kSigstopThenKill:
+            return "SIGSTOP->SIGKILL";
+        case Interruption::kSigstopThenContinue:
+            return "SIGSTOP->SIGCONT";
+    }
+    return "unknown-signal";
+}
+
 struct SharedBlock {
     alignas(64) unsigned char allocator_storage[kAllocatorBytes];
     alignas(64) unsigned char journal_storage[kJournalBytes];
@@ -125,6 +223,17 @@ ClassTableConfig AllocatorConfig() {
     return config;
 }
 
+AllocationRequest RootRequest() {
+    AllocationRequest request;
+    request.object_size = sizeof(D2RecoveryStressMessage);
+    request.type_id = StaticMessageTraits<D2RecoveryStressMessage>::type_id;
+    request.schema = SchemaIdentity{
+        .short_id = StaticMessageTraits<D2RecoveryStressMessage>::schema_short_id,
+        .layout_version = StaticMessageTraits<D2RecoveryStressMessage>::layout_version};
+    request.alignment = alignof(D2RecoveryStressMessage);
+    return request;
+}
+
 AllocationRequest ChildRequest() {
     AllocationRequest request;
     request.object_size = sizeof(uint64_t);
@@ -137,13 +246,88 @@ AllocationRequest ChildRequest() {
 uint64_t NowNs() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+            StressClock::now().time_since_epoch()).count());
+}
+
+void ArmChildWatchdog(StressDeadline deadline) {
+    const auto remaining = deadline - StressClock::now();
+    if (remaining <= StressClock::duration::zero()) {
+        _exit(124);
+    }
+    const auto rounded =
+        std::chrono::ceil<std::chrono::seconds>(remaining).count();
+    const auto maximum = std::numeric_limits<unsigned int>::max();
+    const unsigned int seconds = static_cast<unsigned int>(
+        std::min<uint64_t>(static_cast<uint64_t>(rounded), maximum));
+    sigset_t alarm_signal;
+    ::sigemptyset(&alarm_signal);
+    ::sigaddset(&alarm_signal, SIGALRM);
+    (void)::sigprocmask(SIG_UNBLOCK, &alarm_signal, nullptr);
+    ::signal(SIGALRM, SIG_DFL);
+    ::alarm(std::max(1u, seconds));
+}
+
+uint64_t DefaultStressSeed() {
+    std::random_device random_device;
+    uint64_t seed = static_cast<uint64_t>(random_device()) << 32;
+    seed ^= static_cast<uint64_t>(random_device());
+    seed ^= NowNs();
+    seed ^= static_cast<uint64_t>(::getpid()) * 0x9E3779B97F4A7C15ULL;
+    return seed;
+}
+
+bool ReadUnsignedEnvironment(const char* name, uint64_t fallback,
+                             uint64_t* value, std::string* error) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) {
+        *value = fallback;
+        return true;
+    }
+    if (*text == '\0' || *text == '-') {
+        *error = std::string(name) + " must be an unsigned integer";
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 0);
+    if (errno == ERANGE || end == text || *end != '\0') {
+        *error = std::string(name) + " has invalid value '" + text + "'";
+        return false;
+    }
+    *value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+StressRound MakeRandomRound(std::mt19937_64* random) {
+    std::uniform_int_distribution<size_t> scenario(0, kScenarios.size());
+    const size_t selected = scenario(*random);
+    if (selected == kScenarios.size()) {
+        return StressRound{
+            .pid_incarnation = true,
+            .mutate_epoch = ((*random)() & 1u) != 0,
+        };
+    }
+
+    // Keep SIGKILL dominant while continuously exercising both SIGSTOP paths.
+    std::uniform_int_distribution<uint32_t> signal(0, 7);
+    const uint32_t selected_signal = signal(*random);
+    Interruption interruption = Interruption::kSigkill;
+    if (selected_signal == 0) {
+        interruption = Interruption::kSigstopThenKill;
+    } else if (selected_signal == 1) {
+        interruption = Interruption::kSigstopThenContinue;
+    }
+    return StressRound{
+        .scenario = kScenarios[selected],
+        .interruption = interruption,
+    };
 }
 
 struct HookContext {
     SharedBlock* shared = nullptr;
     CrashScenario target = CrashScenario::kJournalAllocationPublished;
     bool stop_instead_of_pause = false;
+    bool triggered = false;
 };
 
 [[noreturn]] void PauseForKill(HookContext* context) {
@@ -182,7 +366,8 @@ void JournalHook(AllocationJournal::PersistencePoint point, uint64_t,
          point == AllocationJournal::PersistencePoint::kReclaimProgress) ||
         (context->target == CrashScenario::kJournalFinalizingTagged &&
          point == AllocationJournal::PersistencePoint::kFinalizingTagged);
-    if (match) {
+    if (match && !context->triggered) {
+        context->triggered = true;
         ReachHook(context);
     }
 }
@@ -203,14 +388,16 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
          point == MpscChannel::PersistencePoint::kReadyPublished) ||
         (context->target == CrashScenario::kMpscTurnPublished &&
          point == MpscChannel::PersistencePoint::kTurnPublished);
-    if (match) {
+    if (match && !context->triggered) {
+        context->triggered = true;
         ReachHook(context);
     }
 }
 
-[[noreturn]] void PublisherChild(SharedBlock* shared,
-                                 CrashScenario scenario,
-                                 bool stop_instead_of_pause = false) {
+[[noreturn]] void PublisherChild(
+    SharedBlock* shared, CrashScenario scenario, StressDeadline deadline,
+    bool stop_instead_of_pause = false) {
+    ArmChildWatchdog(deadline);
     auto allocator = CentralSlabAllocator::Attach(shared->allocator_storage);
     auto journal = AllocationJournal::Attach(
         shared->journal_storage, kJournalBytes, *allocator);
@@ -304,13 +491,17 @@ protected:
         auto leases = SubscriberLeaseTable::Init(shared_->lease_storage);
         ASSERT_TRUE(leases.ok());
         leases_.emplace(*leases);
+
+        baseline_available_slots_ = ProbeAvailableSlots();
+        ASSERT_EQ(baseline_available_slots_, allocator_.total_slot_count());
+        watchdog_deadline_ = StressClock::now() + kDeterministicWatchdog;
     }
 
     void TearDown() override {
         if (child_pid_ > 0) {
-            ::kill(child_pid_, SIGKILL);
+            (void)::kill(child_pid_, SIGKILL);
             int status = 0;
-            ::waitpid(child_pid_, &status, 0);
+            (void)WaitForExit(watchdog_deadline_, &status);
         }
         if (shared_ != nullptr) {
             ::munmap(shared_, sizeof(SharedBlock));
@@ -330,30 +521,116 @@ protected:
         return live;
     }
 
-    bool WaitReached(uint32_t value) {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(5);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (shared_->reached.load(std::memory_order_acquire) == value) {
+    uint32_t ProbeAvailableSlots() {
+        EXPECT_EQ(LiveSlabs(), 0u)
+            << "capacity probe requires all slab states to start FREE";
+        std::vector<ShmHandle> handles;
+        handles.reserve(allocator_.total_slot_count());
+        for (uint32_t i = 0; i <= allocator_.total_slot_count(); ++i) {
+            auto allocation = allocator_.Allocate(RootRequest());
+            if (!allocation.ok()) {
+                EXPECT_EQ(allocation.status().code(),
+                          StatusCode::kResourceExhausted)
+                    << allocation.status().ToString();
+                break;
+            }
+            handles.push_back(*allocation);
+        }
+        const uint32_t available = static_cast<uint32_t>(handles.size());
+        EXPECT_EQ(LiveSlabs(), available)
+            << "bitmap occupancy and non-FREE slab states diverged while full";
+        for (ShmHandle handle : handles) {
+            EXPECT_TRUE(allocator_.Abort(handle).ok());
+        }
+        EXPECT_EQ(LiveSlabs(), 0u)
+            << "capacity probe must restore every slab state to FREE";
+        return available;
+    }
+
+    void UseWatchdogDeadline(StressDeadline deadline) {
+        watchdog_deadline_ = deadline;
+    }
+
+    bool WaitForExit(StressDeadline deadline, int* status) {
+        for (;;) {
+            const pid_t result = ::waitpid(child_pid_, status, WNOHANG);
+            if (result == child_pid_) {
+                child_pid_ = -1;
+                return true;
+            }
+            if (result == -1 && errno != EINTR) {
+                if (errno == ECHILD) {
+                    child_pid_ = -1;
+                }
+                return false;
+            }
+            if (StressClock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    bool WaitForAtomic(std::atomic<uint32_t>* value, uint32_t expected,
+                       StressDeadline deadline) {
+        for (;;) {
+            if (value->load(std::memory_order_acquire) == expected) {
                 return true;
             }
             int status = 0;
-            if (child_pid_ > 0 &&
-                ::waitpid(child_pid_, &status, WNOHANG) == child_pid_) {
+            const pid_t result = ::waitpid(child_pid_, &status, WNOHANG);
+            if (result == child_pid_) {
                 child_pid_ = -1;
                 return false;
             }
-            std::this_thread::yield();
+            if (result == -1 && errno != EINTR) {
+                if (errno == ECHILD) {
+                    child_pid_ = -1;
+                }
+                return false;
+            }
+            if (StressClock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
-        return false;
     }
 
-    void KillAndReap() {
+    bool WaitReached(uint32_t value, StressDeadline deadline) {
+        return WaitForAtomic(&shared_->reached, value, deadline);
+    }
+
+    bool WaitStopped(StressDeadline deadline) {
+        for (;;) {
+            int status = 0;
+            const pid_t result = ::waitpid(child_pid_, &status,
+                                           WNOHANG | WUNTRACED);
+            if (result == child_pid_) {
+                if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    child_pid_ = -1;
+                    return false;
+                }
+                return WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP;
+            }
+            if (result == -1 && errno != EINTR) {
+                if (errno == ECHILD) {
+                    child_pid_ = -1;
+                }
+                return false;
+            }
+            if (StressClock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    void KillAndReap(StressDeadline deadline) {
         ASSERT_GT(child_pid_, 0);
         ASSERT_EQ(::kill(child_pid_, SIGKILL), 0);
         int status = 0;
-        ASSERT_EQ(::waitpid(child_pid_, &status, 0), child_pid_);
-        child_pid_ = -1;
+        ASSERT_TRUE(WaitForExit(deadline, &status))
+            << "child did not exit before the absolute watchdog deadline";
         ASSERT_TRUE(WIFSIGNALED(status));
     }
 
@@ -363,22 +640,12 @@ protected:
                scenario == CrashScenario::kJournalFinalizingTagged;
     }
 
-    void RunScenario(CrashScenario scenario) {
-        ASSERT_EQ(LiveSlabs(), 0u);
-        ASSERT_EQ(journal_->ActiveTransactionCount(), 0u);
-        ASSERT_TRUE(mpsc_->IsEmpty());
-        shared_->root = {};
-        shared_->child = {};
-        shared_->reached.store(0, std::memory_order_relaxed);
+    bool ExpectedVisibleAfterCompletion(CrashScenario scenario) const {
+        return scenario != CrashScenario::kJournalReclaimTagged &&
+               scenario != CrashScenario::kJournalReclaimProgress;
+    }
 
-        child_pid_ = ::fork();
-        ASSERT_NE(child_pid_, -1) << std::strerror(errno);
-        if (child_pid_ == 0) {
-            PublisherChild(shared_, scenario);
-        }
-        ASSERT_TRUE(WaitReached(static_cast<uint32_t>(scenario)));
-        KillAndReap();
-
+    void RecoverProducts() {
         (void)mpsc_->AbortOrphanedReservations(NowNs() + 1000,
                                                /*lease_ns=*/1);
         (void)journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
@@ -389,11 +656,55 @@ protected:
                                                /*lease_ns=*/1);
         (void)journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
                                       &*mpsc_);
+    }
+
+    void RunScenario(
+        CrashScenario scenario, StressDeadline deadline,
+        Interruption interruption = Interruption::kSigkill) {
+        ASSERT_EQ(LiveSlabs(), 0u);
+        ASSERT_EQ(journal_->ActiveTransactionCount(), 0u);
+        ASSERT_TRUE(mpsc_->IsEmpty());
+        shared_->root = {};
+        shared_->child = {};
+        shared_->reached.store(0, std::memory_order_relaxed);
+
+        child_pid_ = ::fork();
+        ASSERT_NE(child_pid_, -1) << std::strerror(errno);
+        if (child_pid_ == 0) {
+            PublisherChild(shared_, scenario, deadline,
+                           interruption != Interruption::kSigkill);
+        }
+        ASSERT_TRUE(WaitReached(static_cast<uint32_t>(scenario), deadline))
+            << "child did not reach crash point before the absolute deadline";
+
+        bool child_completed = false;
+        if (interruption == Interruption::kSigkill) {
+            KillAndReap(deadline);
+        } else {
+            ASSERT_TRUE(WaitStopped(deadline))
+                << "child did not stop before the absolute deadline";
+            if (interruption == Interruption::kSigstopThenKill) {
+                KillAndReap(deadline);
+            } else {
+                ASSERT_EQ(::kill(child_pid_, SIGCONT), 0);
+                int status = 0;
+                ASSERT_TRUE(WaitForExit(deadline, &status))
+                    << "continued child did not exit before the absolute deadline";
+                ASSERT_TRUE(WIFEXITED(status));
+                ASSERT_EQ(WEXITSTATUS(status), 0);
+                child_completed = true;
+            }
+        }
+
+        RecoverProducts();
         EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
 
         Subscriber<D2RecoveryStressMessage> subscriber(allocator_, *mpsc_);
         auto message = subscriber.TryPoll();
-        if (ExpectedVisible(scenario)) {
+        const bool expected_visible =
+            child_completed ? ExpectedVisibleAfterCompletion(scenario)
+                            : ExpectedVisible(scenario);
+        if (expected_visible) {
             ASSERT_TRUE(message.ok()) << message.status().ToString();
             EXPECT_EQ(message->metadata().payload, shared_->root);
             EXPECT_TRUE(std::move(*message).Ack().ok());
@@ -406,6 +717,104 @@ protected:
             << "product recovery/ACK path must reclaim root and child";
     }
 
+    void RunPidIncarnationScenario(bool mutate_epoch,
+                                   StressDeadline deadline) {
+        ASSERT_EQ(LiveSlabs(), 0u);
+        ASSERT_EQ(journal_->ActiveTransactionCount(), 0u);
+        ASSERT_TRUE(mpsc_->IsEmpty());
+        shared_->child_ready.store(0, std::memory_order_relaxed);
+        shared_->child_command.store(0, std::memory_order_relaxed);
+        shared_->root = {};
+        shared_->child = {};
+
+        child_pid_ = ::fork();
+        ASSERT_NE(child_pid_, -1) << std::strerror(errno);
+        if (child_pid_ == 0) {
+            ArmChildWatchdog(deadline);
+            shared_->child_identity = ProcessIdentity::Current();
+            shared_->child_ready.store(1, std::memory_order_release);
+            while (shared_->child_command.load(std::memory_order_acquire) == 0) {
+                std::this_thread::yield();
+            }
+            _exit(0);
+        }
+        ASSERT_TRUE(WaitForAtomic(&shared_->child_ready, 1, deadline))
+            << "PID incarnation child was not ready before the absolute deadline";
+
+        ProcessIdentity reused_incarnation = shared_->child_identity;
+        reused_incarnation.start_time_ns ^= 0x100000001ULL;
+        if (mutate_epoch) {
+            reused_incarnation.process_epoch ^= 0x200000001ULL;
+        }
+        auto transaction = journal_->Begin(reused_incarnation);
+        ASSERT_TRUE(transaction.ok()) << transaction.status().ToString();
+        auto root = journal_->AllocateRoot(*transaction, RootRequest());
+        ASSERT_TRUE(root.ok()) << root.status().ToString();
+        shared_->root = *root;
+        ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
+        auto child = journal_->AllocateChild(*transaction, ChildRequest());
+        ASSERT_TRUE(child.ok()) << child.status().ToString();
+        shared_->child = *child;
+        ASSERT_TRUE(allocator_.BeginBuild(*child).ok());
+
+        EXPECT_EQ(journal_->RecoverOrphans(), 0u)
+            << "a live PID with a mismatched incarnation must not be reclaimed";
+        EXPECT_TRUE(allocator_.Inspect(*root).ok());
+        EXPECT_TRUE(allocator_.Inspect(*child).ok());
+
+        KillAndReap(deadline);
+        RecoverProducts();
+        EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+        EXPECT_TRUE(mpsc_->IsEmpty());
+        EXPECT_EQ(LiveSlabs(), 0u);
+    }
+
+    void VerifyQueueProgressAndCapacity(uint64_t iteration,
+                                        StressDeadline deadline) {
+        ASSERT_LT(StressClock::now(), deadline)
+            << "round verification started after the absolute deadline";
+        ASSERT_EQ(journal_->ActiveTransactionCount(), 0u);
+        ASSERT_TRUE(mpsc_->IsEmpty());
+        ASSERT_EQ(LiveSlabs(), 0u);
+
+        MpscChannel::ProducerIdentity producer{
+            .owner = ProcessIdentity::Current(),
+            .publisher_id = 0xD213000000000000ULL ^ iteration,
+        };
+        Publisher<D2RecoveryStressMessage> publisher(
+            allocator_, *mpsc_, producer, *journal_);
+        auto builder = publisher.Allocate();
+        ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+        const ShmHandle progress_root = builder->handle();
+        (*builder)->id = 0xD213000000000000ULL ^ (iteration + 1);
+        (*builder)->checksum =
+            (*builder)->id ^ StaticMessageTraits<D2RecoveryStressMessage>::kMask;
+        auto child = builder->AllocateChild(ChildRequest());
+        ASSERT_TRUE(child.ok()) << child.status().ToString();
+        const ShmHandle progress_child = child->handle;
+        *static_cast<uint64_t*>(child->data) = (*builder)->id;
+        ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+
+        Subscriber<D2RecoveryStressMessage> subscriber(allocator_, *mpsc_);
+        auto message = subscriber.TryPoll();
+        ASSERT_TRUE(message.ok()) << message.status().ToString();
+        EXPECT_EQ(message->metadata().payload, progress_root);
+        ASSERT_TRUE(std::move(*message).Ack().ok());
+
+        EXPECT_FALSE(allocator_.Inspect(progress_root).ok());
+        EXPECT_FALSE(allocator_.Inspect(progress_child).ok());
+        EXPECT_TRUE(mpsc_->IsEmpty());
+        EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+        EXPECT_EQ(LiveSlabs(), 0u)
+            << "normal progress must reclaim both root and child";
+        EXPECT_EQ(ProbeAvailableSlots(), baseline_available_slots_)
+            << "allocator availability did not return to its baseline";
+        EXPECT_EQ(LiveSlabs(), 0u)
+            << "the availability probe itself must not retain slabs";
+        EXPECT_LT(StressClock::now(), deadline)
+            << "round verification exceeded the absolute deadline";
+    }
+
     SharedBlock* shared_ = nullptr;
     CentralSlabAllocator allocator_;
     std::optional<AllocationJournal> journal_;
@@ -413,28 +822,137 @@ protected:
     std::optional<BroadcastChannel> broadcast_;
     std::optional<SubscriberLeaseTable> leases_;
     pid_t child_pid_ = -1;
+    uint32_t baseline_available_slots_ = 0;
+    StressDeadline watchdog_deadline_{};
 };
 
+TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
+    uint64_t stress_seconds = 0;
+    uint64_t seed = DefaultStressSeed();
+    std::string seconds_error;
+    std::string seed_error;
+    const bool seconds_ok = ReadUnsignedEnvironment(
+        "MINO_D2_RECOVERY_STRESS_SECONDS", kDefaultStressSeconds,
+        &stress_seconds, &seconds_error);
+    const bool seed_ok = ReadUnsignedEnvironment(
+        "MINO_D2_RECOVERY_STRESS_SEED", seed, &seed, &seed_error);
+    ASSERT_TRUE(seconds_ok) << seconds_error;
+    ASSERT_TRUE(seed_ok) << seed_error;
+
+    const auto started = StressClock::now();
+    const auto maximum_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        StressClock::time_point::max() - started).count();
+    ASSERT_LE(stress_seconds, static_cast<uint64_t>(maximum_seconds))
+        << "MINO_D2_RECOVERY_STRESS_SECONDS is too large";
+    const auto configured_duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::seconds(stress_seconds));
+    const auto cleanup_reserve = CleanupReserveFor(configured_duration);
+    const StressDeadline hard_deadline = started + configured_duration;
+    const StressDeadline scheduling_deadline =
+        hard_deadline - cleanup_reserve;
+    UseWatchdogDeadline(hard_deadline);
+
+    RecordProperty("stress_seed", std::to_string(seed));
+    RecordProperty("stress_seconds", std::to_string(stress_seconds));
+    RecordProperty("cleanup_reserve_ms",
+                   std::to_string(cleanup_reserve.count()));
+    std::cout << "D2 recovery stress: seed=" << seed
+              << " seconds=" << stress_seconds
+              << " cleanup_reserve_ms=" << cleanup_reserve.count()
+              << " round_start_budget_ms="
+              << kEstimatedMinimumRoundBudget.count() << std::endl;
+
+    std::mt19937_64 random(seed);
+    uint64_t iteration = 0;
+    // Preserve both the estimated minimum round budget and the cleanup reserve;
+    // never start a new child close to the hard deadline.
+    while (scheduling_deadline - StressClock::now() >=
+           kEstimatedMinimumRoundBudget) {
+        const StressRound round = MakeRandomRound(&random);
+        std::ostringstream trace;
+        trace << "seed=" << seed << " iteration=" << iteration
+              << " scenario=";
+        if (round.pid_incarnation) {
+            trace << "pid-incarnation-reuse"
+                  << " mutation="
+                  << (round.mutate_epoch ? "start-time+epoch"
+                                         : "start-time");
+        } else {
+            trace << ScenarioName(round.scenario)
+                  << " signal=" << InterruptionName(round.interruption);
+        }
+        SCOPED_TRACE(trace.str());
+
+        if (round.pid_incarnation) {
+            ASSERT_NO_FATAL_FAILURE(
+                RunPidIncarnationScenario(round.mutate_epoch, hard_deadline));
+        } else {
+            ASSERT_NO_FATAL_FAILURE(
+                RunScenario(round.scenario, hard_deadline,
+                            round.interruption));
+        }
+        ASSERT_NO_FATAL_FAILURE(
+            VerifyQueueProgressAndCapacity(iteration, hard_deadline));
+        ++iteration;
+    }
+
+    const auto elapsed = StressClock::now() - started;
+    const auto reserved_and_round_budget =
+        cleanup_reserve + kEstimatedMinimumRoundBudget;
+    const auto elapsed_lower_bound =
+        configured_duration > reserved_and_round_budget
+            ? configured_duration - reserved_and_round_budget
+            : std::chrono::milliseconds::zero();
+    EXPECT_GE(elapsed, elapsed_lower_bound)
+        << "timed stress stopped before its scheduling lower bound; seed="
+        << seed << " iterations=" << iteration;
+    EXPECT_LE(elapsed, configured_duration + kElapsedUpperSlack)
+        << "timed stress exceeded its configured hard bound plus tolerance; seed="
+        << seed << " iterations=" << iteration;
+    if (stress_seconds != 0) {
+        EXPECT_GT(iteration, 0u)
+            << "timed stress scheduled no rounds; seed=" << seed;
+    }
+    RecordProperty(
+        "elapsed_ms",
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                           elapsed).count()));
+    std::cout << "D2 recovery stress completed: seed=" << seed
+              << " iterations=" << iteration
+              << " elapsed_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                     .count()
+              << std::endl;
+}
+
 TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    UseWatchdogDeadline(deadline);
+    uint64_t iteration = 0;
     for (CrashScenario scenario : kScenarios) {
-        SCOPED_TRACE(static_cast<uint32_t>(scenario));
-        RunScenario(scenario);
+        SCOPED_TRACE(ScenarioName(scenario));
+        ASSERT_NO_FATAL_FAILURE(RunScenario(scenario, deadline));
+        ASSERT_NO_FATAL_FAILURE(
+            VerifyQueueProgressAndCapacity(iteration++, deadline));
     }
 }
 
 TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    UseWatchdogDeadline(deadline);
     shared_->reached.store(0, std::memory_order_relaxed);
     child_pid_ = ::fork();
     ASSERT_NE(child_pid_, -1);
     if (child_pid_ == 0) {
-        PublisherChild(shared_, CrashScenario::kMpscWritingPublished,
+        PublisherChild(shared_, CrashScenario::kMpscWritingPublished, deadline,
                        /*stop_instead_of_pause=*/true);
     }
     ASSERT_TRUE(WaitReached(
-        static_cast<uint32_t>(CrashScenario::kMpscWritingPublished)));
-    int status = 0;
-    ASSERT_EQ(::waitpid(child_pid_, &status, WUNTRACED), child_pid_);
-    ASSERT_TRUE(WIFSTOPPED(status));
+        static_cast<uint32_t>(CrashScenario::kMpscWritingPublished), deadline));
+    ASSERT_TRUE(WaitStopped(deadline));
 
     EXPECT_EQ(mpsc_->AbortOrphanedReservations(NowNs() + 1000, 1), 0u);
     EXPECT_EQ(journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
@@ -442,8 +960,8 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     EXPECT_GT(LiveSlabs(), 0u);
 
     ASSERT_EQ(::kill(child_pid_, SIGCONT), 0);
-    ASSERT_EQ(::waitpid(child_pid_, &status, 0), child_pid_);
-    child_pid_ = -1;
+    int status = 0;
+    ASSERT_TRUE(WaitForExit(deadline, &status));
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
 
@@ -452,68 +970,33 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     ASSERT_TRUE(message.ok()) << message.status().ToString();
     EXPECT_TRUE(std::move(*message).Ack().ok());
     EXPECT_EQ(LiveSlabs(), 0u);
+    VerifyQueueProgressAndCapacity(0, deadline);
 }
 
 TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
-    shared_->child_ready.store(0, std::memory_order_relaxed);
-    shared_->child_command.store(0, std::memory_order_relaxed);
-    child_pid_ = ::fork();
-    ASSERT_NE(child_pid_, -1);
-    if (child_pid_ == 0) {
-        shared_->child_identity = ProcessIdentity::Current();
-        shared_->child_ready.store(1, std::memory_order_release);
-        while (shared_->child_command.load(std::memory_order_acquire) == 0) {
-            std::this_thread::yield();
-        }
-        _exit(0);
-    }
-    while (shared_->child_ready.load(std::memory_order_acquire) == 0) {
-        std::this_thread::yield();
-    }
-
-    ProcessIdentity old_incarnation = shared_->child_identity;
-    old_incarnation.start_time_ns ^= 0x100000001ULL;
-    old_incarnation.process_epoch ^= 0x200000001ULL;
-    auto transaction = journal_->Begin(old_incarnation);
-    ASSERT_TRUE(transaction.ok());
-    auto root = journal_->AllocateRoot(*transaction, [] {
-        AllocationRequest request;
-        request.object_size = sizeof(D2RecoveryStressMessage);
-        request.type_id = StaticMessageTraits<D2RecoveryStressMessage>::type_id;
-        request.schema = SchemaIdentity{
-            .short_id = StaticMessageTraits<D2RecoveryStressMessage>::schema_short_id,
-            .layout_version = 1};
-        request.alignment = alignof(D2RecoveryStressMessage);
-        return request;
-    }());
-    ASSERT_TRUE(root.ok());
-    ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
-
-    EXPECT_EQ(journal_->RecoverOrphans(), 0u)
-        << "a live foreign PID with unverifiable incarnation is Unknown";
-    EXPECT_TRUE(allocator_.Inspect(*root).ok());
-
-    ASSERT_EQ(::kill(child_pid_, SIGKILL), 0);
-    int status = 0;
-    ASSERT_EQ(::waitpid(child_pid_, &status, 0), child_pid_);
-    child_pid_ = -1;
-    EXPECT_EQ(journal_->RecoverOrphans(), 1u);
-    EXPECT_EQ(LiveSlabs(), 0u);
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    UseWatchdogDeadline(deadline);
+    ASSERT_NO_FATAL_FAILURE(
+        RunPidIncarnationScenario(/*mutate_epoch=*/true, deadline));
+    ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
 }
 
 TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    UseWatchdogDeadline(deadline);
     child_pid_ = ::fork();
     ASSERT_NE(child_pid_, -1);
     if (child_pid_ == 0) {
+        ArmChildWatchdog(deadline);
         shared_->child_identity = ProcessIdentity::Current();
         shared_->child_ready.store(1, std::memory_order_release);
         for (;;) {
             ::pause();
         }
     }
-    while (shared_->child_ready.load(std::memory_order_acquire) == 0) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForAtomic(&shared_->child_ready, 1, deadline));
 
     constexpr uint64_t kT0 = 10'000;
     SubscriberLeaseCoordinator coordinator(*broadcast_, *leases_);
@@ -535,7 +1018,7 @@ TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
     }
     ASSERT_TRUE(broadcast_->IsFull());
 
-    KillAndReap();
+    KillAndReap(deadline);
     EXPECT_EQ(coordinator.EvictExpired(kT0 + 100, 1), 1u);
     EXPECT_FALSE(broadcast_->IsFull());
     EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kEvicted);
@@ -543,3 +1026,11 @@ TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
 
 }  // namespace
 }  // namespace mino
+
+#else
+
+TEST(D2RecoveryStressTest, RequiresPosixSharedMemoryAndProcessSignals) {
+    GTEST_SKIP() << "D2 recovery stress requires POSIX mmap/fork/signals";
+}
+
+#endif  // defined(__unix__) || defined(__APPLE__)

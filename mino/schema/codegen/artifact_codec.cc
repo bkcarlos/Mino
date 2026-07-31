@@ -379,8 +379,8 @@ Status ValidateFieldSemantics(const AggregateDescriptor& aggregate) {
     return Status::Ok();
 }
 
-Status ValidateLayout(const SchemaDescriptor& descriptor,
-                      const DecodedLayoutArtifact& layout) {
+Status ValidateLayoutShape(const SchemaDescriptor& descriptor,
+                           const DecodedLayoutArtifact& layout) {
     if (layout.layout_version != descriptor.identity().layout_version() ||
         layout.header_size != ObjectHeaderLayout::kSize ||
         layout.presence_bitmap_offset != ObjectHeaderLayout::kSize ||
@@ -446,6 +446,55 @@ Status ValidateLayout(const SchemaDescriptor& descriptor,
          VariableMetadataLayout::kSize >
              layout.object_size - *layout.unknown_fields_offset)) {
         return Invalid("descriptor unknown-field metadata is out of bounds");
+    }
+    return Status::Ok();
+}
+
+Status ValidateCanonicalLayout(
+    const SchemaDescriptor& descriptor,
+    const DecodedLayoutArtifact& layout,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> closure) {
+    LayoutOptions options;
+    options.max_fields = std::max(options.max_fields, layout.fields.size());
+    options.max_object_size =
+        std::max<uint64_t>(options.max_object_size, layout.object_size);
+    options.max_total_child_bytes =
+        std::max(options.max_total_child_bytes, layout.max_child_bytes);
+    options.max_dynamic_children =
+        std::max(options.max_dynamic_children, layout.max_dynamic_children);
+    auto expected = LayoutPlanner::Plan(descriptor, closure, options);
+    if (!expected.ok()) return expected.status();
+
+    const bool top_level_equal =
+        layout.layout_version == expected->layout_version() &&
+        layout.header_size == expected->header_size() &&
+        layout.presence_bitmap_offset == expected->presence_bitmap_offset() &&
+        layout.presence_bitmap_words == expected->presence_bitmap_words() &&
+        layout.fixed_area_offset == expected->fixed_area_offset() &&
+        layout.fixed_area_size == expected->fixed_area_size() &&
+        layout.unknown_fields_offset == expected->unknown_fields_offset() &&
+        layout.object_size == expected->object_size() &&
+        layout.object_alignment == expected->object_alignment() &&
+        layout.max_child_bytes == expected->max_child_bytes() &&
+        layout.max_dynamic_children == expected->max_dynamic_children() &&
+        layout.fields.size() == expected->fields().size();
+    if (!top_level_equal) {
+        return Status::Error(StatusCode::kSchemaMismatch,
+                             "descriptor layout is not canonical");
+    }
+    for (size_t i = 0; i < layout.fields.size(); ++i) {
+        const DecodedFieldLayoutArtifact& actual = layout.fields[i];
+        const FieldLayout& wanted = expected->fields()[i];
+        if (actual.field_id != wanted.field_id() ||
+            actual.offset != wanted.offset() || actual.size != wanted.size() ||
+            actual.alignment != wanted.alignment() ||
+            actual.storage_kind != wanted.storage_kind() ||
+            actual.presence_bit != wanted.presence_bit() ||
+            actual.max_child_bytes != wanted.max_child_bytes() ||
+            actual.max_dynamic_children != wanted.max_dynamic_children()) {
+            return Status::Error(StatusCode::kSchemaMismatch,
+                                 "descriptor field layout is not canonical");
+        }
     }
     return Status::Ok();
 }
@@ -545,7 +594,9 @@ Result<std::string> EncodeDescriptorArtifact(
 }
 
 Result<DecodedDescriptorArtifact> DecodeAndValidate(
-    std::string_view bytes) noexcept {
+    std::string_view bytes,
+    std::span<const std::shared_ptr<const SchemaDescriptor>>
+        external_descriptors) noexcept {
     try {
         if (bytes.size() > kMaxArtifactBytes ||
             bytes.size() < kMagic.size() + 32 || !bytes.starts_with(kMagic)) {
@@ -771,7 +822,8 @@ Result<DecodedDescriptorArtifact> DecodeAndValidate(
                 SchemaIdentity(*short_id, *digest, *schema_version,
                                *layout_version),
                 std::move(*canonical_bytes), std::move(dependencies));
-            const Status layout_status = ValidateLayout(*descriptor, layout);
+            const Status layout_status =
+                ValidateLayoutShape(*descriptor, layout);
             if (!layout_status.ok()) return layout_status;
             const auto existing = identities.find(*full_name);
             if (existing != identities.end() && existing->second != *digest) {
@@ -789,12 +841,49 @@ Result<DecodedDescriptorArtifact> DecodeAndValidate(
                 DecodedTypeArtifact{std::move(descriptor), std::move(layout)});
         }
         if (!reader.done()) return Invalid("descriptor artifact has trailing bytes");
+
+        std::vector<std::shared_ptr<const SchemaDescriptor>> candidates(
+            external_descriptors.begin(), external_descriptors.end());
+        candidates.reserve(candidates.size() + result.types.size());
+        for (const DecodedTypeArtifact& type : result.types) {
+            candidates.push_back(type.descriptor);
+        }
+        for (const DecodedTypeArtifact& type : result.types) {
+            std::vector<std::shared_ptr<const SchemaDescriptor>> exact_closure;
+            exact_closure.reserve(type.descriptor->dependencies().size());
+            for (const DependencyDescriptor& dependency :
+                 type.descriptor->dependencies()) {
+                const auto resolved = std::find_if(
+                    candidates.begin(), candidates.end(),
+                    [&](const auto& candidate) {
+                        return candidate != nullptr &&
+                               candidate->aggregate().full_name() ==
+                                   dependency.full_name() &&
+                               candidate->identity().canonical_digest() ==
+                                   dependency.digest();
+                    });
+                if (resolved == candidates.end()) {
+                    return Status::Error(
+                        StatusCode::kSchemaMismatch,
+                        "descriptor layout dependency closure is unavailable");
+                }
+                exact_closure.push_back(*resolved);
+            }
+            const Status canonical_layout = ValidateCanonicalLayout(
+                *type.descriptor, type.layout, exact_closure);
+            if (!canonical_layout.ok()) return canonical_layout;
+        }
         return result;
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {
         return Status::Error(StatusCode::kInternal);
     }
+}
+
+Result<DecodedDescriptorArtifact> DecodeAndValidate(
+    std::string_view bytes) noexcept {
+    return DecodeAndValidate(bytes, {});
 }
 
 }  // namespace mino::schema::codegen

@@ -43,7 +43,9 @@ struct alignas(64) AllocatorSuperblock {
     uint32_t total_slot_count;
     uint32_t reserved;
     std::atomic<uint64_t> next_transaction_id{1};
-    uint64_t reserved2 = 0;
+    // Offset from this superblock to the first SlabHeader. Zero is accepted
+    // when attaching allocator v3 images and means metadata_size.
+    uint64_t slot_area_offset = 0;
 
     // Followed by:
     //   ClassDescriptor classes[class_count]
@@ -87,7 +89,8 @@ Result<CentralSlabAllocator::Layout> CentralSlabAllocator::ComputeLayout(
     // Slot area begins at the next cache-line boundary; each slot is
     // SlabHeader + max payload, so every slot header stays cache-line
     // aligned.
-    layout.slot_stride = sizeof(SlabHeader) + table.max_object_size();
+    layout.slot_stride = AlignUp(
+        sizeof(SlabHeader) + table.max_object_size(), alignof(SlabHeader));
     layout.metadata_size = AlignUp(off, alignof(SlabHeader));
 
     const uint64_t required =
@@ -101,29 +104,73 @@ Result<CentralSlabAllocator::Layout> CentralSlabAllocator::ComputeLayout(
 
 Result<CentralSlabAllocator> CentralSlabAllocator::Create(
     void* shm_base, uint64_t data_region_size, const ClassTableConfig& config) {
+    return CreateWithStorage(shm_base, data_region_size, data_region_size,
+                             /*slot_area_offset=*/0, data_region_size,
+                             /*region_id=*/0, /*handle_offset_bias=*/0, config);
+}
+
+Result<CentralSlabAllocator> CentralSlabAllocator::CreateInRegion(
+    const RegionAllocatorStorage& storage, const ClassTableConfig& config) {
+    if (storage.region_base == nullptr || storage.allocator_offset > storage.region_size ||
+        storage.data_offset > storage.region_size ||
+        storage.data_offset < storage.allocator_offset ||
+        storage.allocator_size > storage.region_size - storage.allocator_offset ||
+        storage.allocator_size > storage.data_offset - storage.allocator_offset ||
+        storage.data_size > storage.region_size - storage.data_offset ||
+        storage.region_id == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid Region allocator storage");
+    }
+    const uint64_t available_size = storage.region_size - storage.allocator_offset;
+    const uint64_t slot_area_offset = storage.data_offset - storage.allocator_offset;
+    return CreateWithStorage(
+        static_cast<std::byte*>(storage.region_base) + storage.allocator_offset,
+        available_size, storage.allocator_size, slot_area_offset,
+        storage.data_size, storage.region_id, storage.allocator_offset, config);
+}
+
+Result<CentralSlabAllocator> CentralSlabAllocator::CreateWithStorage(
+    void* shm_base, uint64_t available_size, uint64_t metadata_capacity,
+    uint64_t slot_area_offset, uint64_t slot_capacity, uint32_t region_id,
+    uint64_t handle_offset_bias, const ClassTableConfig& config) {
     if (shm_base == nullptr) {
         return Status::Error(StatusCode::kInvalidArgument, "shm_base is null");
     }
+    if (reinterpret_cast<uintptr_t>(shm_base) % alignof(AllocatorSuperblock) != 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator base is not cache-line aligned");
+    }
     MINO_ASSIGN_OR_RETURN(ClassTable table, ClassTable::Create(config));
-    MINO_ASSIGN_OR_RETURN(Layout layout,
-                          ComputeLayout(table, data_region_size));
+    MINO_ASSIGN_OR_RETURN(Layout layout, ComputeLayout(table, available_size));
+    if (slot_area_offset == 0) {
+        slot_area_offset = layout.metadata_size;
+    }
+    const uint64_t slot_bytes = layout.slot_stride * table.total_slot_count();
+    if (metadata_capacity < layout.metadata_size ||
+        slot_area_offset < layout.metadata_size ||
+        slot_area_offset % alignof(SlabHeader) != 0 ||
+        slot_capacity < slot_bytes || slot_area_offset > available_size ||
+        slot_bytes > available_size - slot_area_offset) {
+        return Status::Error(StatusCode::kResourceExhausted,
+                             "Region allocator metadata or data area is too small");
+    }
 
     auto* super = new (shm_base) AllocatorSuperblock{};
     super->magic = kAllocatorMagic;
     super->version = kAllocatorVersion;
-    super->region_id = 0;  // Region id is assigned by the Region layer; the
-                           // allocator uses it read-only via Attach().
+    super->region_id = region_id;
     super->class_count = table.class_count();
-    super->total_size = data_region_size;
+    super->total_size = available_size;
     super->metadata_size = layout.metadata_size;
     super->slot_stride = layout.slot_stride;
     super->total_slot_count = table.total_slot_count();
     super->reserved = 0;
     super->next_transaction_id.store(1, std::memory_order_relaxed);
-    super->reserved2 = 0;
+    super->slot_area_offset = slot_area_offset;
 
     auto* base = static_cast<std::byte*>(shm_base);
-    auto* descriptors = reinterpret_cast<ClassDescriptor*>(base + sizeof(AllocatorSuperblock));
+    auto* descriptors = reinterpret_cast<ClassDescriptor*>(
+        base + sizeof(AllocatorSuperblock));
     for (uint16_t i = 0; i < table.class_count(); ++i) {
         descriptors[i] = table.GetClass(i);
     }
@@ -135,14 +182,12 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Create(
     for (uint32_t i = 0; i < layout.bitmap_words; ++i) {
         new (&bitmap_words[i]) std::atomic<uint64_t>(0);
     }
-
     auto* generations = reinterpret_cast<std::atomic<uint32_t>*>(
         reinterpret_cast<std::byte*>(bitmap_words) +
         sizeof(std::atomic<uint64_t>) * layout.bitmap_words);
     for (uint32_t i = 0; i < table.total_slot_count(); ++i) {
         new (&generations[i]) std::atomic<uint32_t>(0);
     }
-
     auto* draining = reinterpret_cast<std::atomic<uint32_t>*>(
         reinterpret_cast<std::byte*>(generations) +
         sizeof(std::atomic<uint32_t>) * table.total_slot_count());
@@ -150,25 +195,41 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Create(
         new (&draining[i]) std::atomic<uint32_t>(0);
     }
 
-    // Slot headers are zero-initialized; the bitmap remains all-clear.
-
     MINO_ASSIGN_OR_RETURN(ShardedBitmap bitmap,
                           ShardedBitmap::Create(bitmap_words, layout.bitmap_words));
     MINO_ASSIGN_OR_RETURN(GenerationArray gen_array,
-                          GenerationArray::Create(generations, table.total_slot_count()));
+                          GenerationArray::Create(generations,
+                                                  table.total_slot_count()));
 
     CentralSlabAllocator alloc;
     alloc.shm_base_ = shm_base;
     alloc.class_table_ = std::move(table);
     alloc.bitmap_ = bitmap;
     alloc.generations_ = gen_array;
-    alloc.headers_ = reinterpret_cast<SlabHeader*>(base + layout.metadata_size);
+    alloc.headers_ = reinterpret_cast<SlabHeader*>(base + slot_area_offset);
     alloc.class_draining_ = draining;
-    alloc.data_region_size_ = data_region_size;
-    alloc.region_id_ = super->region_id;
+    alloc.data_region_size_ = available_size;
+    alloc.region_id_ = region_id;
     alloc.slot_stride_ = layout.slot_stride;
+    alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
     return alloc;
+}
+
+Result<bool> CentralSlabAllocator::HasAllocatorMetadata(
+    const void* shm_base, uint64_t available_size) {
+    if (shm_base == nullptr || available_size < sizeof(uint32_t)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator metadata probe is out of bounds");
+    }
+    const uint32_t magic = *static_cast<const uint32_t*>(shm_base);
+    if (magic == 0) {
+        return false;
+    }
+    if (magic != kAllocatorMagic) {
+        return Status::Error(StatusCode::kCorruption, "bad allocator magic");
+    }
+    return true;
 }
 
 Result<CentralSlabAllocator> CentralSlabAllocator::Attach(void* shm_base) {
@@ -179,24 +240,112 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Attach(void* shm_base) {
     if (super->magic != kAllocatorMagic) {
         return Status::Error(StatusCode::kCorruption, "bad allocator magic");
     }
-    if (super->version != kAllocatorVersion) {
-        return Status::Error(StatusCode::kCorruption, "bad allocator version");
+    return AttachWithBias(shm_base, super->total_size,
+                          /*handle_offset_bias=*/0);
+}
+
+Result<CentralSlabAllocator> CentralSlabAllocator::Attach(
+    void* shm_base, uint64_t available_size) {
+    return AttachWithBias(shm_base, available_size,
+                          /*handle_offset_bias=*/0);
+}
+
+Result<CentralSlabAllocator> CentralSlabAllocator::AttachInRegion(
+    const RegionAllocatorStorage& storage) {
+    if (storage.region_base == nullptr || storage.allocator_offset > storage.region_size ||
+        storage.data_offset < storage.allocator_offset ||
+        storage.data_offset > storage.region_size ||
+        storage.allocator_size > storage.data_offset - storage.allocator_offset ||
+        storage.data_size > storage.region_size - storage.data_offset) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid Region allocator storage");
+    }
+    const uint64_t available_size = storage.region_size - storage.allocator_offset;
+    MINO_ASSIGN_OR_RETURN(
+        CentralSlabAllocator allocator,
+        AttachWithBias(
+            static_cast<std::byte*>(storage.region_base) + storage.allocator_offset,
+            available_size, storage.allocator_offset));
+    const auto* super = static_cast<const AllocatorSuperblock*>(allocator.shm_base_);
+    const uint64_t persisted_slot_offset =
+        super->slot_area_offset == 0 ? super->metadata_size
+                                     : super->slot_area_offset;
+    const uint64_t slot_bytes =
+        super->slot_stride * static_cast<uint64_t>(super->total_slot_count);
+    if (persisted_slot_offset != storage.data_offset - storage.allocator_offset ||
+        super->metadata_size > storage.allocator_size ||
+        slot_bytes > storage.data_size ||
+        super->total_size != available_size ||
+        allocator.region_id_ != storage.region_id) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocator metadata does not match Region layout");
+    }
+    return allocator;
+}
+
+Result<CentralSlabAllocator> CentralSlabAllocator::AttachWithBias(
+    void* shm_base, uint64_t available_size, uint64_t handle_offset_bias) {
+    if (shm_base == nullptr || available_size < sizeof(AllocatorSuperblock)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator metadata is too small");
+    }
+    if (reinterpret_cast<uintptr_t>(shm_base) % alignof(AllocatorSuperblock) != 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator base is not cache-line aligned");
+    }
+    auto* super = static_cast<AllocatorSuperblock*>(shm_base);
+    if (super->magic != kAllocatorMagic) {
+        return Status::Error(StatusCode::kCorruption, "bad allocator magic");
+    }
+    if (super->version != kAllocatorVersion || super->class_count == 0 ||
+        super->class_count > kMaxClassCount || super->total_size > available_size ||
+        super->total_size < sizeof(AllocatorSuperblock)) {
+        return Status::Error(StatusCode::kCorruption,
+                             "invalid allocator superblock");
+    }
+    const uint64_t descriptor_bytes =
+        sizeof(ClassDescriptor) * static_cast<uint64_t>(super->class_count);
+    if (descriptor_bytes > available_size - sizeof(AllocatorSuperblock)) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocator class table is out of bounds");
     }
 
     auto* base = static_cast<std::byte*>(shm_base);
-    auto* descriptors = reinterpret_cast<ClassDescriptor*>(base + sizeof(AllocatorSuperblock));
-
+    auto* descriptors = reinterpret_cast<ClassDescriptor*>(
+        base + sizeof(AllocatorSuperblock));
     ClassTableConfig config;
     config.classes.reserve(super->class_count);
     for (uint32_t i = 0; i < super->class_count; ++i) {
-        config.classes.push_back(
-            {.slot_size = descriptors[i].slot_size,
-             .slot_count = descriptors[i].slot_count});
+        config.classes.push_back({.slot_size = descriptors[i].slot_size,
+                                  .slot_count = descriptors[i].slot_count});
     }
     MINO_ASSIGN_OR_RETURN(ClassTable table, ClassTable::Create(config));
-
-    MINO_ASSIGN_OR_RETURN(Layout layout,
-                          ComputeLayout(table, super->total_size));
+    for (uint16_t i = 0; i < table.class_count(); ++i) {
+        const ClassDescriptor& expected = table.GetClass(i);
+        if (descriptors[i].class_id != expected.class_id ||
+            descriptors[i].slot_size != expected.slot_size ||
+            descriptors[i].slot_count != expected.slot_count ||
+            descriptors[i].bitmap_shard_offset !=
+                expected.bitmap_shard_offset) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "allocator class descriptor is inconsistent");
+        }
+    }
+    MINO_ASSIGN_OR_RETURN(Layout layout, ComputeLayout(table, super->total_size));
+    const uint64_t slot_area_offset =
+        super->slot_area_offset == 0 ? super->metadata_size
+                                     : super->slot_area_offset;
+    const uint64_t slot_bytes = layout.slot_stride * table.total_slot_count();
+    if (super->metadata_size != layout.metadata_size ||
+        super->slot_stride != layout.slot_stride ||
+        super->total_slot_count != table.total_slot_count() ||
+        slot_area_offset < layout.metadata_size ||
+        slot_area_offset % alignof(SlabHeader) != 0 ||
+        slot_area_offset > super->total_size ||
+        slot_bytes > super->total_size - slot_area_offset) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocator layout metadata is inconsistent");
+    }
 
     auto* bitmap_words = reinterpret_cast<std::atomic<uint64_t>*>(
         base + AlignUp(sizeof(AllocatorSuperblock) +
@@ -212,18 +361,20 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Attach(void* shm_base) {
     MINO_ASSIGN_OR_RETURN(ShardedBitmap bitmap,
                           ShardedBitmap::Create(bitmap_words, layout.bitmap_words));
     MINO_ASSIGN_OR_RETURN(GenerationArray gen_array,
-                          GenerationArray::Create(generations, table.total_slot_count()));
+                          GenerationArray::Create(generations,
+                                                  table.total_slot_count()));
 
     CentralSlabAllocator alloc;
     alloc.shm_base_ = shm_base;
     alloc.class_table_ = std::move(table);
     alloc.bitmap_ = bitmap;
     alloc.generations_ = gen_array;
-    alloc.headers_ = reinterpret_cast<SlabHeader*>(base + layout.metadata_size);
+    alloc.headers_ = reinterpret_cast<SlabHeader*>(base + slot_area_offset);
     alloc.class_draining_ = draining;
     alloc.data_region_size_ = super->total_size;
     alloc.region_id_ = super->region_id;
     alloc.slot_stride_ = layout.slot_stride;
+    alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
     return alloc;
 }
@@ -324,7 +475,7 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
     // Step 9: return the Handle. offset is relative to shm_base so the
     // Handle stays valid across different mappings of the same Region.
     ShmHandle handle;
-    handle.offset = static_cast<uint64_t>(
+    handle.offset = handle_offset_bias_ + static_cast<uint64_t>(
         reinterpret_cast<std::byte*>(&header) -
         static_cast<std::byte*>(shm_base_));
     handle.generation = generation;
@@ -520,7 +671,7 @@ Status CentralSlabAllocator::ReclaimTransactionAppendGap(
             !VerifyImmutableHeader(header)) {
             continue;
         }
-        ShmHandle handle{.offset = static_cast<uint64_t>(
+        ShmHandle handle{.offset = handle_offset_bias_ + static_cast<uint64_t>(
                              reinterpret_cast<std::byte*>(&header) -
                              static_cast<std::byte*>(shm_base_)),
                          .generation = generation,
@@ -722,6 +873,93 @@ bool CentralSlabAllocator::ReadSlotByIndex(uint32_t slot_index, SlabHeader* head
     return true;
 }
 
+bool CentralSlabAllocator::IsSlotOccupiedForRecovery(
+    uint32_t slot_index) const noexcept {
+    return slot_index < total_slot_count() && bitmap_.IsSet(slot_index);
+}
+
+uint32_t CentralSlabAllocator::AuthoritativeGenerationForRecovery(
+    uint32_t slot_index) const noexcept {
+    return slot_index < total_slot_count() ? generations_.Get(slot_index) : 0;
+}
+
+uint16_t CentralSlabAllocator::ClassIdForRecovery(
+    uint32_t slot_index) const noexcept {
+    for (uint16_t class_id = 0; class_id < class_table_.class_count(); ++class_id) {
+        const ClassDescriptor& cls = class_table_.GetClass(class_id);
+        if (slot_index >= cls.bitmap_shard_offset &&
+            slot_index - cls.bitmap_shard_offset < cls.slot_count) {
+            return class_id;
+        }
+    }
+    return class_table_.class_count();
+}
+
+Status CentralSlabAllocator::ClearSlotForRecovery(uint32_t slot_index,
+                                                  uint32_t expected_state) {
+    if (slot_index >= total_slot_count()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "recovery slot index out of range");
+    }
+    SlabHeader& header = HeaderAt(slot_index);
+    uint32_t observed = header.object_state.load(std::memory_order_acquire);
+    if (!bitmap_.IsSet(slot_index)) {
+        return observed == static_cast<uint32_t>(ObjectState::kFree)
+                   ? Status::Ok()
+                   : Status::Error(StatusCode::kWouldBlock,
+                                   "recovery slot is no longer occupied");
+    }
+    if (observed != expected_state) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "recovery slot state changed");
+    }
+    if (observed != static_cast<uint32_t>(ObjectState::kReclaiming) &&
+        !header.object_state.compare_exchange_strong(
+            observed, static_cast<uint32_t>(ObjectState::kReclaiming),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "recovery slot state raced");
+    }
+    uint32_t reclaiming = static_cast<uint32_t>(ObjectState::kReclaiming);
+    if (!header.object_state.compare_exchange_strong(
+            reclaiming, static_cast<uint32_t>(ObjectState::kFree),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (reclaiming == static_cast<uint32_t>(ObjectState::kFree) &&
+            !bitmap_.IsSet(slot_index)) {
+            return Status::Ok();
+        }
+        return Status::Error(StatusCode::kWouldBlock,
+                             "recovery slot was completed or reused");
+    }
+    Status cleared = bitmap_.ClearBit(slot_index);
+    if (cleared.code() == StatusCode::kNotFound) {
+        return Status::Ok();
+    }
+    return cleared;
+}
+
+Status CentralSlabAllocator::ClearStaleStateForRecovery(
+    uint32_t slot_index, uint32_t expected_state) {
+    if (slot_index >= total_slot_count()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "recovery slot index out of range");
+    }
+    if (bitmap_.IsSet(slot_index)) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "slot became occupied during recovery");
+    }
+    SlabHeader& header = HeaderAt(slot_index);
+    uint32_t observed = expected_state;
+    if (header.object_state.compare_exchange_strong(
+            observed, static_cast<uint32_t>(ObjectState::kFree),
+            std::memory_order_acq_rel, std::memory_order_acquire) ||
+        observed == static_cast<uint32_t>(ObjectState::kFree)) {
+        return Status::Ok();
+    }
+    return Status::Error(StatusCode::kWouldBlock,
+                         "stale slot state changed during recovery");
+}
+
 SlabHeader& CentralSlabAllocator::HeaderAt(uint32_t slot_index) {
     auto* base = reinterpret_cast<std::byte*>(headers_);
     return *reinterpret_cast<SlabHeader*>(base + slot_index * slot_stride_);
@@ -739,21 +977,31 @@ Result<uint32_t> CentralSlabAllocator::ResolveLocked(ShmHandle handle) const {
     if (handle.region_id != region_id_) {
         return Status::Error(StatusCode::kInvalidArgument, "foreign region handle");
     }
-    if (handle.offset < sizeof(AllocatorSuperblock) ||
-        handle.offset >= data_region_size_) {
-        return Status::Error(StatusCode::kInvalidArgument, "handle offset out of range");
+    if (handle.offset < handle_offset_bias_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "handle offset below allocator base");
     }
 
-    // Map offset -> slot index. Offsets always point at a SlabHeader.
-    const uint64_t rel = handle.offset;
+    // Map Region-relative offset -> allocator-local slot index. Offsets always
+    // point at a SlabHeader.
+    const uint64_t rel = handle.offset - handle_offset_bias_;
+    if (rel < sizeof(AllocatorSuperblock) || rel >= data_region_size_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "handle offset out of range");
+    }
     const uint64_t metadata_size =
         reinterpret_cast<const std::byte*>(headers_) -
         static_cast<const std::byte*>(shm_base_);
     if (rel < metadata_size || (rel - metadata_size) % slot_stride_ != 0) {
         return Status::Error(StatusCode::kInvalidArgument, "handle offset not slot-aligned");
     }
-    const uint32_t slot_index =
-        static_cast<uint32_t>((rel - metadata_size) / slot_stride_);
+    const uint64_t slot_index64 =
+        (rel - metadata_size) / slot_stride_;
+    if (slot_index64 >= total_slot_count() ||
+        slot_index64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(StatusCode::kInvalidArgument, "slot index out of range");
+    }
+    const uint32_t slot_index = static_cast<uint32_t>(slot_index64);
     if (slot_index >= total_slot_count()) {
         return Status::Error(StatusCode::kInvalidArgument, "slot index out of range");
     }

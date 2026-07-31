@@ -145,6 +145,111 @@ std::string DigestInitializer(const CanonicalDigest& digest) {
     return result;
 }
 
+std::string ByteDigestInitializer(const CanonicalDigest& digest) {
+    std::string result;
+    for (size_t i = 0; i < digest.size(); ++i) {
+        if (i != 0) result.append(", ");
+        result.append("std::byte{0x");
+        const uint8_t value = static_cast<uint8_t>(digest[i]);
+        static constexpr char kHex[] = "0123456789abcdef";
+        result.push_back(kHex[value >> 4]);
+        result.push_back(kHex[value & 0xf]);
+        result.append("}");
+    }
+    return result;
+}
+
+std::string CppStringLiteral(std::string_view value) {
+    std::string result = "\"";
+    for (const unsigned char ch : value) {
+        switch (ch) {
+            case '\\': result.append("\\\\"); break;
+            case '\"': result.append("\\\""); break;
+            case '\n': result.append("\\n"); break;
+            case '\r': result.append("\\r"); break;
+            case '\t': result.append("\\t"); break;
+            default:
+                if (ch >= 0x20 && ch <= 0x7e) {
+                    result.push_back(static_cast<char>(ch));
+                } else {
+                    result.push_back('\\');
+                    result.push_back(static_cast<char>('0' + ((ch >> 6) & 7)));
+                    result.push_back(static_cast<char>('0' + ((ch >> 3) & 7)));
+                    result.push_back(static_cast<char>('0' + (ch & 7)));
+                }
+        }
+    }
+    result.push_back('\"');
+    return result;
+}
+
+std::string ScalarExpression(ScalarType scalar) {
+    switch (scalar) {
+        case ScalarType::kInt32: return "::mino::schema::ScalarType::kInt32";
+        case ScalarType::kInt64: return "::mino::schema::ScalarType::kInt64";
+        case ScalarType::kUint32: return "::mino::schema::ScalarType::kUint32";
+        case ScalarType::kUint64: return "::mino::schema::ScalarType::kUint64";
+        case ScalarType::kFixed32: return "::mino::schema::ScalarType::kFixed32";
+        case ScalarType::kFixed64: return "::mino::schema::ScalarType::kFixed64";
+        case ScalarType::kFloat: return "::mino::schema::ScalarType::kFloat";
+        case ScalarType::kDouble: return "::mino::schema::ScalarType::kDouble";
+        case ScalarType::kBool: return "::mino::schema::ScalarType::kBool";
+        case ScalarType::kString: return "::mino::schema::ScalarType::kString";
+        case ScalarType::kBytes: return "::mino::schema::ScalarType::kBytes";
+    }
+    return {};
+}
+
+std::string TypeExpression(const TypeDescriptor& type) {
+    if (type.kind() == TypeDescriptor::Kind::kScalar) {
+        return "::mino::schema::TypeDescriptor::Scalar(" +
+               ScalarExpression(*type.scalar()) + ", " +
+               CppStringLiteral(type.name()) + ")";
+    }
+    if (type.kind() == TypeDescriptor::Kind::kVector) {
+        return "::mino::schema::TypeDescriptor::Vector(" +
+               TypeExpression(*type.element_type()) + ")";
+    }
+    return "::mino::schema::TypeDescriptor::UserDefined(" +
+           CppStringLiteral(type.name()) + ")";
+}
+
+std::string CardinalityExpression(FieldCardinality cardinality) {
+    switch (cardinality) {
+        case FieldCardinality::kUnspecified:
+            return "::mino::schema::FieldCardinality::kUnspecified";
+        case FieldCardinality::kOptional:
+            return "::mino::schema::FieldCardinality::kOptional";
+        case FieldCardinality::kRequired:
+            return "::mino::schema::FieldCardinality::kRequired";
+    }
+    return {};
+}
+
+std::string DefaultKindExpression(DefaultValue::Kind kind) {
+    switch (kind) {
+        case DefaultValue::Kind::kInteger:
+            return "::mino::schema::DefaultValue::Kind::kInteger";
+        case DefaultValue::Kind::kFloat32:
+            return "::mino::schema::DefaultValue::Kind::kFloat32";
+        case DefaultValue::Kind::kFloat64:
+            return "::mino::schema::DefaultValue::Kind::kFloat64";
+        case DefaultValue::Kind::kBoolean:
+            return "::mino::schema::DefaultValue::Kind::kBoolean";
+        case DefaultValue::Kind::kString:
+            return "::mino::schema::DefaultValue::Kind::kString";
+        case DefaultValue::Kind::kBytes:
+            return "::mino::schema::DefaultValue::Kind::kBytes";
+    }
+    return {};
+}
+
+std::string OptionalU64(std::optional<uint64_t> value) {
+    return value.has_value() ? "std::optional<std::uint64_t>{" +
+                                  std::to_string(*value) + "u}"
+                             : "std::nullopt";
+}
+
 std::string CppScalar(ScalarType scalar) {
     switch (scalar) {
         case ScalarType::kInt32:
@@ -441,10 +546,10 @@ Result<std::map<std::string, std::string, std::less<>>> BuildTypeNames(
         const std::string cpp_namespace = NamespaceName(parts);
         std::string candidate = CppIdentifier(parts.back());
         for (size_t attempt = 0; attempt < 2; ++attempt) {
-            const std::array<std::string, 5> generated = {
+            const std::array<std::string, 6> generated = {
                 candidate, candidate + "VariableMetadata",
                 candidate + "ObjectHeader", candidate + "Accessor",
-                candidate + "Builder"};
+                candidate + "Builder", candidate + "WireAdapter"};
             bool collision = false;
             for (const std::string& symbol : generated) {
                 collision = collision || symbols[cpp_namespace].contains(symbol);
@@ -468,12 +573,143 @@ Result<std::map<std::string, std::string, std::less<>>> BuildTypeNames(
     return result;
 }
 
+std::string WireFactoryName(const SchemaDescriptor& descriptor) {
+    return "BuildWireDescriptors_" +
+           DigestHex(descriptor.identity().canonical_digest()).substr(0, 16);
+}
+
+void EmitDescriptorConstruction(const SchemaDescriptor& descriptor,
+                                std::string& source) {
+    Line(source, "        result.push_back(std::make_shared<const ::mino::schema::SchemaDescriptor>(");
+    Line(source, "            ::mino::schema::AggregateDescriptor(");
+    Line(source, "                " + std::string(descriptor.aggregate().kind() == AggregateKind::kMessage
+                                              ? "::mino::schema::AggregateKind::kMessage"
+                                              : "::mino::schema::AggregateKind::kStruct") + ",");
+    Line(source, "                " + CppStringLiteral(descriptor.aggregate().full_name()) + ",");
+    Line(source, "                std::vector<::mino::schema::FieldDescriptor>{");
+    for (const FieldDescriptor& field : descriptor.aggregate().fields()) {
+        const std::string maximum_bytes = OptionalU64(field.constraints().max_bytes());
+        const std::string maximum_capacity =
+            OptionalU64(field.constraints().max_capacity());
+        std::string default_value = "std::nullopt";
+        if (field.default_value().has_value()) {
+            default_value = "std::optional<::mino::schema::DefaultValue>{" +
+                            "::mino::schema::DefaultValue(" +
+                            DefaultKindExpression(field.default_value()->kind()) +
+                            ", " + CppStringLiteral(
+                                field.default_value()->canonical_value()) + ")}";
+        }
+        Line(source, "                    ::mino::schema::FieldDescriptor(");
+        Line(source, "                        " + std::to_string(field.id()) + "u, " +
+                         CppStringLiteral(field.name()) + ", " +
+                         CardinalityExpression(field.cardinality()) + ",");
+        Line(source, "                        " + TypeExpression(field.type()) + ",");
+        Line(source, "                        ::mino::schema::ConstraintSet(" +
+                         maximum_bytes + ", " + maximum_capacity + ", " +
+                         (field.constraints().snapshot_key() ? "true" : "false") +
+                         "), " + default_value + "),");
+    }
+    Line(source, "                },");
+    Line(source, "                std::vector<::mino::schema::ReservedRangeDescriptor>{");
+    for (const ReservedRangeDescriptor& range :
+         descriptor.aggregate().reserved_ranges()) {
+        Line(source, "                    ::mino::schema::ReservedRangeDescriptor(" +
+                         std::to_string(range.first()) + "u, " +
+                         std::to_string(range.last()) + "u),");
+    }
+    Line(source, "                }),");
+    Line(source, "            ::mino::schema::SchemaIdentity(");
+    Line(source, "                0x" + Hex64(descriptor.identity().short_id()) +
+                     "ULL, ::mino::schema::CanonicalDigest{");
+    Line(source, "                    " +
+                     ByteDigestInitializer(descriptor.identity().canonical_digest()));
+    Line(source, "                }, " +
+                     std::to_string(descriptor.identity().schema_version()) + "u, " +
+                     std::to_string(descriptor.identity().layout_version()) + "u),");
+    Line(source, "            " + CppStringLiteral(descriptor.canonical_schema()) + ",");
+    Line(source, "            std::vector<::mino::schema::DependencyDescriptor>{");
+    for (const DependencyDescriptor& dependency : descriptor.dependencies()) {
+        Line(source, "                ::mino::schema::DependencyDescriptor(");
+        Line(source, "                    " + CppStringLiteral(dependency.full_name()) +
+                         ", ::mino::schema::CanonicalDigest{");
+        Line(source, "                        " +
+                         ByteDigestInitializer(dependency.digest()));
+        Line(source, "                    }),");
+    }
+    Line(source, "            }));");
+}
+
+Status EmitWireDescriptorFactory(
+    const SchemaDescriptor& root,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> available,
+    std::string& source) {
+    auto exact = ExactClosure(root, available);
+    if (!exact.ok()) return exact.status();
+    std::vector<const SchemaDescriptor*> ordered;
+    ordered.push_back(&root);
+    for (const auto& descriptor : *exact) {
+        if (descriptor->aggregate().full_name() != root.aggregate().full_name()) {
+            ordered.push_back(descriptor.get());
+        }
+    }
+
+    Line(source, "namespace {");
+    Line(source, "::mino::Result<std::vector<std::shared_ptr<const ::mino::schema::SchemaDescriptor>>> " +
+                     WireFactoryName(root) + "() noexcept {");
+    Line(source, "    try {");
+    Line(source, "        std::vector<std::shared_ptr<const ::mino::schema::SchemaDescriptor>> result;");
+    Line(source, "        result.reserve(" + std::to_string(ordered.size()) + "u);");
+    for (const SchemaDescriptor* descriptor : ordered) {
+        EmitDescriptorConstruction(*descriptor, source);
+    }
+    Line(source, "        return result;");
+    Line(source, "    } catch (const std::bad_alloc&) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kResourceExhausted);");
+    Line(source, "    } catch (...) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kInternal);");
+    Line(source, "    }");
+    Line(source, "}");
+    Line(source, "}  // namespace");
+    Line(source);
+    return Status::Ok();
+}
+
+std::string DynamicScalarExpression(ScalarType scalar,
+                                    std::string_view accessor) {
+    switch (scalar) {
+        case ScalarType::kInt32:
+        case ScalarType::kInt64:
+            return "::mino::schema::DynamicValue::Signed(" +
+                   std::string(accessor) + ")";
+        case ScalarType::kUint32:
+        case ScalarType::kUint64:
+        case ScalarType::kFixed32:
+        case ScalarType::kFixed64:
+            return "::mino::schema::DynamicValue::Unsigned(" +
+                   std::string(accessor) + ")";
+        case ScalarType::kFloat:
+            return "::mino::schema::DynamicValue::Float32Bits(std::bit_cast<std::uint32_t>(" +
+                   std::string(accessor) + "))";
+        case ScalarType::kDouble:
+            return "::mino::schema::DynamicValue::Float64Bits(std::bit_cast<std::uint64_t>(" +
+                   std::string(accessor) + "))";
+        case ScalarType::kBool:
+            return "::mino::schema::DynamicValue::Boolean(" +
+                   std::string(accessor) + ")";
+        case ScalarType::kString:
+        case ScalarType::kBytes:
+            return {};
+    }
+    return {};
+}
+
 Status EmitType(
     const SchemaDescriptor& descriptor, const LayoutPlan& layout,
     const std::map<std::string, const LayoutPlan*, std::less<>>& plans,
     const std::map<std::string, const SchemaDescriptor*, std::less<>>& descriptors,
     const std::map<std::string, std::string, std::less<>>& type_names,
-    std::string& header, std::string& source) {
+    std::span<const std::shared_ptr<const SchemaDescriptor>> available,
+    bool emit_wire_adapter, std::string& header, std::string& source) {
     const auto parts = SplitName(descriptor.aggregate().full_name());
     const std::string cpp_namespace = NamespaceName(parts);
     const std::string& type_name =
@@ -485,6 +721,15 @@ Status EmitType(
     const std::string header_name = type_name + "ObjectHeader";
     const std::string accessor_name = type_name + "Accessor";
     const std::string builder_name = type_name + "Builder";
+    const std::string wire_adapter_name = type_name + "WireAdapter";
+    const std::string qualified_wire_adapter =
+        cpp_namespace.empty() ? "::" + wire_adapter_name
+                              : "::" + cpp_namespace + "::" + wire_adapter_name;
+    if (emit_wire_adapter) {
+        const Status factory_status =
+            EmitWireDescriptorFactory(descriptor, available, source);
+        if (!factory_status.ok()) return factory_status;
+    }
     auto field_names_result = FieldNames(descriptor.aggregate(), layout.fields());
     if (!field_names_result.ok()) return field_names_result.status();
     const auto& field_names = *field_names_result;
@@ -530,7 +775,7 @@ Status EmitType(
     Line(header, "    static constexpr std::array<std::uint8_t, 32> kSchemaDigest = {");
     Line(header, "        " + DigestInitializer(descriptor.identity().canonical_digest()));
     Line(header, "    };");
-    Line(header, "    std::array<std::byte, kObjectSize> storage{};");
+    Line(header, "    std::array<std::byte, kObjectSize> storage;");
     Line(header, "};");
     Line(header);
 
@@ -599,6 +844,13 @@ Status EmitType(
         Line(header);
     }
 
+    if (emit_wire_adapter && layout.unknown_fields_offset().has_value()) {
+        Line(header, "    " + metadata_name + " unknown_fields() const noexcept {");
+        Line(header, "        return ReadVariable(" +
+                         std::to_string(*layout.unknown_fields_offset()) + "u);");
+        Line(header, "    }");
+        Line(header);
+    }
     Line(header, "    bool valid() const noexcept {");
     Line(header, "        if (data_ == nullptr || size_ < " + type_name +
                      "::kObjectSize || layout_version() != " + type_name +
@@ -663,9 +915,11 @@ Status EmitType(
         }
     }
     if (layout.unknown_fields_offset().has_value()) {
-        Line(header, "        if (!ValidateUnknown(ReadVariable(" +
-                         std::to_string(*layout.unknown_fields_offset()) +
-                         "u))) return false;");
+        Line(header, emit_wire_adapter
+                         ? "        if (!ValidateUnknown(unknown_fields())) return false;"
+                         : "        if (!ValidateUnknown(ReadVariable(" +
+                               std::to_string(*layout.unknown_fields_offset()) +
+                               "u))) return false;");
     }
     Line(header, "        return true;");
     Line(header, "    }");
@@ -862,6 +1116,24 @@ Status EmitType(
     Line(header, "    std::byte* data_;");
     Line(header, "};");
     Line(header);
+
+    if (emit_wire_adapter) {
+        Line(header, "// Canonical Wire adapter for fixed scalars and empty variable values.");
+        Line(header, "// Non-empty variables, nested values, and unknown fields require SHM");
+        Line(header, "// resolution/allocation and are rejected explicitly with kUnsupported.");
+        Line(header, "class " + wire_adapter_name + " final {");
+        Line(header, "public:");
+        Line(header, "    static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(");
+        Line(header, "        const " + type_name + "& value) noexcept;");
+        Line(header, "    static ::mino::Result<std::vector<std::byte>> Encode(");
+        Line(header, "        const " + type_name + "& value,");
+        Line(header, "        const ::mino::schema::WireLimits& limits = {}) noexcept;");
+        Line(header, "    static ::mino::Result<" + type_name + "> Decode(");
+        Line(header, "        std::span<const std::byte> bytes,");
+        Line(header, "        const ::mino::schema::WireLimits& limits = {}) noexcept;");
+        Line(header, "};");
+        Line(header);
+    }
     if (!cpp_namespace.empty()) Line(header, "}  // namespace " + cpp_namespace);
     Line(header);
 
@@ -877,7 +1149,11 @@ Status EmitType(
                      qualified_name + "::kSchemaShortId;");
     Line(header, "    static constexpr std::uint32_t layout_version = " +
                      qualified_name + "::kLayoutVersion;");
-    Line(header, "    static constexpr std::uint32_t index_flags = 0;");
+    Line(header, "    static constexpr std::uint32_t index_flags = " +
+                     std::string(layout.max_dynamic_children() == 0
+                                     ? "0"
+                                     : "::mino::kIndexSlotFlagHasChildSlabs") +
+                     ";");
     Line(header, "    static Status Validate(const " + qualified_name +
                      "& value) noexcept {");
     Line(header, "        return " + qualified_name +
@@ -894,10 +1170,241 @@ Status EmitType(
                      qualified_name + "::kObjectAlignment);");
     Line(source, "static_assert(std::is_standard_layout_v<" + qualified_name + ">);");
     Line(source, "static_assert(std::is_trivially_copyable_v<" + qualified_name + ">);");
+    Line(source, "static_assert(std::is_trivially_default_constructible_v<" +
+                     qualified_name + ">);");
     const std::string qualified_header =
         cpp_namespace.empty() ? "::" + header_name
                               : "::" + cpp_namespace + "::" + header_name;
     Line(source, "static_assert(std::is_standard_layout_v<" + qualified_header + ">);");
+    Line(source);
+    if (!emit_wire_adapter) return Status::Ok();
+
+    Line(source, "::mino::Result<::mino::schema::DynamicMessage> " +
+                     qualified_wire_adapter + "::ToDynamicMessage(");
+    Line(source, "    const " + qualified_name + "& value) noexcept {");
+    Line(source, "    try {");
+    Line(source, "        const " + qualified_name + "Accessor accessor(value);");
+    Line(source, "        if (!accessor.valid()) {");
+    Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch,");
+    Line(source, "                                         \"invalid generated SHM object\");");
+    Line(source, "        }");
+    if (layout.unknown_fields_offset().has_value()) {
+        Line(source, "        if (accessor.unknown_fields().length != 0u) {");
+        Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+        Line(source, "                                         \"static wire adapter cannot resolve unknown-field SHM storage\");");
+        Line(source, "        }");
+    }
+    Line(source, "        ::mino::schema::DynamicMessage message;");
+    for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+        const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+        const FieldLayout& field_layout = layout.fields()[i];
+        const std::string& name = field_names.at(field.id());
+        const bool optional = field_layout.presence_bit().has_value();
+        if (optional) Line(source, "        if (accessor.has_" + name + "()) {");
+        const std::string indent = optional ? "            " : "        ";
+        if (field_layout.storage_kind() == FieldStorageKind::kScalar) {
+            Line(source, indent + "const ::mino::Status field_status_" +
+                             std::to_string(field.id()) + " = message.SetField(" +
+                             std::to_string(field.id()) + "u, " +
+                             DynamicScalarExpression(*field.type().scalar(),
+                                                     "accessor." + name + "()") +
+                             ");");
+            Line(source, indent + "if (!field_status_" +
+                             std::to_string(field.id()) + ".ok()) return field_status_" +
+                             std::to_string(field.id()) + ";");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kVariable &&
+                   field.type().kind() == TypeDescriptor::Kind::kScalar &&
+                   (field.type().scalar() == ScalarType::kString ||
+                    field.type().scalar() == ScalarType::kBytes)) {
+            Line(source, indent + "if (accessor." + name + "().length != 0u) {");
+            Line(source, indent + "    return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, indent + "                                 \"static wire adapter cannot resolve non-empty variable SHM storage\");");
+            Line(source, indent + "}");
+            Line(source, indent + "auto dynamic_" + std::to_string(field.id()) +
+                             " = ::mino::schema::DynamicValue::" +
+                             (field.type().scalar() == ScalarType::kString
+                                  ? "String(\"\")"
+                                  : "Bytes(std::span<const std::byte>{})") + ";");
+            Line(source, indent + "if (!dynamic_" + std::to_string(field.id()) +
+                             ".ok()) return dynamic_" + std::to_string(field.id()) +
+                             ".status();");
+            Line(source, indent + "const ::mino::Status field_status_" +
+                             std::to_string(field.id()) + " = message.SetField(" +
+                             std::to_string(field.id()) + "u, std::move(*dynamic_" +
+                             std::to_string(field.id()) + "));");
+            Line(source, indent + "if (!field_status_" +
+                             std::to_string(field.id()) + ".ok()) return field_status_" +
+                             std::to_string(field.id()) + ";");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kVariable &&
+                   field.type().kind() == TypeDescriptor::Kind::kVector) {
+            Line(source, indent + "if (accessor." + name + "().length != 0u) {");
+            Line(source, indent + "    return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, indent + "                                 \"static wire adapter cannot resolve non-empty vector SHM storage\");");
+            Line(source, indent + "}");
+            Line(source, indent + "auto vector_" + std::to_string(field.id()) +
+                             " = std::make_shared<::mino::schema::DynamicVector>();");
+            Line(source, indent + "auto dynamic_" + std::to_string(field.id()) +
+                             " = ::mino::schema::DynamicValue::Vector(std::move(vector_" +
+                             std::to_string(field.id()) + "));");
+            Line(source, indent + "if (!dynamic_" + std::to_string(field.id()) +
+                             ".ok()) return dynamic_" + std::to_string(field.id()) +
+                             ".status();");
+            Line(source, indent + "const ::mino::Status field_status_" +
+                             std::to_string(field.id()) + " = message.SetField(" +
+                             std::to_string(field.id()) + "u, std::move(*dynamic_" +
+                             std::to_string(field.id()) + "));");
+            Line(source, indent + "if (!field_status_" +
+                             std::to_string(field.id()) + ".ok()) return field_status_" +
+                             std::to_string(field.id()) + ";");
+        } else {
+            Line(source, indent + "return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, indent + "                             \"static wire adapter requires nested SHM resolution\");");
+        }
+        if (optional) Line(source, "        }");
+    }
+    Line(source, "        return message;");
+    Line(source, "    } catch (const std::bad_alloc&) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kResourceExhausted);");
+    Line(source, "    } catch (...) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kInternal);");
+    Line(source, "    }");
+    Line(source, "}");
+    Line(source);
+
+    Line(source, "::mino::Result<std::vector<std::byte>> " +
+                     qualified_wire_adapter + "::Encode(");
+    Line(source, "    const " + qualified_name + "& value,");
+    Line(source, "    const ::mino::schema::WireLimits& limits) noexcept {");
+    Line(source, "    auto message = ToDynamicMessage(value);");
+    Line(source, "    if (!message.ok()) return message.status();");
+    Line(source, "    auto descriptors = " + WireFactoryName(descriptor) + "();");
+    Line(source, "    if (!descriptors.ok()) return descriptors.status();");
+    Line(source, "    return ::mino::schema::CanonicalWireCodec::Encode(");
+    Line(source, "        **descriptors->begin(), *message, *descriptors, limits);");
+    Line(source, "}");
+    Line(source);
+
+    Line(source, "::mino::Result<" + qualified_name + "> " +
+                     qualified_wire_adapter + "::Decode(");
+    Line(source, "    std::span<const std::byte> bytes,");
+    Line(source, "    const ::mino::schema::WireLimits& limits) noexcept {");
+    Line(source, "    auto descriptors = " + WireFactoryName(descriptor) + "();");
+    Line(source, "    if (!descriptors.ok()) return descriptors.status();");
+    Line(source, "    auto message = ::mino::schema::CanonicalWireCodec::Decode(");
+    Line(source, "        **descriptors->begin(), bytes, *descriptors, limits);");
+    Line(source, "    if (!message.ok()) return message.status();");
+    Line(source, "    if (!message->unknown_fields().fields().empty()) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+    Line(source, "                                     \"static wire decode cannot allocate unknown-field SHM storage\");");
+    Line(source, "    }");
+    Line(source, "    " + qualified_name + " result;");
+    Line(source, "    " + qualified_name + "Builder builder(result);");
+    for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+        const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+        const FieldLayout& field_layout = layout.fields()[i];
+        const std::string& name = field_names.at(field.id());
+        Line(source, "    if (const auto* field_" + std::to_string(field.id()) +
+                         " = message->FindField(" + std::to_string(field.id()) +
+                         "u); field_" + std::to_string(field.id()) + " != nullptr) {");
+        if (field_layout.storage_kind() == FieldStorageKind::kScalar) {
+            std::string member;
+            std::string value_expression;
+            switch (*field.type().scalar()) {
+                case ScalarType::kInt32:
+                case ScalarType::kInt64:
+                    member = "signed_integer";
+                    value_expression = "static_cast<" + CppScalar(*field.type().scalar()) +
+                                       ">(field_" + std::to_string(field.id()) +
+                                       "->signed_integer()->value)";
+                    break;
+                case ScalarType::kUint32:
+                case ScalarType::kUint64:
+                case ScalarType::kFixed32:
+                case ScalarType::kFixed64:
+                    member = "unsigned_integer";
+                    value_expression = "static_cast<" + CppScalar(*field.type().scalar()) +
+                                       ">(field_" + std::to_string(field.id()) +
+                                       "->unsigned_integer()->value)";
+                    break;
+                case ScalarType::kFloat:
+                    member = "float32";
+                    value_expression = "std::bit_cast<float>(field_" +
+                                       std::to_string(field.id()) +
+                                       "->float32()->bits)";
+                    break;
+                case ScalarType::kDouble:
+                    member = "float64";
+                    value_expression = "std::bit_cast<double>(field_" +
+                                       std::to_string(field.id()) +
+                                       "->float64()->bits)";
+                    break;
+                case ScalarType::kBool:
+                    member = "boolean";
+                    value_expression = "field_" + std::to_string(field.id()) +
+                                       "->boolean()->value";
+                    break;
+                case ScalarType::kString:
+                case ScalarType::kBytes:
+                    break;
+            }
+            Line(source, "        if (field_" + std::to_string(field.id()) +
+                             "->" + member + "() == nullptr) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch,");
+            Line(source, "                                         \"decoded dynamic scalar has wrong type\");");
+            Line(source, "        }");
+            Line(source, "        builder.set_" + name + "(" + value_expression + ");");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kVariable &&
+                   field.type().kind() == TypeDescriptor::Kind::kScalar &&
+                   field.type().scalar() == ScalarType::kString) {
+            Line(source, "        if (field_" + std::to_string(field.id()) +
+                             "->string() == nullptr || !field_" +
+                             std::to_string(field.id()) + "->string()->value.empty()) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, "                                         \"static wire decode cannot allocate non-empty string SHM storage\");");
+            Line(source, "        }");
+            Line(source, "        if (!builder.set_" + name + "({.element_size = 1u})) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch);");
+            Line(source, "        }");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kVariable &&
+                   field.type().kind() == TypeDescriptor::Kind::kScalar &&
+                   field.type().scalar() == ScalarType::kBytes) {
+            Line(source, "        if (field_" + std::to_string(field.id()) +
+                             "->bytes() == nullptr || !field_" +
+                             std::to_string(field.id()) + "->bytes()->value.empty()) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, "                                         \"static wire decode cannot allocate non-empty bytes SHM storage\");");
+            Line(source, "        }");
+            Line(source, "        if (!builder.set_" + name + "({.element_size = 1u})) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch);");
+            Line(source, "        }");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kVariable &&
+                   field.type().kind() == TypeDescriptor::Kind::kVector) {
+            const size_t element_size = ElementSize(*field.type().element_type(),
+                                                    plans, descriptors);
+            Line(source, "        if (field_" + std::to_string(field.id()) +
+                             "->vector() == nullptr || field_" +
+                             std::to_string(field.id()) + "->vector()->value == nullptr ||");
+            Line(source, "            !field_" + std::to_string(field.id()) +
+                             "->vector()->value->values().empty()) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, "                                         \"static wire decode cannot allocate non-empty vector SHM storage\");");
+            Line(source, "        }");
+            Line(source, "        if (!builder.set_" + name + "({.element_size = " +
+                             std::to_string(element_size) + "u})) {");
+            Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch);");
+            Line(source, "        }");
+        } else {
+            Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+            Line(source, "                                     \"static wire decode requires nested SHM allocation\");");
+        }
+        Line(source, "    }");
+    }
+    Line(source, "    if (!" + qualified_name + "Accessor(result).valid()) {");
+    Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch,");
+    Line(source, "                                     \"decoded static object is invalid\");");
+    Line(source, "    }");
+    Line(source, "    return result;");
+    Line(source, "}");
     Line(source);
     return Status::Ok();
 }
@@ -931,10 +1438,23 @@ Result<GeneratedArtifacts> CodeGenerator::Generate(
         Line(artifacts.header, "#include <cstddef>");
         Line(artifacts.header, "#include <cstdint>");
         Line(artifacts.header, "#include <cstring>");
+        if (options.emit_wire_adapter) {
+            Line(artifacts.header, "#include <memory>");
+            Line(artifacts.header, "#include <new>");
+            Line(artifacts.header, "#include <optional>");
+        }
         Line(artifacts.header, "#include <span>");
         Line(artifacts.header, "#include <type_traits>");
+        if (options.emit_wire_adapter) {
+            Line(artifacts.header, "#include <utility>");
+            Line(artifacts.header, "#include <vector>");
+        }
         Line(artifacts.header);
         Line(artifacts.header, "#include \"mino/runtime/message_traits.h\"");
+        Line(artifacts.header, "#include \"mino/shm/channel/index_slot.h\"");
+        if (options.emit_wire_adapter) {
+            Line(artifacts.header, "#include \"mino/schema/wire.h\"");
+        }
         Line(artifacts.header);
 
         Line(artifacts.source, "// Generated by minoc. DO NOT EDIT.");
@@ -959,8 +1479,8 @@ Result<GeneratedArtifacts> CodeGenerator::Generate(
         for (size_t i = 0; i < schema.types().size(); ++i) {
             const Status emitted = EmitType(
                 *schema.types()[i], layouts[i], plan_by_name,
-                descriptor_by_name, *type_names, artifacts.header,
-                artifacts.source);
+                descriptor_by_name, *type_names, closure,
+                options.emit_wire_adapter, artifacts.header, artifacts.source);
             if (!emitted.ok()) return emitted;
         }
         while (artifacts.source.size() >= 2 &&

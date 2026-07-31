@@ -51,6 +51,9 @@ TEST_F(RegionTest, CreateAttachAndDetachLifecycle) {
   EXPECT_GT(region_id, 0u);
   EXPECT_EQ(created->superblock()->magic, kSuperBlockMagic);
   EXPECT_EQ(LoadRegionState(*created->superblock()), RegionState::kActive);
+  EXPECT_EQ(RecoveryFencePhaseOf(LoadRecoveryFence(*created->superblock())),
+            RecoveryFencePhase::kActive);
+  EXPECT_EQ(RecoveryFenceEpoch(LoadRecoveryFence(*created->superblock())), 1u);
 
   ASSERT_TRUE(created->Detach().ok());
   EXPECT_TRUE(created->Detach().ok());

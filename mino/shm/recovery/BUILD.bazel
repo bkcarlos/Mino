@@ -7,11 +7,14 @@ cc_library(
     hdrs = ["scanner.h"],
     visibility = [
         "//mino/shm:__pkg__",
+        "//mino/shm/region:__pkg__",
         "//tools/mino:__pkg__",
     ],
     deps = [
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
     ],
 )
 
@@ -21,6 +24,8 @@ cc_test(
     deps = [
         ":scanner",
         "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
         "@googletest//:gtest_main",
     ],
 )

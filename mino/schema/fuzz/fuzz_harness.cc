@@ -14,9 +14,9 @@
 
 #include "mino/common/status.h"
 #include "mino/schema/canonical.h"
+#include "mino/schema/codegen/artifact_codec.h"
 #include "mino/schema/compiler.h"
 #include "mino/schema/descriptor.h"
-#include "mino/schema/fuzz/descriptor_artifact_parser.h"
 #include "mino/schema/registry.h"
 #include "mino/schema/wire.h"
 
@@ -136,22 +136,19 @@ Status FuzzDescriptor(std::span<const std::byte> input) noexcept {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "descriptor fuzz input exceeds max bytes");
         }
-        internal::DescriptorArtifactLimits limits;
-        limits.max_input_bytes = kMaxDescriptorInputBytes;
-        Status status =
-            internal::ValidateCodegenDescriptorArtifact(input, limits);
-        if (!status.ok()) return status;
+        const char* data = input.empty()
+                               ? ""
+                               : reinterpret_cast<const char*>(input.data());
+        auto decoded = codegen::DecodeAndValidate(
+            std::string_view(data, input.size()));
+        if (!decoded.ok()) return decoded.status();
 
-        // There is no versioned registry descriptor-byte codec yet. Confirm that
-        // even a valid codegen artifact remains rejected by that public boundary;
-        // this harness validator must never become an accidental C++ ABI codec.
         SchemaRegistry registry;
         auto registered = registry.RegisterDescriptor(input);
-        if (registered.ok()) {
-            return Unexpected("registry unexpectedly accepted descriptor bytes");
-        }
-        if (registered.status().code() != StatusCode::kUnsupported) {
-            return registered.status();
+        if (!registered.ok()) return registered.status();
+        if (decoded->types.empty() || registry.size() != decoded->types.size()) {
+            return Unexpected(
+                "descriptor codec and registry disagree on artifact contents");
         }
         return Status::Ok();
     } catch (const std::bad_alloc&) {

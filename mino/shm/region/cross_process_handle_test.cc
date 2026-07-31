@@ -68,12 +68,13 @@ class FakeAllocatorMetadataProvider : public AllocatorMetadataProvider {
     ::_exit(kExitRemapFailed);
   }
 
-  // The parent left the Region ACTIVE without a clean shutdown; Attach takes
-  // the dirty path of RecoverRegionForAttach, which acquires the (unset)
-  // recovery lease without waiting and re-publishes the Region ACTIVE.
+  // The parent is still a live ACTIVE service. A writable attach cannot prove
+  // quiescence and is fenced; this resolver-only child uses a read-only attach,
+  // which never runs destructive recovery.
   RegionAttachOptions options;
   options.name = name;
   options.region_id = region_id;
+  options.read_only = true;
   auto attached = SharedMemoryRegion::Attach(options);
   if (!attached.ok()) {
     ::_exit(kExitRemapFailed);

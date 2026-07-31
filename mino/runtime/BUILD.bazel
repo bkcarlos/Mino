@@ -122,17 +122,26 @@ cc_test(
     ],
 )
 
-# Explicit long-running variant, excluded from wildcard CI. Example:
+# Explicit 3600-second variant, excluded from wildcard CI. Bazel timeout
+# classes do not encode arbitrary seconds, so the finite 3660-second outer
+# watchdog is supplied explicitly when invoking this manual target:
 #   bazel test //mino/runtime:d2_recovery_stress_long_test \
-#     --test_timeout=3700 \
-#     --test_env=MINO_D2_RECOVERY_STRESS_SECONDS=3600
+#     --test_timeout=3660 \
+#     --test_output=streamed \
+#     --test_env=MINO_D2_RECOVERY_STRESS_SEED=12345
 cc_test(
     name = "d2_recovery_stress_long_test",
     srcs = ["d2_recovery_stress_test.cc"],
+    args = [
+        "--gtest_filter=D2RecoveryStressTest.RandomizedTimedRecoveryStress:"
+        + "D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+    ],
+    env = {"MINO_D2_RECOVERY_STRESS_SECONDS": "3600"},
     tags = [
         "large",
         "manual",
     ],
+    timeout = "long",
     deps = [
         ":allocation_journal",
         ":publisher",

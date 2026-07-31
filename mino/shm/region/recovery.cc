@@ -15,12 +15,17 @@
 #include "mino/shm/region/recovery.h"
 
 #include <atomic>
+#include <limits>
 #include <thread>
+#include <utility>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <time.h>
 #endif
 
+#include "mino/common/checked_arithmetic.h"
+#include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/recovery/scanner.h"
 #include "mino/shm/region/region.h"
 
 namespace mino {
@@ -40,9 +45,107 @@ uint64_t MonotonicNowNs() {
 #endif
 }
 
-uint64_t MsToNs(uint64_t ms) { return ms * 1000000ull; }
+Status DeadlineFromMilliseconds(uint64_t now_ns, uint64_t milliseconds,
+                                bool require_nonzero, uint64_t* deadline_ns) {
+    if (require_nonzero && milliseconds == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "lease duration must be non-zero");
+    }
+    uint64_t duration_ns = 0;
+    if (!CheckedMulU64(milliseconds, 1'000'000, &duration_ns) ||
+        !CheckedAddU64(now_ns, duration_ns, deadline_ns)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "lease/wait deadline overflows");
+    }
+    return Status::Ok();
+}
+
+bool CompareExchangeState(SuperBlock& sb, RegionState expected,
+                          RegionState desired) {
+    uint32_t raw_expected = static_cast<uint32_t>(expected);
+    return std::atomic_ref(sb.state).compare_exchange_strong(
+        raw_expected, static_cast<uint32_t>(desired),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void PublishRegionEpochAtLeast(SuperBlock& sb, uint64_t epoch) {
+    auto region_epoch = std::atomic_ref(sb.region_epoch);
+    uint64_t observed = region_epoch.load(std::memory_order_acquire);
+    while (observed < epoch &&
+           !region_epoch.compare_exchange_weak(
+               observed, epoch, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+}
+
+Status ReplayCommittedFence(SuperBlock& sb, uint64_t fence) {
+    const RecoveryFencePhase phase = RecoveryFencePhaseOf(fence);
+    if (phase == RecoveryFencePhase::kActive) {
+        PublishRegionEpochAtLeast(sb, RecoveryFenceEpoch(fence));
+        StoreCleanShutdown(sb, false);
+        if (LoadRegionState(sb) == RegionState::kRecovering) {
+            (void)CompareExchangeState(sb, RegionState::kRecovering,
+                                       RegionState::kActive);
+        }
+        return LoadRegionState(sb) == RegionState::kActive
+                   ? Status::Ok()
+                   : Status::Error(StatusCode::kCorruption,
+                                   "committed ACTIVE fence conflicts with state");
+    }
+    if (phase == RecoveryFencePhase::kQuarantined) {
+        if (LoadRegionState(sb) == RegionState::kRecovering) {
+            (void)CompareExchangeState(sb, RegionState::kRecovering,
+                                       RegionState::kQuarantined);
+        }
+        return Status::Error(StatusCode::kUnavailable,
+                             "region recovery committed quarantine");
+    }
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "recovery fence is not committed");
+}
+
+bool RegionRecoveryOwnerIsCurrent(const void* context) noexcept {
+    return static_cast<const RecoveryOwner*>(context)->HoldsRecoveryFence();
+}
+
+void RenewRegionRecoveryLease(void* context) noexcept {
+    (void)static_cast<RecoveryOwner*>(context)->RenewLease();
+}
 
 }  // namespace
+
+RecoveryOwner::RecoveryOwner(RecoveryOwner&& other) noexcept
+    : sb_(other.sb_),
+      owner_(other.owner_),
+      lease_value_set_(other.lease_value_set_),
+      epoch_at_acquire_(other.epoch_at_acquire_),
+      is_owner_(other.is_owner_),
+      lease_duration_ms_(other.lease_duration_ms_) {
+    other.ResetMovedFrom();
+}
+
+RecoveryOwner& RecoveryOwner::operator=(RecoveryOwner&& other) noexcept {
+    if (this != &other) {
+        (void)Release();
+        sb_ = other.sb_;
+        owner_ = other.owner_;
+        lease_value_set_ = other.lease_value_set_;
+        epoch_at_acquire_ = other.epoch_at_acquire_;
+        is_owner_ = other.is_owner_;
+        lease_duration_ms_ = other.lease_duration_ms_;
+        other.ResetMovedFrom();
+    }
+    return *this;
+}
+
+void RecoveryOwner::ResetMovedFrom() noexcept {
+    sb_ = nullptr;
+    owner_ = ProcessIdentity{};
+    lease_value_set_ = 0;
+    epoch_at_acquire_ = 0;
+    is_owner_ = false;
+    lease_duration_ms_ = kDefaultRecoveryLeaseMs;
+}
 
 Result<RecoveryOwner> RecoveryOwner::TryAcquire(SharedMemoryRegion& region,
                                                 const ProcessIdentity& owner) {
@@ -60,7 +163,9 @@ Result<RecoveryOwner> RecoveryOwner::TryAcquire(SharedMemoryRegion& region,
 
     auto& lease = sb->recovery_lease_ns;
     const uint64_t now = MonotonicNowNs();
-    const uint64_t new_lease = now + MsToNs(lease_duration_ms);
+    uint64_t new_lease = 0;
+    MINO_RETURN_IF_ERROR(DeadlineFromMilliseconds(
+        now, lease_duration_ms, /*require_nonzero=*/true, &new_lease));
 
     // The single 64-bit CAS that provides mutual exclusion: transition the
     // lease from an expired value to our fresh future value. Only one racing
@@ -84,9 +189,27 @@ Result<RecoveryOwner> RecoveryOwner::TryAcquire(SharedMemoryRegion& region,
     // generation (6.5 step 5). The owner identity is informational; the lease
     // CAS above is the actual lock.
     sb->recovery_owner = owner;
-    const uint64_t epoch = std::atomic_ref(sb->recovery_epoch)
-                               .fetch_add(1, std::memory_order_acq_rel) +
-                           1;
+    auto recovery_epoch = std::atomic_ref(sb->recovery_epoch);
+    uint64_t previous_epoch = recovery_epoch.load(std::memory_order_acquire);
+    if (previous_epoch >= kMaxRecoveryFenceEpoch) {
+        uint64_t owned_token = new_lease;
+        (void)std::atomic_ref(lease).compare_exchange_strong(
+            owned_token, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        return Status::Error(StatusCode::kResourceExhausted,
+                             "recovery fencing epoch exhausted");
+    }
+    if (!recovery_epoch.compare_exchange_strong(
+            previous_epoch, previous_epoch + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        uint64_t owned_token = new_lease;
+        (void)std::atomic_ref(lease).compare_exchange_strong(
+            owned_token, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        return Status::Error(StatusCode::kCorruption,
+                             "recovery epoch changed while lease was exclusive");
+    }
+    const uint64_t epoch = previous_epoch + 1;
 
     RecoveryOwner ro;
     ro.sb_ = sb;
@@ -107,7 +230,9 @@ Status RecoveryOwner::RenewLease(uint64_t lease_duration_ms) {
     }
     auto& lease = sb_->recovery_lease_ns;
     const uint64_t now = MonotonicNowNs();
-    const uint64_t new_lease = now + MsToNs(lease_duration_ms);
+    uint64_t new_lease = 0;
+    MINO_RETURN_IF_ERROR(DeadlineFromMilliseconds(
+        now, lease_duration_ms, /*require_nonzero=*/true, &new_lease));
 
     // Renew only if the lease still holds exactly the value we set. If another
     // process took over after our lease expired, the value differs and our CAS
@@ -126,17 +251,23 @@ Status RecoveryOwner::RenewLease(uint64_t lease_duration_ms) {
 
 Status RecoveryOwner::Release() {
     if (!is_owner_ || sb_ == nullptr) {
-        is_owner_ = false;
+        ResetMovedFrom();
         return Status::Ok();
     }
-    // Clear the owner identity and expire the lease so another process may
-    // acquire. Bump the epoch to record the transition.
-    sb_->recovery_owner = ProcessIdentity{};
-    std::atomic_ref(sb_->recovery_lease_ns)
-        .store(0, std::memory_order_release);
-    std::atomic_ref(sb_->recovery_epoch)
-        .fetch_add(1, std::memory_order_acq_rel);
-    is_owner_ = false;
+    SuperBlock* sb = sb_;
+    uint64_t expected = lease_value_set_;
+    const bool released = std::atomic_ref(sb->recovery_lease_ns)
+                              .compare_exchange_strong(
+                                  expected, 0, std::memory_order_acq_rel,
+                                  std::memory_order_acquire);
+    ResetMovedFrom();
+    if (!released) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "recovery ownership changed before release");
+    }
+    // recovery_owner is informational and deliberately left untouched here:
+    // clearing it after publishing lease=0 could race and erase a new owner's
+    // identity. The next successful acquire overwrites it under its lease.
     return Status::Ok();
 }
 
@@ -146,9 +277,52 @@ bool RecoveryOwner::IsOwner() const {
     }
     // We own the lease iff it still holds the value we set and it has not
     // expired.
-    const uint64_t current =
-        LoadRecoveryLeaseNs(*sb_);
-    return current == lease_value_set_ && current > MonotonicNowNs();
+    const uint64_t current = LoadRecoveryLeaseNs(*sb_);
+    return current == lease_value_set_ && current > MonotonicNowNs() &&
+           LoadRecoveryEpoch(*sb_) == epoch_at_acquire_;
+}
+
+bool RecoveryOwner::HoldsRecoveryFence() const {
+    return IsOwner() &&
+           LoadRecoveryFence(*sb_) == EncodeRecoveryFence(
+               epoch_at_acquire_, RecoveryFencePhase::kRecovering);
+}
+
+Status RecoveryOwner::ClaimRecoveryFence(uint64_t expected_fence) {
+    if (!IsOwner()) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "cannot claim recovery fence without lease/epoch");
+    }
+    const uint64_t desired = EncodeRecoveryFence(
+        epoch_at_acquire_, RecoveryFencePhase::kRecovering);
+    if (!CompareExchangeRecoveryFence(*sb_, &expected_fence, desired)) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "recovery fence changed before takeover claim");
+    }
+    return HoldsRecoveryFence()
+               ? Status::Ok()
+               : Status::Error(StatusCode::kUnavailable,
+                               "recovery fence ownership was immediately lost");
+}
+
+Status RecoveryOwner::CommitRecoveryFence(RecoveryFencePhase phase) {
+    if (sb_ == nullptr || epoch_at_acquire_ == 0) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "recovery owner has no commit fence");
+    }
+    if (phase != RecoveryFencePhase::kActive &&
+        phase != RecoveryFencePhase::kQuarantined) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid recovery fence commit phase");
+    }
+    uint64_t expected = EncodeRecoveryFence(
+        epoch_at_acquire_, RecoveryFencePhase::kRecovering);
+    const uint64_t desired = EncodeRecoveryFence(epoch_at_acquire_, phase);
+    if (!CompareExchangeRecoveryFence(*sb_, &expected, desired)) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "stale recovery owner cannot commit fence");
+    }
+    return Status::Ok();
 }
 
 Status RecoverRegionForAttach(SharedMemoryRegion& region,
@@ -160,71 +334,220 @@ Status RecoverRegionForAttach(SharedMemoryRegion& region,
                              "region has no superblock");
     }
 
-    const bool clean = LoadCleanShutdown(*sb);
-    const RegionState state = LoadRegionState(*sb);
+    const uint64_t start_ns = MonotonicNowNs();
+    uint64_t absolute_deadline_ns = 0;
+    MINO_RETURN_IF_ERROR(DeadlineFromMilliseconds(
+        start_ns, wait_timeout_ms, /*require_nonzero=*/false,
+        &absolute_deadline_ns));
 
-    // Fast path: previously clean and closed/inactive. Mark it in-use and
-    // ACTIVE without recovery (6.3 step 10).
-    if (clean && (state == RegionState::kClosed ||
-                  state == RegionState::kActive)) {
-        StoreCleanShutdown(*sb, false);
-        StoreState(*sb, RegionState::kActive);
-        return Status::Ok();
-    }
-
-    // If another process is actively recovering, wait for it to finish
-    // (6.5 step 4), then re-evaluate.
-    if (state == RegionState::kRecovering) {
-        const uint64_t deadline_ns =
-            MonotonicNowNs() + MsToNs(wait_timeout_ms);
-        while (LoadRegionState(*sb) == RegionState::kRecovering) {
-            if (MonotonicNowNs() >= deadline_ns) {
-                return Status::Error(StatusCode::kTimeout,
-                                     "timed out waiting for region recovery");
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto wait_or_timeout = [&]() -> Status {
+        if (MonotonicNowNs() >= absolute_deadline_ns) {
+            return Status::Error(StatusCode::kTimeout,
+                                 "timed out waiting for region recovery");
         }
-        // Recovery finished (either ACTIVE or QUARANTINED). Re-dispatch.
-        return RecoverRegionForAttach(region, self, wait_timeout_ms);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return Status::Ok();
+    };
+
+    auto recover_as_owner = [&](RecoveryOwner owner) -> Status {
+        auto fail_owned = [&](Status status) {
+            Status committed = owner.CommitRecoveryFence(
+                RecoveryFencePhase::kQuarantined);
+            if (!committed.ok()) {
+                (void)owner.Release();
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "stale recovery owner could not commit quarantine");
+            }
+            if (LoadRegionState(*sb) == RegionState::kRecovering) {
+                (void)CompareExchangeState(*sb, RegionState::kRecovering,
+                                           RegionState::kQuarantined);
+            }
+            (void)owner.Release();
+            return status;
+        };
+
+        const uint64_t allocator_available =
+            region.size() - sb->allocator_offset;
+        void* allocator_base = region.base() + sb->allocator_offset;
+        auto metadata_present = CentralSlabAllocator::HasAllocatorMetadata(
+            allocator_base, allocator_available);
+        if (!metadata_present.ok()) {
+            return fail_owned(metadata_present.status());
+        }
+        if (*metadata_present) {
+            RegionAllocatorStorage storage{
+                .region_base = region.base(),
+                .region_size = region.size(),
+                .allocator_offset = sb->allocator_offset,
+                .allocator_size = sb->data_offset - sb->allocator_offset,
+                .data_offset = sb->data_offset,
+                .data_size = sb->data_size,
+                .region_id = sb->region_id,
+            };
+            auto allocator = CentralSlabAllocator::AttachInRegion(storage);
+            if (!allocator.ok()) {
+                return fail_owned(allocator.status());
+            }
+            shm::recovery::RecoveryOwnership ownership{
+                .context = &owner,
+                .is_owner = &RegionRecoveryOwnerIsCurrent,
+                .heartbeat = &RenewRegionRecoveryLease,
+            };
+            auto scanner = shm::recovery::RecoveryScanner::Create(
+                std::move(*allocator), ownership);
+            if (!scanner.ok()) {
+                return fail_owned(scanner.status());
+            }
+            auto report = scanner->Scan();
+            if (!report.ok()) {
+                return fail_owned(report.status());
+            }
+            if (report->corrupted_slab_count != 0) {
+                return fail_owned(Status::Error(
+                    StatusCode::kCorruption,
+                    "allocator recovery did not establish consistency"));
+            }
+        }
+
+        // Lease renewal is liveness only. The no-window commit is the exact
+        // {epoch, RECOVERING}->{epoch, ACTIVE} CAS below; a takeover and a stale
+        // commit race on this same atomic word.
+        (void)owner.RenewLease();
+        Status committed = owner.CommitRecoveryFence(
+            RecoveryFencePhase::kActive);
+        if (!committed.ok()) {
+            (void)owner.Release();
+            return Status::Error(StatusCode::kUnavailable,
+                                 "stale recovery owner cannot commit ACTIVE");
+        }
+        PublishRegionEpochAtLeast(*sb, owner.epoch());
+        StoreCleanShutdown(*sb, false);
+        if (LoadRegionState(*sb) == RegionState::kRecovering) {
+            (void)CompareExchangeState(*sb, RegionState::kRecovering,
+                                       RegionState::kActive);
+        }
+        Status mirrored = ReplayCommittedFence(
+            *sb, EncodeRecoveryFence(owner.epoch(),
+                                     RecoveryFencePhase::kActive));
+        Status released = owner.Release();
+        if (!mirrored.ok()) {
+            return mirrored;
+        }
+        return released;
+    };
+
+    for (;;) {
+        const RegionState first_state = LoadRegionState(*sb);
+        const bool clean = LoadCleanShutdown(*sb);
+        const RegionState state = LoadRegionState(*sb);
+        if (state != first_state) {
+            continue;
+        }
+
+        if (state == RegionState::kQuarantined) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "region is quarantined");
+        }
+        if (state == RegionState::kClosed && clean) {
+            if (!CompareExchangeState(*sb, RegionState::kClosed,
+                                      RegionState::kActive)) {
+                continue;
+            }
+            StoreCleanShutdown(*sb, false);
+            return Status::Ok();
+        }
+        if (state == RegionState::kActive) {
+            // No business-owner lease exists in this SuperBlock version. An
+            // ACTIVE/in-use Region may still have a live process, so destructive
+            // crash recovery cannot be justified from clean_shutdown alone.
+            return Status::Error(
+                StatusCode::kWouldBlock,
+                "ACTIVE Region may have live service; explicit DIRTY fencing required");
+        }
+        if (state == RegionState::kInitializing ||
+            (state == RegionState::kClosed && !clean)) {
+            if (!CompareExchangeState(*sb, state, RegionState::kDirty)) {
+                continue;
+            }
+            continue;
+        }
+        if (state == RegionState::kDirty) {
+            const uint64_t observed_fence = LoadRecoveryFence(*sb);
+            if (RecoveryFencePhaseOf(observed_fence) ==
+                RecoveryFencePhase::kQuarantined) {
+                if (!CompareExchangeState(*sb, RegionState::kDirty,
+                                          RegionState::kQuarantined)) {
+                    continue;
+                }
+                return Status::Error(StatusCode::kUnavailable,
+                                     "region recovery fence is quarantined");
+            }
+            auto acquired = RecoveryOwner::TryAcquire(region, self);
+            if (!acquired.ok()) {
+                if (acquired.status().code() != StatusCode::kWouldBlock) {
+                    return acquired.status();
+                }
+                MINO_RETURN_IF_ERROR(wait_or_timeout());
+                continue;
+            }
+            RecoveryOwner owner = std::move(*acquired);
+            Status claimed = owner.ClaimRecoveryFence(observed_fence);
+            if (!claimed.ok()) {
+                (void)owner.Release();
+                continue;
+            }
+            if (!CompareExchangeState(*sb, RegionState::kDirty,
+                                      RegionState::kRecovering)) {
+                uint64_t owned_fence = EncodeRecoveryFence(
+                    owner.epoch(), RecoveryFencePhase::kRecovering);
+                (void)CompareExchangeRecoveryFence(
+                    *sb, &owned_fence, observed_fence);
+                (void)owner.Release();
+                continue;
+            }
+            return recover_as_owner(std::move(owner));
+        }
+        if (state == RegionState::kRecovering) {
+            const uint64_t observed_fence = LoadRecoveryFence(*sb);
+            const RecoveryFencePhase fence_phase =
+                RecoveryFencePhaseOf(observed_fence);
+            if (fence_phase == RecoveryFencePhase::kActive ||
+                fence_phase == RecoveryFencePhase::kQuarantined) {
+                return ReplayCommittedFence(*sb, observed_fence);
+            }
+            if (fence_phase != RecoveryFencePhase::kRecovering) {
+                return Status::Error(StatusCode::kCorruption,
+                                     "RECOVERING Region has invalid fence phase");
+            }
+            const uint64_t now = MonotonicNowNs();
+            if (LoadRecoveryLeaseNs(*sb) > now) {
+                MINO_RETURN_IF_ERROR(wait_or_timeout());
+                continue;
+            }
+            auto takeover = RecoveryOwner::TryAcquire(region, self);
+            if (!takeover.ok()) {
+                if (takeover.status().code() != StatusCode::kWouldBlock) {
+                    return takeover.status();
+                }
+                MINO_RETURN_IF_ERROR(wait_or_timeout());
+                continue;
+            }
+            RecoveryOwner owner = std::move(*takeover);
+            if (LoadRegionState(*sb) != RegionState::kRecovering) {
+                (void)owner.Release();
+                continue;
+            }
+            Status claimed = owner.ClaimRecoveryFence(observed_fence);
+            if (!claimed.ok()) {
+                (void)owner.Release();
+                continue;
+            }
+            return recover_as_owner(std::move(owner));
+        }
+        return Status::Error(StatusCode::kCorruption,
+                             "invalid Region lifecycle state");
     }
-
-    if (state == RegionState::kQuarantined) {
-        return Status::Error(StatusCode::kUnavailable,
-                             "region is quarantined");
-    }
-
-    // Dirty path: clean_shutdown == false while the state indicates the Region
-    // was in use (ACTIVE/INITIALIZING) — the previous owner crashed (6.1).
-    // Transition to DIRTY, then acquire ownership and recover (6.5).
-    StoreState(*sb, RegionState::kDirty);
-
-    // Acquire single-writer Recovery Ownership (6.5 step 2).
-    MINO_ASSIGN_OR_RETURN(RecoveryOwner owner,
-                          RecoveryOwner::TryAcquire(region, self));
-    StoreState(*sb, RegionState::kRecovering);
-
-    // --- Recovery body ---------------------------------------------------
-    // The deep consistency scan (orphan slabs, residual ACKs, bitmap
-    // reconciliation) is D1-09 (//mino/shm/recovery:scanner). Here we perform
-    // the protocol-level recovery: establish a fresh epoch and mark the Region
-    // usable again. If a future scanner finds the Region unrecoverable, it
-    // transitions to QUARANTINED (6.5 step 7).
-    // ----------------------------------------------------------------------
-
-    // Publish the new Region Epoch FIRST, then switch to ACTIVE (6.5 step 6).
-    // If we crash between these two stores, the next owner sees the epoch
-    // already bumped but state still RECOVERING and re-runs the full flow,
-    // bumping the epoch again.
-    const uint64_t prev_epoch = LoadRegionEpoch(*sb);
-    StoreRegionEpoch(*sb, prev_epoch + 1);
-
-    // Mark in-use and ACTIVE.
-    StoreCleanShutdown(*sb, false);
-    StoreState(*sb, RegionState::kActive);
-
-    // Release ownership; the lease is expired so others may recover later.
-    MINO_RETURN_IF_ERROR(owner.Release());
-    return Status::Ok();
 }
 
 }  // namespace mino

@@ -45,9 +45,11 @@ public:
 
     // Structured descriptor registration is the v1 descriptor API.
     Result<SchemaHandle> RegisterDescriptor(SchemaHandle descriptor) noexcept;
-    // Explicit byte API boundary. C++ object bytes are never accepted. Until
-    // the independently versioned self-describing descriptor codec is frozen,
-    // this overload returns kUnsupported without inspecting the payload.
+    // Decodes a versioned minoc descriptor artifact and atomically registers
+    // every type it contains. Dependencies must be present in the same artifact
+    // or already registered. Returns the published handle for the artifact's
+    // first encoded type (not an inferred root); empty, malformed, or invalid
+    // artifacts are rejected.
     Result<SchemaHandle> RegisterDescriptor(
         std::span<const std::byte> descriptor_bytes) noexcept;
     Result<std::vector<SchemaHandle>> RegisterCompiled(
