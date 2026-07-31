@@ -1,0 +1,6 @@
+syntax = "v1";
+package alias_root;
+import "alias/one.mino";
+import "alias/two.mino";
+option schema_version = "1.0";
+message Root { minoc_test.common.Point value = 1; }

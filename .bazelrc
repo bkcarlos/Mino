@@ -12,13 +12,19 @@ common --enable_bzlmod
 # The mirror serves identical content and keeps MODULE.bazel.lock stable.
 common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main
 
-# C++20 for all C++ compilation.
+# C++20 for target and exec-platform C++ compilation. Code-generation tools
+# such as minoc run in the exec configuration and must use the same language
+# level as the compiler libraries they link.
 build --cxxopt=-std=c++20
+build --host_cxxopt=-std=c++20
 
 # Warning policy: identical for CI and local builds.
 build --cxxopt=-Wall
 build --cxxopt=-Wextra
 build --cxxopt=-Werror
+build --host_cxxopt=-Wall
+build --host_cxxopt=-Wextra
+build --host_cxxopt=-Werror
 
 # Better diagnostics.
 build --copt=-fno-omit-frame-pointer
@@ -70,6 +76,10 @@ build:ubsan --copt=-fsanitize=undefined
 build:ubsan --copt=-fno-omit-frame-pointer
 build:ubsan --copt=-g
 build:ubsan --linkopt=-fsanitize=undefined
+build:ubsan --host_copt=-fsanitize=undefined
+build:ubsan --host_copt=-fno-omit-frame-pointer
+build:ubsan --host_copt=-g
+build:ubsan --host_linkopt=-fsanitize=undefined
 build:ubsan --test_env=UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
 # TSAN is incompatible with ASAN and UBSAN. Never pass --config=tsan together

@@ -1,0 +1,9 @@
+syntax = "v1";
+package mino.examples;
+option schema_version = "1.0";
+
+struct Point3D {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}

@@ -1,0 +1,6 @@
+syntax = "v1";
+package duplicate_root;
+import "tools/minoc/tests/testdata/duplicate_a.mino";
+import "tools/minoc/tests/testdata/duplicate_b.mino";
+option schema_version = "1.0";
+message Root { duplicate.Value value = 1; }

@@ -1,0 +1,4 @@
+syntax = "v1";
+package duplicate;
+option schema_version = "1.0";
+struct Value { uint64 second = 1; }

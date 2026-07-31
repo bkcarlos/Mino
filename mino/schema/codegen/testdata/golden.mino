@@ -1,0 +1,13 @@
+syntax = "v1";
+package golden;
+option schema_version = "2.1";
+
+message Telemetry {
+  required uint32 sequence = 1;
+  optional string label = 2
+      [max_bytes = 16, snapshot_key, default = "ready"];
+  bytes payload = 3 [max_bytes = 32];
+  vector<uint64> samples = 4 [max_capacity = 8];
+  optional bool active = 5;
+  reserved 6 to 7;
+}

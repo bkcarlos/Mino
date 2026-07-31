@@ -1,0 +1,16 @@
+syntax = "v1";
+package minoc_test;
+option schema_version = "1.0";
+
+message Child {
+  required uint32 id = 1;
+}
+
+message Sample {
+  required uint32 sequence = 1;
+  optional string label = 2 [max_bytes = 16];
+  bytes payload = 3 [max_bytes = 32];
+  vector<uint64> samples = 4 [max_capacity = 8];
+  optional bool active = 5;
+  optional Child child = 6;
+}

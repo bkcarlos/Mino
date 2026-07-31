@@ -1,0 +1,9 @@
+syntax = "v1";
+package minoc_test;
+option schema_version = "1.0";
+import "tools/minoc/tests/testdata/common.mino";
+
+message Located {
+  minoc_test.common.Point point = 1;
+  optional uint64 timestamp = 2;
+}

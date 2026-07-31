@@ -1,0 +1,8 @@
+syntax = "v1";
+package minoc_test.common;
+option schema_version = "1.0";
+
+struct Point {
+  float x = 1;
+  float y = 2;
+}

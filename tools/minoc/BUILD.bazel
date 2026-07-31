@@ -1,2 +1,130 @@
 # minoc: Mino IDL schema compiler (runs on the exec platform).
-package(default_visibility = ["//visibility:private"])
+load(":minoc.bzl", "mino_cc_codegen")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["minoc.bzl"])
+
+cc_library(
+    name = "output_commit",
+    srcs = ["output_commit.cc"],
+    hdrs = ["output_commit.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_binary(
+    name = "minoc",
+    srcs = ["main.cc"],
+    deps = [
+        ":output_commit",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema:parser",
+        "//mino/schema/codegen:code_generator",
+    ],
+)
+
+cc_test(
+    name = "output_commit_test",
+    srcs = ["output_commit_test.cc"],
+    deps = [
+        ":output_commit",
+        "@googletest//:gtest_main",
+    ],
+)
+
+mino_cc_codegen(
+    name = "sample_codegen",
+    src = "//tools/minoc/tests/testdata:sample.mino",
+    out_descriptor = "tests/generated/sample.descriptor",
+    out_header = "tests/generated/sample.generated.h",
+    out_source = "tests/generated/sample.generated.cc",
+)
+
+cc_library(
+    name = "sample_generated",
+    srcs = ["tests/generated/sample.generated.cc"],
+    hdrs = ["tests/generated/sample.generated.h"],
+    deps = ["//mino/runtime:runtime_types"],
+)
+
+cc_test(
+    name = "generated_code_test",
+    srcs = ["tests/generated_code_test.cc"],
+    deps = [
+        ":sample_generated",
+        "//mino/runtime:runtime_types",
+        "@googletest//:gtest_main",
+    ],
+)
+
+mino_cc_codegen(
+    name = "mangling_codegen",
+    src = "//tools/minoc/tests/testdata:mangling.mino",
+    out_descriptor = "tests/generated/mangling.descriptor",
+    out_header = "tests/generated/mangling.generated.h",
+    out_source = "tests/generated/mangling.generated.cc",
+)
+
+cc_library(
+    name = "mangling_generated",
+    srcs = ["tests/generated/mangling.generated.cc"],
+    hdrs = ["tests/generated/mangling.generated.h"],
+    deps = ["//mino/runtime:runtime_types"],
+)
+
+cc_test(
+    name = "mangling_generated_test",
+    srcs = ["tests/mangling_generated_test.cc"],
+    deps = [
+        ":mangling_generated",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# The source and its declared import live outside this package. Building this
+# target exercises cross-directory paths and the action import allowlist.
+mino_cc_codegen(
+    name = "sensor_frame_codegen",
+    src = "//schemas:sensor_frame.mino",
+    imports = ["//schemas:point.mino"],
+    out_descriptor = "tests/generated/sensor_frame.descriptor",
+    out_header = "tests/generated/sensor_frame.generated.h",
+    out_source = "tests/generated/sensor_frame.generated.cc",
+)
+
+cc_library(
+    name = "sensor_frame_generated",
+    srcs = ["tests/generated/sensor_frame.generated.cc"],
+    hdrs = ["tests/generated/sensor_frame.generated.h"],
+    deps = ["//mino/runtime:runtime_types"],
+)
+
+cc_test(
+    name = "cross_directory_generated_test",
+    srcs = ["tests/cross_directory_generated_test.cc"],
+    deps = [
+        ":sensor_frame_generated",
+        "@googletest//:gtest_main",
+    ],
+)
+
+sh_test(
+    name = "minoc_cli_test",
+    srcs = ["tests/minoc_cli_test.sh"],
+    data = [
+        ":minoc",
+        "//tools/minoc/tests/testdata:common.mino",
+        "//tools/minoc/tests/testdata:duplicate_a.mino",
+        "//tools/minoc/tests/testdata:duplicate_b.mino",
+        "//tools/minoc/tests/testdata:duplicate_root.mino",
+        "//tools/minoc/tests/testdata:physical_alias.mino",
+        "//tools/minoc/tests/testdata:sample.mino",
+        "//tools/minoc/tests/testdata:with_import.mino",
+    ],
+)

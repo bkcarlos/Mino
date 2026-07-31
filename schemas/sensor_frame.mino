@@ -1,0 +1,11 @@
+syntax = "v1";
+package mino.examples;
+option schema_version = "1.0";
+import "schemas/point.mino";
+
+message SensorFrame {
+  required uint32 frame_id = 1;
+  optional string device_name = 2 [max_bytes = 64];
+  vector<mino.examples.Point3D> points = 3 [max_capacity = 100];
+  bytes payload = 4 [max_bytes = 4096];
+}

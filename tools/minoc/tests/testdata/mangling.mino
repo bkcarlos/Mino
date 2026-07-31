@@ -1,0 +1,15 @@
+syntax = "v1";
+package names;
+option schema_version = "1.0";
+
+message Thing {
+  optional uint32 x = 1;
+  uint32 has_x = 2;
+  uint32 valid = 3;
+  uint32 class = 4;
+  uint32 foo__bar = 5;
+}
+
+message ThingBuilder {
+  uint32 value = 1;
+}

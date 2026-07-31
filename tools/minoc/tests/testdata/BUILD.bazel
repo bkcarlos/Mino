@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "common.mino",
+    "duplicate_a.mino",
+    "duplicate_b.mino",
+    "duplicate_root.mino",
+    "mangling.mino",
+    "physical_alias.mino",
+    "sample.mino",
+    "with_import.mino",
+])
