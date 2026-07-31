@@ -1,2 +1,303 @@
-# Schema compiler runtime, descriptors, dynamic messages.
-package(default_visibility = ["//visibility:private"])
+# IDL compiler core and dynamic schema runtime primitives.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "ast",
+    hdrs = ["ast.h"],
+)
+
+cc_library(
+    name = "lexer",
+    srcs = ["lexer.cc"],
+    hdrs = ["lexer.h"],
+    deps = [
+        ":ast",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "parser",
+    srcs = ["parser.cc"],
+    hdrs = ["parser.h"],
+    deps = [
+        ":ast",
+        ":lexer",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "descriptor",
+    srcs = ["descriptor.cc"],
+    hdrs = ["descriptor.h"],
+    deps = [":ast"],
+)
+
+cc_library(
+    name = "descriptor_closure",
+    srcs = ["descriptor_closure.cc"],
+    hdrs = ["descriptor_closure.h"],
+    deps = [
+        ":canonical",
+        ":descriptor",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "validator",
+    srcs = ["validator.cc"],
+    hdrs = ["validator.h"],
+    deps = [
+        ":ast",
+        ":descriptor",
+        ":layout",
+        ":lexer",
+        ":unknown_field_set",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "canonical",
+    srcs = ["canonical.cc"],
+    hdrs = ["canonical.h"],
+    deps = [
+        ":descriptor",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "compiler",
+    srcs = ["compiler.cc"],
+    hdrs = ["compiler.h"],
+    deps = [
+        ":canonical",
+        ":descriptor",
+        ":parser",
+        ":unknown_field_set",
+        ":validator",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "compatibility",
+    srcs = ["compatibility.cc"],
+    hdrs = ["compatibility.h"],
+    deps = [
+        ":descriptor",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "layout",
+    srcs = ["layout.cc"],
+    hdrs = ["layout.h"],
+    deps = [
+        ":descriptor",
+        ":descriptor_closure",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "unknown_field_set",
+    srcs = ["unknown_field_set.cc"],
+    hdrs = ["unknown_field_set.h"],
+    deps = ["//mino/common:status"],
+)
+
+cc_library(
+    name = "dynamic_value",
+    srcs = ["dynamic_value.cc"],
+    hdrs = ["dynamic_value.h"],
+    deps = [
+        ":unknown_field_set",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "wire",
+    srcs = ["wire.cc"],
+    hdrs = ["wire.h"],
+    deps = [
+        ":descriptor",
+        ":descriptor_closure",
+        ":dynamic_value",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "object_graph_walker",
+    srcs = ["object_graph_walker.cc"],
+    hdrs = ["object_graph_walker.h"],
+    deps = [
+        ":canonical",
+        ":descriptor",
+        ":descriptor_closure",
+        ":layout",
+        ":unknown_field_set",
+        "//mino/abi:shm_abi",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_library(
+    name = "dynamic_object",
+    srcs = ["dynamic_object.cc"],
+    hdrs = ["dynamic_object.h"],
+    deps = [
+        ":canonical",
+        ":descriptor",
+        ":descriptor_closure",
+        ":dynamic_value",
+        ":layout",
+        ":object_graph_walker",
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/runtime:allocation_journal",
+        "//mino/runtime:shm_shared_ptr",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_library(
+    name = "registry",
+    srcs = ["registry.cc"],
+    hdrs = ["registry.h"],
+    deps = [
+        ":canonical",
+        ":compatibility",
+        ":compiler",
+        ":descriptor",
+        ":lexer",
+        ":parser",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "lexer_test",
+    srcs = ["lexer_test.cc"],
+    deps = [
+        ":lexer",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "parser_test",
+    srcs = ["parser_test.cc"],
+    deps = [
+        ":ast",
+        ":parser",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "validator_test",
+    srcs = ["validator_test.cc"],
+    deps = [
+        ":parser",
+        ":validator",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "compiler_test",
+    srcs = ["compiler_test.cc"],
+    deps = [
+        ":canonical",
+        ":compiler",
+        ":lexer",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "compatibility_test",
+    srcs = ["compatibility_test.cc"],
+    deps = [
+        ":compatibility",
+        ":compiler",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "layout_test",
+    srcs = ["layout_test.cc"],
+    deps = [
+        ":compiler",
+        ":layout",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "wire_test",
+    srcs = ["wire_test.cc"],
+    deps = [
+        ":compiler",
+        ":dynamic_value",
+        ":wire",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "dynamic_object_test",
+    srcs = ["dynamic_object_test.cc"],
+    deps = [
+        ":compiler",
+        ":dynamic_object",
+        ":layout",
+        ":object_graph_walker",
+        ":wire",
+        "//mino/common:status",
+        "//mino/runtime:allocation_journal",
+        "//mino/shm/allocator:central_slab",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "registry_test",
+    srcs = ["registry_test.cc"],
+    deps = [
+        ":canonical",
+        ":registry",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
