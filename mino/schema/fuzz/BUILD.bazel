@@ -1,0 +1,74 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "descriptor_artifact_parser",
+    srcs = ["descriptor_artifact_parser.cc"],
+    hdrs = ["descriptor_artifact_parser.h"],
+    visibility = ["//visibility:private"],
+    deps = ["//mino/common:status"],
+)
+
+cc_library(
+    name = "fuzz_harness",
+    srcs = ["fuzz_harness.cc"],
+    hdrs = ["fuzz_harness.h"],
+    deps = [
+        ":descriptor_artifact_parser",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:descriptor",
+        "//mino/schema:registry",
+        "//mino/schema:wire",
+    ],
+)
+
+cc_library(
+    name = "mutation",
+    srcs = ["mutation.cc"],
+    hdrs = ["mutation.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "fuzz_corpus_test",
+    size = "small",
+    srcs = ["fuzz_corpus_test.cc"],
+    data = [
+        "testdata/canonical_payload.canonical.hex",
+        "testdata/canonical_payload.mino",
+        "testdata/canonical_payload.wire.hex",
+        "testdata/codegen_golden.descriptor",
+    ],
+    deps = [
+        ":fuzz_harness",
+        ":mutation",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:descriptor",
+        "//mino/schema:dynamic_value",
+        "//mino/schema:registry",
+        "//mino/schema:wire",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Opt-in deterministic driver. The manual tag keeps it out of wildcard
+# build/test invocations; request it explicitly with bazel run.
+cc_binary(
+    name = "standalone_fuzz_driver",
+    srcs = ["standalone_fuzz_driver.cc"],
+    tags = [
+        "large",
+        "manual",
+    ],
+    deps = [
+        ":fuzz_harness",
+        ":mutation",
+        "//mino/common:status",
+    ],
+)

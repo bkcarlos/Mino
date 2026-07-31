@@ -1,0 +1,12 @@
+syntax = "v1";
+package fuzz;
+option schema_version = "1.0";
+
+message Payload {
+  int32 delta = 1;
+  uint64 sequence = 2;
+  fixed32 code = 3;
+  float sample = 4;
+  optional string label = 5 [max_bytes = 32];
+  vector<uint32> values = 6 [max_capacity = 4];
+}
