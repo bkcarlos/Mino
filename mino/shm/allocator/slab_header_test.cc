@@ -46,10 +46,10 @@ void InitHeader(SlabHeader& h) {
     h.type_id = 42;
     h.layout_version = 3;
     h.schema_short_id = 0x0123456789ABCDEFull;
-    h.owner_epoch = 0xA5A5;
-    h.allocation_transaction_id = 0x5A5A;
+    h.owner_epoch.store(0xA5A5, std::memory_order_relaxed);
+    h.allocation_transaction_id.store(0x5A5A, std::memory_order_relaxed);
     h.immutable_header_crc = 0;
-    h.reserved = 0;
+    h.allocation_role.store(1, std::memory_order_relaxed);
 }
 
 TEST(SlabHeaderTest, ObjectStateValuesAreStable) {
@@ -74,15 +74,15 @@ TEST(SlabHeaderTest, CrcCoversImmutableFields) {
     const uint32_t base = ComputeImmutableHeaderCrc(h);
 
     // Every covered field must change the CRC (design doc 8.1): magic,
-    // version, class, generation, capacity, object size, type, layout and
-    // schema short id. Mutate in place and restore afterwards.
+    // version, class, generation, capacity, object size, type, layout,
+    // schema identity, and allocation ownership. Mutate in place and restore.
     struct Case {
         const char* name;
         void (*mutate)(SlabHeader&);
     };
     const Case cases[] = {
         {"magic", [](SlabHeader& x) { x.magic = 0xDEADBEEF; }},
-        {"header_version", [](SlabHeader& x) { x.header_version = 2; }},
+        {"header_version", [](SlabHeader& x) { x.header_version = 3; }},
         {"class_id", [](SlabHeader& x) { x.class_id = 3; }},
         {"generation", [](SlabHeader& x) { x.generation = 8; }},
         {"capacity", [](SlabHeader& x) { x.capacity = 4096; }},
@@ -91,6 +91,11 @@ TEST(SlabHeaderTest, CrcCoversImmutableFields) {
         {"layout_version", [](SlabHeader& x) { x.layout_version = 4; }},
         {"schema_short_id",
          [](SlabHeader& x) { x.schema_short_id = 0xFEDCBA9876543210ull; }},
+        {"owner_epoch", [](SlabHeader& x) { x.owner_epoch.store(0x1111); }},
+        {"allocation_transaction_id",
+         [](SlabHeader& x) { x.allocation_transaction_id.store(0x2222); }},
+        {"allocation_role",
+         [](SlabHeader& x) { x.allocation_role.store(2); }},
     };
     for (const Case& c : cases) {
         SlabHeader mutated{};
@@ -105,8 +110,7 @@ TEST(SlabHeaderTest, CrcIgnoresMutableFields) {
     InitHeader(h);
     const uint32_t base = ComputeImmutableHeaderCrc(h);
 
-    // object_state, owner_epoch, allocation_transaction_id and the CRC field
-    // itself must not be covered (design doc 8.1).
+    // Only object_state and the CRC field itself are mutable/excluded.
     {
         SlabHeader mutated{};
         InitHeader(mutated);
@@ -114,30 +118,14 @@ TEST(SlabHeaderTest, CrcIgnoresMutableFields) {
                                    std::memory_order_relaxed);
         EXPECT_EQ(ComputeImmutableHeaderCrc(mutated), base);
     }
-    {
-        SlabHeader mutated{};
-        InitHeader(mutated);
-        mutated.owner_epoch = 0x1111;
-        EXPECT_EQ(ComputeImmutableHeaderCrc(mutated), base);
-    }
-    {
-        SlabHeader mutated{};
-        InitHeader(mutated);
-        mutated.allocation_transaction_id = 0x2222;
-        EXPECT_EQ(ComputeImmutableHeaderCrc(mutated), base);
-    }
+
     {
         SlabHeader mutated{};
         InitHeader(mutated);
         mutated.immutable_header_crc = 0xCAFEBABE;
         EXPECT_EQ(ComputeImmutableHeaderCrc(mutated), base);
     }
-    {
-        SlabHeader mutated{};
-        InitHeader(mutated);
-        mutated.reserved = 0xFFFFFFFFu;
-        EXPECT_EQ(ComputeImmutableHeaderCrc(mutated), base);
-    }
+
 }
 
 TEST(SlabHeaderTest, VerifyImmutableHeaderAcceptsValidHeader) {

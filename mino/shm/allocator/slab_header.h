@@ -29,7 +29,7 @@ namespace mino {
 inline constexpr uint32_t kSlabHeaderMagic = 0x4D534C42u;
 
 // Version of the SlabHeader layout described by this header.
-inline constexpr uint16_t kSlabHeaderVersion = 1;
+inline constexpr uint16_t kSlabHeaderVersion = 2;
 
 // ObjectState is the publication state machine of a single slot
 // (design doc 8.1). The allocator publishes an allocation exclusively via
@@ -43,6 +43,8 @@ enum class ObjectState : uint32_t {
     kPublished = 3,  // Object visible to readers (Resolve requires this).
     kRetired = 4,    // No new Borrow is produced; awaiting final Reclaim.
     kAborting = 5,   // Allocation/construction is being torn down.
+    kReclaiming = 6, // One reclaimer exclusively owns bitmap release.
+    kAllocating = 7, // Bitmap claimed; immutable stamp is being rewritten.
 };
 
 // Compatibility name used by the resolver; ObjectState is the authoritative
@@ -57,7 +59,7 @@ struct alignas(64) SlabHeader {
     uint16_t header_version;
     uint16_t class_id;
 
-    uint32_t generation;
+    std::atomic<uint32_t> generation;
     std::atomic<uint32_t> object_state;
 
     uint32_t capacity;
@@ -66,10 +68,10 @@ struct alignas(64) SlabHeader {
     uint32_t layout_version;
 
     uint64_t schema_short_id;
-    uint64_t owner_epoch;
-    uint64_t allocation_transaction_id;
+    std::atomic<uint64_t> owner_epoch;
+    std::atomic<uint64_t> allocation_transaction_id;
     uint32_t immutable_header_crc;
-    uint32_t reserved;
+    std::atomic<uint32_t> allocation_role;
 };
 
 static_assert(sizeof(SlabHeader) == 64, "SlabHeader must occupy one cache line");
@@ -87,7 +89,7 @@ static_assert(offsetof(SlabHeader, schema_short_id) == 32);
 static_assert(offsetof(SlabHeader, owner_epoch) == 40);
 static_assert(offsetof(SlabHeader, allocation_transaction_id) == 48);
 static_assert(offsetof(SlabHeader, immutable_header_crc) == 56);
-static_assert(offsetof(SlabHeader, reserved) == 60);
+static_assert(offsetof(SlabHeader, allocation_role) == 60);
 
 // Returns the wire (little-endian) encoding of v for CRC computation. On the
 // supported little-endian targets this is the identity; the explicit form
@@ -101,15 +103,15 @@ constexpr uint64_t CrcWire64(uint64_t v) { return v; }
 // over the immutable Slab Header fields, as defined in design doc 8.1:
 //
 //   covered:      magic, header_version, class_id, generation, capacity,
-//                 object_size, type_id, layout_version, schema_short_id
-//   not covered:  immutable_header_crc itself, object_state, owner_epoch,
-//                 allocation_transaction_id, reserved
+//                 object_size, type_id, layout_version, schema_short_id,
+//                 owner_epoch, allocation_transaction_id, allocation_role
+//   not covered:  immutable_header_crc itself and object_state
 //
 // Field order follows the struct declaration. The CRC is calculated before
 // Publish, after the object fields are frozen; it allows recovery and
 // Inspect to detect corruption of the fields that must never change while an
 // allocation is alive.
-constexpr uint32_t ComputeImmutableHeaderCrc(const SlabHeader& h) noexcept {
+inline uint32_t ComputeImmutableHeaderCrc(const SlabHeader& h) noexcept {
     // Reflected CRC-32C table driven implementation, constexpr-friendly.
     constexpr uint32_t kPoly = 0x82F63B78u;  // Reflected CRC-32C polynomial.
 
@@ -145,12 +147,15 @@ constexpr uint32_t ComputeImmutableHeaderCrc(const SlabHeader& h) noexcept {
     add_u32(h.magic);
     add_u16(h.header_version);
     add_u16(h.class_id);
-    add_u32(h.generation);
+    add_u32(h.generation.load(std::memory_order_relaxed));
     add_u32(h.capacity);
     add_u32(h.object_size);
     add_u32(h.type_id);
     add_u32(h.layout_version);
     add_u64(h.schema_short_id);
+    add_u64(h.owner_epoch.load(std::memory_order_relaxed));
+    add_u64(h.allocation_transaction_id.load(std::memory_order_relaxed));
+    add_u32(h.allocation_role.load(std::memory_order_relaxed));
 
     return crc ^ 0xFFFFFFFFu;
 }

@@ -128,11 +128,15 @@ private:
     Result<ShmPinToken> CloneToken(const ShmPinToken& source) noexcept;
     Result<ShmPinToken> AcquireRecord(ShmHandle handle,
                                       const ProcessIdentity& owner,
-                                      const void* data) noexcept;
+                                      const void* data,
+                                      uint32_t object_bucket) noexcept;
+    static bool ReclaimGuardCallback(ShmHandle handle,
+                                     void* context) noexcept;
     Status ReleaseRecord(uint32_t record_index, uint64_t record_state,
                          ShmHandle handle,
                          const ProcessIdentity& owner) noexcept;
     Status MaybeReclaim(ShmHandle handle) noexcept;
+    bool HasPinOrPublicationGuard(ShmHandle handle) const noexcept;
 
     SharedControl* control_ = nullptr;
     SharedRecord* records_ = nullptr;

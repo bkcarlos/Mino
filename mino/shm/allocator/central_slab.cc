@@ -23,7 +23,7 @@ namespace {
 
 // Magic and version of the allocator superblock ("MSLA" little-endian).
 constexpr uint32_t kAllocatorMagic = 0x4D534C41u;
-constexpr uint32_t kAllocatorVersion = 1;
+constexpr uint32_t kAllocatorVersion = 3;
 
 // Shared-memory allocator superblock, followed by class descriptors, the
 // sharded bitmap, the generation array, and the per-slot headers/payloads.
@@ -42,6 +42,8 @@ struct alignas(64) AllocatorSuperblock {
     uint64_t slot_stride;       // sizeof(SlabHeader) + max payload per slot.
     uint32_t total_slot_count;
     uint32_t reserved;
+    std::atomic<uint64_t> next_transaction_id{1};
+    uint64_t reserved2 = 0;
 
     // Followed by:
     //   ClassDescriptor classes[class_count]
@@ -117,6 +119,8 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Create(
     super->slot_stride = layout.slot_stride;
     super->total_slot_count = table.total_slot_count();
     super->reserved = 0;
+    super->next_transaction_id.store(1, std::memory_order_relaxed);
+    super->reserved2 = 0;
 
     auto* base = static_cast<std::byte*>(shm_base);
     auto* descriptors = reinterpret_cast<ClassDescriptor*>(base + sizeof(AllocatorSuperblock));
@@ -163,6 +167,7 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Create(
     alloc.data_region_size_ = data_region_size;
     alloc.region_id_ = super->region_id;
     alloc.slot_stride_ = layout.slot_stride;
+    alloc.next_transaction_id_ = &super->next_transaction_id;
     return alloc;
 }
 
@@ -219,6 +224,7 @@ Result<CentralSlabAllocator> CentralSlabAllocator::Attach(void* shm_base) {
     alloc.data_region_size_ = super->total_size;
     alloc.region_id_ = super->region_id;
     alloc.slot_stride_ = layout.slot_stride;
+    alloc.next_transaction_id_ = &super->next_transaction_id;
     return alloc;
 }
 
@@ -226,6 +232,16 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
     // Step 1: checked-align the request size. Alignment must be a power of
     // two; the aligned size must not overflow.
     const uint32_t alignment = request.alignment == 0 ? 1 : request.alignment;
+    if ((request.allocation_flags & ~kAllocationFlagMask) != 0 ||
+        ((request.allocation_flags & kAllocationFlagTransactionRoot) != 0 &&
+         (request.allocation_flags & kAllocationFlagTransactionChild) != 0) ||
+        ((request.owner_epoch == 0) !=
+         (request.allocation_transaction_id == 0)) ||
+        (request.allocation_transaction_id == 0 &&
+         request.allocation_flags != 0)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid allocation transaction metadata");
+    }
     if ((alignment & (alignment - 1)) != 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "alignment must be a power of two");
@@ -255,39 +271,50 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
             cls.bitmap_shard_offset + cls.slot_count));
 
     const uint32_t slot_index = bit_index;
+    SlabHeader& header = HeaderAt(slot_index);
+    uint32_t free_state = static_cast<uint32_t>(ObjectState::kFree);
+    if (!header.object_state.compare_exchange_strong(
+            free_state, static_cast<uint32_t>(ObjectState::kAllocating),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        (void)bitmap_.ClearBit(slot_index);
+        return Status::Error(StatusCode::kCorruption,
+                             "free bitmap slot has a non-free lifecycle state");
+    }
 
     // Step 6: increment the authoritative generation and copy it into the
     // header; refuse to wrap at UINT32_MAX by marking the class DRAINING.
     const uint32_t generation = generations_.Increment(slot_index);
     if (generation == kGenerationDraining) {
         class_draining_[class_id].store(1, std::memory_order_release);
-        // Undo the bitmap claim so the slot stays free for recovery.
+        // Undo the lifecycle/bitmap claim so the slot stays free for recovery.
+        header.object_state.store(static_cast<uint32_t>(ObjectState::kFree),
+                                  std::memory_order_release);
         bitmap_.ClearBit(slot_index);
         return Status::Error(StatusCode::kResourceExhausted,
                              "generation exhausted; class marked DRAINING");
     }
 
-    SlabHeader& header = HeaderAt(slot_index);
     header.magic = kSlabHeaderMagic;
     header.header_version = kSlabHeaderVersion;
     header.class_id = class_id;
-    header.generation = generation;
+    header.generation.store(generation, std::memory_order_relaxed);
     header.capacity = cls.slot_size;
     header.object_size = request.object_size;
     header.type_id = request.type_id.value;
     header.layout_version = request.schema.layout_version;
     header.schema_short_id = request.schema.short_id;
 
-    // Step 7: Owner Epoch and Transaction ID. Owner epoch identifies the
-    // allocating process generation; transaction id is left for the dynamic
-    // allocation journal (design doc 8.6). For the D1 central allocator both
-    // are stamped as zero until the runtime supplies them.
-    header.owner_epoch = 0;
-    header.allocation_transaction_id = 0;
+    // Step 7: transaction identity is written before kAllocated is published.
+    // Journal recovery can therefore find the allocation even if its process
+    // dies before appending the returned Handle to the journal record.
+    header.owner_epoch.store(request.owner_epoch, std::memory_order_relaxed);
+    header.allocation_transaction_id.store(
+        request.allocation_transaction_id, std::memory_order_relaxed);
+    header.allocation_role.store(request.allocation_flags,
+                                 std::memory_order_relaxed);
 
-    // Immutable CRC covers the frozen identity fields (design doc 8.1).
+    // The safety stamp is immutable for this generation and CRC-covered.
     header.immutable_header_crc = ComputeImmutableHeaderCrc(header);
-    header.reserved = 0;
 
     // Step 8: single publication point. Everything above must be visible to
     // any thread that observes kAllocated with acquire ordering.
@@ -303,6 +330,204 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
     handle.generation = generation;
     handle.region_id = region_id_;
     return handle;
+}
+
+Result<uint64_t> CentralSlabAllocator::NextAllocationTransactionId() {
+    if (next_transaction_id_ == nullptr) {
+        return Status::Error(StatusCode::kInternal,
+                             "allocator transaction counter is unavailable");
+    }
+    uint64_t current = next_transaction_id_->load(std::memory_order_relaxed);
+    for (;;) {
+        if (current == 0 || current == std::numeric_limits<uint64_t>::max()) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "allocation transaction id exhausted");
+        }
+        if (next_transaction_id_->compare_exchange_weak(
+                current, current + 1, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return current;
+        }
+    }
+}
+
+Status CentralSlabAllocator::PublishTransactionHandle(
+    uint64_t owner_epoch, uint64_t transaction_id, ShmHandle handle,
+    uint32_t required_role) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+    SlabHeader& header = HeaderAt(slot_index);
+    if (header.generation.load(std::memory_order_acquire) != handle.generation ||
+        header.owner_epoch.load(std::memory_order_acquire) != owner_epoch ||
+        header.allocation_transaction_id.load(std::memory_order_acquire) !=
+            transaction_id ||
+        (header.allocation_role.load(std::memory_order_acquire) & required_role) ==
+            0 ||
+        !VerifyImmutableHeader(header)) {
+        return Status::Error(StatusCode::kCorruption,
+                             "manifest handle stamp does not match transaction");
+    }
+    uint32_t state = header.object_state.load(std::memory_order_acquire);
+    if (state == static_cast<uint32_t>(ObjectState::kPublished)) {
+        return Status::Ok();
+    }
+    if (state != static_cast<uint32_t>(ObjectState::kBuilding) ||
+        !header.object_state.compare_exchange_strong(
+            state, static_cast<uint32_t>(ObjectState::kPublished),
+            std::memory_order_release, std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "transaction object is not fully built");
+    }
+    return Status::Ok();
+}
+
+Status CentralSlabAllocator::PublishTransaction(
+    uint64_t owner_epoch, uint64_t transaction_id,
+    std::span<const ShmHandle> handles, ShmHandle root) {
+    if (owner_epoch == 0 || transaction_id == 0 || root.IsNull() ||
+        handles.empty() || handles.front() != root) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid allocation transaction manifest");
+    }
+    for (size_t i = handles.size(); i > 1; --i) {
+        if (!handles[i - 1].IsNull()) {
+            MINO_RETURN_IF_ERROR(PublishTransactionHandle(
+                owner_epoch, transaction_id, handles[i - 1],
+                kAllocationFlagTransactionChild));
+        }
+    }
+    return PublishTransactionHandle(owner_epoch, transaction_id, root,
+                                    kAllocationFlagTransactionRoot);
+}
+
+bool CentralSlabAllocator::CanReclaim(ShmHandle handle) const noexcept {
+    return reclaim_guard_ == nullptr ||
+           reclaim_guard_(handle, reclaim_guard_context_);
+}
+
+Status CentralSlabAllocator::ReclaimSlotExact(uint32_t slot_index,
+                                              ShmHandle handle,
+                                              bool allow_published) {
+    SlabHeader& header = HeaderAt(slot_index);
+    for (;;) {
+        if (!bitmap_.IsSet(slot_index) ||
+            generations_.Get(slot_index) != handle.generation ||
+            header.generation.load(std::memory_order_acquire) !=
+                handle.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "stale handle during reclaim");
+        }
+        uint32_t state = header.object_state.load(std::memory_order_acquire);
+        if (state == static_cast<uint32_t>(ObjectState::kReclaiming)) {
+            return Status::Ok();
+        }
+        if (state == static_cast<uint32_t>(ObjectState::kPublished) &&
+            !allow_published) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "published slot must be retired first");
+        }
+        if (state != static_cast<uint32_t>(ObjectState::kRetired) &&
+            state != static_cast<uint32_t>(ObjectState::kAborting) &&
+            state != static_cast<uint32_t>(ObjectState::kAllocated) &&
+            state != static_cast<uint32_t>(ObjectState::kBuilding) &&
+            state != static_cast<uint32_t>(ObjectState::kAllocating) &&
+            !(allow_published &&
+              state == static_cast<uint32_t>(ObjectState::kPublished))) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "slot is not reclaimable");
+        }
+        if (!CanReclaim(handle)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "slot has a live or in-flight Pin");
+        }
+        if (!header.object_state.compare_exchange_weak(
+                state, static_cast<uint32_t>(ObjectState::kReclaiming),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        // The bitmap remains set while kReclaiming is owned, so Allocate cannot
+        // advance the generation. Recheck all ABA-sensitive identity before the
+        // irreversible bitmap clear.
+        if (!bitmap_.IsSet(slot_index) ||
+            generations_.Get(slot_index) != handle.generation ||
+            header.generation.load(std::memory_order_acquire) !=
+                handle.generation ||
+            !CanReclaim(handle)) {
+            uint32_t reclaiming =
+                static_cast<uint32_t>(ObjectState::kReclaiming);
+            (void)header.object_state.compare_exchange_strong(
+                reclaiming, state, std::memory_order_release,
+                std::memory_order_relaxed);
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "reclaim identity or Pin guard changed");
+        }
+        // Publish kFree while the bitmap still excludes Allocate; only this
+        // exact-generation reclaimer can clear the bit, so reuse cannot race the
+        // final state store.
+        header.object_state.store(static_cast<uint32_t>(ObjectState::kFree),
+                                  std::memory_order_release);
+        return bitmap_.ClearBit(slot_index);
+    }
+}
+
+Status CentralSlabAllocator::ReclaimTransaction(
+    uint64_t owner_epoch, uint64_t transaction_id,
+    std::span<const ShmHandle> handles) {
+    if (owner_epoch == 0 || transaction_id == 0 || handles.empty()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid allocation transaction manifest");
+    }
+    for (size_t i = handles.size(); i > 0; --i) {
+        const ShmHandle handle = handles[i - 1];
+        if (handle.IsNull()) continue;
+        Result<uint32_t> slot_index = ResolveLocked(handle);
+        if (!slot_index.ok()) {
+            if (slot_index.status().code() == StatusCode::kNotFound) continue;
+            return slot_index.status();
+        }
+        SlabHeader& header = HeaderAt(*slot_index);
+        if (header.owner_epoch.load(std::memory_order_acquire) != owner_epoch ||
+            header.allocation_transaction_id.load(std::memory_order_acquire) !=
+                transaction_id ||
+            !VerifyImmutableHeader(header)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "manifest reclaim stamp mismatch");
+        }
+        MINO_RETURN_IF_ERROR(ReclaimSlotExact(*slot_index, handle, true));
+    }
+    return Status::Ok();
+}
+
+Status CentralSlabAllocator::ReclaimTransactionAppendGap(
+    uint64_t owner_epoch, uint64_t transaction_id) {
+    if (owner_epoch == 0 || transaction_id == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "invalid allocation transaction identity");
+    }
+    for (uint32_t i = 0; i < total_slot_count(); ++i) {
+        if (!bitmap_.IsSet(i)) continue;
+        SlabHeader& header = HeaderAt(i);
+        const uint32_t state =
+            header.object_state.load(std::memory_order_acquire);
+        if (state == static_cast<uint32_t>(ObjectState::kFree) ||
+            state == static_cast<uint32_t>(ObjectState::kReclaiming) ||
+            header.owner_epoch.load(std::memory_order_acquire) != owner_epoch ||
+            header.allocation_transaction_id.load(std::memory_order_acquire) !=
+                transaction_id) {
+            continue;
+        }
+        const uint32_t generation = generations_.Get(i);
+        if (header.generation.load(std::memory_order_acquire) != generation ||
+            !VerifyImmutableHeader(header)) {
+            continue;
+        }
+        ShmHandle handle{.offset = static_cast<uint64_t>(
+                             reinterpret_cast<std::byte*>(&header) -
+                             static_cast<std::byte*>(shm_base_)),
+                         .generation = generation,
+                         .region_id = region_id_};
+        MINO_RETURN_IF_ERROR(ReclaimSlotExact(i, handle, true));
+    }
+    return Status::Ok();
 }
 
 Result<MutableBuildView> CentralSlabAllocator::BeginBuild(ShmHandle handle) {
@@ -404,28 +629,27 @@ Status CentralSlabAllocator::Retire(ShmHandle handle) {
 
 Status CentralSlabAllocator::Reclaim(ShmHandle handle) {
     MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
-
     SlabHeader& header = HeaderAt(slot_index);
-    const uint32_t state = header.object_state.load(std::memory_order_acquire);
-    // Design doc 8.4: Reclaim only after Retire, or for slots in an
-    // intermediate crash state (recovery-driven reclaim).
-    if (state != static_cast<uint32_t>(ObjectState::kRetired) &&
-        state != static_cast<uint32_t>(ObjectState::kAborting) &&
-        state != static_cast<uint32_t>(ObjectState::kAllocated) &&
-        state != static_cast<uint32_t>(ObjectState::kBuilding)) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "slot must be retired (or crash-intermediate) before reclaim");
+    const uint64_t owner_epoch =
+        header.owner_epoch.load(std::memory_order_acquire);
+    const uint64_t transaction_id =
+        header.allocation_transaction_id.load(std::memory_order_acquire);
+    const uint32_t role =
+        header.allocation_role.load(std::memory_order_acquire);
+    if ((role & kAllocationFlagTransactionRoot) != 0 && owner_epoch != 0 &&
+        transaction_id != 0) {
+        if (!CanReclaim(handle)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "transaction root has a live or in-flight Pin");
+        }
+        // The Journal record may already be finalized after Channel publication.
+        // Transaction stamps remain in every SlabHeader, so root retirement can
+        // still reclaim the complete graph. This recovery-safe fallback is
+        // bounded by allocator capacity; a dedicated persistent graph index can
+        // replace the scan without changing the ownership contract.
+        return ReclaimTransactionAppendGap(owner_epoch, transaction_id);
     }
-
-    // D1 scope: the caller guarantees no valid Borrow and no live Pin.
-    // Enforcement lands with the Borrow/Pin registry (design doc 11).
-
-    // Mark the slot free before clearing the bitmap so that recovery never
-    // sees "bitmap clear but state non-free" as an in-use slot.
-    header.object_state.store(static_cast<uint32_t>(ObjectState::kFree),
-                              std::memory_order_release);
-    MINO_RETURN_IF_ERROR(bitmap_.ClearBit(slot_index));
-    return Status::Ok();
+    return ReclaimSlotExact(slot_index, handle, false);
 }
 
 Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
@@ -448,6 +672,12 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
     view.type_id = TypeId{header.type_id};
     view.schema_short_id = header.schema_short_id;
     view.layout_version = header.layout_version;
+    view.owner_epoch = header.owner_epoch.load(std::memory_order_acquire);
+    view.allocation_transaction_id =
+        header.allocation_transaction_id.load(std::memory_order_acquire);
+    view.allocation_flags =
+        header.allocation_role.load(std::memory_order_acquire) &
+        kAllocationFlagMask;
     view.data = reinterpret_cast<const std::byte*>(&header) + sizeof(SlabHeader);
     return view;
 }
@@ -464,7 +694,9 @@ bool CentralSlabAllocator::ReadSlotByIndex(uint32_t slot_index, SlabHeader* head
         header_out->magic = header.magic;
         header_out->header_version = header.header_version;
         header_out->class_id = header.class_id;
-        header_out->generation = header.generation;
+        header_out->generation.store(
+            header.generation.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
         header_out->object_state.store(
             header.object_state.load(std::memory_order_acquire),
             std::memory_order_relaxed);
@@ -473,10 +705,16 @@ bool CentralSlabAllocator::ReadSlotByIndex(uint32_t slot_index, SlabHeader* head
         header_out->type_id = header.type_id;
         header_out->layout_version = header.layout_version;
         header_out->schema_short_id = header.schema_short_id;
-        header_out->owner_epoch = header.owner_epoch;
-        header_out->allocation_transaction_id = header.allocation_transaction_id;
+        header_out->owner_epoch.store(
+            header.owner_epoch.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
+        header_out->allocation_transaction_id.store(
+            header.allocation_transaction_id.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
         header_out->immutable_header_crc = header.immutable_header_crc;
-        header_out->reserved = header.reserved;
+        header_out->allocation_role.store(
+            header.allocation_role.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
     }
     if (data_out != nullptr) {
         *data_out = reinterpret_cast<const std::byte*>(&header) + sizeof(SlabHeader);
@@ -523,7 +761,9 @@ Result<uint32_t> CentralSlabAllocator::ResolveLocked(ShmHandle handle) const {
         return Status::Error(StatusCode::kNotFound, "slot is not allocated");
     }
     const uint32_t current_gen = generations_.Get(slot_index);
-    if (current_gen != handle.generation) {
+    if (current_gen != handle.generation ||
+        HeaderAt(slot_index).generation.load(std::memory_order_acquire) !=
+            handle.generation) {
         return Status::Error(StatusCode::kNotFound,
                              "stale handle (generation mismatch)");
     }

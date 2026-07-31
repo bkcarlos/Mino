@@ -75,6 +75,25 @@ ClassTableConfig AllocatorConfig() {
     return config;
 }
 
+struct FinalizeRaceContext {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+
+void BlockFirstFinalize(AllocationJournal::PersistencePoint point, uint64_t,
+                        void* opaque) noexcept {
+    if (point != AllocationJournal::PersistencePoint::kFinalizingTagged) {
+        return;
+    }
+    auto* context = static_cast<FinalizeRaceContext*>(opaque);
+    if (context->entered.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    while (!context->release.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
 class RuntimeSpscTest : public ::testing::Test {
 protected:
     static constexpr uint64_t kAllocatorBytes = 1u << 20;
@@ -178,6 +197,93 @@ TEST_F(RuntimeSpscTest, ValidationFailureAbortsBuilderAndPublishesNothing) {
     EXPECT_EQ(status.code(), StatusCode::kInvalidArgument);
     EXPECT_TRUE(channel_->IsEmpty());
     EXPECT_EQ(allocator_.Inspect(handle).status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(RuntimeSpscTest, AllocationJournalTracksBuilderRootAndChild) {
+    constexpr uint32_t kTransactionCapacity = 1;
+    constexpr uint32_t kHandlesPerTransaction = 2;
+    const size_t journal_size = AllocationJournal::RequiredSize(
+        kTransactionCapacity, kHandlesPerTransaction);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, kTransactionCapacity,
+        kHandlesPerTransaction, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_, *journal);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+    (*builder)->id = 17;
+    const ShmHandle root = builder->handle();
+
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{43};
+    child_request.schema = SchemaIdentity{.short_id = 2, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    const ShmHandle child = child_build->handle;
+
+    ASSERT_TRUE(publisher.Abort(std::move(*builder)).ok());
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+
+    auto committed = publisher.Allocate();
+    ASSERT_TRUE(committed.ok());
+    (*committed)->id = 18;
+    auto committed_child_build = committed->AllocateChild(child_request);
+    ASSERT_TRUE(committed_child_build.ok())
+        << committed_child_build.status().ToString();
+    const ShmHandle committed_child = committed_child_build->handle;
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*committed)).ok());
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
+    auto message = subscriber.TryPoll();
+    ASSERT_TRUE(message.ok());
+    EXPECT_EQ((*message)->id, 18u);
+    EXPECT_TRUE(std::move(*message).Ack().ok());
+    EXPECT_EQ(allocator_.Inspect(committed_child).status().code(),
+              StatusCode::kNotFound)
+        << "root ACK must reclaim every published transaction child";
+
+    auto reused = publisher.Allocate();
+    ASSERT_TRUE(reused.ok()) << "successful Channel commit must finalize Journal";
+    EXPECT_TRUE(publisher.Abort(std::move(*reused)).ok());
+}
+
+TEST_F(RuntimeSpscTest, VisibleCommitWithFinalizeRaceReturnsPublishedSuccess) {
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok());
+
+    FinalizeRaceContext race;
+    journal->SetPersistenceHook(&BlockFirstFinalize, &race);
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_, *journal);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0xF1;
+
+    Status publish_status = Status::Error(StatusCode::kInternal);
+    std::thread publishing([&]() {
+        publish_status = publisher.PublishLocal(std::move(*builder));
+    });
+    while (!race.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(journal->RecoverOrphans(), 1u)
+        << "kFinalizing is completed without owner liveness arbitration";
+    race.release.store(true, std::memory_order_release);
+    publishing.join();
+
+    EXPECT_TRUE(publish_status.ok()) << publish_status.ToString();
+    EXPECT_EQ(publisher.journal_cleanup_debt_count(), 1u);
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
+    auto message = subscriber.TryPoll();
+    ASSERT_TRUE(message.ok()) << "channel commit was already visible";
+    EXPECT_EQ((*message)->id, 0xF1u);
+    EXPECT_TRUE(std::move(*message).Ack().ok());
 }
 
 TEST_F(RuntimeSpscTest, DropNewestIsNormalizedToSuccessAndCounted) {

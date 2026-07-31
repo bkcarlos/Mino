@@ -334,16 +334,21 @@ static_assert(sizeof(WorkQueueSlotMeta) == 16);
 // IndexSlot::sequence_num (CRC-covered), so a redundant copy would only risk
 // divergence. Recovery reads the sequence from the slot, not the sidecar.
 struct MpscReservationMeta {
-    uint64_t owner_node_id = 0;
-    uint64_t owner_process_id = 0;
-    uint64_t owner_process_epoch = 0;
-    uint64_t owner_start_time_ns = 0;
-    uint64_t owner_publisher_id = 0;
-    uint64_t reservation_timestamp_ns = 0;
+    // Exact tagged claim: ((sequence + 1) << 3) | phase. Zero means no era owns
+    // this sidecar. Claiming this word happens before reservation_cursor moves,
+    // so recovery can undo an interrupted pre-cursor claim without guessing.
+    std::atomic<uint64_t> claim_control{0};
+    std::atomic<uint64_t> claim_sequence{0};
+    std::atomic<uint64_t> owner_node_id{0};
+    std::atomic<uint64_t> owner_process_id{0};
+    std::atomic<uint64_t> owner_process_epoch{0};
+    std::atomic<uint64_t> owner_start_time_ns{0};
+    std::atomic<uint64_t> owner_publisher_id{0};
+    std::atomic<uint64_t> reservation_timestamp_ns{0};
 };
 
 static_assert(std::is_standard_layout_v<MpscReservationMeta>);
-static_assert(sizeof(MpscReservationMeta) == 48);
+static_assert(sizeof(MpscReservationMeta) == 64);
 
 }  // namespace mino
 

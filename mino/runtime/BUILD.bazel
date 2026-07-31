@@ -17,9 +17,23 @@ cc_library(
 )
 
 cc_library(
+    name = "allocation_journal",
+    srcs = ["allocation_journal.cc"],
+    hdrs = ["allocation_journal.h"],
+    deps = [
+        "//mino/abi:shm_abi",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_library(
     name = "publisher",
     hdrs = ["publisher.h"],
     deps = [
+        ":allocation_journal",
         ":delivery_receipt",
         ":runtime_types",
         ":shm_shared_ptr",
@@ -70,6 +84,68 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/platform:process_identity",
+    ],
+)
+
+cc_test(
+    name = "allocation_journal_test",
+    srcs = ["allocation_journal_test.cc"],
+    deps = [
+        ":allocation_journal",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# D2-13: fork + MAP_SHARED SIGKILL/SIGSTOP/PID-reuse recovery stress.
+# The default target runs a short randomized smoke and is included in //...
+# MINO_D2_RECOVERY_STRESS_SECONDS controls the randomized phase duration;
+# MINO_D2_RECOVERY_STRESS_SEED makes a failing sequence reproducible.
+cc_test(
+    name = "d2_recovery_stress_test",
+    srcs = ["d2_recovery_stress_test.cc"],
+    deps = [
+        ":allocation_journal",
+        ":publisher",
+        ":subscriber",
+        ":subscriber_lease",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:queue_full_policy",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Explicit long-running variant, excluded from wildcard CI. Example:
+#   bazel test //mino/runtime:d2_recovery_stress_long_test \
+#     --test_timeout=3700 \
+#     --test_env=MINO_D2_RECOVERY_STRESS_SECONDS=3600
+cc_test(
+    name = "d2_recovery_stress_long_test",
+    srcs = ["d2_recovery_stress_test.cc"],
+    tags = [
+        "large",
+        "manual",
+    ],
+    deps = [
+        ":allocation_journal",
+        ":publisher",
+        ":subscriber",
+        ":subscriber_lease",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:queue_full_policy",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -127,6 +203,7 @@ cc_test(
     name = "publisher_subscriber_test",
     srcs = ["publisher_subscriber_test.cc"],
     deps = [
+        ":allocation_journal",
         ":delivery_receipt",
         ":publisher",
         ":shm_shared_ptr",

@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <span>
 
 #include "mino/abi/shm_handle.h"
 #include "mino/common/ids.h"
@@ -57,11 +58,19 @@ struct SchemaIdentity {
 };
 
 // AllocationRequest (design doc 8.2).
+inline constexpr uint32_t kAllocationFlagTransactionRoot = 1u << 0;
+inline constexpr uint32_t kAllocationFlagTransactionChild = 1u << 1;
+inline constexpr uint32_t kAllocationFlagMask =
+    kAllocationFlagTransactionRoot | kAllocationFlagTransactionChild;
+
 struct AllocationRequest {
     uint32_t object_size = 0;
     TypeId type_id;
     SchemaIdentity schema;
     uint32_t alignment = 1;
+    uint64_t owner_epoch = 0;
+    uint64_t allocation_transaction_id = 0;
+    uint32_t allocation_flags = 0;
 };
 
 // SlabView is a read-only snapshot of one slot returned by Inspect().
@@ -77,6 +86,9 @@ struct SlabView {
     TypeId type_id;
     uint64_t schema_short_id = 0;
     uint32_t layout_version = 0;
+    uint64_t owner_epoch = 0;
+    uint64_t allocation_transaction_id = 0;
+    uint32_t allocation_flags = 0;
     const void* data = nullptr;  // Slot payload address in this process.
 };
 
@@ -101,6 +113,8 @@ struct MutableBuildView {
 // processes) yield equivalent allocators.
 class CentralSlabAllocator {
 public:
+    static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
+                  "CentralSlabAllocator requires lock-free 64-bit atomics");
     // Initializes a fresh allocator in the shared memory at `shm_base`.
     // `data_region_size` is the total size of the Region in bytes and must
     // cover allocator metadata plus all configured slots. The memory must be
@@ -132,6 +146,30 @@ public:
     // set but whose object_state is not a legally published state never had
     // its generation exposed; recovery may safely clear the bit.
     Result<ShmHandle> Allocate(const AllocationRequest& request);
+
+    // Returns a globally unique, non-zero transaction id for this allocator.
+    // The id is persisted in the allocator superblock and is suitable for both
+    // AllocationJournal tagged control words and SlabHeader transaction stamps.
+    Result<uint64_t> NextAllocationTransactionId();
+
+    // Normal graph operations are manifest-driven and therefore O(handles).
+    // `handles` is root-first; children are published/reclaimed before root.
+    Status PublishTransaction(uint64_t owner_epoch, uint64_t transaction_id,
+                              std::span<const ShmHandle> handles,
+                              ShmHandle root);
+    Status ReclaimTransaction(uint64_t owner_epoch, uint64_t transaction_id,
+                              std::span<const ShmHandle> handles);
+
+    // Recovery-only append-gap scan. Callers must have exclusively claimed the
+    // dead journal transaction before invoking this O(all slots) fallback.
+    Status ReclaimTransactionAppendGap(uint64_t owner_epoch,
+                                       uint64_t transaction_id);
+
+    using ReclaimGuard = bool (*)(ShmHandle, void*) noexcept;
+    void SetReclaimGuard(ReclaimGuard guard, void* context) noexcept {
+        reclaim_guard_ = guard;
+        reclaim_guard_context_ = context;
+    }
 
     // Claims exclusive construction ownership and transitions an object from
     // kAllocated to kBuilding. The returned writable view is process-local;
@@ -195,6 +233,12 @@ private:
     // validation. `require_live` additionally demands the bitmap bit set and
     // generation match.
     Result<uint32_t> ResolveLocked(ShmHandle handle) const;
+    Status PublishTransactionHandle(uint64_t owner_epoch,
+                                    uint64_t transaction_id,
+                                    ShmHandle handle, uint32_t required_role);
+    Status ReclaimSlotExact(uint32_t slot_index, ShmHandle handle,
+                            bool allow_published);
+    bool CanReclaim(ShmHandle handle) const noexcept;
     SlabHeader& HeaderAt(uint32_t slot_index);
     const SlabHeader& HeaderAt(uint32_t slot_index) const;
 
@@ -210,6 +254,9 @@ private:
     uint64_t data_region_size_ = 0;
     uint32_t region_id_ = 0;
     uint64_t slot_stride_ = 0;  // sizeof(SlabHeader) + max slot payload align
+    std::atomic<uint64_t>* next_transaction_id_ = nullptr;
+    ReclaimGuard reclaim_guard_ = nullptr;
+    void* reclaim_guard_context_ = nullptr;
 };
 
 }  // namespace mino

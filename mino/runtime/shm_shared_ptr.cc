@@ -231,6 +231,8 @@ Result<ShmPinTable> ShmPinTable::Init(void* shm_base, size_t shm_size,
     layout.control->layout_version.store(kPinTableLayoutVersion,
                                          std::memory_order_relaxed);
     layout.control->magic.store(kPinTableMagic, std::memory_order_release);
+    allocator.SetReclaimGuard(&ShmPinTable::ReclaimGuardCallback,
+                              layout.control);
     return ShmPinTable(layout.control, layout.records, &allocator);
 }
 
@@ -261,6 +263,8 @@ Result<ShmPinTable> ShmPinTable::Attach(void* shm_base, size_t shm_size,
         return Status::Error(StatusCode::kCorruption,
                              "Pin table layout mismatch");
     }
+    allocator.SetReclaimGuard(&ShmPinTable::ReclaimGuardCallback,
+                              layout.control);
     return ShmPinTable(layout.control, layout.records, &allocator);
 }
 
@@ -271,11 +275,21 @@ Result<ShmPinToken> ShmPinTable::Pin(ShmHandle handle,
         return Status::Error(StatusCode::kInvalidArgument);
     }
 
+    const SharedLayout layout = LayoutOf(control_);
+    const uint32_t object_bucket = static_cast<uint32_t>(
+        HandleHash(handle) % kObjectQuotaBucketCount);
+    if (!IncrementQuota(layout.object_quotas[object_bucket],
+                        kMaxPinsPerObject)) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+
     Result<SlabView> slab = allocator_->Inspect(handle);
     if (!slab.ok()) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return slab.status();
     }
     if (slab->state != ObjectState::kPublished) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return Status::Error(StatusCode::kInvalidArgument,
                              "only a Published object may establish a new Pin");
     }
@@ -284,23 +298,25 @@ Result<ShmPinToken> ShmPinTable::Pin(ShmHandle handle,
         slab->layout_version != contract.layout_version ||
         slab->object_size != contract.object_size ||
         slab->capacity < contract.object_size || slab->data == nullptr) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return Status::Error(StatusCode::kSchemaMismatch,
                              "object does not match the requested Pin contract");
     }
-    return AcquireRecord(handle, owner, slab->data);
+    return AcquireRecord(handle, owner, slab->data, object_bucket);
 }
 
 Result<ShmPinToken> ShmPinTable::AcquireRecord(
-    ShmHandle handle, const ProcessIdentity& owner, const void* data) noexcept {
+    ShmHandle handle, const ProcessIdentity& owner, const void* data,
+    uint32_t object_bucket) noexcept {
     const SharedLayout layout = LayoutOf(control_);
-    const uint32_t object_bucket = static_cast<uint32_t>(
-        HandleHash(handle) % kObjectQuotaBucketCount);
     const uint32_t owner_bucket = static_cast<uint32_t>(
         OwnerHash(owner) % kOwnerQuotaBucketCount);
 
     const uint64_t epoch =
         control_->next_epoch.fetch_add(1, std::memory_order_relaxed);
     if (epoch == 0 || epoch > (std::numeric_limits<uint64_t>::max() >> 3)) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
+        MaybeReclaim(handle).ok();
         return Status::Error(StatusCode::kResourceExhausted);
     }
     const uint64_t writing_state = EncodeState(epoch, kStateWriting);
@@ -319,6 +335,8 @@ Result<ShmPinToken> ShmPinTable::AcquireRecord(
         }
     }
     if (record_index == kInvalidRecordIndex) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
+        MaybeReclaim(handle).ok();
         return Status::Error(StatusCode::kResourceExhausted);
     }
 
@@ -336,18 +354,16 @@ Result<ShmPinToken> ShmPinTable::AcquireRecord(
     record.object_quota_bucket.store(object_bucket, std::memory_order_relaxed);
     record.owner_quota_bucket.store(owner_bucket, std::memory_order_relaxed);
 
-    if (!IncrementQuota(layout.object_quotas[object_bucket],
-                        kMaxPinsPerObject)) {
-        record.state.store(0, std::memory_order_release);
-        return Status::Error(StatusCode::kResourceExhausted);
-    }
+    // Pin()/CloneToken() pre-charge the object bucket before Inspect(). This
+    // closes the Inspect-to-record publication window against allocator reclaim.
     record.state.store(EncodeState(epoch, kStateObjectCharged),
                        std::memory_order_release);
 
     if (!IncrementQuota(layout.owner_quotas[owner_bucket],
                         kMaxPinsPerProcess)) {
-        DecrementQuota(layout.object_quotas[object_bucket]);
         record.state.store(0, std::memory_order_release);
+        DecrementQuota(layout.object_quotas[object_bucket]);
+        MaybeReclaim(handle).ok();
         return Status::Error(StatusCode::kResourceExhausted);
     }
 
@@ -365,18 +381,29 @@ Result<ShmPinToken> ShmPinTable::CloneToken(
         return Status::Error(StatusCode::kNotFound);
     }
 
+    const SharedLayout layout = LayoutOf(control_);
+    const uint32_t object_bucket = static_cast<uint32_t>(
+        HandleHash(source.handle_) % kObjectQuotaBucketCount);
+    if (!IncrementQuota(layout.object_quotas[object_bucket],
+                        kMaxPinsPerObject)) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
     Result<SlabView> slab = allocator_->Inspect(source.handle_);
     if (!slab.ok()) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return slab.status();
     }
     if (slab->state != ObjectState::kPublished &&
         slab->state != ObjectState::kRetired) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return Status::Error(StatusCode::kInvalidArgument);
     }
     if (slab->data == nullptr) {
+        DecrementQuota(layout.object_quotas[object_bucket]);
         return Status::Error(StatusCode::kCorruption);
     }
-    return AcquireRecord(source.handle_, source.owner_, slab->data);
+    return AcquireRecord(source.handle_, source.owner_, slab->data,
+                         object_bucket);
 }
 
 Status ShmPinTable::ReleaseRecord(uint32_t record_index,
@@ -508,6 +535,25 @@ void ShmPinTable::RetirePayloadCallback(ShmHandle handle,
     if (context != nullptr) {
         static_cast<ShmPinTable*>(context)->RetirePayload(handle).ok();
     }
+}
+
+bool ShmPinTable::HasPinOrPublicationGuard(ShmHandle handle) const noexcept {
+    if (handle.IsNull() || control_ == nullptr) return false;
+    const SharedLayout layout = LayoutOf(control_);
+    const uint32_t object_bucket = static_cast<uint32_t>(
+        HandleHash(handle) % kObjectQuotaBucketCount);
+    return layout.object_quotas[object_bucket].load(std::memory_order_acquire) !=
+           0;
+}
+
+bool ShmPinTable::ReclaimGuardCallback(ShmHandle handle,
+                                       void* context) noexcept {
+    if (handle.IsNull() || context == nullptr) return false;
+    const SharedLayout layout = LayoutOf(context);
+    const uint32_t object_bucket = static_cast<uint32_t>(
+        HandleHash(handle) % kObjectQuotaBucketCount);
+    return layout.object_quotas[object_bucket].load(std::memory_order_acquire) ==
+           0;
 }
 
 Status ShmPinTable::MaybeReclaim(ShmHandle handle) noexcept {

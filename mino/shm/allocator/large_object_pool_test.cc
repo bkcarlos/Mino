@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <set>
@@ -195,14 +196,14 @@ TEST_F(LargeObjectPoolTest, InspectRejectsNullHandle) {
     EXPECT_EQ(plan.status().code(), StatusCode::kInvalidArgument);
 }
 
-TEST_F(LargeObjectPoolTest, PlanValidationDetectsCorruptSegmentCount) {
+TEST_F(LargeObjectPoolTest, PlanValidationDetectsCorruptDerivedSegmentCount) {
     auto handle = pool_.Allocate(100 * 1024, LargeObjectTypeId{1});
     ASSERT_TRUE(handle.ok());
 
-    // Corrupt the stored segment count in segment 0's header (reserved is
-    // deliberately not covered by the immutable CRC).
+    // Make the CRC-valid object size imply a segment run beyond pool bounds.
     auto* header = reinterpret_cast<SlabHeader*>(region_.get() + handle->offset);
-    header->reserved = 99;
+    header->object_size = std::numeric_limits<uint32_t>::max();
+    header->immutable_header_crc = ComputeImmutableHeaderCrc(*header);
 
     auto plan = pool_.InspectPlan(*handle);
     ASSERT_FALSE(plan.ok());

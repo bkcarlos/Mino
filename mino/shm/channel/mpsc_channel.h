@@ -61,10 +61,13 @@
 #define MINO_SHM_CHANNEL_MPSC_CHANNEL_H_
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <type_traits>
 
 #include "mino/common/result.h"
@@ -74,7 +77,8 @@
 #include "mino/shm/channel/queue_full_policy.h"
 #include "mino/shm/channel/spsc_channel.h"  // detail::SpinPause
 
-#if defined(__linux__)
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/types.h>
 #include <unistd.h>
 #endif
 
@@ -90,12 +94,28 @@ public:
     // v4: reservation sidecars carry the owner's full process incarnation so
     // recovery detects PID reuse by start time. v3 introduced per-slot Vyukov
     // `turn`; v2 dropped the ordered commit bitmap.
-    static constexpr uint32_t kLayoutVersion = 4;
+    static constexpr uint32_t kLayoutVersion = 5;
 
     // Default producer lease (design doc 9.5). 30 s tolerates long pauses
     // (SIGSTOP, scheduling) without wedging the queue for minutes.
     static constexpr uint64_t kDefaultProducerLeaseNs =
         30ULL * 1000 * 1000 * 1000;
+
+    enum class PersistencePoint : uint32_t {
+        kClaimTagged = 1,
+        kOwnerPublished = 2,
+        kCursorAdvanced = 3,
+        kWritingPublished = 4,
+        kReadyPublished = 5,
+        kTurnPublished = 6,
+    };
+    using PersistenceHook = void (*)(PersistencePoint, uint64_t,
+                                     void*) noexcept;
+
+    void SetPersistenceHook(PersistenceHook hook, void* context) noexcept {
+        persistence_hook_ = hook;
+        persistence_hook_context_ = context;
+    }
 
     // -----------------------------------------------------------------------
     // Control block
@@ -216,7 +236,7 @@ public:
 
         MpscReservationMeta* metas = MetasOf(shm_base, capacity);
         for (uint64_t i = 0; i < capacity; ++i) {
-            metas[i] = MpscReservationMeta{};
+            new (&metas[i]) MpscReservationMeta{};
         }
 
         control->magic.store(kMagic, std::memory_order_release);
@@ -545,6 +565,7 @@ public:
                 // so we do it here on the slot's behalf.
                 slot->turn.store(cons + capacity_, std::memory_order_release);
                 AdvanceConsumerPast(cons);
+                ReleaseClaim(cons);
                 continue;
             }
             if (turn != cons + 1 ||
@@ -596,49 +617,130 @@ public:
         if (lease_ns == 0) {
             lease_ns = kDefaultProducerLeaseNs;
         }
-        const uint64_t consumed =
-            control_->consumer_cursor.load(std::memory_order_acquire);
-        const uint64_t reserved =
-            control_->reservation_cursor.load(std::memory_order_acquire);
-        uint64_t aborted = 0;
-        for (uint64_t seq = consumed; seq < reserved; ++seq) {
-            const uint64_t phys = seq & mask_;
-            IndexSlot* slot = &slots_[phys];
-            const uint32_t state =
-                slot->state.load(std::memory_order_acquire);
-            if (state != static_cast<uint32_t>(SlotState::kReserved) &&
-                state != static_cast<uint32_t>(SlotState::kWriting)) {
-                continue;
-            }
-            // Validity rule (design doc 9.2): the sidecar is only
-            // meaningful while the slot still carries this exact sequence.
-            if (slot->sequence_num.load(std::memory_order_acquire) != seq) {
-                continue;
-            }
+        uint64_t recovered = 0;
+        for (uint64_t phys = 0; phys < capacity_; ++phys) {
             MpscReservationMeta& meta = metas_[phys];
-            if (now_ns - meta.reservation_timestamp_ns < lease_ns) {
-                continue;  // Fresh reservation: owner may still be working.
-            }
-            if (IsOwnerAlive(meta)) {
-                continue;  // Live (possibly paused) owner: never reclaim.
-            }
-            // CAS so a racing legitimate Commit/Abort (owner was merely
-            // unreachable from this scanner, e.g. /proc hidepid) loses
-            // cleanly instead of being double-stamped.
-            uint32_t expected = state;
-            if (!slot->state.compare_exchange_strong(
-                    expected, static_cast<uint32_t>(SlotState::kAborted),
-                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            uint64_t claim =
+                meta.claim_control.load(std::memory_order_acquire);
+            if (claim == 0) {
                 continue;
             }
-            ++aborted;
+            const uint64_t seq =
+                meta.claim_sequence.load(std::memory_order_acquire);
+            const ClaimPhase phase = ClaimState(claim);
+            if (phase == ClaimPhase::kInitializing) {
+                // The claimant PID is part of the atomic claim itself, so even
+                // a death immediately after the claim CAS is distinguishable
+                // from a paused writer. A live/reused/unknown PID is deferred;
+                // only proven death permits exact-tag revocation.
+                if (PidLiveness(ClaimProcessId(claim)) !=
+                    ProcessLivenessState::kDead) {
+                    continue;
+                }
+                uint64_t expected = claim;
+                if (meta.claim_control.compare_exchange_strong(
+                        expected, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    ++recovered;
+                }
+                continue;
+            }
+            const uint64_t timestamp =
+                meta.reservation_timestamp_ns.load(std::memory_order_acquire);
+            const bool expired = timestamp == 0 || now_ns < timestamp ||
+                                 now_ns - timestamp >= lease_ns;
+            if (!expired) {
+                continue;
+            }
+            if (OwnerLiveness(meta) != ProcessLivenessState::kDead) {
+                continue;
+            }
+
+            const uint64_t reserved =
+                control_->reservation_cursor.load(std::memory_order_acquire);
+            if (seq >= reserved) {
+                uint64_t expected = claim;
+                if (meta.claim_control.compare_exchange_strong(
+                        expected, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    ++recovered;
+                }
+                continue;
+            }
+
+            IndexSlot* slot = &slots_[phys];
+            if (slot->sequence_num.load(std::memory_order_acquire) != seq) {
+                slot->sequence_num.store(seq, std::memory_order_relaxed);
+                slot->state.store(static_cast<uint32_t>(SlotState::kAborted),
+                                  std::memory_order_release);
+                ++recovered;
+                continue;
+            }
+            uint32_t state = slot->state.load(std::memory_order_acquire);
+            if (state == static_cast<uint32_t>(SlotState::kReserved) ||
+                state == static_cast<uint32_t>(SlotState::kWriting) ||
+                phase == ClaimPhase::kCursorAdvanced) {
+                uint32_t expected = state;
+                if (slot->state.compare_exchange_strong(
+                        expected, static_cast<uint32_t>(SlotState::kAborted),
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    ++recovered;
+                }
+                continue;
+            }
+            if (state == static_cast<uint32_t>(SlotState::kReady) &&
+                slot->turn.load(std::memory_order_acquire) == seq) {
+                // Commit had already sealed metadata and published READY. Roll
+                // forward the sole missing visibility store rather than
+                // leaving the ordered prefix permanently wedged.
+                meta.claim_control.store(
+                    WithClaimPhase(claim, ClaimPhase::kReady),
+                    std::memory_order_release);
+                slot->turn.store(seq + 1, std::memory_order_release);
+                ++recovered;
+            }
         }
-        return aborted;
+        return recovered;
     }
 
     // -----------------------------------------------------------------------
     // Observers
     // -----------------------------------------------------------------------
+
+    enum class PublicationVisibility : uint32_t {
+        kNotVisible = 0,
+        kVisible = 1,
+        kIndeterminate = 2,
+    };
+
+    PublicationVisibility InspectPublication(uint64_t sequence,
+                                             ShmHandle payload) const noexcept {
+        const uint64_t consumed =
+            control_->consumer_cursor.load(std::memory_order_acquire);
+        if (consumed > sequence) {
+            return PublicationVisibility::kVisible;
+        }
+        const uint64_t reserved =
+            control_->reservation_cursor.load(std::memory_order_acquire);
+        if (reserved <= sequence) {
+            return PublicationVisibility::kNotVisible;
+        }
+        const IndexSlot& slot = slots_[sequence & mask_];
+        if (slot.sequence_num.load(std::memory_order_acquire) != sequence) {
+            return PublicationVisibility::kIndeterminate;
+        }
+        const uint32_t state = slot.state.load(std::memory_order_acquire);
+        if (state == static_cast<uint32_t>(SlotState::kAborted)) {
+            return PublicationVisibility::kNotVisible;
+        }
+        if (state == static_cast<uint32_t>(SlotState::kReady) &&
+            slot.turn.load(std::memory_order_acquire) == sequence + 1 &&
+            slot.payload == payload) {
+            return PublicationVisibility::kVisible;
+        }
+        return PublicationVisibility::kIndeterminate;
+    }
 
     // Approximate (not linearizable): the queue has no outstanding
     // reservations once the consumer has caught up to the reservation
@@ -670,6 +772,37 @@ public:
     uint64_t capacity() const noexcept { return capacity_; }
 
 private:
+    enum class ClaimPhase : uint8_t {
+        kInitializing = 1,
+        kOwnerReady = 2,
+        kCursorAdvanced = 3,
+        kWriting = 4,
+        kReady = 5,
+    };
+
+    enum class ProcessLivenessState : uint8_t {
+        kAlive,
+        kDead,
+        kUnknown,
+    };
+
+    static uint64_t MakeInitialClaim(uint32_t process_id,
+                                     uint32_t token) noexcept {
+        return (static_cast<uint64_t>(process_id) << 32) |
+               ((static_cast<uint64_t>(token & 0x1FFF'FFFFu)) << 3) |
+               static_cast<uint8_t>(ClaimPhase::kInitializing);
+    }
+    static uint64_t WithClaimPhase(uint64_t claim,
+                                   ClaimPhase phase) noexcept {
+        return (claim & ~uint64_t{0x7}) | static_cast<uint8_t>(phase);
+    }
+    static uint32_t ClaimProcessId(uint64_t claim) noexcept {
+        return static_cast<uint32_t>(claim >> 32);
+    }
+    static ClaimPhase ClaimState(uint64_t claim) noexcept {
+        return static_cast<ClaimPhase>(claim & 0x7u);
+    }
+
     MpscChannel(ControlBlock* control, IndexSlot* slots,
                 MpscReservationMeta* metas, uint64_t capacity) noexcept
         : control_(control),
@@ -716,6 +849,7 @@ private:
         // prior reads of this slot happen-before its reuse in a new era.
         oldest->turn.store(cons + capacity_, std::memory_order_release);
         AdvanceConsumerPast(cons);
+        ReleaseClaim(cons);
     }
 
     // Vyukov per-slot-turn probe-then-claim. Probes slot[res % capacity].turn
@@ -784,32 +918,76 @@ private:
                                      "MPSC slot holds an unconsumed tombstone");
             }
 
-            // turn == res: the slot is free for this era. Claim the sequence
-            // by advancing the cursor; only on success do we own the slot.
+            // Claim the sidecar before advancing the shared cursor. This exact
+            // sequence-tagged CAS closes the old cursor-advanced/slot-unowned
+            // crash window and arbitrates every producer for this era.
+            MpscReservationMeta& meta = metas_[phys];
+            uint64_t no_claim = 0;
+            uint32_t token = static_cast<uint32_t>(
+                control_->reserved2.fetch_add(1, std::memory_order_relaxed) + 1);
+            if ((token & 0x1FFF'FFFFu) == 0) {
+                token = static_cast<uint32_t>(
+                    control_->reserved2.fetch_add(1,
+                                                  std::memory_order_relaxed) + 1);
+            }
+            const uint64_t initializing = MakeInitialClaim(
+                static_cast<uint32_t>(owner.owner.process_id), token);
+            if (!meta.claim_control.compare_exchange_strong(
+                    no_claim, initializing, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                // Another producer is finishing the same cursor era. This is
+                // arbitration, not queue fullness; re-read the cursor rather
+                // than surfacing a spurious kFail to the caller.
+                detail::SpinPause();
+                continue;
+            }
+            InvokePersistenceHook(PersistencePoint::kClaimTagged, res);
+            meta.claim_sequence.store(res, std::memory_order_relaxed);
+
+            meta.owner_node_id.store(owner.owner.node_id,
+                                     std::memory_order_relaxed);
+            meta.owner_process_id.store(owner.owner.process_id,
+                                        std::memory_order_relaxed);
+            meta.owner_process_epoch.store(owner.owner.process_epoch,
+                                           std::memory_order_relaxed);
+            meta.owner_start_time_ns.store(owner.owner.start_time_ns,
+                                           std::memory_order_relaxed);
+            meta.owner_publisher_id.store(owner.publisher_id,
+                                          std::memory_order_relaxed);
+            meta.reservation_timestamp_ns.store(MonotonicNowNs(),
+                                                std::memory_order_relaxed);
+            uint64_t claim_expected = initializing;
+            const uint64_t owner_ready =
+                WithClaimPhase(initializing, ClaimPhase::kOwnerReady);
+            if (!meta.claim_control.compare_exchange_strong(
+                    claim_expected, owner_ready, std::memory_order_release,
+                    std::memory_order_acquire)) {
+                continue;
+            }
+            InvokePersistenceHook(PersistencePoint::kOwnerPublished, res);
+
             uint64_t expected = res;
-            if (!control_->reservation_cursor.compare_exchange_weak(
+            if (!control_->reservation_cursor.compare_exchange_strong(
                     expected, res + 1, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
-                continue;  // Another producer claimed res; re-probe.
+                claim_expected = owner_ready;
+                meta.claim_control.compare_exchange_strong(
+                    claim_expected, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+                continue;
             }
+            meta.claim_control.store(
+                WithClaimPhase(owner_ready, ClaimPhase::kCursorAdvanced),
+                std::memory_order_release);
+            InvokePersistenceHook(PersistencePoint::kCursorAdvanced, res);
 
-            // We own sequence `res` and slot `phys` for this era (the cursor
-            // CAS serialized us against every other producer for this exact
-            // cursor value, and the turn probe guaranteed the slot was free).
-            // Publish the claim with RELEASE stores: the kWriting store must
-            // be visible to a wrapping producer's acquire probe so it reads
-            // turn < its pos and reports full/wedged instead of reusing the
-            // slot. sequence_num is published by the same release.
-            MpscReservationMeta& meta = metas_[phys];
-            meta.owner_node_id = owner.owner.node_id;
-            meta.owner_process_id = owner.owner.process_id;
-            meta.owner_process_epoch = owner.owner.process_epoch;
-            meta.owner_start_time_ns = owner.owner.start_time_ns;
-            meta.owner_publisher_id = owner.publisher_id;
-            meta.reservation_timestamp_ns = MonotonicNowNs();
             slot->sequence_num.store(res, std::memory_order_relaxed);
             slot->state.store(static_cast<uint32_t>(SlotState::kWriting),
                               std::memory_order_release);
+            meta.claim_control.store(
+                WithClaimPhase(owner_ready, ClaimPhase::kWriting),
+                std::memory_order_release);
+            InvokePersistenceHook(PersistencePoint::kWritingPublished, res);
             return Reservation(this, slot, res);
         }
     }
@@ -821,21 +999,42 @@ private:
     // bitmap is needed.
     Status CommitSlot(IndexSlot* slot, uint64_t sequence) noexcept {
         SealIndexSlotImmutableCrc(*slot);
-        slot->state.store(static_cast<uint32_t>(SlotState::kReady),
-                          std::memory_order_release);
-        // Vyukov: mark the slot ready for the consumer reading `sequence`.
+        uint32_t expected = static_cast<uint32_t>(SlotState::kWriting);
+        if (!slot->state.compare_exchange_strong(
+                expected, static_cast<uint32_t>(SlotState::kReady),
+                std::memory_order_release, std::memory_order_acquire)) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "MPSC reservation was recovered before commit");
+        }
+        InvokePersistenceHook(PersistencePoint::kReadyPublished, sequence);
+        MpscReservationMeta& meta = metas_[sequence & mask_];
+        const uint64_t claim =
+            meta.claim_control.load(std::memory_order_acquire);
+        meta.claim_control.store(WithClaimPhase(claim, ClaimPhase::kReady),
+                                 std::memory_order_release);
+        // Vyukov visibility store. Recovery rolls this forward when a dead
+        // producer stopped after READY but before turn publication.
         slot->turn.store(sequence + 1, std::memory_order_release);
+        InvokePersistenceHook(PersistencePoint::kTurnPublished, sequence);
         return Status::Ok();
     }
 
     // Stamps an ABORTED tombstone. The consumer retires and skips it
     // transparently in Poll() (it advances turn past the slot there).
     Status AbortSlot(IndexSlot* slot, uint64_t sequence) noexcept {
-        (void)sequence;
         uint32_t expected = static_cast<uint32_t>(SlotState::kWriting);
-        slot->state.compare_exchange_strong(
-            expected, static_cast<uint32_t>(SlotState::kAborted),
-            std::memory_order_acq_rel, std::memory_order_relaxed);
+        if (!slot->state.compare_exchange_strong(
+                expected, static_cast<uint32_t>(SlotState::kAborted),
+                std::memory_order_acq_rel, std::memory_order_acquire) &&
+            expected != static_cast<uint32_t>(SlotState::kAborted)) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "MPSC reservation is no longer abortable");
+        }
+        MpscReservationMeta& meta = metas_[sequence & mask_];
+        const uint64_t claim =
+            meta.claim_control.load(std::memory_order_acquire);
+        meta.claim_control.store(WithClaimPhase(claim, ClaimPhase::kWriting),
+                                 std::memory_order_release);
         return Status::Ok();
     }
 
@@ -855,6 +1054,7 @@ private:
     void RetireAndAdvance(IndexSlot* slot, uint64_t cons) noexcept {
         slot->turn.store(cons + capacity_, std::memory_order_release);
         AdvanceConsumerPast(cons);
+        ReleaseClaim(cons);
     }
 
     Status AckSlot(uint64_t sequence) noexcept {
@@ -882,17 +1082,61 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
     }
 
-    // True iff the exact recorded process incarnation could still publish.
-    // IsProcessIdentityAlive compares Linux process start time in addition to
-    // PID, so PID reuse cannot indefinitely protect an orphaned reservation.
-    static bool IsOwnerAlive(const MpscReservationMeta& meta) noexcept {
+    static ProcessLivenessState PidLiveness(uint32_t process_id) noexcept {
+        if (process_id == 0) {
+            return ProcessLivenessState::kUnknown;
+        }
+        errno = 0;
+        const int rc = ::kill(static_cast<pid_t>(process_id), 0);
+        if (rc == 0 || errno == EPERM) {
+            return ProcessLivenessState::kUnknown;
+        }
+        return errno == ESRCH ? ProcessLivenessState::kDead
+                              : ProcessLivenessState::kUnknown;
+    }
+
+    static ProcessLivenessState OwnerLiveness(
+        const MpscReservationMeta& meta) noexcept {
         const ProcessIdentity owner{
-            .node_id = meta.owner_node_id,
-            .process_id = meta.owner_process_id,
-            .process_epoch = meta.owner_process_epoch,
-            .start_time_ns = meta.owner_start_time_ns,
+            .node_id = meta.owner_node_id.load(std::memory_order_acquire),
+            .process_id =
+                meta.owner_process_id.load(std::memory_order_acquire),
+            .process_epoch =
+                meta.owner_process_epoch.load(std::memory_order_acquire),
+            .start_time_ns =
+                meta.owner_start_time_ns.load(std::memory_order_acquire),
         };
-        return IsProcessIdentityAlive(owner);
+        if (owner.IsZero() || owner.process_id == 0) {
+            return ProcessLivenessState::kUnknown;
+        }
+        if (IsProcessIdentityAlive(owner)) {
+            return ProcessLivenessState::kAlive;
+        }
+        errno = 0;
+        const int rc = ::kill(static_cast<pid_t>(owner.process_id), 0);
+        if (rc == 0 || errno == EPERM) {
+            return ProcessLivenessState::kUnknown;
+        }
+        return errno == ESRCH ? ProcessLivenessState::kDead
+                              : ProcessLivenessState::kUnknown;
+    }
+
+    void InvokePersistenceHook(PersistencePoint point,
+                               uint64_t sequence) noexcept {
+        if (persistence_hook_ != nullptr) {
+            persistence_hook_(point, sequence, persistence_hook_context_);
+        }
+    }
+
+    void ReleaseClaim(uint64_t sequence) noexcept {
+        MpscReservationMeta& meta = metas_[sequence & mask_];
+        uint64_t claim = meta.claim_control.load(std::memory_order_acquire);
+        while (claim != 0 &&
+               meta.claim_sequence.load(std::memory_order_acquire) == sequence &&
+               !meta.claim_control.compare_exchange_weak(
+                   claim, 0, std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {
+        }
     }
 
     ControlBlock* control_ = nullptr;
@@ -900,6 +1144,8 @@ private:
     MpscReservationMeta* metas_ = nullptr;
     uint64_t capacity_ = 0;
     uint64_t mask_ = 0;
+    PersistenceHook persistence_hook_ = nullptr;
+    void* persistence_hook_context_ = nullptr;
 };
 
 }  // namespace mino

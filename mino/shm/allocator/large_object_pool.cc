@@ -283,8 +283,8 @@ Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
         gen.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Fill segment headers. Segment 0 carries the immutable CRC and the
-    // segment count (in `reserved`, which is not covered by the CRC).
+    // Fill segment headers. Segment 0 carries the immutable CRC. The segment
+    // count is derived deterministically from object_size and segment_size.
     for (uint32_t i = 0; i < segments_needed; ++i) {
         const uint32_t seg = run_start + i;
         SlabHeader& h = headers_[seg];
@@ -297,9 +297,9 @@ Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
         h.type_id = type_id.value;
         h.layout_version = 0;
         h.schema_short_id = 0;
-        h.owner_epoch = 0;
-        h.allocation_transaction_id = 0;
-        h.reserved = segments_needed;
+        h.owner_epoch.store(0, std::memory_order_relaxed);
+        h.allocation_transaction_id.store(0, std::memory_order_relaxed);
+        h.allocation_role.store(0, std::memory_order_relaxed);
         h.immutable_header_crc = i == 0 ? ComputeImmutableHeaderCrc(h) : 0;
     }
 
@@ -370,12 +370,11 @@ Result<LargeObjectPlan> LargeObjectPool::InspectPlan(ShmHandle handle) const {
         return Status::Error(StatusCode::kCorruption,
                              "segment 0 immutable CRC mismatch");
     }
-    const uint32_t segments_needed = h0.reserved;
-    const uint32_t expected =
+    const uint32_t segments_needed =
         (h0.object_size + segment_size_ - 1) / segment_size_;
-    if (segments_needed != expected || segments_needed == 0) {
+    if (segments_needed == 0) {
         return Status::Error(StatusCode::kCorruption,
-                             "stored segment count disagrees with object size");
+                             "large object has an invalid segment count");
     }
     if (seg0 + segments_needed > segment_count_) {
         return Status::Error(StatusCode::kCorruption,

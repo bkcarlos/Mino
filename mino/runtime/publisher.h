@@ -17,6 +17,7 @@
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/runtime/allocation_journal.h"
 #include "mino/runtime/deadline.h"
 #include "mino/runtime/delivery_receipt.h"
 #include "mino/runtime/message_traits.h"
@@ -64,12 +65,51 @@ public:
     bool active() const noexcept { return active_; }
     ShmHandle handle() const noexcept { return handle_; }
 
+    Result<MutableBuildView> AllocateChild(
+        const AllocationRequest& request) noexcept {
+        if (!active_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "message builder is not active");
+        }
+        if (journal_ == nullptr) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "message builder has no allocation journal");
+        }
+        MINO_ASSIGN_OR_RETURN(ShmHandle child,
+                              journal_->AllocateChild(transaction_, request));
+        Result<MutableBuildView> build = allocator_->BeginBuild(child);
+        if (!build.ok()) {
+            (void)journal_->Abort(transaction_);
+            active_ = false;
+            return build.status();
+        }
+        return build;
+    }
+
+    Status RegisterChild(ShmHandle child) noexcept {
+        if (!active_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "message builder is not active");
+        }
+        if (journal_ == nullptr) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "message builder has no allocation journal");
+        }
+        return journal_->RegisterChild(transaction_, child);
+    }
+
 private:
     friend class Publisher<T>;
 
     MessageBuilder(CentralSlabAllocator* allocator, ShmHandle handle,
-                   T* value) noexcept
-        : allocator_(allocator), handle_(handle), value_(value), active_(true) {}
+                   T* value, AllocationJournal* journal = nullptr,
+                   AllocationTransaction transaction = {}) noexcept
+        : allocator_(allocator),
+          handle_(handle),
+          value_(value),
+          journal_(journal),
+          transaction_(transaction),
+          active_(true) {}
 
     Status Abort() noexcept {
         if (!active_) {
@@ -80,14 +120,75 @@ private:
         std::destroy_at(value_);
         value_ = nullptr;
         CentralSlabAllocator* allocator = allocator_;
+        AllocationJournal* journal = journal_;
+        const AllocationTransaction transaction = transaction_;
+        const bool journal_committed = journal_committed_;
         allocator_ = nullptr;
-        return allocator->Abort(handle_);
+        journal_ = nullptr;
+        transaction_ = {};
+        journal_committed_ = false;
+        if (journal == nullptr) {
+            return allocator->Abort(handle_);
+        }
+        return journal_committed ? journal->RollbackCommitted(transaction)
+                                 : journal->Abort(transaction);
+    }
+
+    Status CommitJournal(const PublicationBinding& binding) noexcept {
+        if (journal_ == nullptr) {
+            return Status::Ok();
+        }
+        const Status status = journal_->Commit(transaction_, binding);
+        if (status.ok()) {
+            journal_committed_ = true;
+        }
+        return status;
+    }
+
+    Status FinalizeJournal() noexcept {
+        if (journal_ == nullptr) {
+            return Status::Ok();
+        }
+        if (!journal_committed_) {
+            return Status::Error(StatusCode::kInternal,
+                                 "allocation journal is not committed");
+        }
+        const Status status = journal_->FinalizeCommit(transaction_);
+        if (status.ok()) {
+            journal_ = nullptr;
+            transaction_ = {};
+            journal_committed_ = false;
+        }
+        return status;
+    }
+
+    Status RollbackJournal() noexcept {
+        std::destroy_at(value_);
+        value_ = nullptr;
+        if (journal_ == nullptr) {
+            MINO_RETURN_IF_ERROR(allocator_->Retire(handle_));
+            return allocator_->Reclaim(handle_);
+        }
+        if (!journal_committed_) {
+            return Status::Error(StatusCode::kInternal,
+                                 "allocation journal is not committed");
+        }
+        const Status status = journal_->RollbackCommitted(transaction_);
+        if (status.ok()) {
+            journal_ = nullptr;
+            transaction_ = {};
+            journal_committed_ = false;
+        }
+        return status;
     }
 
     void Disarm() noexcept {
         active_ = false;
         allocator_ = nullptr;
         value_ = nullptr;
+        journal_ = nullptr;
+        transaction_ = {};
+        journal_committed_ = false;
     }
 
     void AbortIfActive() noexcept {
@@ -100,15 +201,24 @@ private:
         allocator_ = other.allocator_;
         handle_ = other.handle_;
         value_ = other.value_;
+        journal_ = other.journal_;
+        transaction_ = other.transaction_;
+        journal_committed_ = other.journal_committed_;
         active_ = other.active_;
         other.allocator_ = nullptr;
         other.value_ = nullptr;
+        other.journal_ = nullptr;
+        other.transaction_ = {};
+        other.journal_committed_ = false;
         other.active_ = false;
     }
 
     CentralSlabAllocator* allocator_ = nullptr;
     ShmHandle handle_;
     T* value_ = nullptr;
+    AllocationJournal* journal_ = nullptr;
+    AllocationTransaction transaction_;
+    bool journal_committed_ = false;
     bool active_ = false;
 };
 
@@ -129,6 +239,18 @@ public:
         ValidateStaticContract();
     }
 
+    Publisher(CentralSlabAllocator& allocator, SpscChannel& channel,
+              AllocationJournal& journal,
+              const ProcessIdentity& owner = ProcessIdentity::Current(),
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          allocation_journal_(&journal),
+          allocation_owner_(owner),
+          options_(options) {
+        ValidateStaticContract();
+    }
+
     Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
               MpscChannel::ProducerIdentity producer_identity,
               PublisherOptions options = {}) noexcept
@@ -139,9 +261,36 @@ public:
         ValidateStaticContract();
     }
 
+    Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
+              MpscChannel::ProducerIdentity producer_identity,
+              AllocationJournal& journal,
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          mpsc_identity_(producer_identity),
+          allocation_journal_(&journal),
+          allocation_owner_(producer_identity.owner),
+          options_(options) {
+        ValidateStaticContract();
+    }
+
     Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
               ShmPinTable& pins, PublisherOptions options = {}) noexcept
         : allocator_(&allocator), channel_(&channel), options_(options) {
+        channel.SetPayloadRetireObserver(&ShmPinTable::RetirePayloadCallback,
+                                         &pins);
+        ValidateStaticContract();
+    }
+
+    Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
+              ShmPinTable& pins, AllocationJournal& journal,
+              const ProcessIdentity& owner = ProcessIdentity::Current(),
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          allocation_journal_(&journal),
+          allocation_owner_(owner),
+          options_(options) {
         channel.SetPayloadRetireObserver(&ShmPinTable::RetirePayloadCallback,
                                          &pins);
         ValidateStaticContract();
@@ -162,20 +311,47 @@ public:
         };
         request.alignment = alignof(T);
 
-        MINO_ASSIGN_OR_RETURN(ShmHandle handle, allocator_->Allocate(request));
+        if (allocation_journal_ == nullptr) {
+            MINO_ASSIGN_OR_RETURN(ShmHandle handle, allocator_->Allocate(request));
+            Result<MutableBuildView> build = allocator_->BeginBuild(handle);
+            if (!build.ok()) {
+                allocator_->Abort(handle).ok();
+                return build.status();
+            }
+            if (build->capacity < sizeof(T) || build->object_size != sizeof(T) ||
+                build->data == nullptr) {
+                allocator_->Abort(handle).ok();
+                return Status::Error(StatusCode::kCorruption,
+                                     "allocator returned an invalid build view");
+            }
+            T* value = std::construct_at(static_cast<T*>(build->data));
+            return MessageBuilder<T>(allocator_, handle, value);
+        }
+
+        MINO_ASSIGN_OR_RETURN(
+            AllocationTransaction transaction,
+            allocation_journal_->Begin(allocation_owner_));
+        Result<ShmHandle> allocated =
+            allocation_journal_->AllocateRoot(transaction, request);
+        if (!allocated.ok()) {
+            (void)allocation_journal_->Abort(transaction);
+            return allocated.status();
+        }
+        const ShmHandle handle = *allocated;
         Result<MutableBuildView> build = allocator_->BeginBuild(handle);
         if (!build.ok()) {
-            allocator_->Abort(handle).ok();
+            (void)allocation_journal_->Abort(transaction);
             return build.status();
         }
         if (build->capacity < sizeof(T) || build->object_size != sizeof(T) ||
             build->data == nullptr) {
-            allocator_->Abort(handle).ok();
+            (void)allocation_journal_->Abort(transaction);
             return Status::Error(StatusCode::kCorruption,
                                  "allocator returned an invalid build view");
         }
         T* value = std::construct_at(static_cast<T*>(build->data));
-        return MessageBuilder<T>(allocator_, handle, value);
+        return MessageBuilder<T>(allocator_, handle, value,
+                                 allocation_journal_, transaction);
     }
 
     // Publishes locally. Success means kLocalPublished only. A policy-driven
@@ -216,6 +392,10 @@ public:
 
     uint64_t dropped_count() const noexcept {
         return dropped_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t journal_cleanup_debt_count() const noexcept {
+        return journal_cleanup_debt_count_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -275,7 +455,10 @@ private:
             return AbortWith(builder, reservation.status());
         }
 
-        const Status published = allocator_->Publish(builder.handle_);
+        const Status published =
+            builder.journal_ == nullptr
+                ? allocator_->Publish(builder.handle_)
+                : builder.journal_->PublishGraph(builder.transaction_);
         if (!published.ok()) {
             return AbortWith(builder, published);
         }
@@ -293,14 +476,33 @@ private:
 
         const uint64_t committed_sequence =
             slot->sequence_num.load(std::memory_order_relaxed);
+        PublicationBinding binding{
+            .channel_kind = PublicationKind(),
+            .channel_id = 0,
+            .sequence = committed_sequence,
+            .payload = builder.handle_,
+        };
+        const Status journal_committed = builder.CommitJournal(binding);
+        if (!journal_committed.ok()) {
+            return AbortWith(builder, journal_committed);
+        }
         const Status committed = std::move(*reservation).Commit();
         if (!committed.ok()) {
-            allocator_->Retire(builder.handle_).ok();
-            allocator_->Reclaim(builder.handle_).ok();
+            const Status rollback = builder.RollbackJournal();
             builder.Disarm();
-            return committed;
+            return rollback.ok() ? committed : rollback;
         }
+        const Status finalized = builder.FinalizeJournal();
         builder.Disarm();
+        if (!finalized.ok()) {
+            // Channel Commit is the publication linearization point. Reporting a
+            // normal publish failure here would invite a duplicate retry even
+            // though consumers can already observe the message. Persisted
+            // binding + kCommitted/kFinalizing state lets recovery discharge
+            // this cleanup debt later.
+            journal_cleanup_debt_count_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+        }
         if constexpr (std::is_same_v<Reservation,
                                      BroadcastChannel::Reservation>) {
             std::get<BroadcastChannel*>(channel_)->CollectGarbage();
@@ -394,6 +596,16 @@ private:
         return abort.ok() ? original : abort;
     }
 
+    PublicationChannelKind PublicationKind() const noexcept {
+        if (std::holds_alternative<SpscChannel*>(channel_)) {
+            return PublicationChannelKind::kSpsc;
+        }
+        if (std::holds_alternative<MpscChannel*>(channel_)) {
+            return PublicationChannelKind::kMpsc;
+        }
+        return PublicationChannelKind::kBroadcast;
+    }
+
     static uint64_t MonotonicNowNs() noexcept {
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
         return static_cast<uint64_t>(
@@ -403,9 +615,12 @@ private:
     CentralSlabAllocator* allocator_;
     std::variant<SpscChannel*, MpscChannel*, BroadcastChannel*> channel_;
     MpscChannel::ProducerIdentity mpsc_identity_{};
+    AllocationJournal* allocation_journal_ = nullptr;
+    ProcessIdentity allocation_owner_;
     PublisherOptions options_;
     std::atomic<uint64_t> published_count_{0};
     std::atomic<uint64_t> dropped_count_{0};
+    std::atomic<uint64_t> journal_cleanup_debt_count_{0};
 };
 
 }  // namespace mino

@@ -42,8 +42,8 @@ namespace {
 
 static_assert(std::is_trivially_copyable_v<MpscChannel>,
               "MpscChannel must be a trivially copyable view");
-static_assert(sizeof(MpscReservationMeta) == 48,
-              "MPSC sidecar carries the full process incarnation");
+static_assert(sizeof(MpscReservationMeta) == 64,
+              "MPSC sidecar carries tagged claim and full process incarnation");
 
 // ---------------------------------------------------------------------------
 // Fixture: 64-byte-aligned shared-memory stand-in
