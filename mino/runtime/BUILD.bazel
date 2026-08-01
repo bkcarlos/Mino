@@ -131,17 +131,17 @@ cc_test(
 #     --test_env=MINO_D2_RECOVERY_STRESS_SEED=12345
 cc_test(
     name = "d2_recovery_stress_long_test",
+    timeout = "long",
     srcs = ["d2_recovery_stress_test.cc"],
     args = [
-        "--gtest_filter=D2RecoveryStressTest.RandomizedTimedRecoveryStress:"
-        + "D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+        "--gtest_filter=D2RecoveryStressTest.RandomizedTimedRecoveryStress:" +
+        "D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals",
     ],
     env = {"MINO_D2_RECOVERY_STRESS_SECONDS": "3600"},
     tags = [
         "large",
         "manual",
     ],
-    timeout = "long",
     deps = [
         ":allocation_journal",
         ":publisher",

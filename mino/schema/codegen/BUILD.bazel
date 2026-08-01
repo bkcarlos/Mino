@@ -43,8 +43,8 @@ cc_test(
     deps = [
         ":artifact_codec",
         ":code_generator",
-        "//mino/schema:compiler",
         "//mino/runtime:runtime_types",
+        "//mino/schema:compiler",
         "//mino/schema:layout",
         "//mino/schema:registry",
         "//mino/schema:wire",

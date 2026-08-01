@@ -185,6 +185,22 @@ uint64_t DefaultStressSeed() {
     return seed;
 }
 
+class ScopedSharedMemoryUnlink {
+public:
+    explicit ScopedSharedMemoryUnlink(std::string name)
+        : name_(std::move(name)) {}
+
+    ~ScopedSharedMemoryUnlink() {
+        (void)SharedMemorySegment::Unlink(name_);
+    }
+
+    ScopedSharedMemoryUnlink(const ScopedSharedMemoryUnlink&) = delete;
+    ScopedSharedMemoryUnlink& operator=(const ScopedSharedMemoryUnlink&) = delete;
+
+private:
+    std::string name_;
+};
+
 bool ReadUnsignedEnvironment(const char* name, uint64_t fallback,
                              uint64_t* value, std::string* error) {
     const char* text = std::getenv(name);
@@ -411,9 +427,6 @@ protected:
             int status = 0;
             (void)WaitForExit(watchdog_deadline_, &status);
         }
-        for (const std::string& name : names_) {
-            (void)SharedMemorySegment::Unlink(name);
-        }
         if (shared_ != nullptr) {
             shared_->~SharedControl();
             (void)::munmap(shared_, sizeof(SharedControl));
@@ -426,7 +439,6 @@ protected:
         std::string name = "/d1k_" + std::to_string(::getpid()) + "_" +
                            std::to_string(value);
         EXPECT_LE(name.size(), 31u);
-        names_.push_back(name);
         return name;
     }
 
@@ -451,6 +463,7 @@ protected:
     }
 
     bool WaitReached(CrashScenario scenario, StressDeadline deadline) {
+        wait_reached_failure_.clear();
         const uint32_t expected = static_cast<uint32_t>(scenario);
         for (;;) {
             if (shared_->reached.load(std::memory_order_acquire) == expected) {
@@ -460,15 +473,31 @@ protected:
             const pid_t result = ::waitpid(child_pid_, &status, WNOHANG);
             if (result == child_pid_) {
                 child_pid_ = -1;
+                std::ostringstream message;
+                if (WIFEXITED(status)) {
+                    message << "child exited early with code "
+                            << WEXITSTATUS(status);
+                } else if (WIFSIGNALED(status)) {
+                    message << "child terminated early by signal "
+                            << WTERMSIG(status);
+                } else {
+                    message << "child changed state before reaching crash point"
+                            << " (wait status=" << status << ")";
+                }
+                wait_reached_failure_ = message.str();
                 return false;
             }
             if (result == -1 && errno != EINTR) {
-                if (errno == ECHILD) {
+                const int wait_errno = errno;
+                if (wait_errno == ECHILD) {
                     child_pid_ = -1;
                 }
+                wait_reached_failure_ =
+                    std::string("waitpid failed: ") + std::strerror(wait_errno);
                 return false;
             }
             if (StressClock::now() >= deadline) {
+                wait_reached_failure_ = "global watchdog deadline expired";
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -587,6 +616,7 @@ protected:
                      StressDeadline deadline) {
         ASSERT_LT(StressClock::now(), deadline);
         const std::string name = NextRegionName();
+        ScopedSharedMemoryUnlink unlink_region(name);
         shared_->region_id = 0;
         shared_->baseline_available = 0;
         shared_->survivor = {};
@@ -602,8 +632,8 @@ protected:
             ChildAtCrashPoint(name, shared_, scenario, interruption, deadline);
         }
         ASSERT_TRUE(WaitReached(scenario, deadline))
-            << "child did not reach " << ScenarioName(scenario)
-            << " before the global watchdog deadline";
+            << "child did not reach " << ScenarioName(scenario) << ": "
+            << wait_reached_failure_;
         if (interruption == Interruption::kSigstopThenKill) {
             ASSERT_TRUE(WaitStopped(deadline))
                 << "child did not enter SIGSTOP before the deadline";
@@ -744,7 +774,7 @@ protected:
     SharedControl* shared_ = nullptr;
     pid_t child_pid_ = -1;
     StressDeadline watchdog_deadline_{};
-    std::vector<std::string> names_;
+    std::string wait_reached_failure_;
 };
 
 TEST_F(D1RegionRecoveryKillStressTest, RandomizedTimedRecoveryStress) {

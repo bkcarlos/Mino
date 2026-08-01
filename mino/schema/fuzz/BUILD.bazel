@@ -17,11 +17,11 @@ cc_library(
     deps = [
         "//mino/common:status",
         "//mino/schema:canonical",
-        "//mino/schema/codegen:artifact_codec",
         "//mino/schema:compiler",
         "//mino/schema:descriptor",
         "//mino/schema:registry",
         "//mino/schema:wire",
+        "//mino/schema/codegen:artifact_codec",
     ],
 )
 

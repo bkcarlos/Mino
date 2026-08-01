@@ -107,17 +107,17 @@ cc_test(
 #     --test_env=MINO_D1_REGION_RECOVERY_STRESS_SEED=12345
 cc_test(
     name = "d1_region_recovery_kill_stress_long_test",
+    timeout = "long",
     srcs = ["d1_region_recovery_kill_stress_test.cc"],
     args = [
-        "--gtest_filter=D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:"
-        + "D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+        "--gtest_filter=D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:" +
+        "D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals",
     ],
     env = {"MINO_D1_REGION_RECOVERY_STRESS_SECONDS": "3600"},
     tags = [
         "large",
         "manual",
     ],
-    timeout = "long",
     deps = [
         ":region",
         ":superblock",

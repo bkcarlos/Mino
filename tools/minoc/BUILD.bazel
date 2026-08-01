@@ -83,8 +83,8 @@ cc_test(
     srcs = ["tests/canonical_wire_generated_test.cc"],
     deps = [
         ":canonical_wire_generated",
-        "//mino/schema:compiler",
         "//mino/runtime:publisher",
+        "//mino/schema:compiler",
         "//mino/schema:dynamic_value",
         "//mino/schema:wire",
         "//mino/shm/allocator:central_slab",

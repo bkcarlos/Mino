@@ -32,7 +32,8 @@ jobs:
         config: [debug, release, asan, ubsan, tsan]
 
     env:
-      CC: gcc
+      CC: gcc-12
+      CXX: g++-12
 
     steps:
       - name: Checkout
@@ -42,7 +43,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++ gcc libatomic1
+            gcc-12 g++-12 libatomic1
 
       # Bazelisk 读取 .bazelversion 锁定 Bazel 版本，保证构建可复现。
       # 该 action 同时缓存下载的 Bazel 发行版。

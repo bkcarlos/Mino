@@ -22,6 +22,9 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-22.04
     timeout-minutes: 135
+    env:
+      CC: gcc-12
+      CXX: g++-12
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -48,7 +51,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc g++ libatomic1
+            gcc-12 g++-12 libatomic1
 
       - name: Setup Bazelisk
         uses: bazelbuild/setup-bazelisk@v3

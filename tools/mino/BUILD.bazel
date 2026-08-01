@@ -11,7 +11,7 @@ cc_library(
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
         "//mino/shm/allocator:slab_header",
-        "//mino/shm/region:region",
+        "//mino/shm/region",
     ],
 )
 
@@ -23,7 +23,7 @@ cc_test(
         "//mino/common:status",
         "//mino/platform:shared_memory",
         "//mino/shm/allocator:central_slab",
-        "//mino/shm/region:region",
+        "//mino/shm/region",
         "@googletest//:gtest_main",
     ],
 )
