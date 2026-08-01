@@ -1,0 +1,10 @@
+.git
+.git/**
+bazel-*
+.cache/
+hermetic-codegen/
+fuzz-corpus/
+fuzz-corpus-minimized/
+fuzz-artifacts/
+fuzz-output/
+.DS_Store
