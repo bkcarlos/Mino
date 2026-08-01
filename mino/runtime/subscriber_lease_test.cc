@@ -38,8 +38,15 @@ ProcessIdentity Owner(uint64_t epoch) {
     };
 }
 
-bool AlwaysAlive(const ProcessIdentity&, void*) noexcept { return true; }
-bool AlwaysDead(const ProcessIdentity&, void*) noexcept { return false; }
+ProcessIdentityLiveness AlwaysAlive(const ProcessIdentity&, void*) noexcept {
+    return ProcessIdentityLiveness::kAlive;
+}
+ProcessIdentityLiveness AlwaysDead(const ProcessIdentity&, void*) noexcept {
+    return ProcessIdentityLiveness::kDead;
+}
+ProcessIdentityLiveness AlwaysUnknown(const ProcessIdentity&, void*) noexcept {
+    return ProcessIdentityLiveness::kUnknown;
+}
 
 void CountPinCleanup(const ProcessIdentity& owner, void* context) noexcept {
     auto* count = static_cast<uint64_t*>(context);
@@ -114,6 +121,27 @@ TEST_F(SubscriberLeaseTest, LiveOwnerIsNotEvictedAfterTimeout) {
     EXPECT_EQ(coordinator.EvictExpired(kT0 + 100 * kLease, kLease), 0u);
     EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kActive);
     EXPECT_TRUE(channel_->Heartbeat(lease->subscriber, kT0 + 100 * kLease).ok());
+}
+
+TEST_F(SubscriberLeaseTest, UnknownOwnerLivenessPreventsDestructiveEviction) {
+    uint64_t cleaned_epoch_sum = 0;
+    SubscriberLeaseCoordinator coordinator(
+        *channel_, *leases_, &AlwaysUnknown, nullptr, &CountPinCleanup,
+        &cleaned_epoch_sum);
+    auto lease = coordinator.Register(SubscriberId{1}, Owner(4), kT0);
+    ASSERT_TRUE(lease.ok());
+
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        Publish(*channel_, i + 1);
+    }
+    ASSERT_TRUE(channel_->IsFull());
+
+    EXPECT_EQ(coordinator.EvictExpired(kT0 + 100 * kLease, kLease), 0u);
+    EXPECT_EQ(leases_->State(1), SubscriberLeaseState::kActive);
+    EXPECT_EQ(cleaned_epoch_sum, 0u);
+    EXPECT_TRUE(channel_->IsFull());
+    EXPECT_TRUE(channel_->Heartbeat(lease->subscriber,
+                                    kT0 + 100 * kLease).ok());
 }
 
 TEST_F(SubscriberLeaseTest, FreshHeartbeatPreventsEviction) {

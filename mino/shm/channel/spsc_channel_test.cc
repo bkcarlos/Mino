@@ -213,6 +213,26 @@ TEST(SpscAbortTest, ExplicitAbortIsSkipped) {
     EXPECT_TRUE(ch->IsEmpty());
 }
 
+TEST(SpscAbortTest, ConsumedAbortedSequenceIsIndeterminate) {
+    ChannelFixture<8> f;
+    auto ch = SpscChannel::Init(f.storage, 8);
+    ASSERT_TRUE(ch.ok());
+
+    auto res = ch->Reserve();
+    ASSERT_TRUE(res.ok());
+    FillSlot(*res, 0);
+    const ShmHandle payload = res->slot()->payload;
+    const uint64_t sequence =
+        res->slot()->sequence_num.load(std::memory_order_relaxed);
+    ASSERT_TRUE(std::move(*res).Abort().ok());
+    EXPECT_EQ(ch->InspectPublication(sequence, payload),
+              SpscChannel::PublicationVisibility::kNotVisible);
+
+    EXPECT_EQ(ch->Poll().status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(ch->InspectPublication(sequence, payload),
+              SpscChannel::PublicationVisibility::kIndeterminate);
+}
+
 TEST(SpscAbortTest, DestroyedReservationAutoAborts) {
     ChannelFixture<8> f;
     auto ch = SpscChannel::Init(f.storage, 8);

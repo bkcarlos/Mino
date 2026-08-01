@@ -16,7 +16,9 @@
 
 #include "mino/platform/shared_memory.h"
 #include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/allocator/large_object_pool.h"
 #include "mino/shm/allocator/slab_header.h"
+#include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/region.h"
 
 namespace mino {
@@ -141,6 +143,14 @@ TEST_F(RecoveryOwnerTest, DirtyAttachScansRealRegionAllocatorMetadata) {
   config.classes = {{.slot_size = 256, .slot_count = 8}};
   auto allocator = CentralSlabAllocator::CreateInRegion(storage, config);
   ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+  RecoveryResourceDescriptor central_resource{
+      .resource_id = 1,
+      .kind = static_cast<uint32_t>(RecoveryResourceKind::kCentralAllocator),
+      .format_version = 1,
+      .offset = sb.allocator_offset,
+      .size = sb.data_offset - sb.allocator_offset,
+  };
+  ASSERT_TRUE(created.RegisterRecoveryResource(central_resource).ok());
 
   AllocationRequest request{
       .object_size = 64,
@@ -192,6 +202,109 @@ TEST_F(RecoveryOwnerTest, DirtyAttachScansRealRegionAllocatorMetadata) {
   EXPECT_EQ(recovered->Inspect(*orphan).status().code(),
             StatusCode::kNotFound);
   EXPECT_EQ(LoadRecoveryLeaseNs(*created.superblock()), 0u);
+}
+
+TEST_F(RecoveryOwnerTest, CompleteSnapshotCannotDeleteObjectPublishedAfterIt) {
+  SharedMemoryRegion& created = region();
+  const SuperBlock& sb = *created.superblock();
+  LargeObjectPoolStorage storage{
+      .region_base = created.base(),
+      .region_size = created.size(),
+      .pool_offset = sb.data_offset,
+      .pool_size = sb.data_size,
+      .region_id = sb.region_id,
+  };
+  auto pool = LargeObjectPool::Create(storage, 256 * 1024, 64 * 1024);
+  ASSERT_TRUE(pool.ok()) << pool.status().ToString();
+  RecoveryResourceDescriptor resource{
+      .resource_id = 21,
+      .kind = static_cast<uint32_t>(RecoveryResourceKind::kLargeObjectPool),
+      .format_version = 1,
+      .offset = sb.data_offset,
+      .size = sb.data_size,
+  };
+  ASSERT_TRUE(created.RegisterRecoveryResource(resource).ok());
+
+  auto survivor = pool->Allocate(100 * 1024, TypeId{31});
+  ASSERT_TRUE(survivor.ok());
+  ASSERT_TRUE(pool->Publish(*survivor).ok());
+  auto plan = pool->InspectPlan(*survivor);
+  ASSERT_TRUE(plan.ok());
+  const RecoveryObjectReference references[] = {{
+      .resource_id = 21,
+      .unit_index = plan->segments[0].segment_index,
+      .generation = survivor->generation,
+  }};
+  ASSERT_TRUE(created.PublishRecoveryReferences(references, true).ok());
+
+  // This publication happens after the directory declared its older reference
+  // snapshot complete. A subsequent crash must not turn that stale observation
+  // into authority to delete the newly published object.
+  auto published_after_snapshot = pool->Allocate(32 * 1024, TypeId{32});
+  ASSERT_TRUE(published_after_snapshot.ok());
+  ASSERT_TRUE(pool->Publish(*published_after_snapshot).ok());
+
+  StoreState(*created.superblock(), RegionState::kDirty);
+  Status recovered = RecoverRegionForAttach(
+      created, ProcessIdentity::Current(), /*wait_timeout_ms=*/1000);
+  ASSERT_TRUE(recovered.ok()) << recovered.ToString();
+  auto attached = LargeObjectPool::Attach(storage);
+  ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+  EXPECT_TRUE(attached->InspectPlan(*survivor).ok());
+  EXPECT_TRUE(attached->InspectPlan(*published_after_snapshot).ok());
+}
+
+TEST_F(RecoveryOwnerTest, DirectoryCleansGenerationScopedAckAndPinResources) {
+  SharedMemoryRegion& created = region();
+  const SuperBlock& sb = *created.superblock();
+  auto* ack_control = new (created.base() + sb.data_offset)
+      RecoveryGenerationControl{.generation = 2, .live_mask = 0b01};
+  auto* ack_values = new (created.base() + sb.data_offset + 64)
+      RecoveryGenerationValue[2]{
+          {.generation = 1, .value = 0b11},
+          {.generation = 2, .value = 0b11},
+      };
+  auto* pin_control = new (created.base() + sb.data_offset + 128)
+      RecoveryGenerationControl{.generation = 5, .live_mask = 0};
+  auto* pin_values = new (created.base() + sb.data_offset + 192)
+      RecoveryGenerationValue[2]{
+          {.generation = 4, .value = 6},
+          {.generation = 5, .value = 8},
+      };
+  (void)ack_control;
+  (void)pin_control;
+  RecoveryResourceDescriptor ack{
+      .resource_id = 30,
+      .kind = static_cast<uint32_t>(RecoveryResourceKind::kChannelAckSource),
+      .format_version = 1,
+      .offset = sb.data_offset + 64,
+      .size = 2 * sizeof(RecoveryGenerationValue),
+      .generation = 1,
+      .element_count = 2,
+      .element_stride = sizeof(RecoveryGenerationValue),
+      .generation_offset = offsetof(RecoveryGenerationValue, generation),
+      .value_offset = offsetof(RecoveryGenerationValue, value),
+      .control_offset = sb.data_offset,
+      .control_size = sizeof(RecoveryGenerationControl),
+  };
+  RecoveryResourceDescriptor pin = ack;
+  pin.resource_id = 31;
+  pin.kind = static_cast<uint32_t>(
+      RecoveryResourceKind::kPinCleanupParticipant);
+  pin.offset = sb.data_offset + 192;
+  pin.generation = 4;
+  pin.control_offset = sb.data_offset + 128;
+  ASSERT_TRUE(created.RegisterRecoveryResource(ack).ok());
+  ASSERT_TRUE(created.RegisterRecoveryResource(pin).ok());
+
+  StoreState(*created.superblock(), RegionState::kDirty);
+  Status recovered = RecoverRegionForAttach(
+      created, ProcessIdentity::Current(), /*wait_timeout_ms=*/1000);
+  ASSERT_TRUE(recovered.ok()) << recovered.ToString();
+  EXPECT_EQ(ack_values[0].value, 0u);
+  EXPECT_EQ(ack_values[1].value, 0b01u);
+  EXPECT_EQ(pin_values[0].value, 0u);
+  EXPECT_EQ(pin_values[1].value, 8u);
 }
 
 TEST_F(RecoveryOwnerTest, MoveClearsSourceOwnership) {

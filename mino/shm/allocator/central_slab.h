@@ -119,6 +119,17 @@ struct RegionAllocatorStorage {
     uint32_t region_id = 0;
 };
 
+// Authoritative allocator facts for one Region-relative slot-header offset.
+// This deliberately exposes values rather than shared-memory pointers so
+// consumers cannot mutate allocation metadata or depend on its layout.
+struct CentralSlabSlotMetadata {
+    bool occupied = false;
+    uint32_t generation = 0;
+    uint16_t class_id = 0;
+    uint16_t class_count = 0;
+    uint32_t capacity = 0;
+};
+
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
 // Region following the strict 9-step protocol of design doc 8.3.
 //
@@ -243,6 +254,13 @@ public:
     // (design doc 8.2). Validates region id, bounds, bitmap occupancy,
     // generation and header CRC.
     Result<SlabView> Inspect(ShmHandle handle) const;
+
+    // Maps an exact Region-relative SlabHeader offset to the minimum
+    // authoritative metadata needed for safe handle resolution. The bitmap,
+    // generation array and immutable class table are consulted directly; the
+    // potentially corrupt SlabHeader is not trusted.
+    Result<CentralSlabSlotMetadata> GetSlotMetadata(
+        uint64_t header_offset) const;
 
     // Total number of slots managed by this allocator.
     uint32_t total_slot_count() const { return class_table_.total_slot_count(); }

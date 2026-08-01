@@ -15,7 +15,6 @@
 #include "mino/shm/region/handle_resolver.h"
 
 #include <cstdint>
-#include <new>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -24,15 +23,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "mino/platform/process_identity.h"
 #include "mino/platform/shared_memory.h"
-#include "mino/shm/allocator/slab_header.h"
+#include "mino/shm/allocator/central_slab.h"
 
 namespace mino {
 namespace {
 
 constexpr TypeId kType{17};
-constexpr uint32_t kGeneration = 9;
 constexpr uint64_t kSchema = 0x1234;
 constexpr uint64_t kPayloadMagic = 0xDEADBEEFCAFEF00Dull;
 
@@ -41,24 +38,29 @@ constexpr int kExitRemapFailed = 1;       // Placeholder mmap or Attach failed.
 constexpr int kExitSameBaseAddress = 2;   // Attach reused the parent's base.
 constexpr int kExitResolutionFailed = 3;  // Resolve/payload/stale check failed.
 
-class FakeAllocatorMetadataProvider : public AllocatorMetadataProvider {
- public:
-  bool IsSlotOccupied(uint64_t offset) const override {
-    return occupied && offset == slot_offset;
-  }
-  uint32_t AuthoritativeGeneration(uint64_t offset) const override {
-    return offset == slot_offset ? generation : 0;
-  }
+RegionAllocatorStorage AllocatorStorage(SharedMemoryRegion& region) {
+  const SuperBlock& sb = *region.superblock();
+  return RegionAllocatorStorage{
+      .region_base = region.base(),
+      .region_size = region.size(),
+      .allocator_offset = sb.allocator_offset,
+      .allocator_size = sb.data_offset - sb.allocator_offset,
+      .data_offset = sb.data_offset,
+      .data_size = sb.data_size,
+      .region_id = sb.region_id,
+  };
+}
 
-  uint64_t slot_offset = 0;
-  uint32_t generation = kGeneration;
-  bool occupied = true;
-};
+ClassTableConfig CrossProcessClassConfig() {
+  ClassTableConfig config;
+  config.classes = {{.slot_size = 128, .slot_count = 8}};
+  return config;
+}
 
 // Child body. Never returns; reports success as _exit(0).
 [[noreturn]] void ChildMain(const std::string& name, uint32_t region_id,
                             std::byte* old_base, uint64_t region_size,
-                            uint64_t slot_offset) {
+                            ShmHandle handle) {
   // Occupy the inherited mapping's address: MAP_FIXED implicitly unmaps the
   // inherited range, so the subsequent Attach must be placed elsewhere.
   const void* placeholder =
@@ -84,19 +86,30 @@ class FakeAllocatorMetadataProvider : public AllocatorMetadataProvider {
     ::_exit(kExitSameBaseAddress);
   }
 
-  FakeAllocatorMetadataProvider allocator;
-  allocator.slot_offset = slot_offset;
-  HandleResolver resolver(child_region, &allocator);
+  auto allocator =
+      CentralSlabAllocator::AttachInRegion(AllocatorStorage(child_region));
+  if (!allocator.ok()) {
+    ::_exit(kExitResolutionFailed);
+  }
+  CentralSlabAllocatorMetadataProvider provider(*allocator);
+  HandleResolver resolver(child_region, provider);
 
-  const ShmHandle handle{slot_offset, kGeneration, region_id};
   auto resolved = resolver.Resolve<uint64_t>(handle, kType, kSchema);
   if (!resolved.ok()) {
     ::_exit(kExitResolutionFailed);
   }
   const uint64_t* payload = resolved.value();
-  const auto* expected = reinterpret_cast<const uint64_t*>(
-      child_region.base() + handle.offset + sizeof(SlabHeader));
-  if (payload != expected || *payload != kPayloadMagic) {
+  auto inspected = allocator->Inspect(handle);
+  if (!inspected.ok() || payload != inspected->data ||
+      *payload != kPayloadMagic) {
+    ::_exit(kExitResolutionFailed);
+  }
+
+  // The child mapping is PROT_READ. Mutable resolution must reject it before
+  // it could ever expose a writable pointer into that mapping.
+  auto mutable_result = resolver.ResolveMutable<uint64_t>(handle, kType, kSchema);
+  if (mutable_result.ok() ||
+      mutable_result.status().code() != StatusCode::kPermissionDenied) {
     ::_exit(kExitResolutionFailed);
   }
 
@@ -144,29 +157,27 @@ TEST_F(CrossProcessHandleTest,
   ASSERT_TRUE(created.ok()) << created.status().ToString();
   SharedMemoryRegion& region = created.value();
 
-  const uint64_t slot_offset = region.superblock()->data_offset;
-  auto* header = new (region.base() + slot_offset) SlabHeader{};
-  header->magic = kSlabHeaderMagic;
-  header->header_version = kSlabHeaderVersion;
-  header->generation = kGeneration;
-  header->object_state.store(static_cast<uint32_t>(ObjectState::kPublished));
-  header->capacity = 128;
-  header->object_size = sizeof(uint64_t);
-  header->type_id = kType.value;
-  header->schema_short_id = kSchema;
-  header->owner_epoch = ProcessIdentity::Current().process_epoch;
-
-  auto* payload = reinterpret_cast<uint64_t*>(region.base() + slot_offset +
-                                              sizeof(SlabHeader));
-  *payload = kPayloadMagic;
+  auto allocator = CentralSlabAllocator::CreateInRegion(
+      AllocatorStorage(region), CrossProcessClassConfig());
+  ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+  AllocationRequest request;
+  request.object_size = sizeof(uint64_t);
+  request.type_id = kType;
+  request.schema = {.short_id = kSchema, .layout_version = 1};
+  request.alignment = alignof(uint64_t);
+  auto handle_result = allocator->Allocate(request);
+  ASSERT_TRUE(handle_result.ok()) << handle_result.status().ToString();
+  const ShmHandle handle = *handle_result;
+  auto build = allocator->BeginBuild(handle);
+  ASSERT_TRUE(build.ok()) << build.status().ToString();
+  *static_cast<uint64_t*>(build->data) = kPayloadMagic;
+  ASSERT_TRUE(allocator->Publish(handle).ok());
 
   const uint32_t region_id = region.region_id();
-  const ShmHandle handle{slot_offset, kGeneration, region_id};
 
-  // Sanity-check the fixture in the parent before forking.
-  FakeAllocatorMetadataProvider allocator;
-  allocator.slot_offset = slot_offset;
-  HandleResolver parent_resolver(region, &allocator);
+  // Sanity-check the real allocator/provider path in the parent before forking.
+  CentralSlabAllocatorMetadataProvider provider(*allocator);
+  HandleResolver parent_resolver(region, provider);
   auto parent_check =
       parent_resolver.Resolve<uint64_t>(handle, kType, kSchema);
   ASSERT_TRUE(parent_check.ok()) << parent_check.status().ToString();
@@ -177,7 +188,7 @@ TEST_F(CrossProcessHandleTest,
   const pid_t pid = ::fork();
   ASSERT_NE(pid, -1) << "fork failed";
   if (pid == 0) {
-    ChildMain(name_, region_id, old_base, region_size, slot_offset);
+    ChildMain(name_, region_id, old_base, region_size, handle);
   }
   WaitChild(pid);
 }

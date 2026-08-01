@@ -719,7 +719,10 @@ public:
         const uint64_t consumed =
             control_->consumer_cursor.load(std::memory_order_acquire);
         if (consumed > sequence) {
-            return PublicationVisibility::kVisible;
+            // The consumer advances over both committed messages and ABORTED
+            // tombstones. Without a durable per-sequence outcome sidecar, the
+            // cursor alone is not evidence that this publication was visible.
+            return PublicationVisibility::kIndeterminate;
         }
         const uint64_t reserved =
             control_->reservation_cursor.load(std::memory_order_acquire);

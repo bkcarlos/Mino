@@ -234,13 +234,20 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     if (!CheckedAlignUpU64(kSuperBlockSize, 64, &dir_off)) {
         return Status::Error(StatusCode::kInvalidArgument, "layout overflow");
     }
+    if (options.directory_size_bytes < kRecoveryDirectoryMinimumSize) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "directory sub-region is too small for recovery directory");
+    }
+    uint64_t directory_end = 0;
     uint64_t alloc_off = 0;
-    if (!CheckedAlignUpU64(dir_off + options.directory_size_bytes, 64,
-                           &alloc_off)) {
+    if (!CheckedAddU64(dir_off, options.directory_size_bytes, &directory_end) ||
+        !CheckedAlignUpU64(directory_end, 64, &alloc_off)) {
         return Status::Error(StatusCode::kInvalidArgument, "layout overflow");
     }
+    uint64_t allocator_end = 0;
     uint64_t data_off = 0;
-    if (!CheckedAlignUpU64(alloc_off + options.allocator_size_bytes,
+    if (!CheckedAddU64(alloc_off, options.allocator_size_bytes, &allocator_end) ||
+        !CheckedAlignUpU64(allocator_end,
                            HostPageSize(), &data_off)) {
         return Status::Error(StatusCode::kInvalidArgument, "layout overflow");
     }
@@ -308,6 +315,13 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
 
     // Seal the immutable header with its CRC (covers fields [0, 80)).
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
+
+    // Initialize the v4 fixed-capacity recovery directory before publishing
+    // ACTIVE. A crash before this point leaves INITIALIZING and recovery will
+    // quarantine rather than infer resources from untrusted bytes.
+    MINO_RETURN_IF_ERROR(InitializeRecoveryDirectory(
+        static_cast<std::byte*>(segment.base()) + dir_off,
+        alloc_off - dir_off));
 
     // Initialization complete -> ACTIVE (6.1). clean_shutdown stays false
     // while the Region is in use; it becomes true only on clean Detach.
@@ -441,6 +455,14 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
 
     // Step 9: sub-region bounds.
     MINO_RETURN_IF_ERROR(ValidateSubRegionBounds(*sb));
+    if (sb->layout_version >= 4) {
+        auto directory = ::mino::ReadRecoveryDirectory(
+            static_cast<const std::byte*>(segment.base()) + sb->directory_offset,
+            sb->allocator_offset - sb->directory_offset);
+        if (!directory.ok()) {
+            return directory.status();
+        }
+    }
 
     // If the caller specified an explicit region_id, it must match the one
     // recorded at Create (Region ID mismatch is a hard rejection, 7.1).
@@ -458,12 +480,13 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
                              "region is quarantined");
     }
 
-    // v2 remains readable, but it has no service-owner identity/fence. A v2
-    // writable Attach therefore cannot prove that destructive recovery is safe.
+    // Older layouts remain readable, but only v4 carries the durable recovery
+    // directory required for safe automatic discovery. Writable compatibility
+    // is therefore deliberately conservative.
     if (!options.read_only && sb->layout_version < kRegionLayoutVersion) {
         return Status::Error(
             StatusCode::kUnsupported,
-            "v2 Region supports read-only compatibility only; recreate as v3 for writable supervisor Attach");
+            "older Region layout supports read-only compatibility only; recreate as v4 for writable supervisor Attach");
     }
 
     SharedMemoryRegion region;
@@ -569,6 +592,72 @@ Status SharedMemoryRegion::ValidateSupervisorFence() const {
                              "writable supervisor service fence is stale");
     }
     return Status::Ok();
+}
+
+Result<RecoveryDirectorySnapshot>
+SharedMemoryRegion::recovery_directory() const {
+    if (!segment_.has_value() || detached_) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "Region is detached");
+    }
+    const SuperBlock* sb = superblock();
+    if (sb->layout_version < 4) {
+        return Status::Error(StatusCode::kUnsupported,
+                             "Region layout has no recovery directory");
+    }
+    return ::mino::ReadRecoveryDirectory(
+        base() + sb->directory_offset,
+        sb->allocator_offset - sb->directory_offset);
+}
+
+Status SharedMemoryRegion::RegisterRecoveryResource(
+    const RecoveryResourceDescriptor& descriptor) {
+    MINO_RETURN_IF_ERROR(ValidateSupervisorFence());
+    const SuperBlock* sb = superblock();
+    if (sb->layout_version < 4) {
+        return Status::Error(StatusCode::kUnsupported,
+                             "Region layout has no recovery directory");
+    }
+    const auto kind = static_cast<RecoveryResourceKind>(descriptor.kind);
+    const uint64_t minimum_offset =
+        kind == RecoveryResourceKind::kCentralAllocator
+            ? sb->allocator_offset
+            : sb->data_offset;
+    if (descriptor.offset < minimum_offset ||
+        ((kind == RecoveryResourceKind::kChannelAckSource ||
+          kind == RecoveryResourceKind::kPinCleanupParticipant) &&
+         descriptor.control_offset < sb->data_offset)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "recovery resource overlaps Region control metadata");
+    }
+    std::lock_guard lock(recovery_directory_mutex_);
+    return ::mino::PublishRecoveryResource(
+        base() + sb->directory_offset,
+        sb->allocator_offset - sb->directory_offset, size(), descriptor);
+}
+
+Status SharedMemoryRegion::PublishRecoveryReferences(
+    std::span<const RecoveryObjectReference> references, bool complete) {
+    MINO_RETURN_IF_ERROR(ValidateSupervisorFence());
+    std::lock_guard lock(recovery_directory_mutex_);
+    auto directory = recovery_directory();
+    if (!directory.ok()) {
+        return directory.status();
+    }
+    for (const RecoveryObjectReference& reference : references) {
+        bool found = false;
+        for (uint32_t i = 0; i < directory->resource_count; ++i) {
+            found |= directory->resources[i].resource_id == reference.resource_id;
+        }
+        if (!found) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "reference names an unregistered recovery resource");
+        }
+    }
+    const SuperBlock* sb = superblock();
+    return ::mino::PublishRecoveryReferences(
+        base() + sb->directory_offset,
+        sb->allocator_offset - sb->directory_offset, references, complete);
 }
 
 Status SharedMemoryRegion::Detach() {

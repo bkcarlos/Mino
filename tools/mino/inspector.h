@@ -26,6 +26,8 @@
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/shm/allocator/slab_header.h"
+#include "mino/shm/channel/index_slot.h"
+#include "mino/shm/channel/mpmc_ring.h"
 
 namespace mino {
 class CentralSlabAllocator;
@@ -65,46 +67,14 @@ public:
         uint32_t reserved;
     };
 
-    // MPMC skeleton control block (detailed design 9.9). Producer and
-    // consumer cursors live on separate cache lines.
-    struct alignas(64) RingControlView {
-        static constexpr uint32_t kMagic = 0x52494E47;  // "RING".
-
-        uint32_t magic;
-        uint32_t layout_version;
-        uint32_t elem_size;
-        uint32_t elem_align;
-        uint64_t capacity;  // Power of two.
-        uint64_t reserved0[3];
-
-        alignas(64) std::atomic<uint64_t> enqueue_pos;
-        uint64_t reserved1[7];
-
-        alignas(64) std::atomic<uint64_t> dequeue_pos;
-        uint64_t reserved2[7];
-    };
-    static_assert(sizeof(RingControlView) == 192,
-                  "RingControlView must be three cache lines");
-
-    // Index slot view (detailed design 9.2). Only the fields the Inspector
-    // reports on are interpreted; the slot is 128 bytes on the wire.
-    struct IndexSlotView {
-        uint32_t msg_type;
-        uint32_t schema_version;
-        uint64_t schema_short_id;
-        uint32_t schema_layout_version;
-        uint32_t reserved;
-        uint64_t sequence_num;
-        uint64_t timestamp_ns;
-        uint64_t payload_offset;
-        uint32_t payload_generation;
-        uint32_t payload_region_id;
-        uint32_t payload_len;
-        uint32_t immutable_metadata_crc;
-        std::atomic<uint32_t> state;
-        uint32_t flags;
-    };
-    static constexpr uint32_t kIndexSlotSize = 128;
+    // Ring diagnostics consume the authoritative channel ABI directly. A real
+    // MpmcRing slot contains its own Vyukov sequence before the aligned element
+    // storage; it is not an array of bare IndexSlot records.
+    using RingControlView = ::mino::MpmcRingControlBlock;
+    using IndexSlotView = ::mino::IndexSlot;
+    using RingSlotView =
+        ::mino::MpmcRingSlot<sizeof(IndexSlotView), alignof(IndexSlotView)>;
+    static constexpr uint32_t kRingSlotStride = sizeof(RingSlotView);
 
     struct Layout {
         // Class descriptors are host-side snapshots parsed from a sidecar or
@@ -113,12 +83,12 @@ public:
         // remains delegated to the validated allocator facade; offset fields
         // are therefore zero and must not be reused as an offline sidecar.
         std::vector<ClassView> classes;
-        // Ring buffers: channel_id -> (control block, slot array) offsets.
+        // Ring buffers: channel_id -> MpmcRing backing offset. The slot array
+        // immediately follows the control block, as required by MpmcRing ABI.
         struct RingRef {
             uint32_t channel_id;
             uint32_t reserved;
             uint64_t control_offset;
-            uint64_t slots_offset;  // IndexSlotView[kIndexSlotSize] array.
         };
         std::vector<RingRef> rings;
     };
@@ -145,7 +115,8 @@ public:
     };
 
     struct RingSlotSummary {
-        uint64_t sequence = 0;
+        uint64_t ring_sequence = 0;  // MpmcRing slot ownership sequence.
+        uint64_t sequence = 0;       // IndexSlot message sequence.
         uint32_t state = 0;
         uint32_t msg_type = 0;
         uint64_t timestamp_ns = 0;
@@ -183,8 +154,8 @@ public:
     Result<SlabConsistencyReport> ScanSlabs() const;
 
     // Dumps one ring buffer: control block plus per-slot summaries in
-    // physical order. Returns kNotFound for unknown channel ids and
-    // kCorruption for a bad control block.
+    // physical order. Returns kNotFound for unknown channel ids; malformed or
+    // incompatible backing returns the authoritative MpmcRing validation status.
     Result<RingBufferDump> DumpRingBuffer(uint32_t channel_id) const;
 
     // Writes a human-readable diagnostic report. Runs ScanSlabs() and dumps

@@ -21,6 +21,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,18 @@
 
 namespace mino::tools {
 namespace {
+
+struct alignas(alignof(Inspector::IndexSlotView)) TestRingElement {
+    std::byte bytes[sizeof(Inspector::IndexSlotView)]{};
+};
+using TestMpmcRing = MpmcRing<TestRingElement>;
+
+static_assert(sizeof(TestRingElement) == sizeof(Inspector::IndexSlotView));
+static_assert(alignof(TestRingElement) == alignof(Inspector::IndexSlotView));
+static_assert(TestMpmcRing::RequiredSize(
+                  1, sizeof(TestRingElement), alignof(TestRingElement)) ==
+              sizeof(Inspector::RingControlView) +
+                  Inspector::kRingSlotStride);
 
 // In-memory region image used to exercise the Inspector without real SHM.
 class InspectorFixture {
@@ -55,11 +68,8 @@ public:
 
         offset = Align64(offset);
         ring_control_offset_ = offset;
-        offset += sizeof(Inspector::RingControlView);
-
-        offset = Align64(offset);
-        ring_slots_offset_ = offset;
-        offset += 8 * Inspector::kIndexSlotSize;
+        offset += TestMpmcRing::RequiredSize(
+            8, sizeof(TestRingElement), alignof(TestRingElement));
 
         size_ = offset;
         // 64-byte-aligned allocation: the views placed inside carry
@@ -68,14 +78,17 @@ public:
         memory_.reset(new (std::align_val_t(64)) std::byte[size_]);
         std::memset(memory_.get(), 0, size_);
 
-        // Initialize the ring control block (8 slots, 128-byte elements).
-        auto* control = RingControl();
-        new (control) Inspector::RingControlView();
-        control->magic = Inspector::RingControlView::kMagic;
-        control->layout_version = 1;
-        control->elem_size = Inspector::kIndexSlotSize;
-        control->elem_align = 64;
-        control->capacity = 8;
+        // Initialize the complete backing through the production MpmcRing ABI.
+        auto initialized = TestMpmcRing::Init(
+            memory_.get() + ring_control_offset_, 8, sizeof(TestRingElement),
+            alignof(TestRingElement));
+        if (!initialized.ok()) {
+            throw std::runtime_error(initialized.status().ToString());
+        }
+        ring_ = *initialized;
+        for (uint32_t i = 0; i < 8; ++i) {
+            new (RingSlot(i)) Inspector::IndexSlotView();
+        }
     }
 
     Inspector::Layout MakeLayout() const {
@@ -85,7 +98,6 @@ public:
         ring.channel_id = 7;
         ring.reserved = 0;
         ring.control_offset = ring_control_offset_;
-        ring.slots_offset = ring_slots_offset_;
         layout.rings.push_back(ring);
         return layout;
     }
@@ -99,10 +111,18 @@ public:
     }
 
     Inspector::IndexSlotView* RingSlot(uint32_t index) {
-        return reinterpret_cast<Inspector::IndexSlotView*>(
-            memory_.get() + ring_slots_offset_ +
-            index * Inspector::kIndexSlotSize);
+        auto* ring_slot = reinterpret_cast<Inspector::RingSlotView*>(
+            memory_.get() + ring_control_offset_ +
+            sizeof(Inspector::RingControlView) +
+            static_cast<uint64_t>(index) * Inspector::kRingSlotStride);
+        return reinterpret_cast<Inspector::IndexSlotView*>(ring_slot->storage);
     }
+
+    Inspector::IndexSlotView* ResetRingSlot(uint32_t index) {
+        return new (RingSlot(index)) Inspector::IndexSlotView();
+    }
+
+    TestMpmcRing& ring() { return ring_; }
 
     Inspector::SlabHeaderView* Slab(uint32_t slot) {
         return reinterpret_cast<Inspector::SlabHeaderView*>(
@@ -177,8 +197,8 @@ private:
     std::unique_ptr<std::byte[], AlignedDeleter> memory_;
     uint64_t size_ = 0;
     uint64_t ring_control_offset_ = 0;
-    uint64_t ring_slots_offset_ = 0;
     Inspector::ClassView class_{};
+    TestMpmcRing ring_;
 };
 
 class InspectorTest : public ::testing::Test {
@@ -428,11 +448,11 @@ TEST_F(InspectorTest, DumpRingBufferReportsCursorsAndSlots) {
     control->dequeue_pos.store(2, std::memory_order_release);
 
     auto* slot = fixture_.RingSlot(3);
-    slot->sequence_num = 41;
+    slot->sequence_num.store(41, std::memory_order_relaxed);
     slot->msg_type = 7;
     slot->timestamp_ns = 123456789;
-    slot->payload_offset = 0x2000;
-    slot->payload_generation = 9;
+    slot->payload.offset = 0x2000;
+    slot->payload.generation = 9;
     slot->payload_len = 256;
     slot->state.store(3 /*READY*/, std::memory_order_release);
 
@@ -458,6 +478,69 @@ TEST_F(InspectorTest, DumpRingBufferReportsCursorsAndSlots) {
     EXPECT_EQ(dump->slots[0].state, 0u);
 }
 
+TEST_F(InspectorTest, DumpRingBufferInteroperatesWithRealMpmcBackingAndStride) {
+    TestRingElement element{};
+    auto first = fixture_.ring().TryEnqueue();
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_TRUE(fixture_.ring().CommitEnqueue(*first, element).ok());
+    auto* slot0 = fixture_.ResetRingSlot(0);
+    slot0->sequence_num.store(101, std::memory_order_relaxed);
+    slot0->msg_type = 11;
+
+    auto second = fixture_.ring().TryEnqueue();
+    ASSERT_TRUE(second.ok()) << second.status().ToString();
+    ASSERT_TRUE(fixture_.ring().CommitEnqueue(*second, element).ok());
+    auto* slot1 = fixture_.ResetRingSlot(1);
+    slot1->sequence_num.store(202, std::memory_order_relaxed);
+    slot1->msg_type = 22;
+    slot1->payload.offset = 0x4560;
+    slot1->payload.generation = 17;
+    slot1->payload_len = 64;
+    slot1->state.store(static_cast<uint32_t>(SlotState::kReady),
+                       std::memory_order_release);
+
+    auto inspector = Inspector::AttachMemory(
+        fixture_.base(), fixture_.size(), fixture_.MakeLayout(), "test");
+    ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+    auto dump = inspector->DumpRingBuffer(7);
+    ASSERT_TRUE(dump.ok()) << dump.status().ToString();
+
+    EXPECT_EQ(dump->elem_size, sizeof(Inspector::IndexSlotView));
+    EXPECT_EQ(dump->elem_align, alignof(Inspector::IndexSlotView));
+    EXPECT_EQ(dump->enqueue_pos, 2u);
+    EXPECT_EQ(dump->pending, 2u);
+    ASSERT_EQ(dump->slots.size(), 8u);
+    EXPECT_EQ(dump->slots[0].ring_sequence, 1u);
+    EXPECT_EQ(dump->slots[0].sequence, 101u);
+    EXPECT_EQ(dump->slots[0].msg_type, 11u);
+    EXPECT_EQ(dump->slots[1].ring_sequence, 2u);
+    EXPECT_EQ(dump->slots[1].sequence, 202u);
+    EXPECT_EQ(dump->slots[1].msg_type, 22u);
+    EXPECT_EQ(dump->slots[1].payload_offset, 0x4560u);
+    EXPECT_EQ(dump->slots[1].payload_generation, 17u);
+    EXPECT_EQ(dump->slots[1].payload_len, 64u);
+    EXPECT_EQ(dump->slots[1].state,
+              static_cast<uint32_t>(SlotState::kReady));
+}
+
+TEST_F(InspectorTest, AttachMemoryRejectsTruncatedRealMpmcBacking) {
+    auto result = Inspector::AttachMemory(
+        fixture_.base(), fixture_.size() - 1, fixture_.MakeLayout(), "test");
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), StatusCode::kInvalidArgument);
+    EXPECT_NE(result.status().message().find("ring slots"),
+              std::string_view::npos);
+}
+
+TEST_F(InspectorTest, AttachMemoryRejectsMisalignedRingControl) {
+    Inspector::Layout layout = fixture_.MakeLayout();
+    layout.rings[0].control_offset += 8;
+    auto result = Inspector::AttachMemory(fixture_.base(), fixture_.size(),
+                                          std::move(layout), "test");
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), StatusCode::kInvalidArgument);
+}
+
 TEST_F(InspectorTest, DumpRingBufferUnknownChannel) {
     auto inspector = Inspector::AttachMemory(
         fixture_.base(), fixture_.size(), fixture_.MakeLayout(), "test");
@@ -468,7 +551,7 @@ TEST_F(InspectorTest, DumpRingBufferUnknownChannel) {
 }
 
 TEST_F(InspectorTest, DumpRingBufferBadMagicIsCorruption) {
-    fixture_.RingControl()->magic = 0xBAD;
+    fixture_.RingControl()->magic.store(0xBAD, std::memory_order_release);
     auto inspector = Inspector::AttachMemory(
         fixture_.base(), fixture_.size(), fixture_.MakeLayout(), "test");
     ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();

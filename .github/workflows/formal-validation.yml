@@ -1,0 +1,71 @@
+name: Formal Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+  push:
+    branches: [master, main]
+    paths:
+      - .github/workflows/formal-validation.yml
+      - docs/formal/**
+      - tools/ci/run_tla_validation.py
+  pull_request:
+    branches: [master, main]
+    paths:
+      - .github/workflows/formal-validation.yml
+      - docs/formal/**
+      - tools/ci/run_tla_validation.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tla-validation:
+    name: TLC v1.7.4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 70
+    env:
+      TLA_VERSION: 1.7.4
+      TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download and verify TLA+ tools
+        env:
+          TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "${TLA_JAR}" \
+            "https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
+          printf '%s  %s\n' "${TLA_SHA256}" "${TLA_JAR}" | sha256sum --check --strict -
+
+      - name: Run all formal models
+        env:
+          TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
+        run: |
+          python3 tools/ci/run_tla_validation.py \
+            --jar "${TLA_JAR}" \
+            --out formal-validation \
+            --timeout-seconds 1200
+
+      - name: Upload formal validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: formal-validation-${{ github.run_id }}
+          path: formal-validation
+          if-no-files-found: warn
+          retention-days: 90

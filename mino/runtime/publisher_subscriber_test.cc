@@ -2,6 +2,7 @@
 //
 // Licensed under the GNU Lesser General Public License, Version 3.0.
 
+#include "mino/runtime/journal_channel_recovery.h"
 #include "mino/runtime/publisher.h"
 #include "mino/runtime/subscriber.h"
 
@@ -130,6 +131,33 @@ protected:
         return std::move(*builder);
     }
 };
+
+TEST_F(RuntimeSpscTest,
+       PublisherUsesStableIdsAndRegistersItsRecoveryChannelOnce) {
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 1);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 1, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+    JournalChannelRecoveryCoordinator recovery(*journal);
+
+    Publisher<RuntimeTestMessage> compatible(allocator_, *channel_);
+    EXPECT_EQ(compatible.channel_id(),
+              Publisher<RuntimeTestMessage>::kDefaultSingleChannelId);
+
+    Publisher<RuntimeTestMessage> legacy_zero(allocator_, *channel_,
+                                              /*channel_id=*/0);
+    EXPECT_EQ(legacy_zero.channel_id(),
+              Publisher<RuntimeTestMessage>::kDefaultSingleChannelId);
+
+    constexpr uint64_t kExplicitChannelId = 0xA501;
+    Publisher<RuntimeTestMessage> explicit_id(
+        allocator_, *channel_, kExplicitChannelId);
+    EXPECT_EQ(explicit_id.channel_id(), kExplicitChannelId);
+    EXPECT_TRUE(explicit_id.RegisterRecoveryChannel(recovery).ok());
+    EXPECT_EQ(explicit_id.RegisterRecoveryChannel(recovery).code(),
+              StatusCode::kAlreadyExists);
+}
 
 TEST_F(RuntimeSpscTest, PublishPollAndExplicitAckAreEndToEnd) {
     Publisher<RuntimeTestMessage> publisher(allocator_, *channel_);
@@ -260,7 +288,10 @@ TEST_F(RuntimeSpscTest, VisibleCommitWithFinalizeRaceReturnsPublishedSuccess) {
 
     FinalizeRaceContext race;
     journal->SetPersistenceHook(&BlockFirstFinalize, &race);
-    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_, *journal);
+    constexpr uint64_t kChannelId = 0xA502;
+    const ProcessIdentity owner = ProcessIdentity::Current();
+    Publisher<RuntimeTestMessage> publisher(
+        allocator_, *channel_, kChannelId, *journal, owner);
     auto builder = publisher.Allocate();
     ASSERT_TRUE(builder.ok());
     (*builder)->id = 0xF1;
@@ -370,7 +401,7 @@ TEST_F(RuntimeSpscTest, PublishCreatesReceiptAfterLocalCommit) {
     EXPECT_TRUE(receipt->Wait(Deadline::Infinite()).ok());
 }
 
-TEST_F(RuntimeSpscTest, ReceiptExhaustionDoesNotRollbackLocalCommit) {
+TEST_F(RuntimeSpscTest, ReceiptExhaustionPreventsLocalCommit) {
     Publisher<RuntimeTestMessage> publisher(allocator_, *channel_);
     Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
     OutstandingReceiptTable receipts(
@@ -392,15 +423,106 @@ TEST_F(RuntimeSpscTest, ReceiptExhaustionDoesNotRollbackLocalCommit) {
     auto builder = publisher.Allocate();
     ASSERT_TRUE(builder.ok());
     (*builder)->id = 88;
+    const ShmHandle handle = builder->handle();
     auto receipt = publisher.Publish(std::move(*builder), receipts, identity,
                                      targets, requirement);
     ASSERT_FALSE(receipt.ok());
     EXPECT_EQ(receipt.status().code(), StatusCode::kResourceExhausted);
 
-    auto message = subscriber.TryPoll();
-    ASSERT_TRUE(message.ok()) << "local Commit must remain visible";
-    EXPECT_EQ((*message)->id, 88u);
-    EXPECT_TRUE(std::move(*message).Ack().ok());
+    EXPECT_TRUE(channel_->IsEmpty());
+    EXPECT_EQ(publisher.published_count(), 0u);
+    EXPECT_EQ(receipts.outstanding(), 0u);
+    EXPECT_EQ(allocator_.Inspect(handle).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(subscriber.TryPoll().status().code(), StatusCode::kWouldBlock);
+}
+
+TEST_F(RuntimeSpscTest, ReceiptReservationIsCanceledWhenLocalPublishFails) {
+    Publisher<RuntimeTestMessage> fill(allocator_, *channel_);
+    for (uint64_t i = 1; i <= kChannelCapacity; ++i) {
+        auto builder = fill.Allocate();
+        ASSERT_TRUE(builder.ok());
+        (*builder)->id = i;
+        ASSERT_TRUE(fill.PublishLocal(std::move(*builder)).ok());
+    }
+
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_);
+    OutstandingReceiptTable receipts(
+        {.max_outstanding = 1, .max_per_publisher = 1});
+    const PublisherReceiptIdentity identity{
+        .process = ProcessIdentity::Current(),
+        .publisher_id = PublisherId{4},
+    };
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 12},
+    };
+    const DeliveryRequirement requirement{
+        .stage = DeliveryStage::kRemoteAccepted,
+        .completion = CompletionPolicy::kAll,
+        .quorum = 0,
+        .deadline = Deadline::Infinite(),
+    };
+
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 90;
+    const ShmHandle handle = builder->handle();
+    auto receipt = publisher.Publish(std::move(*builder), receipts, identity,
+                                     targets, requirement);
+    ASSERT_FALSE(receipt.ok());
+    EXPECT_EQ(receipt.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(receipts.outstanding(), 0u);
+    EXPECT_EQ(allocator_.Inspect(handle).status().code(), StatusCode::kNotFound);
+
+    auto replacement = receipts.Reserve(identity, targets, requirement);
+    ASSERT_TRUE(replacement.ok())
+        << "local failure must release the receipt reservation";
+    replacement->Cancel();
+}
+
+TEST_F(RuntimeSpscTest, ReceiptReservationIsCanceledWhenLocalPublishDrops) {
+    Publisher<RuntimeTestMessage> fill(allocator_, *channel_);
+    for (uint64_t i = 1; i <= kChannelCapacity; ++i) {
+        auto builder = fill.Allocate();
+        ASSERT_TRUE(builder.ok());
+        (*builder)->id = i;
+        ASSERT_TRUE(fill.PublishLocal(std::move(*builder)).ok());
+    }
+
+    PublisherOptions options;
+    options.queue_full_policy = QueueFullPolicy::kDropNewest;
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_, options);
+    OutstandingReceiptTable receipts(
+        {.max_outstanding = 1, .max_per_publisher = 1});
+    const PublisherReceiptIdentity identity{
+        .process = ProcessIdentity::Current(),
+        .publisher_id = PublisherId{3},
+    };
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 11},
+    };
+    const DeliveryRequirement requirement{
+        .stage = DeliveryStage::kRemoteAccepted,
+        .completion = CompletionPolicy::kAll,
+        .quorum = 0,
+        .deadline = Deadline::Infinite(),
+    };
+
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 89;
+    const ShmHandle handle = builder->handle();
+    auto receipt = publisher.Publish(std::move(*builder), receipts, identity,
+                                     targets, requirement);
+    ASSERT_FALSE(receipt.ok());
+    EXPECT_EQ(receipt.status().code(), StatusCode::kDegraded);
+    EXPECT_EQ(publisher.dropped_count(), 1u);
+    EXPECT_EQ(receipts.outstanding(), 0u);
+    EXPECT_EQ(allocator_.Inspect(handle).status().code(), StatusCode::kNotFound);
+
+    auto replacement = receipts.Reserve(identity, targets, requirement);
+    ASSERT_TRUE(replacement.ok())
+        << "Drop must release the per-publisher receipt reservation";
+    replacement->Cancel();
 }
 
 TEST_F(RuntimeSpscTest, TransferPinsPayloadBeyondChannelAck) {

@@ -1,14 +1,28 @@
 # Long-running recovery validation is intentionally separate from PR CI.
-# The first push that adds/changes this workflow triggers a run; subsequent
-# runs can be started manually from the GitHub Actions UI.
-name: Two-Hour Recovery Stress
+name: Reproducible Recovery Stress
 
 on:
+  schedule:
+    - cron: "17 3 * * 0"
   workflow_dispatch:
+    inputs:
+      seed:
+        description: Optional decimal uint64 seed override (recorded in manifest)
+        required: false
+        type: string
   push:
     branches: [master, main]
     paths:
       - .github/workflows/recovery-stress.yml
+      - tools/ci/run_recovery_stress.py
+      - .bazelrc
+      - .bazelversion
+      - MODULE.bazel
+      - MODULE.bazel.lock
+      - mino/abi/**
+      - mino/platform/**
+      - mino/shm/**
+      - mino/runtime/**
 
 permissions:
   contents: read
@@ -21,10 +35,11 @@ jobs:
   recovery-stress:
     name: ${{ matrix.name }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 135
+    timeout-minutes: 150
     env:
       CC: gcc-12
       CXX: g++-12
+      RECOVERY_STRESS_SECONDS: "7200"
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -32,20 +47,14 @@ jobs:
         include:
           - id: d1
             name: D1 Region recovery (2h)
-            target: //mino/shm/region:d1_region_recovery_kill_stress_test
-            seconds_env: MINO_D1_REGION_RECOVERY_STRESS_SECONDS
-            seed_env: MINO_D1_REGION_RECOVERY_STRESS_SEED
-            filter: D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals
+            seed: "910009"
           - id: d2
             name: D2 Runtime recovery (2h)
-            target: //mino/runtime:d2_recovery_stress_test
-            seconds_env: MINO_D2_RECOVERY_STRESS_SECONDS
-            seed_env: MINO_D2_RECOVERY_STRESS_SEED
-            filter: D2RecoveryStressTest.RandomizedTimedRecoveryStress:D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals
+            seed: "920009"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install build dependencies
         run: |
@@ -54,10 +63,10 @@ jobs:
             gcc-12 g++-12 libatomic1
 
       - name: Setup Bazelisk
-        uses: bazelbuild/setup-bazelisk@v3
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
       - name: Cache Bazel output base
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/bazel
           key: recovery-stress-${{ runner.os }}-${{ matrix.id }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
@@ -65,23 +74,60 @@ jobs:
             recovery-stress-${{ runner.os }}-${{ matrix.id }}-
             recovery-stress-${{ runner.os }}-
 
-      - name: Run two-hour recovery stress
+      - name: Run reproducible two-hour recovery stress
+        env:
+          STRESS_SEED: ${{ inputs.seed || matrix.seed }}
         run: |
-          bazel test "${{ matrix.target }}" \
-            --test_timeout=7260 \
-            --test_env="${{ matrix.seconds_env }}=7200" \
-            --test_env="${{ matrix.seed_env }}=${{ github.run_id }}" \
-            --test_arg="--gtest_filter=${{ matrix.filter }}" \
-            --test_output=streamed \
-            --nocache_test_results
+          python3 tools/ci/run_recovery_stress.py "${{ matrix.id }}" \
+            --seconds="${RECOVERY_STRESS_SECONDS}" \
+            --seed="${STRESS_SEED}" \
+            --out="recovery-stress-results/${{ matrix.id }}"
 
-      - name: Upload Bazel test logs
+      - name: Write recovery stress summary
         if: always()
-        uses: actions/upload-artifact@v4
+        env:
+          RESULT_DIR: recovery-stress-results/${{ matrix.id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = Path(os.environ["RESULT_DIR"])
+          manifest_path = result / "manifest.json"
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          lines = ["## Recovery stress evidence", ""]
+          if not manifest_path.is_file():
+              lines += ["No manifest was produced; inspect setup and runner logs.", ""]
+          else:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              hashes = manifest.get("test_log_hashes", {})
+              lines += [
+                  "| Field | Value |",
+                  "| --- | --- |",
+                  f"| Status | `{manifest.get('status')}` |",
+                  f"| Suite / target | `{manifest.get('suite')}` / `{manifest.get('target')}` |",
+                  f"| Commit | `{manifest.get('commit')}` |",
+                  f"| Seed | `{manifest.get('seed')}` |",
+                  f"| Requested duration | `{manifest.get('duration_seconds')}s` |",
+                  f"| Start | `{manifest.get('start_time_utc')}` |",
+                  f"| End | `{manifest.get('end_time_utc')}` |",
+                  f"| Exit code | `{manifest.get('exit_code')}` |",
+                  f"| test.log SHA-256 | `{hashes.get('test.log')}` |",
+                  f"| test.xml SHA-256 | `{hashes.get('test.xml')}` |",
+                  "",
+                  f"Artifact retention: **90 days**. Artifact source: `{result}`.",
+                  "",
+              ]
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines))
+          PY
+
+      - name: Upload recovery stress evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: recovery-stress-${{ matrix.id }}-${{ github.run_id }}
-          path: |
-            bazel-testlogs/**/test.log
-            bazel-testlogs/**/test.xml
+          name: recovery-stress-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: recovery-stress-results/${{ matrix.id }}/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 90

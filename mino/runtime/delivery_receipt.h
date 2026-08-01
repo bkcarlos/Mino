@@ -72,6 +72,7 @@ struct PublisherReceiptIdentity {
 };
 
 class OutstandingReceiptTable;
+struct OutstandingReceiptTableTestAccess;
 
 class DeliveryReceipt {
 public:
@@ -101,6 +102,32 @@ public:
         uint32_t max_per_publisher = 256;
     };
 
+    // Move-only admission capability. Until Commit(), the table slot is
+    // reserved but not visible to Acknowledge() or outstanding(). Destruction
+    // and Cancel() release the reservation.
+    class Reservation {
+    public:
+        Reservation() = default;
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        Reservation(Reservation&& other) noexcept;
+        Reservation& operator=(Reservation&& other) noexcept;
+        ~Reservation();
+
+        bool valid() const noexcept { return table_ != nullptr; }
+        DeliveryReceipt Commit(uint64_t source_sequence) && noexcept;
+        void Cancel() noexcept;
+
+    private:
+        friend class OutstandingReceiptTable;
+
+        Reservation(OutstandingReceiptTable* table, ReceiptId id) noexcept
+            : table_(table), id_(id) {}
+
+        OutstandingReceiptTable* table_ = nullptr;
+        ReceiptId id_;
+    };
+
     OutstandingReceiptTable();
     explicit OutstandingReceiptTable(Limits limits);
     ~OutstandingReceiptTable();
@@ -108,6 +135,14 @@ public:
     OutstandingReceiptTable(const OutstandingReceiptTable&) = delete;
     OutstandingReceiptTable& operator=(const OutstandingReceiptTable&) = delete;
 
+    // Performs validation and reserves global/per-publisher admission before a
+    // local message is published. Commit binds the eventual local sequence.
+    Result<Reservation> Reserve(
+        const PublisherReceiptIdentity& publisher,
+        std::span<const DeliveryTarget> targets,
+        const DeliveryRequirement& requirement);
+
+    // Convenience for callers that already have a committed local sequence.
     Result<DeliveryReceipt> Create(
         const PublisherReceiptIdentity& publisher, uint64_t source_sequence,
         std::span<const DeliveryTarget> targets,
@@ -126,6 +161,24 @@ public:
         const PublisherReceiptIdentity& publisher) const noexcept;
 
 private:
+    friend struct OutstandingReceiptTableTestAccess;
+
+    enum class ReserveFailurePointForTesting : uint32_t {
+        kNone = 0,
+        kState,
+        kTargets,
+        kUpdated,
+        kPublisherEntry,
+        kReceiptEntry,
+    };
+
+    DeliveryReceipt CommitReservation(ReceiptId id,
+                                      uint64_t source_sequence) noexcept;
+    void CancelReservation(ReceiptId id) noexcept;
+    void SetReserveFailurePointForTesting(
+        ReserveFailurePointForTesting point) noexcept;
+    void SetNextReceiptIdForTesting(uint64_t next_id);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

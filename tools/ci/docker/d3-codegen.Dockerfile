@@ -1,6 +1,6 @@
-
-
-ARG BASE_IMAGE=ubuntu:24.04
+# Multi-platform OCI index for ubuntu:24.04, resolved 2026-08-01.
+# Callers may explicitly override BASE_IMAGE, but the reproducible default is immutable.
+ARG BASE_IMAGE=ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -40,15 +40,29 @@ RUN curl -fsSL \
 COPY . ${WORKSPACE_PATH}
 WORKDIR ${WORKSPACE_PATH}
 
+# The host uses the raw GitHub BCR mirror for a host-specific Java TLS issue.
+# The isolated Linux images have a normal CA/JDK stack and must use the official
+# BCR endpoint; rewrite only the copied image configuration.
+RUN sed -i \
+        's#https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main#https://bcr.bazel.build#' \
+        .bazelrc
+
 # Download Bazel itself and all external repositories while image builds still
-# have network access. The actual comparison containers run with --network=none.
-RUN bazel fetch --config=release \
-        //mino/schema/codegen:code_generator_test \
-        //tools/minoc:canonical_wire_generated_test \
-        //tools/minoc:minoc_cli_test \
-        //tools/minoc:cross_directory_generated_test \
-        //tools/minoc:sample_codegen \
-        //tools/minoc:canonical_wire_codegen \
-        //tools/minoc:mangling_codegen \
-        //tools/minoc:sensor_frame_codegen \
-        //mino/schema/fuzz:codegen_golden
+# have network access. Registry reads occasionally time out, so retry the same
+# hermetic fetch without changing inputs. The actual comparison containers run
+# with --network=none and therefore cannot conceal missing dependencies.
+RUN for attempt in 1 2 3; do \
+        bazel fetch --config=release \
+            //mino/schema/codegen:code_generator_test \
+            //tools/minoc:canonical_wire_generated_test \
+            //tools/minoc:minoc_cli_test \
+            //tools/minoc:cross_directory_generated_test \
+            //tools/minoc:sample_codegen \
+            //tools/minoc:canonical_wire_codegen \
+            //tools/minoc:mangling_codegen \
+            //tools/minoc:sensor_frame_codegen \
+            //mino/schema/fuzz:codegen_golden \
+        && exit 0; \
+        if [ "${attempt}" -eq 3 ]; then exit 1; fi; \
+        sleep 15; \
+    done

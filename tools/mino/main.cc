@@ -71,7 +71,7 @@ OPTIONS:
 // The sidecar is a tiny line-based format (no third-party deps per task):
 //
 //   class <class_id> <slot_count> <bitmap_off> <slots_off> <slot_stride>
-//   ring  <channel_id> <control_off> <slots_off>
+//   ring  <channel_id> <control_off>
 //   recovery <state_off>            (required for `recover`)
 //   # comment
 //
@@ -128,7 +128,6 @@ Status ParseSidecar(const std::string& path, Sidecar* out) {
             if (!parse_u64(&tmp)) goto malformed;
             ref.channel_id = static_cast<uint32_t>(tmp);
             if (!parse_u64(&ref.control_offset)) goto malformed;
-            if (!parse_u64(&ref.slots_offset)) goto malformed;
             out->inspector_layout.rings.push_back(ref);
             continue;
         }
@@ -297,7 +296,8 @@ int CmdDumpRing(const CommonArgs& args) {
     out << "layout_version:     " << dump->layout_version << "\n";
     for (uint64_t i = 0; i < dump->slots.size(); ++i) {
         const auto& s = dump->slots[i];
-        out << "[" << i << "] seq=" << s.sequence
+        out << "[" << i << "] ring_seq=" << s.ring_sequence
+            << " seq=" << s.sequence
             << " state=" << mino::tools::SlotStateName(s.state)
             << " msg_type=" << s.msg_type << " ts=" << s.timestamp_ns
             << " payload_off=0x" << std::hex << s.payload_offset << std::dec

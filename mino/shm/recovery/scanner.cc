@@ -13,6 +13,8 @@
 
 #include <unistd.h>
 
+#include "mino/common/checked_arithmetic.h"
+
 namespace mino::shm::recovery {
 namespace {
 
@@ -300,17 +302,46 @@ Result<RecoveryScanner> RecoveryScanner::Create(
 
 Result<RecoveryScanner> RecoveryScanner::Create(
     CentralSlabAllocator allocator, RecoveryOwnership ownership,
-    RecoveryScannerOptions options) {
+    RecoveryScannerOptions options, uint32_t resource_id,
+    std::span<const RecoveryObjectReference> references,
+    bool references_complete) {
     if (allocator.total_slot_count() == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "recovery allocator has no slots");
     }
-    return RecoveryScanner(std::move(allocator), ownership, options);
+    if (references_complete && resource_id == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "complete references require a resource id");
+    }
+    RecoveryScanner scanner(std::move(allocator), ownership, options);
+    scanner.resource_id_ = resource_id;
+    scanner.references_.assign(references.begin(), references.end());
+    scanner.references_complete_ = references_complete;
+    return scanner;
+}
+
+Result<RecoveryScanner> RecoveryScanner::Create(
+    LargeObjectPool pool, uint32_t resource_id, RecoveryOwnership ownership,
+    RecoveryScannerOptions options,
+    std::span<const RecoveryObjectReference> references,
+    bool references_complete) {
+    if (pool.segment_count() == 0 || resource_id == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "large pool recovery resource is invalid");
+    }
+    RecoveryScanner scanner(std::move(pool), resource_id, ownership, options);
+    scanner.references_.assign(references.begin(), references.end());
+    scanner.references_complete_ = references_complete;
+    return scanner;
 }
 
 Result<RecoveryReport> RecoveryScanner::Scan() {
     RecoveryReport report;
-    MINO_RETURN_IF_ERROR(ScanSlots(report, options_.repair));
+    if (large_pool_.has_value()) {
+        MINO_RETURN_IF_ERROR(ScanLargePool(report, options_.repair));
+    } else {
+        MINO_RETURN_IF_ERROR(ScanSlots(report, options_.repair));
+    }
     return report;
 }
 
@@ -320,7 +351,9 @@ Status RecoveryScanner::ReclaimOrphanSlabs() {
                              "reclaim requires Region recovery ownership");
     }
     RecoveryReport report;
-    return ScanSlots(report, /*repair=*/true);
+    return large_pool_.has_value()
+               ? ScanLargePool(report, /*repair=*/true)
+               : ScanSlots(report, /*repair=*/true);
 }
 
 Status RecoveryScanner::CleanupStaleAcks(const AckScanInput& input,
@@ -366,9 +399,117 @@ Status RecoveryScanner::CleanupStaleAcks(const AckScanInput& input,
     return Status::Ok();
 }
 
+Status RecoveryScanner::CleanupGenerationScopedResource(
+    std::byte* region_base, uint64_t region_size,
+    const RecoveryResourceDescriptor& descriptor,
+    RecoveryOwnership ownership, RecoveryReport* report) {
+    if (!ownership.IsOwner()) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "generation cleanup requires recovery ownership");
+    }
+    if (region_base == nullptr || report == nullptr) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "generation cleanup input is null");
+    }
+    MINO_RETURN_IF_ERROR(
+        ValidateRecoveryResourceDescriptor(descriptor, region_size));
+    const auto kind = static_cast<RecoveryResourceKind>(descriptor.kind);
+    if (kind != RecoveryResourceKind::kChannelAckSource &&
+        kind != RecoveryResourceKind::kPinCleanupParticipant) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "resource is not generation-scoped cleanup data");
+    }
+    auto* control_generation = reinterpret_cast<uint64_t*>(
+        region_base + descriptor.control_offset);
+    auto* live_mask_word = reinterpret_cast<uint64_t*>(
+        region_base + descriptor.control_offset + sizeof(uint64_t));
+    const uint64_t active_generation =
+        std::atomic_ref(*control_generation).load(std::memory_order_acquire);
+    const uint64_t live_mask = kind == RecoveryResourceKind::kChannelAckSource
+                                   ? std::atomic_ref(*live_mask_word)
+                                         .load(std::memory_order_acquire)
+                                   : 0;
+    if (active_generation == 0 || active_generation < descriptor.generation) {
+        return Status::Error(StatusCode::kCorruption,
+                             "cleanup control generation is invalid");
+    }
+    auto add_count = [](uint64_t delta, uint64_t* total) -> Status {
+        uint64_t updated = 0;
+        if (!CheckedAddU64(*total, delta, &updated)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "generation cleanup count overflow");
+        }
+        *total = updated;
+        return Status::Ok();
+    };
+
+    for (uint64_t i = 0; i < descriptor.element_count; ++i) {
+        if ((i % 256u) == 0) {
+            ownership.Heartbeat();
+            if (!ownership.IsOwner()) {
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "recovery ownership lost during generation cleanup");
+            }
+        }
+        uint64_t element_delta = 0;
+        uint64_t element_offset = 0;
+        if (!CheckedMulU64(i, descriptor.element_stride, &element_delta) ||
+            !CheckedAddU64(descriptor.offset, element_delta,
+                           &element_offset)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "cleanup element offset overflow");
+        }
+        uint64_t generation_offset = 0;
+        uint64_t value_offset = 0;
+        if (!CheckedAddU64(element_offset, descriptor.generation_offset,
+                           &generation_offset) ||
+            !CheckedAddU64(element_offset, descriptor.value_offset,
+                           &value_offset)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "cleanup field offset overflow");
+        }
+        auto* generation_word = reinterpret_cast<uint64_t*>(
+            region_base + generation_offset);
+        auto* value_word = reinterpret_cast<uint64_t*>(
+            region_base + value_offset);
+        const uint64_t generation =
+            std::atomic_ref(*generation_word).load(std::memory_order_acquire);
+        auto value = std::atomic_ref(*value_word);
+        if (generation != active_generation) {
+            const uint64_t stale = value.exchange(0, std::memory_order_acq_rel);
+            if (kind == RecoveryResourceKind::kChannelAckSource) {
+                MINO_RETURN_IF_ERROR(add_count(
+                    static_cast<uint64_t>(__builtin_popcountll(stale)),
+                    &report->stale_ack_count));
+            } else {
+                MINO_RETURN_IF_ERROR(
+                    add_count(stale, &report->stale_pin_count));
+            }
+        } else if (kind == RecoveryResourceKind::kChannelAckSource) {
+            const uint64_t before =
+                value.fetch_and(live_mask, std::memory_order_acq_rel);
+            MINO_RETURN_IF_ERROR(add_count(
+                static_cast<uint64_t>(
+                    __builtin_popcountll(before & ~live_mask)),
+                &report->stale_ack_count));
+        }
+        if (!ownership.IsOwner()) {
+            return Status::Error(
+                StatusCode::kUnavailable,
+                "recovery fence lost after generation cleanup write");
+        }
+    }
+    return Status::Ok();
+}
+
 Status RecoveryScanner::VerifyBitmapConsistency() {
     RecoveryReport report;
-    MINO_RETURN_IF_ERROR(ScanSlots(report, /*repair=*/false));
+    if (large_pool_.has_value()) {
+        MINO_RETURN_IF_ERROR(ScanLargePool(report, /*repair=*/false));
+    } else {
+        MINO_RETURN_IF_ERROR(ScanSlots(report, /*repair=*/false));
+    }
     if (report.bitmap_inconsistency_count != 0 ||
         report.orphan_slab_count != 0 || report.corrupted_slab_count != 0) {
         return Status::Error(
@@ -489,6 +630,83 @@ Status RecoveryScanner::ScanSlots(RecoveryReport& report, bool repair) {
             continue;
         }
 
+        if (state == static_cast<uint32_t>(ObjectState::kAllocated) ||
+            state == static_cast<uint32_t>(ObjectState::kBuilding) ||
+            state == static_cast<uint32_t>(ObjectState::kAborting)) {
+            ++report.orphan_slab_count;
+            ++report.unpublished_orphan_candidate_count;
+            const uint64_t owner_epoch =
+                header.owner_epoch.load(std::memory_order_acquire);
+            const uint64_t transaction_id =
+                header.allocation_transaction_id.load(std::memory_order_acquire);
+            const bool proven_dead =
+                CanReclaimUnpublished(owner_epoch, transaction_id);
+            if (!proven_dead) {
+                ++report.deferred_reclaim_count;
+            }
+            if (repair && proven_dead) {
+                if (!ownership_.IsOwner()) {
+                    return Status::Error(
+                        StatusCode::kUnavailable,
+                        "recovery fence lost before unpublished slab repair");
+                }
+                MINO_RETURN_IF_ERROR(
+                    allocator_.ClearSlotForRecovery(slot, state));
+                if (!ownership_.IsOwner()) {
+                    return Status::Error(
+                        StatusCode::kUnavailable,
+                        "recovery fence lost after unpublished slab repair");
+                }
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "unpublished_orphan_candidate", expected_class, slot,
+                "object_state=" + std::string(ObjectStateName(state)) +
+                    " owner_epoch=" + std::to_string(owner_epoch) +
+                    " transaction_id=" + std::to_string(transaction_id) +
+                    (repair && proven_dead
+                         ? " reclaimed with owner/transaction death proof"
+                         : proven_dead ? " (read-only; not reclaimed)"
+                                       : " deferred: no Journal/owner-death proof")));
+            continue;
+        }
+
+        if (state == static_cast<uint32_t>(ObjectState::kPublished) &&
+            references_complete_ &&
+            !IsReferenced(slot, authoritative_generation)) {
+            ++report.orphan_slab_count;
+            ++report.published_orphan_candidate_count;
+            const bool destructive = CanReclaimPublishedOrphan();
+            if (!destructive) {
+                ++report.deferred_reclaim_count;
+            }
+            if (repair && destructive) {
+                if (!ownership_.IsOwner()) {
+                    return Status::Error(
+                        StatusCode::kUnavailable,
+                        "recovery fence lost before published candidate repair");
+                }
+                MINO_RETURN_IF_ERROR(
+                    allocator_.ClearSlotForRecovery(slot, state));
+                if (!ownership_.IsOwner()) {
+                    return Status::Error(
+                        StatusCode::kUnavailable,
+                        "recovery fence lost after published candidate repair");
+                }
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "published_orphan_candidate", expected_class, slot,
+                repair && destructive
+                    ? "unreferenced PUBLISHED slab reclaimed with explicit "
+                      "offline/quiesced proof"
+                    : destructive
+                          ? "unreferenced PUBLISHED slab (read-only; not reclaimed)"
+                          : "unreferenced PUBLISHED slab deferred: complete "
+                            "snapshot is not a publication fence"));
+            continue;
+        }
+
         if (state == static_cast<uint32_t>(ObjectState::kRetired) &&
             options_.reclaim_retired) {
             if (repair) {
@@ -510,6 +728,209 @@ Status RecoveryScanner::ScanSlots(RecoveryReport& report, bool repair) {
                 "retired_slab", expected_class, slot,
                 repair ? "RETIRED reclaimed under exclusive Region recovery"
                        : "RETIRED (not reclaimed)"));
+        }
+    }
+    return Status::Ok();
+}
+
+bool RecoveryScanner::CanReclaimPublishedOrphan() const noexcept {
+    return options_.offline_or_quiesced &&
+           ownership_.ProvesDestructiveReclaim(
+               options_.destructive_reclaim_proof_token);
+}
+
+bool RecoveryScanner::CanReclaimUnpublished(
+    uint64_t owner_epoch, uint64_t transaction_id) const noexcept {
+    return ownership_.ProvesUnpublishedOwnerDead(owner_epoch, transaction_id);
+}
+
+bool RecoveryScanner::IsReferenced(uint32_t unit_index,
+                                   uint32_t generation) const {
+    for (const RecoveryObjectReference& reference : references_) {
+        if (reference.resource_id == resource_id_ &&
+            reference.unit_index == unit_index &&
+            reference.generation == generation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Status RecoveryScanner::ScanLargePool(RecoveryReport& report, bool repair) {
+    if (!large_pool_.has_value()) {
+        return Status::Error(StatusCode::kInternal,
+                             "large pool scanner is not initialized");
+    }
+    if (repair && !ownership_.IsOwner()) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "repairing large pool scan requires ownership");
+    }
+    LargeObjectPool& pool = *large_pool_;
+    for (uint32_t segment = 0; segment < pool.segment_count(); ++segment) {
+        if (repair && (segment % 256u) == 0) {
+            ownership_.Heartbeat();
+            if (!ownership_.IsOwner()) {
+                return Status::Error(StatusCode::kUnavailable,
+                                     "ownership lost during large pool scan");
+            }
+        }
+        ++report.slots_scanned;
+        SlabHeader header{};
+        if (!pool.ReadSegmentForRecovery(segment, &header)) {
+            return Status::Error(StatusCode::kInternal,
+                                 "large pool segment disappeared");
+        }
+        const bool occupied = pool.IsSegmentOccupiedForRecovery(segment);
+        const uint32_t state =
+            header.object_state.load(std::memory_order_acquire);
+        if (!occupied) {
+            if (state != static_cast<uint32_t>(ObjectState::kFree)) {
+                ++report.bitmap_inconsistency_count;
+                report.AddDetail(Finding(
+                    "large_bitmap_inconsistency", 0xFFFFu, segment,
+                    "bitmap free but object_state=" +
+                        std::string(ObjectStateName(state))));
+                if (repair) {
+                    MINO_RETURN_IF_ERROR(
+                        pool.ClearStaleStateForRecovery(segment, state));
+                }
+            }
+            continue;
+        }
+        if (!IsValidPublishedState(state)) {
+            if (!IsProtocolReclaimableState(state)) {
+                ++report.corrupted_slab_count;
+                report.AddDetail(Finding(
+                    "large_corruption", 0xFFFFu, segment,
+                    "unknown object_state=" + std::to_string(state)));
+                continue;
+            }
+            ++report.orphan_slab_count;
+            if (repair) {
+                const bool complete_segment_zero =
+                    VerifyImmutableHeader(header) &&
+                    header.class_id == 0xFFFFu &&
+                    header.allocation_role.load(std::memory_order_acquire) == 0;
+                if (complete_segment_zero) {
+                    MINO_RETURN_IF_ERROR(
+                        pool.ClearObjectForRecovery(segment, state));
+                } else {
+                    MINO_RETURN_IF_ERROR(
+                        pool.ClearSegmentForRecovery(segment, state));
+                }
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "large_orphan", 0xFFFFu, segment,
+                repair ? "incomplete protocol segment reclaimed"
+                       : "incomplete protocol segment (not reclaimed)"));
+            continue;
+        }
+        const uint32_t generation =
+            pool.AuthoritativeGenerationForRecovery(segment);
+        if (!VerifyImmutableHeader(header) ||
+            header.generation.load(std::memory_order_acquire) != generation ||
+            header.class_id != 0xFFFFu ||
+            header.capacity != pool.segment_size() ||
+            header.object_size == 0 ||
+            header.object_size > pool.max_object_size()) {
+            ++report.corrupted_slab_count;
+            report.AddDetail(Finding(
+                "large_corruption", 0xFFFFu, segment,
+                "segment header/generation invariant failed"));
+            continue;
+        }
+        const uint32_t role =
+            header.allocation_role.load(std::memory_order_acquire);
+        if (role > segment) {
+            ++report.corrupted_slab_count;
+            report.AddDetail(Finding("large_corruption", 0xFFFFu, segment,
+                                     "continuation role underflows pool"));
+            continue;
+        }
+        const uint32_t first = segment - role;
+        auto handle = pool.HandleForRecovery(first);
+        if (!handle.ok()) {
+            ++report.corrupted_slab_count;
+            report.AddDetail(Finding("large_corruption", 0xFFFFu, segment,
+                                     "continuation has no segment 0"));
+            continue;
+        }
+        auto plan = pool.InspectPlan(*handle);
+        if (!plan.ok()) {
+            ++report.corrupted_slab_count;
+            report.AddDetail(Finding("large_corruption", 0xFFFFu, segment,
+                                     plan.status().ToString()));
+            continue;
+        }
+        if (role != 0) {
+            continue;
+        }
+        if (state == static_cast<uint32_t>(ObjectState::kAllocated) ||
+            state == static_cast<uint32_t>(ObjectState::kBuilding) ||
+            state == static_cast<uint32_t>(ObjectState::kAborting)) {
+            ++report.orphan_slab_count;
+            ++report.unpublished_orphan_candidate_count;
+            const uint64_t owner_epoch =
+                header.owner_epoch.load(std::memory_order_acquire);
+            const uint64_t transaction_id =
+                header.allocation_transaction_id.load(std::memory_order_acquire);
+            const bool proven_dead =
+                CanReclaimUnpublished(owner_epoch, transaction_id);
+            if (!proven_dead) {
+                ++report.deferred_reclaim_count;
+            }
+            if (repair && proven_dead) {
+                MINO_RETURN_IF_ERROR(
+                    pool.ClearObjectForRecovery(first, state));
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "large_unpublished_orphan_candidate", 0xFFFFu, first,
+                "object_state=" + std::string(ObjectStateName(state)) +
+                    " owner_epoch=" + std::to_string(owner_epoch) +
+                    " transaction_id=" + std::to_string(transaction_id) +
+                    (repair && proven_dead
+                         ? " reclaimed with owner/transaction death proof"
+                         : proven_dead ? " (read-only; not reclaimed)"
+                                       : " deferred: no Journal/owner-death proof")));
+            continue;
+        }
+        if (state == static_cast<uint32_t>(ObjectState::kPublished) &&
+            references_complete_ && !IsReferenced(first, generation)) {
+            ++report.orphan_slab_count;
+            ++report.published_orphan_candidate_count;
+            const bool destructive = CanReclaimPublishedOrphan();
+            if (!destructive) {
+                ++report.deferred_reclaim_count;
+            }
+            if (repair && destructive) {
+                MINO_RETURN_IF_ERROR(
+                    pool.ClearObjectForRecovery(first, state));
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "large_published_orphan_candidate", 0xFFFFu, first,
+                repair && destructive
+                    ? "unreferenced PUBLISHED large object reclaimed with "
+                      "explicit offline/quiesced proof"
+                    : destructive
+                          ? "unreferenced PUBLISHED large object (read-only; not reclaimed)"
+                          : "unreferenced PUBLISHED large object deferred: complete "
+                            "snapshot is not a publication fence"));
+            continue;
+        }
+        if (state == static_cast<uint32_t>(ObjectState::kRetired) &&
+            options_.reclaim_retired) {
+            if (repair) {
+                MINO_RETURN_IF_ERROR(
+                    pool.ClearObjectForRecovery(first, state));
+                ++report.reclaimed_slab_count;
+            }
+            report.AddDetail(Finding(
+                "large_retired", 0xFFFFu, first,
+                repair ? "RETIRED large object reclaimed"
+                       : "RETIRED large object (not reclaimed)"));
         }
     }
     return Status::Ok();
@@ -615,6 +1036,53 @@ Status RecoveryScanner::ScanLegacyImage(RecoveryReport& report, bool repair) {
                     "corruption", cls.class_id, slot,
                     "allocator SlabHeader invariant failed "
                     "(NOT auto-repaired; quarantine required)"));
+                continue;
+            }
+            if (state == static_cast<uint32_t>(ObjectState::kAllocated) ||
+                state == static_cast<uint32_t>(ObjectState::kBuilding) ||
+                state == static_cast<uint32_t>(ObjectState::kAborting)) {
+                ++report.orphan_slab_count;
+                ++report.unpublished_orphan_candidate_count;
+                const uint64_t owner_epoch =
+                    header->owner_epoch.load(std::memory_order_acquire);
+                const uint64_t transaction_id =
+                    header->allocation_transaction_id.load(
+                        std::memory_order_acquire);
+                const bool proven_dead =
+                    CanReclaimUnpublished(owner_epoch, transaction_id);
+                if (!proven_dead) {
+                    ++report.deferred_reclaim_count;
+                }
+                if (repair && proven_dead) {
+                    if (!ownership_.IsOwner()) {
+                        return Status::Error(
+                            StatusCode::kUnavailable,
+                            "offline recovery fence lost before unpublished repair");
+                    }
+                    uint32_t expected_state = state;
+                    if (header->object_state.compare_exchange_strong(
+                            expected_state,
+                            static_cast<uint32_t>(ObjectState::kFree),
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        bitmap[slot / 64].fetch_and(~mask,
+                                                    std::memory_order_acq_rel);
+                        ++report.reclaimed_slab_count;
+                    }
+                    if (!ownership_.IsOwner()) {
+                        return Status::Error(
+                            StatusCode::kUnavailable,
+                            "offline recovery fence lost after unpublished repair");
+                    }
+                }
+                report.AddDetail(Finding(
+                    "unpublished_orphan_candidate", cls.class_id, slot,
+                    "object_state=" + std::string(ObjectStateName(state)) +
+                        (repair && proven_dead
+                             ? " reclaimed with owner/transaction death proof"
+                             : proven_dead
+                                   ? " (read-only; not reclaimed)"
+                                   : " deferred: no Journal/owner-death proof")));
                 continue;
             }
             if (state == static_cast<uint32_t>(ObjectState::kRetired) &&

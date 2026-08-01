@@ -2,6 +2,28 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "recovery_directory",
+    srcs = ["recovery_directory.cc"],
+    hdrs = ["recovery_directory.h"],
+    deps = [
+        ":superblock",
+        "//mino/common:checked_arithmetic",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "recovery_directory_test",
+    srcs = ["recovery_directory_test.cc"],
+    deps = [
+        ":recovery_directory",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "superblock",
     hdrs = ["superblock.h"],
     deps = [
@@ -25,6 +47,7 @@ cc_library(
         "region.h",
     ],
     deps = [
+        ":recovery_directory",
         ":superblock",
         "//mino/common:checked_arithmetic",
         "//mino/common:result",
@@ -32,6 +55,7 @@ cc_library(
         "//mino/platform:process_identity",
         "//mino/platform:shared_memory",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/recovery:scanner",
     ],
 )
@@ -49,6 +73,8 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/allocator:slab_header",
     ],
 )
@@ -75,6 +101,7 @@ cc_test(
         "//mino/platform:process_identity",
         "//mino/platform:shared_memory",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/allocator:slab_header",
         "@googletest//:gtest_main",
     ],
@@ -155,6 +182,8 @@ cc_test(
         "//mino/common:status",
         "//mino/platform:process_identity",
         "//mino/platform:shared_memory",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/allocator:slab_header",
         "@googletest//:gtest_main",
     ],
@@ -169,9 +198,8 @@ cc_test(
         "//mino/abi:shm_abi",
         "//mino/common:ids",
         "//mino/common:status",
-        "//mino/platform:process_identity",
         "//mino/platform:shared_memory",
-        "//mino/shm/allocator:slab_header",
+        "//mino/shm/allocator:central_slab",
         "@googletest//:gtest_main",
     ],
 )

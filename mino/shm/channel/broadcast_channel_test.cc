@@ -51,6 +51,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 using Control = BroadcastChannel::ControlBlock;
+using EraMeta = BroadcastChannel::BroadcastEraMeta;
 using SubSlot = BroadcastChannel::SubscriberSlot;
 static_assert(sizeof(Control) == 3 * 64,
               "control block must occupy exactly three cache lines");
@@ -74,17 +75,18 @@ static_assert(BroadcastChannel::kMaxSubscribers == kBroadcastMaxSubscribers);
 
 TEST(BroadcastLayoutTest, RequiredSizeMatchesLayout) {
     // ControlBlock -> IndexSlot[cap] -> BroadcastSlotMeta[cap] ->
-    // SubscriberSlot[64]. 64 * sizeof(IndexSlot) is 64-aligned, so the
-    // sidecar starts flush; 8 * 16B of sidecar is 64-aligned for cap >= 4,
-    // so SubsOffset needs no extra padding at cap 8.
+    // BroadcastEraMeta[cap] -> SubscriberSlot[64].
     constexpr uint64_t kCap = 8;
     EXPECT_EQ(BroadcastChannel::SlotsOffset(), 3u * 64u);
     EXPECT_EQ(BroadcastChannel::MetasOffset(kCap), 3u * 64u + kCap * 128u);
-    EXPECT_EQ(BroadcastChannel::SubsOffset(kCap),
+    EXPECT_EQ(BroadcastChannel::EraMetasOffset(kCap),
               3u * 64u + kCap * 128u + kCap * 16u);
+    EXPECT_EQ(BroadcastChannel::SubsOffset(kCap),
+              3u * 64u + kCap * 128u + kCap * 16u +
+                  kCap * sizeof(EraMeta));
     EXPECT_EQ(BroadcastChannel::RequiredSize(kCap),
               3u * 64u + kCap * 128u + kCap * 16u +
-                  kBroadcastMaxSubscribers * 128u);
+                  kCap * sizeof(EraMeta) + kBroadcastMaxSubscribers * 128u);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +119,22 @@ struct ChannelFixture {
     BroadcastSlotMeta* metas() {
         return reinterpret_cast<BroadcastSlotMeta*>(
             storage + BroadcastChannel::MetasOffset(kCapacity));
+    }
+    EraMeta* era_metas() {
+        return reinterpret_cast<EraMeta*>(
+            storage + BroadcastChannel::EraMetasOffset(kCapacity));
+    }
+    uint64_t ack_bits(uint64_t sequence) {
+        const uint64_t token = sequence + 1;
+        uint64_t bits = 0;
+        for (uint32_t id = 0; id < BroadcastChannel::kMaxSubscribers; ++id) {
+            if (era_metas()[sequence & (kCapacity - 1)]
+                    .ack_era[id]
+                    .load(std::memory_order_acquire) == token) {
+                bits |= uint64_t{1} << id;
+            }
+        }
+        return bits;
     }
     SubSlot* subs() {
         return reinterpret_cast<SubSlot*>(storage +
@@ -163,6 +181,11 @@ void BlockingRetireObserver(ShmHandle payload, void* opaque) noexcept {
     }
 }
 
+void CountingRetireObserver(ShmHandle, void* opaque) noexcept {
+    static_cast<std::atomic<uint64_t>*>(opaque)->fetch_add(
+        1, std::memory_order_relaxed);
+}
+
 // Monotonic clock used throughout the membership tests: registration,
 // heartbeat and eviction all quote the same time source (design doc 12.2).
 uint64_t NowNs() { return BroadcastChannel::MonotonicNowNs(); }
@@ -191,7 +214,9 @@ TEST(BroadcastInitTest, InitSucceeds) {
     for (uint64_t i = 0; i < 8; ++i) {
         EXPECT_EQ(f.slots()[i].state.load(), static_cast<uint32_t>(SlotState::kFree));
         EXPECT_EQ(f.slots()[i].sequence_num.load(), i);
-        EXPECT_EQ(f.metas()[i].ack_bitmap.bits.load(), 0u);
+        EXPECT_EQ(f.ack_bits(i), 0u);
+        EXPECT_EQ(f.era_metas()[i].payload_era.load(), 0u);
+        EXPECT_EQ(f.era_metas()[i].retired_era.load(), 0u);
     }
     // Every subscriber slot starts FREE with generation 0.
     for (uint32_t i = 0; i < kBroadcastMaxSubscribers; ++i) {
@@ -261,9 +286,8 @@ TEST(BroadcastBasicTest, FanOutToAllSubscribers) {
         ASSERT_FALSE(empty.ok());
         EXPECT_EQ(empty.status().code(), StatusCode::kWouldBlock);
     }
-    // All three acked: the slot retires.
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    // All three acked: exact logical era 0 is retired (token sequence + 1).
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
 }
 
 TEST(BroadcastBasicTest, RegistrationJoinCutPointSkipsHistory) {
@@ -309,6 +333,15 @@ TEST(BroadcastBasicTest, PollRejectsUnregisteredAndStaleGeneration) {
 
     // Standalone Ack follows the same validation.
     EXPECT_EQ(ch->Ack(stale_gen, 0).code(), StatusCode::kNotFound);
+
+    // Public subscriber entry points reject out-of-range ids before indexing
+    // the fixed SubscriberSlot array.
+    BroadcastChannel::SubscriberHandle out_of_range{
+        SubscriberId{kBroadcastMaxSubscribers}, 1};
+    auto bad_id = ch->Poll(out_of_range);
+    ASSERT_FALSE(bad_id.ok());
+    EXPECT_EQ(bad_id.status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(ch->Ack(out_of_range, 0).code(), StatusCode::kNotFound);
 }
 
 TEST(BroadcastBasicTest, UnregisterThenPollFails) {
@@ -342,7 +375,7 @@ TEST(BroadcastAckBitmapTest, BitsClearedPerSubscriberAndSlotRetires) {
 
     Publish(*ch, 3);
     // Commit stamped exactly the two active subscriber bits.
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b11u);
+    EXPECT_EQ(f.ack_bits(0), 0b11u);
     EXPECT_EQ(f.slots()[0].state.load(),
               static_cast<uint32_t>(SlotState::kReady));
 
@@ -350,25 +383,24 @@ TEST(BroadcastAckBitmapTest, BitsClearedPerSubscriberAndSlotRetires) {
         auto borrow = ch->Poll(a);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
-        EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b10u);
+        EXPECT_EQ(f.ack_bits(0), 0b10u);
         EXPECT_EQ(f.slots()[0].state.load(),
                   static_cast<uint32_t>(SlotState::kReady));
     }
-    {  // Subscriber 1 acks: the bitmap drains and the slot retires.
+    {  // Subscriber 1 acks: the bitmap drains and logical era 0 retires.
         auto borrow = ch->Poll(b);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
-        EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
-        EXPECT_EQ(f.slots()[0].state.load(),
-                  static_cast<uint32_t>(SlotState::kRetired));
+        EXPECT_EQ(f.ack_bits(0), 0u);
+        EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
     }
     // Garbage collection is idempotent.
     ch->CollectGarbage();
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
 }
 
-TEST(BroadcastAckBitmapTest, RetiringSlotBlocksPublisherReuse) {
+TEST(BroadcastAckBitmapTest,
+     RetireObserverUsesEraSnapshotWithoutBlockingPublisherReuse) {
     ChannelFixture<4> f;
     auto ch = BroadcastChannel::Init(f.storage, 4);
     ASSERT_TRUE(ch.ok());
@@ -398,44 +430,34 @@ TEST(BroadcastAckBitmapTest, RetiringSlotBlocksPublisherReuse) {
         FAIL() << "retire observer was not invoked";
         return;
     }
-    ASSERT_EQ(f.slots()[0].state.load(std::memory_order_acquire),
-              static_cast<uint32_t>(SlotState::kRetiring));
+    ASSERT_EQ(observer.observed_payload.offset, 0x6000u);
+    ASSERT_EQ(f.era_metas()[0].retired_era.load(std::memory_order_acquire), 1u);
 
-    std::atomic<bool> publisher_started{false};
-    std::atomic<bool> reservation_acquired{false};
+    // The observer is still blocked, but it owns a local atomic-era snapshot,
+    // not a shared lock. The publisher may safely recycle physical slot 0.
     std::atomic<bool> publish_ok{false};
     std::thread publisher([&]() {
-        publisher_started.store(true, std::memory_order_release);
         auto res = ch->Reserve(QueueFullPolicy::kBlock);
         if (!res.ok()) {
             return;
         }
-        reservation_acquired.store(true, std::memory_order_release);
         FillSlot(res.value(), 4);
         publish_ok.store(std::move(res.value()).Commit().ok(),
                          std::memory_order_release);
     });
-
-    while (!publisher_started.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
+    for (uint32_t i = 0;
+         i < 2000 && !publish_ok.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    EXPECT_FALSE(reservation_acquired.load(std::memory_order_acquire));
-    EXPECT_EQ(f.slots()[0].state.load(std::memory_order_acquire),
-              static_cast<uint32_t>(SlotState::kRetiring));
-    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 0u);
-    EXPECT_EQ(f.slots()[0].payload.offset, 0x6000u);
+    EXPECT_TRUE(publish_ok.load(std::memory_order_acquire));
+    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 4u);
+    EXPECT_EQ(f.slots()[0].payload.offset, 0x6040u);
+    EXPECT_EQ(observer.observed_payload.offset, 0x6000u);
 
     observer.release.store(true, std::memory_order_release);
     collector.join();
     publisher.join();
-
     EXPECT_TRUE(ack_ok.load(std::memory_order_acquire));
-    EXPECT_TRUE(reservation_acquired.load(std::memory_order_acquire));
-    EXPECT_TRUE(publish_ok.load(std::memory_order_acquire));
-    EXPECT_EQ(observer.observed_payload.offset, 0x6000u);
-    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 4u);
-    EXPECT_EQ(f.slots()[0].payload.offset, 0x6040u);
 }
 
 TEST(BroadcastAckBitmapTest, PublicAckApiClearsBitAndAdvancesCursor) {
@@ -446,14 +468,134 @@ TEST(BroadcastAckBitmapTest, PublicAckApiClearsBitAndAdvancesCursor) {
     Publish(*ch, 9);
 
     ASSERT_TRUE(ch->Ack(sub, 0).ok());
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
+    EXPECT_EQ(f.ack_bits(0), 0u);
     EXPECT_EQ(f.subs()[4].cursor.load(), 1u);
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
 
     // An Ack behind the cursor reports kNotFound (and stays harmless).
     EXPECT_EQ(ch->Ack(sub, 0).code(), StatusCode::kNotFound);
     EXPECT_EQ(f.subs()[4].cursor.load(), 1u);
+}
+
+TEST(BroadcastAckBitmapTest, CrashedAckCleanupTokenIsHelpedWithoutLock) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto sub = Register(*ch, 0);
+    EXPECT_EQ(sub.id.value, 0u);
+    Publish(*ch, 0);
+    ASSERT_EQ(f.ack_bits(0), 1u);
+
+    // Simulate death immediately after ACK won cursor cleanup authority but
+    // before it cleared the exact-era bit or published cursor 1.
+    f.subs()[0].cursor.store(BroadcastChannel::kCursorCleanupBit,
+                             std::memory_order_release);
+    auto reservation = ch->TryReserve();
+    ASSERT_TRUE(reservation.ok()) << reservation.status().ToString();
+    EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(f.ack_bits(0), 0u);
+    ASSERT_TRUE(std::move(*reservation).Abort().ok());
+    ch->CollectGarbage();
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
+}
+
+TEST(BroadcastAckBitmapTest, StaleCleanupTokenNeverClearsRecycledEra) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    for (uint32_t i = 0; i <= 4; ++i) {
+        Publish(*ch, i);
+    }
+    ASSERT_EQ(f.slots()[0].sequence_num.load(), 4u);
+    f.era_metas()[0].ack_era[0].store(5u, std::memory_order_release);
+    f.subs()[0].cursor.store(BroadcastChannel::kCursorCleanupBit,
+                             std::memory_order_release);
+
+    auto reservation = ch->TryReserve();
+    ASSERT_TRUE(reservation.ok());
+    EXPECT_EQ(f.ack_bits(4), 1u);
+    EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 1u);
+    ASSERT_TRUE(std::move(*reservation).Abort().ok());
+}
+
+TEST(BroadcastAckBitmapTest, ResidualRetiringStateDoesNotWedgeReuse) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto sub = Register(*ch, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+    f.slots()[0].state.store(static_cast<uint32_t>(SlotState::kRetiring),
+                             std::memory_order_release);
+
+    auto borrow = ch->Poll(sub);
+    ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+    EXPECT_EQ(borrow->slot()->sequence_num, 0u);
+    ASSERT_TRUE(std::move(*borrow).Ack().ok());
+
+    auto reservation = ch->TryReserve();
+    ASSERT_TRUE(reservation.ok()) << reservation.status().ToString();
+    EXPECT_EQ(reservation->sequence(), 4u);
+    FillSlot(*reservation, 4);
+    ASSERT_TRUE(std::move(*reservation).Commit().ok());
+    EXPECT_EQ(f.slots()[0].sequence_num.load(), 4u);
+}
+
+TEST(BroadcastAckBitmapTest, ClaimedRetireEraAfterCrashIsAtMostOnceAndHelpFree) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    Publish(*ch, 0);
+    std::atomic<uint64_t> calls{0};
+    ch->SetPayloadRetireObserver(&CountingRetireObserver, &calls);
+
+    // Simulate death after the durable at-most-once claim and before callback.
+    f.era_metas()[0].retired_era.store(1, std::memory_order_release);
+    ch->CollectGarbage();
+    EXPECT_EQ(calls.load(std::memory_order_acquire), 0u);
+    for (uint32_t i = 1; i <= 4; ++i) {
+        Publish(*ch, i);
+    }
+    EXPECT_EQ(f.slots()[0].sequence_num.load(), 4u);
+}
+
+TEST(BroadcastAckBitmapTest,
+     StaleBorrowCannotAckReusedSubscriberGenerationOrSlotEra) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto stale = Register(*ch, 0);
+    auto keeper = Register(*ch, 1);
+
+    Publish(*ch, 0);
+    auto held = ch->Poll(stale);
+    ASSERT_TRUE(held.ok());
+    ASSERT_EQ(held.value()->sequence_num, 0u);
+
+    // Tear down id 0 while its Borrow survives, then reuse the id. The fresh
+    // generation joins at sequence 1 and owes ACKs only from that point on.
+    ASSERT_TRUE(ch->UnregisterSubscriber(stale.id, stale.generation).ok());
+    auto fresh = Register(*ch, 0);
+    ASSERT_NE(fresh.generation, stale.generation);
+    for (uint32_t sequence = 1; sequence < 4; ++sequence) {
+        Publish(*ch, sequence);
+    }
+
+    // Let the publisher reuse physical slot 0 for sequence 4. Both current
+    // subscribers owe the new message, so its fresh bitmap is 0b11.
+    auto keeper_zero = ch->Poll(keeper);
+    ASSERT_TRUE(keeper_zero.ok());
+    ASSERT_TRUE(std::move(keeper_zero.value()).Ack().ok());
+    Publish(*ch, 4);
+    ASSERT_EQ(f.slots()[0].sequence_num.load(), 4u);
+    ASSERT_EQ(f.ack_bits(4), 0b11u);
+
+    // The old Borrow carries generation 1 and sequence 0. It must reject both
+    // stale authorities and leave generation 2's sequence-4 bit untouched.
+    EXPECT_EQ(std::move(held.value()).Ack().code(), StatusCode::kNotFound);
+    EXPECT_EQ(f.ack_bits(4), 0b11u);
+    EXPECT_EQ(f.subs()[0].cursor.load(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,9 +654,8 @@ TEST(BroadcastUnregisterTest, UnregisterDrainsAckAndAllowsRetirement) {
         auto borrow = ch->Poll(b);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
-        EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
-        EXPECT_EQ(f.slots()[0].state.load(),
-                  static_cast<uint32_t>(SlotState::kRetired));
+        EXPECT_EQ(f.ack_bits(0), 0u);
+        EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
     }
 }
 
@@ -530,15 +671,14 @@ TEST(BroadcastUnregisterTest, UnregisterReclaimsOutstandingBitsAtomically) {
     // it blocks ID reuse in kEvicting, removes future membership, clears the
     // old generation's outstanding bit, then returns the slot to kFree.
     ASSERT_TRUE(ch->UnregisterSubscriber(b.id, b.generation).ok());
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b01u);
+    EXPECT_EQ(f.ack_bits(0), 0b01u);
     {
         auto borrow = ch->Poll(a);
         ASSERT_TRUE(borrow.ok());
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
     }
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.ack_bits(0), 0u);
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
 
     // Cleanup is complete and idempotent before Unregister returns.
     EXPECT_EQ(ch->ClearStaleAcks(b.id), 0u);
@@ -711,19 +851,20 @@ TEST(BroadcastPolicyTest, DropOldestAdvancesSlowestAndLateAckNotFound) {
     // (seq 1..3 in physical slots 1..3; bit 1 still outstanding). Slot 0
     // itself was immediately recycled for message 4 and carries a fresh
     // 0b11 bitmap stamped by Commit.
-    EXPECT_EQ(f.metas()[1].ack_bitmap.bits.load(), 0b10u);
-    EXPECT_EQ(f.metas()[2].ack_bitmap.bits.load(), 0b10u);
-    EXPECT_EQ(f.metas()[3].ack_bitmap.bits.load(), 0b10u);
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b11u);
+    EXPECT_EQ(f.ack_bits(1), 0b10u);
+    EXPECT_EQ(f.ack_bits(2), 0b10u);
+    EXPECT_EQ(f.ack_bits(3), 0b10u);
+    EXPECT_EQ(f.ack_bits(4), 0b11u);
 
     // The held borrow still sees ITS message (snapshot semantics); its late
-    // Ack reports kNotFound, moves no cursor, and harmlessly clears the bit
-    // on the recycled slot (design doc 9.6: 被越过后仍尝试 Clear).
+    // Ack reports kNotFound and moves no cursor. Because physical slot 0 now
+    // carries sequence 4, the old sequence-0 ACK must not clear the new era's
+    // subscriber-0 bit.
     EXPECT_EQ(held.value()->msg_type, 0x4000u + 0u);
     auto late = std::move(held.value()).Ack();
     EXPECT_EQ(late.code(), StatusCode::kNotFound);
     EXPECT_EQ(f.subs()[0].cursor.load(), 4u);
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b10u);
+    EXPECT_EQ(f.ack_bits(4), 0b11u);
 
     // Subscriber 0 resumes at the head: it sees message 4 next.
     auto borrow = ch->Poll(a);
@@ -736,6 +877,54 @@ TEST(BroadcastPolicyTest, DropOldestAdvancesSlowestAndLateAckNotFound) {
     ASSERT_TRUE(b1.ok());
     EXPECT_EQ(b1.value()->sequence_num, 1u);
     ASSERT_TRUE(std::move(b1.value()).Ack().ok());
+}
+
+TEST(BroadcastPolicyTest, ConcurrentAckAndDropNeverClearNewEra) {
+    constexpr uint32_t kRounds = 200;
+    ChannelFixture<4> f;
+    for (uint32_t round = 0; round < kRounds; ++round) {
+        auto ch = BroadcastChannel::Init(f.storage, 4);
+        ASSERT_TRUE(ch.ok()) << round;
+        auto sub = Register(*ch, 0);
+        for (uint32_t i = 0; i < 4; ++i) {
+            Publish(*ch, i);
+        }
+
+        std::atomic<bool> start{false};
+        std::atomic<bool> ack_result_valid{false};
+        std::atomic<bool> publish_ok{false};
+        std::thread acker([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const Status status = ch->Ack(sub, 0);
+            ack_result_valid.store(
+                status.ok() || status.code() == StatusCode::kNotFound,
+                std::memory_order_release);
+        });
+        std::thread publisher([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            auto reservation = ch->Reserve(QueueFullPolicy::kDropOldest);
+            if (!reservation.ok()) {
+                return;
+            }
+            FillSlot(*reservation, 4);
+            publish_ok.store(std::move(*reservation).Commit().ok(),
+                             std::memory_order_release);
+        });
+        start.store(true, std::memory_order_release);
+        acker.join();
+        publisher.join();
+
+        ASSERT_TRUE(ack_result_valid.load(std::memory_order_acquire)) << round;
+        ASSERT_TRUE(publish_ok.load(std::memory_order_acquire)) << round;
+        EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 4u)
+            << round;
+        EXPECT_EQ(f.ack_bits(4), 1u)
+            << "old ACK cleared the recycled era in round " << round;
+    }
 }
 
 TEST(BroadcastPolicyTest, DropOldestNoActiveSubscriberIsNeverFull) {
@@ -985,8 +1174,7 @@ TEST(BroadcastWrapTest, LongWrapNoLossNoDuplicationPerSubscriber) {
     }
     EXPECT_EQ(ch->Size(), kTotal);
     for (uint64_t i = 0; i < 8; ++i) {
-        EXPECT_EQ(f.slots()[i].state.load(),
-                  static_cast<uint32_t>(SlotState::kRetired)) << i;
+        EXPECT_EQ(f.era_metas()[i].retired_era.load(), 993u + i) << i;
     }
 }
 
@@ -1009,10 +1197,9 @@ TEST(BroadcastWrapTest, StaleSlotSequenceNeverConfusesSubscribers) {
             ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
         }
     }
-    // Every physical slot is retired; a third wrap starts clean.
+    // Every physical slot's latest era is retired; a third wrap starts clean.
     for (uint32_t i = 0; i < 4; ++i) {
-        EXPECT_EQ(f.slots()[i].state.load(),
-                  static_cast<uint32_t>(SlotState::kRetired));
+        EXPECT_EQ(f.era_metas()[i].retired_era.load(), 5u + i);
     }
 }
 
@@ -1032,7 +1219,7 @@ TEST(BroadcastEmptyMembershipTest, PublishingNeedsNoAcks) {
     EXPECT_EQ(ch->Size(), 32u);
     // Every bitmap stayed empty; every slot recycled freely.
     for (uint64_t i = 0; i < 4; ++i) {
-        EXPECT_EQ(f.metas()[i].ack_bitmap.bits.load(), 0u);
+        EXPECT_EQ(f.ack_bits(28 + i), 0u);
     }
 }
 
@@ -1045,8 +1232,7 @@ TEST(BroadcastEmptyMembershipTest, EmptyMembershipSlotsRetireViaGc) {
     EXPECT_EQ(f.slots()[0].state.load(),
               static_cast<uint32_t>(SlotState::kReady));
     ch->CollectGarbage();
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,11 +1311,12 @@ TEST(BroadcastThreadTest, ConcurrentPublisherAndSubscribers) {
     }
     EXPECT_EQ(done.load(), kSubscribers);
     EXPECT_EQ(ch->Size(), kCount);
-    // Every slot fully acked and retired.
+    // Every latest physical-slot era is fully acked and retired.
     for (uint64_t i = 0; i < 64; ++i) {
-        EXPECT_EQ(f.slots()[i].state.load(),
-                  static_cast<uint32_t>(SlotState::kRetired)) << i;
-        EXPECT_EQ(f.metas()[i].ack_bitmap.bits.load(), 0u) << i;
+        const uint64_t last_sequence =
+            (kCount - 1) - ((kCount - 1 - i) % 64);
+        EXPECT_EQ(f.era_metas()[i].retired_era.load(), last_sequence + 1) << i;
+        EXPECT_EQ(f.ack_bits(last_sequence), 0u) << i;
     }
 }
 
@@ -1347,10 +1534,9 @@ TEST(BroadcastLeaseTest, EvictionDrainsAckResponsibilityAndRetires) {
         ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
     }
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b10u)
+    EXPECT_EQ(f.ack_bits(0), 0b10u)
         << "the doomed subscriber still owes its ack";
-    EXPECT_NE(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 0u);
 
     // `alive` keeps its lease; `doomed` lets it lapse.
     const uint64_t now = kT0 + kLease;
@@ -1358,12 +1544,10 @@ TEST(BroadcastLeaseTest, EvictionDrainsAckResponsibilityAndRetires) {
     EXPECT_EQ(ch->EvictStaleSubscribers(now, kLease), 1u);
 
     // Its bits are gone and the fully-acked slots retire.
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
-    EXPECT_EQ(f.metas()[1].ack_bitmap.bits.load(), 0u);
-    EXPECT_EQ(f.slots()[0].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
-    EXPECT_EQ(f.slots()[1].state.load(),
-              static_cast<uint32_t>(SlotState::kRetired));
+    EXPECT_EQ(f.ack_bits(0), 0u);
+    EXPECT_EQ(f.ack_bits(1), 0u);
+    EXPECT_EQ(f.era_metas()[0].retired_era.load(), 1u);
+    EXPECT_EQ(f.era_metas()[1].retired_era.load(), 2u);
     // The survivor is untouched.
     EXPECT_EQ(f.subs()[0].state.load(),
               static_cast<uint32_t>(BroadcastChannel::SubscriberState::kActive));
@@ -1486,14 +1670,14 @@ TEST(BroadcastLeaseTest, EvictsOnlyExpiredAmongMany) {
 
     // Survivors still receive; the publish snapshot excludes the evicted one.
     Publish(*ch, 42);
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0b101u);
+    EXPECT_EQ(f.ack_bits(0), 0b101u);
     for (auto* sub : {&*a, &*c}) {
         auto borrow = ch->Poll(*sub);
         ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
         EXPECT_EQ(borrow.value()->msg_type, 0x4000u + 42u);
         ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
     }
-    EXPECT_EQ(f.metas()[0].ack_bitmap.bits.load(), 0u);
+    EXPECT_EQ(f.ack_bits(0), 0u);
 }
 
 }  // namespace

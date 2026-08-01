@@ -11,6 +11,8 @@ cc_library(
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
         "//mino/shm/allocator:slab_header",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpmc_ring",
         "//mino/shm/region",
     ],
 )

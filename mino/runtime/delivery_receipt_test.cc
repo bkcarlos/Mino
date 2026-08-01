@@ -6,10 +6,54 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <limits>
+#include <utility>
 #include <vector>
 
 namespace mino {
+
+struct OutstandingReceiptTableTestAccess {
+    enum class AllocationPoint {
+        kState,
+        kTargets,
+        kUpdated,
+        kPublisherEntry,
+        kReceiptEntry,
+    };
+
+    static void FailNextAllocation(OutstandingReceiptTable& table,
+                                   AllocationPoint point) noexcept {
+        using FailurePoint =
+            OutstandingReceiptTable::ReserveFailurePointForTesting;
+        switch (point) {
+            case AllocationPoint::kState:
+                table.SetReserveFailurePointForTesting(FailurePoint::kState);
+                return;
+            case AllocationPoint::kTargets:
+                table.SetReserveFailurePointForTesting(FailurePoint::kTargets);
+                return;
+            case AllocationPoint::kUpdated:
+                table.SetReserveFailurePointForTesting(FailurePoint::kUpdated);
+                return;
+            case AllocationPoint::kPublisherEntry:
+                table.SetReserveFailurePointForTesting(
+                    FailurePoint::kPublisherEntry);
+                return;
+            case AllocationPoint::kReceiptEntry:
+                table.SetReserveFailurePointForTesting(
+                    FailurePoint::kReceiptEntry);
+                return;
+        }
+    }
+
+    static void SetNextReceiptId(OutstandingReceiptTable& table,
+                                 uint64_t next_id) {
+        table.SetNextReceiptIdForTesting(next_id);
+    }
+};
+
 namespace {
 
 PublisherReceiptIdentity Publisher(uint64_t id = 1) {
@@ -130,6 +174,147 @@ TEST(DeliveryReceiptTest, RemoteAndStorageBranchesCannotImpersonateEachOther) {
     ASSERT_FALSE(wrong.ok());
     EXPECT_EQ(wrong.code(), StatusCode::kInvalidArgument);
     EXPECT_EQ(table.outstanding(), 1u);
+}
+
+TEST(DeliveryReceiptTest, ReservationHoldsAdmissionUntilCommitOrCancel) {
+    OutstandingReceiptTable table({.max_outstanding = 1,
+                                   .max_per_publisher = 1});
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 1},
+    };
+    const auto requirement = Requirement(DeliveryStage::kRemoteAccepted,
+                                         CompletionPolicy::kAll);
+
+    auto reserved = table.Reserve(Publisher(), targets, requirement);
+    ASSERT_TRUE(reserved.ok());
+    EXPECT_EQ(table.outstanding(), 0u);
+    auto blocked = table.Reserve(Publisher(2), targets, requirement);
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.status().code(), StatusCode::kResourceExhausted);
+
+    reserved->Cancel();
+    auto replacement = table.Reserve(Publisher(), targets, requirement);
+    ASSERT_TRUE(replacement.ok());
+    DeliveryReceipt receipt = std::move(*replacement).Commit(17);
+    EXPECT_TRUE(receipt.valid());
+    EXPECT_EQ(table.outstanding(), 1u);
+    EXPECT_EQ(table.outstanding_for(Publisher()), 1u);
+}
+
+TEST(DeliveryReceiptTest, ReservationDestructorReleasesAdmission) {
+    OutstandingReceiptTable table({.max_outstanding = 1,
+                                   .max_per_publisher = 1});
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 1},
+    };
+    const auto requirement = Requirement(DeliveryStage::kRemoteAccepted,
+                                         CompletionPolicy::kAll);
+    {
+        auto reserved = table.Reserve(Publisher(), targets, requirement);
+        ASSERT_TRUE(reserved.ok());
+    }
+    EXPECT_TRUE(table.Reserve(Publisher(), targets, requirement).ok());
+}
+
+TEST(DeliveryReceiptTest, AllocationFailuresRejectAndReleaseReservationQuota) {
+    using AllocationPoint =
+        OutstandingReceiptTableTestAccess::AllocationPoint;
+    constexpr std::array kFailurePoints = {
+        AllocationPoint::kState,
+        AllocationPoint::kTargets,
+        AllocationPoint::kUpdated,
+        AllocationPoint::kPublisherEntry,
+        AllocationPoint::kReceiptEntry,
+    };
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 1},
+    };
+    const auto requirement = Requirement(DeliveryStage::kRemoteAccepted,
+                                         CompletionPolicy::kAll);
+
+    for (AllocationPoint point : kFailurePoints) {
+        SCOPED_TRACE(static_cast<int>(point));
+        OutstandingReceiptTable table({.max_outstanding = 1,
+                                       .max_per_publisher = 1});
+        OutstandingReceiptTableTestAccess::FailNextAllocation(table, point);
+        auto failed = table.Reserve(Publisher(), targets, requirement);
+        ASSERT_FALSE(failed.ok());
+        EXPECT_EQ(failed.status().code(), StatusCode::kResourceExhausted);
+        EXPECT_EQ(table.outstanding(), 0u);
+
+        auto replacement = table.Reserve(Publisher(), targets, requirement);
+        ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
+        replacement->Cancel();
+    }
+}
+
+TEST(DeliveryReceiptTest, ReceiptAllocationFailurePreservesExistingQuota) {
+    OutstandingReceiptTable table({.max_outstanding = 2,
+                                   .max_per_publisher = 2});
+    const std::vector<DeliveryTarget> targets = {
+        {DeliveryTargetKind::kNode, 1},
+    };
+    const auto requirement = Requirement(DeliveryStage::kRemoteAccepted,
+                                         CompletionPolicy::kAll);
+    ASSERT_TRUE(table.Create(Publisher(), 1, targets, requirement).ok());
+
+    OutstandingReceiptTableTestAccess::FailNextAllocation(
+        table,
+        OutstandingReceiptTableTestAccess::AllocationPoint::kReceiptEntry);
+    auto failed = table.Reserve(Publisher(), targets, requirement);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(table.outstanding_for(Publisher()), 1u);
+
+    auto replacement = table.Create(Publisher(), 2, targets, requirement);
+    ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
+    EXPECT_EQ(table.outstanding_for(Publisher()), 2u);
+}
+
+TEST(DeliveryReceiptTest, ReceiptIdsSkipCollisionsWithoutWrapping) {
+    const DeliveryTarget target{DeliveryTargetKind::kNode, 1};
+    const std::vector<DeliveryTarget> targets = {target};
+    const auto requirement = Requirement(DeliveryStage::kRemoteAccepted,
+                                         CompletionPolicy::kAll);
+
+    OutstandingReceiptTable collision_table(
+        {.max_outstanding = 4, .max_per_publisher = 4});
+    auto first = collision_table.Create(Publisher(), 1, targets, requirement);
+    ASSERT_TRUE(first.ok());
+    EXPECT_EQ(first->id().value, 1u);
+    OutstandingReceiptTableTestAccess::SetNextReceiptId(collision_table, 1);
+    auto after_collision =
+        collision_table.Create(Publisher(), 2, targets, requirement);
+    ASSERT_TRUE(after_collision.ok()) << after_collision.status().ToString();
+    EXPECT_EQ(after_collision->id().value, 2u);
+
+    OutstandingReceiptTable exhausted_table(
+        {.max_outstanding = 4, .max_per_publisher = 4});
+    constexpr uint64_t kMaxId = std::numeric_limits<uint64_t>::max();
+    OutstandingReceiptTableTestAccess::SetNextReceiptId(exhausted_table,
+                                                        kMaxId - 1);
+    auto penultimate =
+        exhausted_table.Create(Publisher(), 1, targets, requirement);
+    ASSERT_TRUE(penultimate.ok());
+    EXPECT_EQ(penultimate->id().value, kMaxId - 1);
+    auto last = exhausted_table.Create(Publisher(), 2, targets, requirement);
+    ASSERT_TRUE(last.ok());
+    EXPECT_EQ(last->id().value, kMaxId);
+
+    auto exhausted = exhausted_table.Reserve(Publisher(), targets, requirement);
+    ASSERT_FALSE(exhausted.ok());
+    EXPECT_EQ(exhausted.status().code(), StatusCode::kResourceExhausted);
+    ASSERT_TRUE(exhausted_table.Acknowledge(
+        penultimate->id(), target, DeliveryStage::kRemoteAccepted).ok());
+    ASSERT_TRUE(exhausted_table.Acknowledge(
+        last->id(), target, DeliveryStage::kRemoteAccepted).ok());
+    EXPECT_EQ(exhausted_table.outstanding(), 0u);
+
+    auto still_exhausted =
+        exhausted_table.Reserve(Publisher(), targets, requirement);
+    ASSERT_FALSE(still_exhausted.ok());
+    EXPECT_EQ(still_exhausted.status().code(),
+              StatusCode::kResourceExhausted);
 }
 
 TEST(DeliveryReceiptTest, LimitsRejectWithoutGrowingState) {

@@ -8,75 +8,31 @@
 | `BroadcastMembership.tla` | 注册、注销、Subscriber ID/Generation 复用、publish snapshot、ACK、generation-scoped cleanup、retire | Snapshot/ACK 责任冻结；旧 generation 的 ACK/cleanup 不清除新 generation 责任 |
 | `LeaseEviction.tla` | heartbeat、expiry observation、进程存活复查、EVICTING、ACK/Pin cleanup、EVICTED、lease reuse | expiry 不等于死亡；live owner 不进入剔除态；cleanup 同时绑定 generation、lease epoch 与 owner incarnation |
 
-## TLC 运行
+## TLC 运行与证据
 
-前提：安装 Java，并取得官方 TLA+ tools 的 `tla2tools.jar`。下面命令从本目录运行；请把 `/path/to/tla2tools.jar` 替换为本机实际路径。配置写入 `/tmp`，不会在仓库中新增 `.cfg` 文件。
-
-### MPSC Reservation
+三个模型的 TLC 配置已固化为同名 `.cfg` 文件。仓库根目录下使用统一脚本顺序运行全部模型：
 
 ```sh
-cat >/tmp/MpscReservation.cfg <<'EOF'
-SPECIFICATION Spec
-INVARIANTS
-    TypeOK
-    TailIsContiguous
-    ConsumedPrefixClosed
-    ConsumerNeverPassesTail
-    ReservationOwnerBinding
-    ReadyImpliesCompleteWrite
-    DeadReservationIsNeverConsumedAsData
-    DeadHeadIsRecoverable
-PROPERTIES
-    DeadReservationEventuallyAborted
-    QueueNotPermanentlyBlockedByDeadOwner
-EOF
-java -cp /path/to/tla2tools.jar tlc2.TLC -deadlock -config /tmp/MpscReservation.cfg MpscReservation.tla
+python3 tools/ci/run_tla_validation.py \
+  --jar /path/to/tla2tools.jar \
+  --out /tmp/mino-formal-validation
 ```
 
-### Broadcast Membership
+`--out` 必须指向不存在或为空的目录。可用 `--timeout-seconds N` 设置每个模型的超时；某个模型失败或超时后，脚本仍会继续运行后续模型，全部结束后以非零状态退出。`--self-test` 不需要 JAR，用于检查日志解析和哈希逻辑：
 
 ```sh
-cat >/tmp/BroadcastMembership.cfg <<'EOF'
-SPECIFICATION Spec
-INVARIANTS
-    TypeOK
-    MembershipStateOK
-    PublishedStateWellFormed
-    SnapshotHasOneGenerationPerId
-    AckAccounting
-    GenerationScopedCleanup
-    RetiredOnlyAfterAllResponsibilitiesClear
-    OldGenerationDoesNotClearNewResponsibility
-PROPERTIES
-    PendingCleanupEventuallyCompletes
-    PublishedMessagesEventuallyRetire
-EOF
-java -cp /path/to/tla2tools.jar tlc2.TLC -deadlock -config /tmp/BroadcastMembership.cfg BroadcastMembership.tla
+python3 tools/ci/run_tla_validation.py --self-test
 ```
 
-### Lease Eviction
+输出目录包含：
 
-```sh
-cat >/tmp/LeaseEviction.cfg <<'EOF'
-SPECIFICATION Spec
-INVARIANTS
-    TypeOK
-    CurrentLeaseWasIssued
-    GenerationLeaseEpochBinding
-    RecheckBindsCurrentLease
-    EvictionBindsCurrentLease
-    LiveOwnerIsNeverEvicted
-    CleanupIsLeaseScoped
-    OldLeaseCleanupDoesNotAffectCurrentLease
-    EvictedHasNoResponsibilities
-PROPERTIES
-    ExpiredDeadLeaseEventuallyEvicted
-    EvictingEventuallyEvicted
-EOF
-java -cp /path/to/tla2tools.jar tlc2.TLC -deadlock -config /tmp/LeaseEviction.cfg LeaseEviction.tla
-```
+- 每个模型独立的完整 `stdout.log` 与 `stderr.log`；
+- `manifest.json`，记录 JAR SHA-256、每个 `.tla`/`.cfg` 的 SHA-256、实际命令、退出码、TLC 版本、成功标志、耗时，以及可解析时的生成状态数、不同状态数、队列剩余状态数和搜索深度；
+- 顶层 `overall_success` 与 `complete` 标志。manifest 在每个模型结束后原子更新，因此普通模型失败不会丢失已生成的证据。
 
-TLC 的 `INVARIANTS` 是逐状态安全检查；`PROPERTIES` 是 temporal/liveness 检查。后两类进展性质依赖各模块 `Spec` 中显式列出的 weak fairness。模型使用有界 sequence/generation/time，并通过 `[Next]_vars` 允许终止后的 stuttering；`-deadlock` 仅关闭 TLC 对“必须存在非 stuttering `Next` 后继”的额外检查，不会关闭 invariant 或 temporal property 检查。若只想快速检查状态不变量，可从临时配置中移除 `PROPERTIES` 段。
+`.github/workflows/formal-validation.yml` 在 push、pull request、每周定时任务和手工触发时执行同一脚本。CI 固定使用官方 TLA+ `v1.7.4`，下载的 JAR 必须通过仓库中固定的 SHA-256 校验后才能执行，并将上述证据保留 90 天。
+
+TLC 的 `INVARIANTS` 是逐状态安全检查；`PROPERTIES` 是 temporal/liveness 检查。后两类进展性质依赖各模块 `Spec` 中显式列出的 weak fairness。模型使用有界 sequence/generation/time，并通过 `[Next]_vars` 允许终止后的 stuttering；`-deadlock` 仅关闭 TLC 对“必须存在非 stuttering `Next` 后继”的额外检查，不会关闭 invariant 或 temporal property 检查。若只想快速检查状态不变量，可复制对应仓库 `.cfg` 到仓库外并移除 `PROPERTIES` 段；CI 始终运行完整配置。
 
 ## INV 映射
 

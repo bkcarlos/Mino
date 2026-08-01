@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install build dependencies
         run: |
@@ -48,12 +48,12 @@ jobs:
       # Bazelisk 读取 .bazelversion 锁定 Bazel 版本，保证构建可复现。
       # 该 action 同时缓存下载的 Bazel 发行版。
       - name: Setup Bazelisk
-        uses: bazelbuild/setup-bazelisk@v3
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
       # 缓存 Bazel output base（~/.cache/bazel）：含外部分析仓库与构建产物。
       # key 含配置名避免跨 sanitizer 配置产物互相污染。
       - name: Cache Bazel output base
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/bazel
           key: bazel-${{ runner.os }}-${{ matrix.config }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
@@ -85,7 +85,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install buildifier
         run: |

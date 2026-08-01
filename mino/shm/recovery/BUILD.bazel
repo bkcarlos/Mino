@@ -11,10 +11,13 @@ cc_library(
         "//tools/mino:__pkg__",
     ],
     deps = [
+        "//mino/common:checked_arithmetic",
         "//mino/common:result",
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/allocator:slab_header",
+        "//mino/shm/region:recovery_directory",
     ],
 )
 
@@ -25,7 +28,9 @@ cc_test(
         ":scanner",
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
         "//mino/shm/allocator:slab_header",
+        "//mino/shm/region:recovery_directory",
         "@googletest//:gtest_main",
     ],
 )

@@ -30,11 +30,27 @@ cc_library(
 )
 
 cc_library(
+    name = "journal_channel_recovery",
+    srcs = ["journal_channel_recovery.cc"],
+    hdrs = ["journal_channel_recovery.h"],
+    deps = [
+        ":allocation_journal",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpsc",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_library(
     name = "publisher",
     hdrs = ["publisher.h"],
     deps = [
         ":allocation_journal",
         ":delivery_receipt",
+        ":journal_channel_recovery",
         ":runtime_types",
         ":shm_shared_ptr",
         "//mino/common:result",
@@ -99,6 +115,18 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "journal_channel_recovery_test",
+    srcs = ["journal_channel_recovery_test.cc"],
+    deps = [
+        ":journal_channel_recovery",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/shm/allocator:central_slab",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # D2-13: fork + MAP_SHARED SIGKILL/SIGSTOP/PID-reuse recovery stress.
 # The default target runs a short randomized smoke and is included in //...
 # MINO_D2_RECOVERY_STRESS_SECONDS controls the randomized phase duration;
@@ -108,6 +136,7 @@ cc_test(
     srcs = ["d2_recovery_stress_test.cc"],
     deps = [
         ":allocation_journal",
+        ":journal_channel_recovery",
         ":publisher",
         ":subscriber",
         ":subscriber_lease",
@@ -144,6 +173,7 @@ cc_test(
     ],
     deps = [
         ":allocation_journal",
+        ":journal_channel_recovery",
         ":publisher",
         ":subscriber",
         ":subscriber_lease",
@@ -214,6 +244,7 @@ cc_test(
     deps = [
         ":allocation_journal",
         ":delivery_receipt",
+        ":journal_channel_recovery",
         ":publisher",
         ":shm_shared_ptr",
         ":subscriber",

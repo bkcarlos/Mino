@@ -175,6 +175,25 @@ TEST(MpscChannelTest, AbortLeavesSkippableTombstone) {
     EXPECT_TRUE(ch->IsEmpty());
 }
 
+TEST(MpscChannelTest, ConsumedAbortedSequenceIsIndeterminate) {
+    ChannelFixture<64> fixture;
+    auto ch = MpscChannel::Init(fixture.storage, 64);
+    ASSERT_TRUE(ch.ok());
+
+    auto res = ch->Reserve(MakeIdentity(1));
+    ASSERT_TRUE(res.ok());
+    FillSlot(*res, 1);
+    const ShmHandle payload = res->slot()->payload;
+    const uint64_t sequence = res->sequence();
+    ASSERT_TRUE(std::move(*res).Abort().ok());
+    EXPECT_EQ(ch->InspectPublication(sequence, payload),
+              MpscChannel::PublicationVisibility::kNotVisible);
+
+    EXPECT_EQ(ch->Poll().status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(ch->InspectPublication(sequence, payload),
+              MpscChannel::PublicationVisibility::kIndeterminate);
+}
+
 // ---------------------------------------------------------------------------
 // Ordered prefix: out-of-order commit still delivers in sequence order
 // ---------------------------------------------------------------------------

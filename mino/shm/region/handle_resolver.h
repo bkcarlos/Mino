@@ -28,24 +28,71 @@
 
 namespace mino {
 
-// AllocatorMetadataProvider abstracts the allocator-owned metadata that
-// HandleResolver must consult but does not own (design doc 7.2: Slab bitmap
-// occupancy and the authoritative Generation Array). The Central Slab
-// Allocator (D1-07) provides the production implementation; tests inject a
-// fake. This indirection keeps the resolver independent of the allocator's
-// internal layout.
+class CentralSlabAllocator;
+class LargeObjectPool;
+
+// Describes how allocator-owned storage represents one logical object.
+enum class AllocatorObjectKind : uint8_t {
+    kContiguousSlot = 0,
+    kSegmented = 1,
+};
+
+// Allocator-owned facts for one Region-relative SlabHeader offset. The class
+// fields must come from the immutable allocator class table, not from the
+// SlabHeader being validated.
+struct AllocatorSlotMetadata {
+    bool occupied = false;
+    uint32_t generation = 0;
+    uint16_t class_id = 0;
+    uint16_t class_count = 0;
+    uint32_t capacity = 0;
+
+    // Added compatibly: legacy providers may leave these fields at their
+    // defaults, in which case a contiguous payload immediately after the
+    // SlabHeader with extent `capacity` is assumed. Segmented providers must
+    // return explicit Region-relative payload and whole-object extents.
+    uint64_t payload_offset = 0;
+    uint64_t object_extent = 0;
+    AllocatorObjectKind object_kind = AllocatorObjectKind::kContiguousSlot;
+};
+
+// AllocatorMetadataProvider abstracts the authoritative allocator metadata
+// consulted by HandleResolver: slot identity, bitmap occupancy, Generation
+// Array, and class-table capacity. Returning one record also lets providers
+// reject offsets that are aligned but are not actual slot starts.
 class AllocatorMetadataProvider {
 public:
     virtual ~AllocatorMetadataProvider() = default;
 
-    // Returns true if the slot at `offset` (a SlabHeader offset within the
-    // Region's data area) is marked occupied in the allocation bitmap.
-    virtual bool IsSlotOccupied(uint64_t offset) const = 0;
+    virtual Result<AllocatorSlotMetadata> GetSlotMetadata(
+        uint64_t offset) const = 0;
+};
 
-    // Returns the authoritative generation for the slot at `offset` from the
-    // Generation Array (design doc 8.1). The resolver compares this against
-    // both the Handle's generation and the SlabHeader's stored generation.
-    virtual uint32_t AuthoritativeGeneration(uint64_t offset) const = 0;
+// Production adapters over allocator-owned read-only metadata APIs. Wrapped
+// allocators must outlive the providers and any HandleResolver using them.
+class CentralSlabAllocatorMetadataProvider final
+    : public AllocatorMetadataProvider {
+public:
+    explicit CentralSlabAllocatorMetadataProvider(
+        const CentralSlabAllocator& allocator);
+
+    Result<AllocatorSlotMetadata> GetSlotMetadata(
+        uint64_t offset) const override;
+
+private:
+    const CentralSlabAllocator* allocator_;
+};
+
+class LargeObjectPoolMetadataProvider final
+    : public AllocatorMetadataProvider {
+public:
+    explicit LargeObjectPoolMetadataProvider(const LargeObjectPool& pool);
+
+    Result<AllocatorSlotMetadata> GetSlotMetadata(
+        uint64_t offset) const override;
+
+private:
+    const LargeObjectPool* pool_;
 };
 
 // HandleResolver safely dereferences ShmHandles into typed pointers within an
@@ -56,21 +103,23 @@ public:
 // validation.
 class HandleResolver {
 public:
-    // `region` must outlive the resolver. `allocator` may be nullptr, in which
-    // case the allocator-owned checks (bitmap occupancy, authoritative
-    // generation) are skipped — acceptable only during bring-up; production
-    // wiring must always supply the provider.
+    // `region` and `allocator` must outlive the resolver. The reference form is
+    // preferred for new callers. The pointer overload is retained for source
+    // compatibility, but a null provider makes every Resolve fail with
+    // kInvalidArgument; authoritative checks are never skipped.
     HandleResolver(SharedMemoryRegion& region,
-                   const AllocatorMetadataProvider* allocator)
-        : region_(&region), allocator_(allocator) {}
+                   const AllocatorMetadataProvider& allocator);
+    HandleResolver(SharedMemoryRegion& region,
+                   const AllocatorMetadataProvider* allocator);
 
     // Resolves a handle to a mutable object pointer. Requires the object's
     // SlabObjectState to be kAllocated or kBuilding AND the object's owner to
-    // be the current process (design doc 7.2). The returned object is the
-    // payload immediately following the SlabHeader.
+    // be the current process (design doc 7.2). The returned address is the
+    // allocator-provided payload offset after complete metadata validation.
     template <typename T>
     Result<T*> ResolveMutable(ShmHandle handle, TypeId expected) {
-        return ResolveMutableInternal(handle, expected, /*expected_schema=*/0)
+        return ResolveMutableInternal(handle, expected, /*expected_schema=*/0,
+                                      sizeof(T), alignof(T))
             .AndThenCast<T>();
     }
 
@@ -78,7 +127,8 @@ public:
     template <typename T>
     Result<T*> ResolveMutable(ShmHandle handle, TypeId expected,
                               uint64_t expected_schema_short_id) {
-        return ResolveMutableInternal(handle, expected, expected_schema_short_id)
+        return ResolveMutableInternal(handle, expected, expected_schema_short_id,
+                                      sizeof(T), alignof(T))
             .AndThenCast<T>();
     }
 
@@ -86,7 +136,8 @@ public:
     // SlabObjectState to be kPublished (design doc 7.2).
     template <typename T>
     Result<const T*> Resolve(ShmHandle handle, TypeId expected) const {
-        return ResolveInternal(handle, expected, /*expected_schema=*/0)
+        return ResolveInternal(handle, expected, /*expected_schema=*/0,
+                               sizeof(T), alignof(T))
             .AndThenConstCast<T>();
     }
 
@@ -94,7 +145,8 @@ public:
     template <typename T>
     Result<const T*> Resolve(ShmHandle handle, TypeId expected,
                              uint64_t expected_schema_short_id) const {
-        return ResolveInternal(handle, expected, expected_schema_short_id)
+        return ResolveInternal(handle, expected, expected_schema_short_id,
+                               sizeof(T), alignof(T))
             .AndThenConstCast<T>();
     }
 
@@ -125,13 +177,21 @@ private:
 
     // Full validation for mutable access (defined in handle_resolver.cc).
     MutableAddress ResolveMutableInternal(ShmHandle handle, TypeId expected,
-                                          uint64_t expected_schema_short_id);
+                                          uint64_t expected_schema_short_id,
+                                          uint64_t type_size,
+                                          uint64_t type_alignment);
     // Full validation for read-only access (defined in handle_resolver.cc).
     ConstAddress ResolveInternal(ShmHandle handle, TypeId expected,
-                                 uint64_t expected_schema_short_id) const;
+                                 uint64_t expected_schema_short_id,
+                                 uint64_t type_size,
+                                 uint64_t type_alignment) const;
 
     SharedMemoryRegion* region_;
     const AllocatorMetadataProvider* allocator_;
+    uint32_t attached_region_id_ = 0;
+    uint64_t attached_region_uuid_lo_ = 0;
+    uint64_t attached_region_uuid_hi_ = 0;
+    uint64_t attached_region_epoch_ = 0;
 };
 
 }  // namespace mino

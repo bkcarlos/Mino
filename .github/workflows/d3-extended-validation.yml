@@ -74,7 +74,7 @@ jobs:
 
     steps:
       - name: Checkout into environment-specific path
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: ${{ matrix.checkout_path }}
 
@@ -84,7 +84,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
 
       - name: Setup Bazelisk
-        uses: bazelbuild/setup-bazelisk@v3
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
       - name: Run existing hermetic CodeGen tests
         working-directory: ${{ matrix.checkout_path }}
@@ -127,7 +127,7 @@ jobs:
           } > hermetic-codegen/PROVENANCE.txt
 
       - name: Upload CodeGen bytes and hashes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: d3-codegen-${{ matrix.id }}
           path: ${{ matrix.checkout_path }}/hermetic-codegen
@@ -141,29 +141,173 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download GCC artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: d3-codegen-ubuntu22-gcc12
           path: compare/ubuntu22-gcc12
 
       - name: Download Clang artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: d3-codegen-ubuntu24-clang18
           path: compare/ubuntu24-clang18
 
-      - name: Require byte-identical logical manifests
+      - name: Compare exactly 15 logical outputs
+        env:
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          diff -u \
-            compare/ubuntu22-gcc12/SHA256SUMS \
-            compare/ubuntu24-clang18/SHA256SUMS
-          diff -u \
-            compare/ubuntu22-gcc12/ROOT_SHA256 \
-            compare/ubuntu24-clang18/ROOT_SHA256
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          expected_count = 15
+          roots = {
+              "ubuntu22-gcc12": Path("compare/ubuntu22-gcc12"),
+              "ubuntu24-clang18": Path("compare/ubuntu24-clang18"),
+          }
+          output = Path("codegen-comparison")
+          output.mkdir(parents=True, exist_ok=True)
+          errors = []
+          environments = {}
+          manifests = {}
+          line_pattern = re.compile(r"^([0-9a-f]{64})  (.+)$")
+
+          for name, root in roots.items():
+              manifest_path = root / "SHA256SUMS"
+              root_path = root / "ROOT_SHA256"
+              entries = {}
+              manifest_bytes = b""
+              declared_root = None
+              try:
+                  manifest_bytes = manifest_path.read_bytes()
+                  for line_number, line in enumerate(
+                      manifest_bytes.decode("utf-8").splitlines(), start=1
+                  ):
+                      match = line_pattern.fullmatch(line)
+                      if match is None:
+                          errors.append(
+                              f"{name}: malformed SHA256SUMS line {line_number}"
+                          )
+                          continue
+                      digest, logical_path = match.groups()
+                      if logical_path in entries:
+                          errors.append(f"{name}: duplicate output {logical_path}")
+                      entries[logical_path] = digest
+                  declared_root = root_path.read_text(encoding="ascii").strip()
+              except (OSError, UnicodeError) as error:
+                  errors.append(f"{name}: unable to read hashes: {error}")
+
+              computed_root = hashlib.sha256(manifest_bytes).hexdigest()
+              if declared_root != computed_root:
+                  errors.append(
+                      f"{name}: ROOT_SHA256 does not hash SHA256SUMS "
+                      f"(declared={declared_root}, computed={computed_root})"
+                  )
+              if len(entries) != expected_count:
+                  errors.append(
+                      f"{name}: expected {expected_count} outputs, found {len(entries)}"
+                  )
+              manifests[name] = entries
+              environments[name] = {
+                  "declared_root_sha256": declared_root,
+                  "computed_root_sha256": computed_root,
+                  "manifest_sha256": computed_root,
+                  "output_count": len(entries),
+              }
+
+          gcc = manifests["ubuntu22-gcc12"]
+          clang = manifests["ubuntu24-clang18"]
+          all_paths = sorted(set(gcc) | set(clang))
+          comparisons = [
+              {
+                  "path": path,
+                  "ubuntu22_gcc12_sha256": gcc.get(path),
+                  "ubuntu24_clang18_sha256": clang.get(path),
+                  "match": gcc.get(path) == clang.get(path),
+              }
+              for path in all_paths
+          ]
+          mismatches = [entry for entry in comparisons if not entry["match"]]
+          if mismatches:
+              errors.append(f"{len(mismatches)} logical outputs differ")
+
+          passed = not errors and len(comparisons) == expected_count
+          report = {
+              "schema_version": 1,
+              "commit": os.environ["COMMIT_SHA"],
+              "expected_output_count": expected_count,
+              "compared_output_count": len(comparisons),
+              "environments": environments,
+              "outputs": comparisons,
+              "result": {
+                  "passed": passed,
+                  "mismatch_count": len(mismatches),
+                  "errors": errors,
+              },
+          }
+          report_bytes = (
+              json.dumps(report, indent=2, sort_keys=True) + "\n"
+          ).encode("utf-8")
+          (output / "comparison.json").write_bytes(report_bytes)
+          comparison_root = hashlib.sha256(report_bytes).hexdigest()
+          (output / "ROOT_SHA256").write_text(
+              comparison_root + "\n", encoding="ascii"
+          )
+
+          status = "PASS" if passed else "FAIL"
+          summary = [
+              "## D3 CodeGen deterministic comparison",
+              "",
+              f"**{status}** — compared {len(comparisons)}/{expected_count} expected outputs.",
+              "",
+              "| Environment | Outputs | ROOT SHA-256 |",
+              "|---|---:|---|",
+          ]
+          for name, evidence in environments.items():
+              summary.append(
+                  f"| `{name}` | {evidence['output_count']} | "
+                  f"`{evidence['declared_root_sha256']}` |"
+              )
+          summary.extend(
+              [
+                  "",
+                  f"Comparison JSON SHA-256: `{comparison_root}`",
+                  f"Mismatched outputs: **{len(mismatches)}**",
+              ]
+          )
+          if errors:
+              summary.extend(["", "### Errors"])
+              summary.extend(f"- {error}" for error in errors)
+          summary_text = "\n".join(summary) + "\n"
+          (output / "summary.md").write_text(summary_text, encoding="utf-8")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as job_summary:
+              job_summary.write(summary_text)
+
+          if not passed:
+              sys.exit(1)
+          PY
+
+      - name: Upload CodeGen comparison evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d3-codegen-comparison-${{ github.run_id }}
+          path: codegen-comparison
+          if-no-files-found: warn
+          retention-days: 90
 
   fuzz:
-    name: ${{ matrix.sanitizer }} libFuzzer (1h)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: ${{ matrix.sanitizer }} libFuzzer (${{ github.event_name == 'pull_request' && '60s smoke' || '1h' }})
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'))
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
@@ -176,10 +320,11 @@ jobs:
       CXX: clang++
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '60' || '3600' }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # GitHub's Ubuntu 22.04 image already provides Clang and compiler-rt.
       # Only the project runtime dependency needs an explicit package install.
@@ -189,71 +334,35 @@ jobs:
           sudo apt-get install -y --no-install-recommends libatomic1
 
       - name: Setup Bazelisk
-        uses: bazelbuild/setup-bazelisk@v3
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
-      - name: Prepare selector-prefixed seed corpus
-        run: |
-          python3 tools/ci/prepare_d3_fuzz_corpus.py --out=fuzz-corpus
-          mkdir -p fuzz-artifacts fuzz-output
-          {
-            echo "commit=${GITHUB_SHA}"
-            echo "sanitizer=${{ matrix.sanitizer }}"
-            echo "seed=${{ github.run_number }}"
-            uname -a
-            bazel --version
-            clang++ --version
-          } > fuzz-output/environment.txt
+      - name: Self-test fuzz campaign tooling
+        run: python3 tools/ci/run_d3_fuzz_campaign.py --self-test
 
-      - name: Run one-hour sanitizer campaign
+      - name: Run sanitizer fuzz campaign
         run: |
-          set -o pipefail
-          bazel run \
-            --config=${{ matrix.sanitizer }} \
-            --config=fuzz \
-            //mino/schema/fuzz:libfuzzer_driver -- \
-            "${GITHUB_WORKSPACE}/fuzz-corpus" \
-            -max_total_time=3600 \
-            -max_len=32769 \
-            -timeout=10 \
-            -rss_limit_mb=4096 \
-            -malloc_limit_mb=512 \
-            -jobs=1 \
-            -workers=1 \
-            -seed=${{ github.run_number }} \
-            -print_final_stats=1 \
-            -artifact_prefix="${GITHUB_WORKSPACE}/fuzz-artifacts/" \
-            2>&1 | tee fuzz-output/fuzz.log
-
-      - name: Require all fuzz harnesses to execute
-        run: |
-          grep -E \
-            'D3 libFuzzer selectors: IDL=[1-9][0-9]* Descriptor=[1-9][0-9]* CanonicalPayload=[1-9][0-9]*' \
-            fuzz-output/fuzz.log
-
-      - name: Minimize surviving corpus
-        run: |
-          mkdir -p fuzz-corpus-minimized
-          bazel run \
-            --config=${{ matrix.sanitizer }} \
-            --config=fuzz \
-            //mino/schema/fuzz:libfuzzer_driver -- \
-            -merge=1 \
-            -timeout=10 \
-            -rss_limit_mb=4096 \
-            -malloc_limit_mb=512 \
-            "${GITHUB_WORKSPACE}/fuzz-corpus-minimized" \
-            "${GITHUB_WORKSPACE}/fuzz-corpus" \
-            >> fuzz-output/fuzz.log 2>&1
+          if [ "${FUZZ_SECONDS}" = "3600" ]; then
+            python3 tools/ci/run_d3_fuzz_campaign.py \
+              --sanitizer=${{ matrix.sanitizer }} \
+              --seconds="${FUZZ_SECONDS}" \
+              --seed=${{ github.run_number }} \
+              --out=fuzz-evidence-${{ matrix.sanitizer }} \
+              --minimize \
+              --clean
+          else
+            python3 tools/ci/run_d3_fuzz_campaign.py \
+              --sanitizer=${{ matrix.sanitizer }} \
+              --seconds="${FUZZ_SECONDS}" \
+              --seed=${{ github.run_number }} \
+              --out=fuzz-evidence-${{ matrix.sanitizer }} \
+              --clean
+          fi
 
       - name: Upload fuzz evidence and reproducers
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: d3-fuzz-${{ matrix.sanitizer }}-${{ github.run_id }}
-          path: |
-            fuzz-output/**
-            fuzz-corpus/**
-            fuzz-corpus-minimized/**
-            fuzz-artifacts/**
+          path: fuzz-evidence-${{ matrix.sanitizer }}
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90

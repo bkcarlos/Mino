@@ -10,15 +10,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/allocator/large_object_pool.h"
 #include "mino/shm/allocator/slab_header.h"
+#include "mino/shm/region/recovery_directory.h"
 
 namespace mino::shm::recovery {
 
@@ -109,6 +114,13 @@ struct RecoveryScannerOptions {
     // excludes normal Region service. The real allocator's reclaim protocol is
     // used; recovery does not invent borrow/pin fields in SlabHeader.
     bool reclaim_retired = true;
+
+    // PUBLISHED reference snapshots are observations, not publication fences.
+    // Destructive orphan reclaim is therefore disabled by default and requires
+    // both this explicit offline/quiesced declaration and a non-zero proof token
+    // that the supplied RecoveryOwnership validates at mutation time.
+    bool offline_or_quiesced = false;
+    uint64_t destructive_reclaim_proof_token = 0;
 };
 
 struct RecoveryReport {
@@ -116,8 +128,12 @@ struct RecoveryReport {
     uint64_t orphan_slab_count = 0;
     uint64_t reclaimed_slab_count = 0;
     uint64_t stale_ack_count = 0;
+    uint64_t stale_pin_count = 0;
     uint64_t bitmap_inconsistency_count = 0;
     uint64_t corrupted_slab_count = 0;
+    uint64_t published_orphan_candidate_count = 0;
+    uint64_t unpublished_orphan_candidate_count = 0;
+    uint64_t deferred_reclaim_count = 0;
     std::string details;
 
     void AddDetail(std::string line) {
@@ -135,6 +151,13 @@ struct RecoveryOwnership {
     bool (*is_owner)(const void*) noexcept = nullptr;
     void (*heartbeat)(void*) noexcept = nullptr;
 
+    // Optional, explicit evidence providers. Region automatic recovery leaves
+    // both null: a stale complete reference snapshot or exclusive recovery lease
+    // alone is not proof that a PUBLISHED or transaction-owned object is dead.
+    uint64_t (*destructive_reclaim_proof)(const void*) noexcept = nullptr;
+    bool (*can_reclaim_unpublished)(const void*, uint64_t owner_epoch,
+                                    uint64_t transaction_id) noexcept = nullptr;
+
     bool IsOwner() const noexcept {
         return is_owner != nullptr && is_owner(context);
     }
@@ -142,6 +165,16 @@ struct RecoveryOwnership {
         if (heartbeat != nullptr) {
             heartbeat(context);
         }
+    }
+    bool ProvesDestructiveReclaim(uint64_t token) const noexcept {
+        return token != 0 && destructive_reclaim_proof != nullptr &&
+               destructive_reclaim_proof(context) == token;
+    }
+    bool ProvesUnpublishedOwnerDead(uint64_t owner_epoch,
+                                    uint64_t transaction_id) const noexcept {
+        return owner_epoch != 0 && transaction_id != 0 &&
+               can_reclaim_unpublished != nullptr &&
+               can_reclaim_unpublished(context, owner_epoch, transaction_id);
     }
 };
 
@@ -190,7 +223,14 @@ public:
         RecoveryScannerOptions options = {});
     static Result<RecoveryScanner> Create(
         CentralSlabAllocator allocator, RecoveryOwnership ownership,
-        RecoveryScannerOptions options = {});
+        RecoveryScannerOptions options = {}, uint32_t resource_id = 0,
+        std::span<const RecoveryObjectReference> references = {},
+        bool references_complete = false);
+    static Result<RecoveryScanner> Create(
+        LargeObjectPool pool, uint32_t resource_id,
+        RecoveryOwnership ownership, RecoveryScannerOptions options = {},
+        std::span<const RecoveryObjectReference> references = {},
+        bool references_complete = false);
 
     Result<RecoveryReport> Scan();
     Status ReclaimOrphanSlabs();
@@ -198,6 +238,13 @@ public:
     // atomic fetch_and so concurrent observers never see a torn ACK word.
     Status CleanupStaleAcks(const AckScanInput& input,
                             uint64_t* cleared = nullptr);
+
+    // Applies the fixed generation-scoped ACK/Pin wire protocol registered in
+    // the Region Directory. No persisted callback or process pointer is used.
+    static Status CleanupGenerationScopedResource(
+        std::byte* region_base, uint64_t region_size,
+        const RecoveryResourceDescriptor& descriptor,
+        RecoveryOwnership ownership, RecoveryReport* report);
 
     // Pure read-only verification. Returns kCorruption for any bitmap/header
     // inconsistency, orphan, or corrupted slab and never applies repairs.
@@ -221,6 +268,14 @@ private:
           options_(options),
           legacy_owner_state_(legacy_owner_state) {}
 
+    RecoveryScanner(LargeObjectPool pool, uint32_t resource_id,
+                    RecoveryOwnership ownership,
+                    RecoveryScannerOptions options)
+        : large_pool_(std::move(pool)),
+          ownership_(ownership),
+          options_(options),
+          resource_id_(resource_id) {}
+
     struct LegacyOwnershipContext {
         RecoveryOwnerState* state = nullptr;
         uint64_t pid = 0;
@@ -231,9 +286,15 @@ private:
     static bool LegacyIsOwner(const void* context) noexcept;
     static void LegacyHeartbeat(void* context) noexcept;
     Status ScanSlots(RecoveryReport& report, bool repair);
+    Status ScanLargePool(RecoveryReport& report, bool repair);
     Status ScanLegacyImage(RecoveryReport& report, bool repair);
+    bool IsReferenced(uint32_t unit_index, uint32_t generation) const;
+    bool CanReclaimPublishedOrphan() const noexcept;
+    bool CanReclaimUnpublished(uint64_t owner_epoch,
+                               uint64_t transaction_id) const noexcept;
 
     CentralSlabAllocator allocator_;
+    std::optional<LargeObjectPool> large_pool_;
     RecoveryOwnership ownership_;
     RecoveryScannerOptions options_;
     RecoveryOwnerState* legacy_owner_state_ = nullptr;
@@ -241,6 +302,9 @@ private:
     Layout legacy_layout_{};
     std::byte* legacy_base_ = nullptr;
     uint64_t legacy_size_ = 0;
+    uint32_t resource_id_ = 0;
+    std::vector<RecoveryObjectReference> references_;
+    bool references_complete_ = false;
 };
 
 }  // namespace mino::shm::recovery

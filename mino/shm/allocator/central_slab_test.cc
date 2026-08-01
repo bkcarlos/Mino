@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <set>
@@ -351,6 +352,33 @@ TEST_F(CentralSlabTest, InspectRejectsStaleGeneration) {
     auto view = alloc_.Inspect(stale);
     ASSERT_FALSE(view.ok());
     EXPECT_EQ(view.status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(CentralSlabTest, SlotMetadataUsesAuthoritativeArraysAndCheckedOffsets) {
+    auto handle = alloc_.Allocate(Request(65));
+    ASSERT_TRUE(handle.ok());
+
+    auto metadata = alloc_.GetSlotMetadata(handle->offset);
+    ASSERT_TRUE(metadata.ok()) << metadata.status().ToString();
+    EXPECT_TRUE(metadata->occupied);
+    EXPECT_EQ(metadata->generation, handle->generation);
+    EXPECT_EQ(metadata->class_id, 1u);
+    EXPECT_EQ(metadata->class_count, 2u);
+    EXPECT_EQ(metadata->capacity, 256u);
+
+    EXPECT_EQ(alloc_.GetSlotMetadata(handle->offset + 1).status().code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(alloc_.GetSlotMetadata(std::numeric_limits<uint64_t>::max())
+                  .status()
+                  .code(),
+              StatusCode::kInvalidArgument);
+
+    ASSERT_TRUE(alloc_.Retire(*handle).ok());
+    ASSERT_TRUE(alloc_.Reclaim(*handle).ok());
+    auto reclaimed = alloc_.GetSlotMetadata(handle->offset);
+    ASSERT_TRUE(reclaimed.ok());
+    EXPECT_FALSE(reclaimed->occupied);
+    EXPECT_EQ(reclaimed->generation, handle->generation);
 }
 
 TEST_F(CentralSlabTest, CrashRecoveryClearsUnpublishedSlot) {

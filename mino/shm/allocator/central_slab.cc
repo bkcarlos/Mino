@@ -18,6 +18,8 @@
 #include <cstring>
 #include <new>
 
+#include "mino/common/checked_arithmetic.h"
+
 namespace mino {
 namespace {
 
@@ -831,6 +833,62 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
         kAllocationFlagMask;
     view.data = reinterpret_cast<const std::byte*>(&header) + sizeof(SlabHeader);
     return view;
+}
+
+Result<CentralSlabSlotMetadata> CentralSlabAllocator::GetSlotMetadata(
+    uint64_t header_offset) const {
+    if (shm_base_ == nullptr || headers_ == nullptr || !class_table_.valid() ||
+        slot_stride_ == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator metadata facade is not initialized");
+    }
+
+    const uint64_t headers_local_offset = static_cast<uint64_t>(
+        reinterpret_cast<const std::byte*>(headers_) -
+        static_cast<const std::byte*>(shm_base_));
+    uint64_t first_header_offset = 0;
+    if (!CheckedAddU64(handle_offset_bias_, headers_local_offset,
+                       &first_header_offset) ||
+        header_offset < first_header_offset) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "offset is below the allocator slot area");
+    }
+
+    const uint64_t relative = header_offset - first_header_offset;
+    if (relative % slot_stride_ != 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "offset is not an exact allocator slot start");
+    }
+    const uint64_t slot_index64 = relative / slot_stride_;
+    if (slot_index64 >= total_slot_count() ||
+        slot_index64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator slot offset is out of range");
+    }
+    const uint32_t slot_index = static_cast<uint32_t>(slot_index64);
+
+    uint64_t checked_delta = 0;
+    uint64_t checked_offset = 0;
+    if (!CheckedMulU64(slot_index64, slot_stride_, &checked_delta) ||
+        !CheckedAddU64(first_header_offset, checked_delta, &checked_offset) ||
+        checked_offset != header_offset) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocator slot offset arithmetic overflow");
+    }
+
+    const uint16_t class_id = ClassIdForRecovery(slot_index);
+    if (class_id >= class_table_.class_count()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "offset names a reserved bitmap slot");
+    }
+    const ClassDescriptor& cls = class_table_.GetClass(class_id);
+    return CentralSlabSlotMetadata{
+        .occupied = bitmap_.IsSet(slot_index),
+        .generation = generations_.Get(slot_index),
+        .class_id = class_id,
+        .class_count = class_table_.class_count(),
+        .capacity = cls.slot_size,
+    };
 }
 
 bool CentralSlabAllocator::ReadSlotByIndex(uint32_t slot_index, SlabHeader* header_out,

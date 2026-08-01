@@ -17,13 +17,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/platform/process_identity.h"
 #include "mino/platform/shared_memory.h"
+#include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/superblock.h"
 
 namespace mino {
@@ -135,6 +138,22 @@ public:
     // The identity used for service and recovery ownership in this process.
     const ProcessIdentity& owner_identity() const { return owner_identity_; }
 
+    // Publishes one persistent, Region-relative recovery resource descriptor.
+    // Registration is restricted to the current writable supervisor. Reusing a
+    // resource_id atomically replaces that descriptor in the next directory
+    // snapshot; no process pointer is ever persisted.
+    Status RegisterRecoveryResource(
+        const RecoveryResourceDescriptor& descriptor);
+
+    // Atomically publishes the allocator-unit reference set. `complete=false`
+    // is conservative: recovery validates resources and protocol intermediates
+    // but never classifies a normal PUBLISHED object as an orphan.
+    Status PublishRecoveryReferences(
+        std::span<const RecoveryObjectReference> references, bool complete);
+
+    // Returns the current CRC-validated recovery directory snapshot.
+    Result<RecoveryDirectorySnapshot> recovery_directory() const;
+
 private:
     SharedMemoryRegion() = default;
 
@@ -154,6 +173,7 @@ private:
     int supervisor_lock_fd_ = -1;
     bool is_supervisor_ = false;
     bool detached_ = false;
+    mutable std::mutex recovery_directory_mutex_;
 };
 
 }  // namespace mino

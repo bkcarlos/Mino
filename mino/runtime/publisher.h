@@ -20,6 +20,7 @@
 #include "mino/runtime/allocation_journal.h"
 #include "mino/runtime/deadline.h"
 #include "mino/runtime/delivery_receipt.h"
+#include "mino/runtime/journal_channel_recovery.h"
 #include "mino/runtime/message_traits.h"
 #include "mino/runtime/shm_shared_ptr.h"
 #include "mino/shm/allocator/central_slab.h"
@@ -233,9 +234,22 @@ struct PublisherOptions {
 template <typename T>
 class Publisher {
 public:
+    // Compatibility constructors model one process-local channel and bind it
+    // to this stable, non-zero ID. Multi-channel runtimes should use an
+    // explicit channel_id overload and register every Publisher with the same
+    // JournalChannelRecoveryCoordinator.
+    static constexpr uint64_t kDefaultSingleChannelId = 1;
+
     Publisher(CentralSlabAllocator& allocator, SpscChannel& channel,
               PublisherOptions options = {}) noexcept
-        : allocator_(&allocator), channel_(&channel), options_(options) {
+        : Publisher(allocator, channel, kDefaultSingleChannelId, options) {}
+
+    Publisher(CentralSlabAllocator& allocator, SpscChannel& channel,
+              uint64_t channel_id, PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
+          options_(options) {
         ValidateStaticContract();
     }
 
@@ -243,8 +257,16 @@ public:
               AllocationJournal& journal,
               const ProcessIdentity& owner = ProcessIdentity::Current(),
               PublisherOptions options = {}) noexcept
+        : Publisher(allocator, channel, kDefaultSingleChannelId, journal,
+                    owner, options) {}
+
+    Publisher(CentralSlabAllocator& allocator, SpscChannel& channel,
+              uint64_t channel_id, AllocationJournal& journal,
+              const ProcessIdentity& owner = ProcessIdentity::Current(),
+              PublisherOptions options = {}) noexcept
         : allocator_(&allocator),
           channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
           allocation_journal_(&journal),
           allocation_owner_(owner),
           options_(options) {
@@ -254,8 +276,16 @@ public:
     Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
               MpscChannel::ProducerIdentity producer_identity,
               PublisherOptions options = {}) noexcept
+        : Publisher(allocator, channel, kDefaultSingleChannelId,
+                    producer_identity, options) {}
+
+    Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
+              uint64_t channel_id,
+              MpscChannel::ProducerIdentity producer_identity,
+              PublisherOptions options = {}) noexcept
         : allocator_(&allocator),
           channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
           mpsc_identity_(producer_identity),
           options_(options) {
         ValidateStaticContract();
@@ -265,8 +295,17 @@ public:
               MpscChannel::ProducerIdentity producer_identity,
               AllocationJournal& journal,
               PublisherOptions options = {}) noexcept
+        : Publisher(allocator, channel, kDefaultSingleChannelId,
+                    producer_identity, journal, options) {}
+
+    Publisher(CentralSlabAllocator& allocator, MpscChannel& channel,
+              uint64_t channel_id,
+              MpscChannel::ProducerIdentity producer_identity,
+              AllocationJournal& journal,
+              PublisherOptions options = {}) noexcept
         : allocator_(&allocator),
           channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
           mpsc_identity_(producer_identity),
           allocation_journal_(&journal),
           allocation_owner_(producer_identity.owner),
@@ -276,7 +315,16 @@ public:
 
     Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
               ShmPinTable& pins, PublisherOptions options = {}) noexcept
-        : allocator_(&allocator), channel_(&channel), options_(options) {
+        : Publisher(allocator, channel, kDefaultSingleChannelId, pins,
+                    options) {}
+
+    Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
+              uint64_t channel_id, ShmPinTable& pins,
+              PublisherOptions options = {}) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
+          options_(options) {
         channel.SetPayloadRetireObserver(&ShmPinTable::RetirePayloadCallback,
                                          &pins);
         ValidateStaticContract();
@@ -286,8 +334,17 @@ public:
               ShmPinTable& pins, AllocationJournal& journal,
               const ProcessIdentity& owner = ProcessIdentity::Current(),
               PublisherOptions options = {}) noexcept
+        : Publisher(allocator, channel, kDefaultSingleChannelId, pins, journal,
+                    owner, options) {}
+
+    Publisher(CentralSlabAllocator& allocator, BroadcastChannel& channel,
+              uint64_t channel_id, ShmPinTable& pins,
+              AllocationJournal& journal,
+              const ProcessIdentity& owner = ProcessIdentity::Current(),
+              PublisherOptions options = {}) noexcept
         : allocator_(&allocator),
           channel_(&channel),
+          channel_id_(NormalizeChannelId(channel_id)),
           allocation_journal_(&journal),
           allocation_owner_(owner),
           options_(options) {
@@ -359,7 +416,7 @@ public:
     // the Runtime error contract rather than exposing Channel kDegraded.
     Status PublishLocal(MessageBuilder<T>&& builder,
                         Deadline deadline = Deadline::Infinite()) noexcept {
-        return PublishLocalImpl(builder, deadline, nullptr);
+        return PublishLocalImpl(builder, deadline, nullptr, nullptr);
     }
 
     Result<DeliveryReceipt> Publish(
@@ -368,14 +425,39 @@ public:
         std::span<const DeliveryTarget> target_snapshot,
         const DeliveryRequirement& requirement,
         Deadline deadline = Deadline::Infinite()) noexcept {
+        if (!builder.active() || builder.allocator_ != allocator_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "builder does not belong to this publisher");
+        }
+        if (deadline.expired()) {
+            return AbortWith(builder, Status::Error(
+                StatusCode::kTimeout, "publish deadline expired"));
+        }
+        const Status validation = StaticMessageTraits<T>::Validate(*builder);
+        if (!validation.ok()) {
+            return AbortWith(builder, validation);
+        }
+
+        Result<OutstandingReceiptTable::Reservation> receipt_reservation =
+            receipts.Reserve(publisher_identity, target_snapshot, requirement);
+        if (!receipt_reservation.ok()) {
+            return AbortWith(builder, receipt_reservation.status());
+        }
+
         uint64_t source_sequence = 0;
-        const Status local = PublishLocalImpl(builder, deadline,
-                                              &source_sequence);
+        bool locally_published = false;
+        const Status local = PublishLocalImpl(
+            builder, deadline, &source_sequence, &locally_published);
         if (!local.ok()) {
             return local;
         }
-        return receipts.Create(publisher_identity, source_sequence,
-                               target_snapshot, requirement);
+        if (!locally_published) {
+            receipt_reservation->Cancel();
+            return Status::Error(
+                StatusCode::kDegraded,
+                "local publish was dropped; delivery receipt canceled");
+        }
+        return std::move(*receipt_reservation).Commit(source_sequence);
     }
 
     Status Abort(MessageBuilder<T>&& builder) noexcept {
@@ -398,9 +480,37 @@ public:
         return journal_cleanup_debt_count_.load(std::memory_order_relaxed);
     }
 
+    uint64_t channel_id() const noexcept { return channel_id_; }
+
+    // Registers this Publisher's channel and stable ID in one operation. A
+    // Broadcast Publisher additionally supplies the read-only publication view
+    // because BroadcastChannel intentionally exposes no shared-memory base.
+    Status RegisterRecoveryChannel(
+        JournalChannelRecoveryCoordinator& coordinator,
+        const BroadcastPublicationView* broadcast_view = nullptr) const {
+        if (std::holds_alternative<SpscChannel*>(channel_)) {
+            return coordinator.RegisterChannel(
+                channel_id_, *std::get<SpscChannel*>(channel_));
+        }
+        if (std::holds_alternative<MpscChannel*>(channel_)) {
+            return coordinator.RegisterChannel(
+                channel_id_, *std::get<MpscChannel*>(channel_));
+        }
+        if (broadcast_view == nullptr) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "broadcast recovery registration requires a publication view");
+        }
+        return coordinator.RegisterChannel(channel_id_, *broadcast_view);
+    }
+
 private:
     Status PublishLocalImpl(MessageBuilder<T>& builder, Deadline deadline,
-                            uint64_t* source_sequence) noexcept {
+                            uint64_t* source_sequence,
+                            bool* locally_published) noexcept {
+        if (locally_published != nullptr) {
+            *locally_published = false;
+        }
         if (!builder.active() || builder.allocator_ != allocator_) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "builder does not belong to this publisher");
@@ -417,13 +527,14 @@ private:
 
         if (std::holds_alternative<SpscChannel*>(channel_)) {
             return FinishPublish(builder, ReserveSpsc(deadline),
-                                 source_sequence);
+                                 source_sequence, locally_published);
         }
         if (std::holds_alternative<MpscChannel*>(channel_)) {
-            return FinishPublish(builder, ReserveMpsc(deadline), source_sequence);
+            return FinishPublish(builder, ReserveMpsc(deadline), source_sequence,
+                                 locally_published);
         }
         return FinishPublish(builder, ReserveBroadcast(deadline),
-                             source_sequence);
+                             source_sequence, locally_published);
     }
 
     static constexpr void ValidateStaticContract() noexcept {
@@ -442,7 +553,8 @@ private:
     template <typename Reservation>
     Status FinishPublish(MessageBuilder<T>& builder,
                          Result<Reservation> reservation,
-                         uint64_t* source_sequence) noexcept {
+                         uint64_t* source_sequence,
+                         bool* locally_published) noexcept {
         if (!reservation.ok()) {
             if (reservation.status().code() == StatusCode::kDegraded) {
                 const Status abort = builder.Abort();
@@ -478,7 +590,7 @@ private:
             slot->sequence_num.load(std::memory_order_relaxed);
         PublicationBinding binding{
             .channel_kind = PublicationKind(),
-            .channel_id = 0,
+            .channel_id = channel_id_,
             .sequence = committed_sequence,
             .payload = builder.handle_,
         };
@@ -509,6 +621,9 @@ private:
         }
         if (source_sequence != nullptr) {
             *source_sequence = committed_sequence;
+        }
+        if (locally_published != nullptr) {
+            *locally_published = true;
         }
         published_count_.fetch_add(1, std::memory_order_relaxed);
         return Status::Ok();
@@ -606,6 +721,13 @@ private:
         return PublicationChannelKind::kBroadcast;
     }
 
+    static constexpr uint64_t NormalizeChannelId(
+        uint64_t channel_id) noexcept {
+        // Zero was the historical hard-coded binding. Treat it as the explicit
+        // single-channel compatibility choice, never as a persisted channel ID.
+        return channel_id == 0 ? kDefaultSingleChannelId : channel_id;
+    }
+
     static uint64_t MonotonicNowNs() noexcept {
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
         return static_cast<uint64_t>(
@@ -614,6 +736,7 @@ private:
 
     CentralSlabAllocator* allocator_;
     std::variant<SpscChannel*, MpscChannel*, BroadcastChannel*> channel_;
+    uint64_t channel_id_ = kDefaultSingleChannelId;
     MpscChannel::ProducerIdentity mpsc_identity_{};
     AllocationJournal* allocation_journal_ = nullptr;
     ProcessIdentity allocation_owner_;

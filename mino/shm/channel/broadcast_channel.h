@@ -19,28 +19,29 @@
 //
 // Single publisher / N subscriber fan-out over shared memory. Every active
 // subscriber receives every published message exactly once; each subscriber
-// advances its own cursor and ACKs individually through the per-slot
-// AckBitmap sidecar (design doc 9.2).
+// advances its own cursor and ACKs through a per-slot, per-subscriber exact-era
+// token (layout v4). BroadcastSlotMeta::ack_bitmap remains the immutable
+// membership snapshot for diagnostics/compatibility, not cleanup authority.
 //
 // Publication protocol (design doc 9.6):
 //   Reserve : single publisher, no Vyukov turn arbitration (turn is
 //             initialized for layout consistency but never read). Full
 //             iff publisher_cursor - MinActiveCursor() >= capacity; with no
 //             active subscriber the channel is never full.
-//   Commit  : the per-slot ack_bitmap is stamped with the subscriber-set
-//             snapshot taken at Reserve time (version + membership), the
-//             immutable CRC is sealed, state goes kReady (release), and
-//             finally publisher_cursor advances (release).
-//   Abort   : state goes kAborted, the ack_bitmap is cleared (no delivery
+//   Commit  : the per-slot membership bitmap and exact ack_era tokens are
+//             stamped from the subscriber-set snapshot, the immutable CRC is
+//             sealed, state goes kReady (release), and publisher_cursor advances.
+//   Abort   : state goes kAborted, all ACK metadata is cleared (no delivery
 //             obligation), and publisher_cursor advances. Subscribers skip
 //             tombstones transparently.
 //
 // Consumption protocol: Poll(sub) validates the subscriber registration
 // (active + generation match), then walks from the subscriber's own cursor:
 // kAborted slots are skipped, sequence/CRC mismatches report kCorruption
-// and are skipped, otherwise a snapshot Borrow is returned. Ack(seq) clears
-// the subscriber's bit in the slot's ack_bitmap and advances the
-// subscriber cursor, then runs CollectGarbage() to retire fully-acked slots.
+// and are skipped, otherwise a snapshot Borrow is returned. Ack(seq) binds
+// both the borrowed slot era (exact sequence) and subscriber generation before
+// clearing the subscriber's exact ack_era token, advances the cursor, then runs
+// CollectGarbage() to retire fully-acked slots.
 //
 // BroadcastChannel is header-only: a non-owning view over shared memory
 // (design doc 9.9 lifecycle: a process exiting does not "destruct" the
@@ -72,11 +73,15 @@ public:
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4252'4443ULL;  // "MINOBRDC"
-    // v3: kRetiring gives GC exclusive ownership while it captures the payload
-    // Handle and invokes the process-local retire observer. v2 added heartbeat
-    // generation binding and kRegistering membership state.
-    static constexpr uint32_t kLayoutVersion = 3;
+    // v4: recoverable sequence-bound cursor cleanup tokens replace kRetiring,
+    // and a per-slot atomic era record lets GC snapshot payload handles without
+    // excluding (or ever wedging) the publisher. v3 used kRetiring for that
+    // exclusion; v2 added heartbeat generation binding and kRegistering.
+    static constexpr uint32_t kLayoutVersion = 4;
     static constexpr uint32_t kMaxSubscribers = kBroadcastMaxSubscribers;  // 64
+    // Stable cursors are ordinary logical sequences. The high bit denotes a
+    // recoverable in-progress cleanup for the sequence in the low 63 bits.
+    static constexpr uint64_t kCursorCleanupBit = uint64_t{1} << 63;
 
     // -----------------------------------------------------------------------
     // Control block
@@ -180,6 +185,30 @@ public:
                   "heartbeat generation must remain in line B");
 
     // -----------------------------------------------------------------------
+    // Broadcast-only era sidecar (layout v4)
+    // -----------------------------------------------------------------------
+    //
+    // The payload copy is split into lock-free 64-bit atomics. payload_era is a
+    // seqlock-style publication stamp (`sequence + 1`, zero while being
+    // replaced), so GC can obtain a coherent handle even while the publisher
+    // recycles IndexSlot's non-atomic payload fields. Each ack_era entry is the
+    // exact logical era owed by one subscriber, also encoded as sequence + 1;
+    // clearing it uses an exact CAS, so even a delayed crash helper cannot touch
+    // a reused era. retired_era is the monotonic observer claim. None is a lock.
+    struct BroadcastEraMeta {
+        std::atomic<uint64_t> payload_era{0};
+        std::atomic<uint64_t> payload_offset{0};
+        std::atomic<uint64_t> payload_identity{0};
+        std::atomic<uint64_t> retired_era{0};
+        std::atomic<uint64_t> ack_era[kMaxSubscribers]{};
+    };
+
+    static_assert(sizeof(BroadcastEraMeta) ==
+                  (4 + kMaxSubscribers) * sizeof(uint64_t));
+    static_assert(alignof(BroadcastEraMeta) == alignof(uint64_t));
+    static_assert(std::is_standard_layout_v<BroadcastEraMeta>);
+
+    // -----------------------------------------------------------------------
     // Layout offsets
     // -----------------------------------------------------------------------
 
@@ -201,17 +230,21 @@ public:
         return SlotsOffset() + capacity * sizeof(IndexSlot);
     }
 
-    // Byte offset of the SubscriberSlot array. sizeof(BroadcastSlotMeta)
-    // is 16, so capacity * 16 may end mid-cache-line: align up to keep the
-    // subscriber slots cache-line aligned (their cursor lines are hot).
+    // Byte offset of the layout-v4 era sidecar array.
+    static constexpr uint64_t EraMetasOffset(uint64_t capacity) {
+        return MetasOffset(capacity) + capacity * sizeof(BroadcastSlotMeta);
+    }
+
+    // Byte offset of the SubscriberSlot array. Sidecars may end mid-cache-line:
+    // align up to keep subscriber cursor lines isolated and cache-line aligned.
     static constexpr uint64_t SubsOffset(uint64_t capacity) {
-        return AlignUp64(MetasOffset(capacity) +
-                         capacity * sizeof(BroadcastSlotMeta));
+        return AlignUp64(EraMetasOffset(capacity) +
+                         capacity * sizeof(BroadcastEraMeta));
     }
 
     // Total bytes the channel occupies in shared memory: ControlBlock ->
     // IndexSlot[capacity] -> BroadcastSlotMeta[capacity] ->
-    // SubscriberSlot[kMaxSubscribers].
+    // BroadcastEraMeta[capacity] -> SubscriberSlot[kMaxSubscribers].
     static constexpr uint64_t RequiredSize(uint64_t capacity) {
         return SubsOffset(capacity) +
                kMaxSubscribers * sizeof(SubscriberSlot);
@@ -281,9 +314,18 @@ public:
         }
 
         BroadcastSlotMeta* metas = MetasOf(shm_base, capacity);
+        BroadcastEraMeta* era_metas = EraMetasOf(shm_base, capacity);
         for (uint64_t i = 0; i < capacity; ++i) {
             metas[i].subscriber_set_version = 0;
             metas[i].ack_bitmap.bits.store(0, std::memory_order_relaxed);
+            era_metas[i].payload_era.store(0, std::memory_order_relaxed);
+            era_metas[i].payload_offset.store(0, std::memory_order_relaxed);
+            era_metas[i].payload_identity.store(0, std::memory_order_relaxed);
+            era_metas[i].retired_era.store(0, std::memory_order_relaxed);
+            for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+                era_metas[i].ack_era[id].store(0,
+                                               std::memory_order_relaxed);
+            }
         }
 
         SubscriberSlot* subs = SubsOf(shm_base, capacity);
@@ -303,7 +345,8 @@ public:
         // Publish: release so every plain/relaxed write above is visible to
         // any observer that acquires the magic.
         control->magic.store(kMagic, std::memory_order_release);
-        return BroadcastChannel(control, slots, metas, subs, capacity);
+        return BroadcastChannel(control, slots, metas, era_metas, subs,
+                                capacity);
     }
 
     // Attaches to an already-initialized channel at `shm_base`, validating
@@ -339,6 +382,7 @@ public:
         }
         return BroadcastChannel(control, SlotsOf(shm_base),
                                 MetasOf(shm_base, capacity),
+                                EraMetasOf(shm_base, capacity),
                                 SubsOf(shm_base, capacity), capacity);
     }
 
@@ -465,30 +509,31 @@ public:
         return Status::Ok();
     }
 
-    // Clears every outstanding ack bit of subscriber `id` in the current
-    // window [MinCursor, publisher_cursor) (bounded by capacity slots).
-    // Returns the number of bits cleared. Primitive for D2-06 eviction:
-    // reclaiming the bits of a departed/slow subscriber lets the window
-    // retire fully-acked slots again. Safe to call at any time; clearing a
-    // bit that is not set (or that a racing Ack is also clearing) is a
-    // no-op.
+    // Clears this subscriber's outstanding responsibilities by walking its
+    // cursor to the publisher head. Each step first CASes the cursor into a
+    // sequence-bound cleanup token, then clears that exact era's bit, then
+    // publishes the next stable cursor. Any process (including the publisher)
+    // can finish a token left by a crash, so cleanup cannot wedge the ring.
     uint64_t ClearStaleAcks(SubscriberId id) noexcept {
         if (id.value >= kMaxSubscribers) {
             return 0;
         }
+        SubscriberSlot& sub = subs_[id.value];
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_acquire);
-        const uint64_t lo =
-            (prod > capacity_) ? prod - capacity_ : uint64_t{0};
         uint64_t cleared = 0;
-        for (uint64_t seq = lo; seq < prod; ++seq) {
-            IndexSlot* slot = &slots_[seq & mask_];
-            // Sidecar validity rule (design doc 9.2): only trust the bitmap
-            // while the slot still carries this exact sequence.
-            if (slot->sequence_num.load(std::memory_order_acquire) != seq) {
+        for (;;) {
+            uint64_t cursor = LoadCursorAndHelp(id.value);
+            if (cursor >= prod) {
+                break;
+            }
+            uint64_t expected = cursor;
+            if (!sub.cursor.compare_exchange_weak(
+                    expected, CursorCleanupToken(cursor),
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
                 continue;
             }
-            if (metas_[seq & mask_].ack_bitmap.Clear(id.value)) {
+            if (FinishCursorCleanup(id.value, cursor)) {
                 ++cleared;
             }
         }
@@ -782,6 +827,10 @@ public:
         // Single publisher: no CAS needed to claim our own cursor slot.
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_relaxed);
+        if (prod >= kCursorCleanupBit) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "broadcast sequence space exhausted");
+        }
 
         if (IsFullAt(prod)) {
             switch (policy) {
@@ -803,12 +852,12 @@ public:
                         StatusCode::kDegraded,
                         "broadcast channel full: newest message dropped");
                 case QueueFullPolicy::kDropOldest:
-                    // Force the slowest active subscriber's cursor forward
-                    // past the oldest slot, clearing its bit in every slot
-                    // it jumps over. Without an active subscriber the
-                    // channel is never full, so this cannot be reached with
-                    // an empty membership.
-                    ForceDropOldest(prod);
+                    // A membership race or tied slowest cursors may require
+                    // more than one successful drop before the physical slot
+                    // is reusable. Every drop CASes its victim cursor first.
+                    while (IsFullAt(prod)) {
+                        ForceDropOldest(prod);
+                    }
                     break;
                 case QueueFullPolicy::kSample: {
                     const uint32_t rate = sample_rate == 0 ? 1 : sample_rate;
@@ -835,22 +884,17 @@ public:
         // no active subscribers). Assign the logical sequence now: it IS the
         // publisher position, making each subscriber's ABA check
         // (slot.sequence_num == its cursor) exact across wraps (INV-01).
-        // Claim the slot before changing any immutable field. kRetiring means
-        // GC owns the previous era while it captures the payload Handle; wait
-        // until it publishes kRetired rather than racing those reads.
+        // Help any subscriber that died after claiming ACK cleanup for this
+        // exact physical era. The token is recoverable, so this can never wait
+        // for the originating process. GC does not own SlotState in layout v4.
+        HelpAllCursorCleanups();
         uint32_t expected = slot->state.load(std::memory_order_acquire);
-        for (;;) {
-            if (expected == static_cast<uint32_t>(SlotState::kRetiring)) {
-                detail::SpinPause();
-                expected = slot->state.load(std::memory_order_acquire);
-                continue;
-            }
-            if (slot->state.compare_exchange_weak(
-                    expected, static_cast<uint32_t>(SlotState::kWriting),
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                break;
-            }
+        while (!slot->state.compare_exchange_weak(
+            expected, static_cast<uint32_t>(SlotState::kWriting),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
         }
+        era_metas_[prod & mask_].payload_era.store(0,
+                                                   std::memory_order_release);
         slot->sequence_num.store(prod, std::memory_order_relaxed);
         return Reservation(this, slot, prod);
     }
@@ -860,25 +904,26 @@ public:
     Result<Reservation> TryReserve() noexcept {
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_relaxed);
+        if (prod >= kCursorCleanupBit) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "broadcast sequence space exhausted");
+        }
         if (IsFullAt(prod)) {
             return Status::Error(StatusCode::kWouldBlock,
                                  "broadcast channel full");
         }
         IndexSlot* slot = &slots_[prod & mask_];
-        // Same ownership protocol as Reserve(), but preserve the non-blocking
-        // contract when a concurrent GC temporarily owns the physical slot.
+        // Cursor cleanup and GC are both helpable/non-exclusive in layout v4,
+        // so a stale kRetiring value from a crashed legacy-style operation is
+        // simply reusable rather than a reason to block forever.
+        HelpAllCursorCleanups();
         uint32_t expected = slot->state.load(std::memory_order_acquire);
-        for (;;) {
-            if (expected == static_cast<uint32_t>(SlotState::kRetiring)) {
-                return Status::Error(StatusCode::kWouldBlock,
-                                     "broadcast slot is being retired");
-            }
-            if (slot->state.compare_exchange_weak(
-                    expected, static_cast<uint32_t>(SlotState::kWriting),
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                break;
-            }
+        while (!slot->state.compare_exchange_weak(
+            expected, static_cast<uint32_t>(SlotState::kWriting),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
         }
+        era_metas_[prod & mask_].payload_era.store(0,
+                                                   std::memory_order_release);
         slot->sequence_num.store(prod, std::memory_order_relaxed);
         return Reservation(this, slot, prod);
     }
@@ -901,7 +946,7 @@ public:
 
         Borrow(Borrow&& other) noexcept
             : channel_(other.channel_),
-              sub_(other.sub_),
+              subscriber_(other.subscriber_),
               snapshot_(other.snapshot_),
               active_(other.active_) {
             other.channel_ = nullptr;
@@ -910,7 +955,7 @@ public:
         Borrow& operator=(Borrow&& other) noexcept {
             if (this != &other) {
                 channel_ = other.channel_;
-                sub_ = other.sub_;
+                subscriber_ = other.subscriber_;
                 snapshot_ = other.snapshot_;
                 active_ = other.active_;
                 other.channel_ = nullptr;
@@ -928,12 +973,12 @@ public:
         }
         bool active() const noexcept { return active_; }
 
-        // Clears this subscriber's ack bit on the borrowed slot, advances
-        // the subscriber cursor past it and retires fully-acked slots. If
-        // the message was overtaken by kDropOldest while borrowed, the bit
-        // is still cleared (it may already have been cleared by the drop
-        // itself; Clear is idempotent) and Ack reports kNotFound without
-        // moving the cursor. After Ack (either outcome) the Borrow is empty.
+        // Clears this subscriber generation's ack bit on the exact borrowed
+        // slot era, advances the subscriber cursor past it and retires
+        // fully-acked slots. If kDropOldest overtook the message while it was
+        // borrowed, Ack reports kNotFound without moving the cursor or clearing
+        // any bit; stale Borrows have no cleanup authority.
+        // After Ack (either outcome) the Borrow is empty.
         Status Ack() && {
             if (!active_) {
                 return Status::Error(StatusCode::kInvalidArgument,
@@ -942,18 +987,18 @@ public:
             active_ = false;
             BroadcastChannel* ch = channel_;
             channel_ = nullptr;
-            return ch->AckSlot(sub_, snapshot_.sequence_num);
+            return ch->AckSlot(subscriber_, snapshot_.sequence_num);
         }
 
     private:
         friend class BroadcastChannel;
-        Borrow(BroadcastChannel* channel, SubscriberId sub,
+        Borrow(BroadcastChannel* channel, SubscriberHandle subscriber,
                const IndexSlotSnapshot& snapshot) noexcept
-            : channel_(channel), sub_(sub), snapshot_(snapshot),
+            : channel_(channel), subscriber_(subscriber), snapshot_(snapshot),
               active_(true) {}
 
         BroadcastChannel* channel_ = nullptr;
-        SubscriberId sub_;
+        SubscriberHandle subscriber_;
         IndexSlotSnapshot snapshot_;
         bool active_ = false;
     };
@@ -968,9 +1013,13 @@ public:
     //                      subscriber's cursor was advanced past it so the
     //                      channel keeps making progress.
     //
-    // Aborted tombstones are transparently skipped (the ack_bitmap carries
-    // no delivery obligation for them, so only the cursor advances).
+    // Aborted tombstones are transparently skipped (ACK metadata carries no
+    // delivery obligation for them, so only the cursor advances).
     Result<Borrow> Poll(SubscriberHandle sub) noexcept {
+        if (sub.id.value >= kMaxSubscribers) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber id out of range");
+        }
         SubscriberSlot& ss = subs_[sub.id.value];
         if (ss.state.load(std::memory_order_acquire) !=
                 static_cast<uint32_t>(SubscriberState::kActive) ||
@@ -980,9 +1029,9 @@ public:
                 "subscriber not registered or stale generation");
         }
         while (true) {
-            // The cursor may be CAS-advanced by kDropOldest concurrently, so
-            // re-read it on every iteration instead of caching it.
-            const uint64_t cons = ss.cursor.load(std::memory_order_acquire);
+            // The cursor may be CAS-advanced by kDropOldest concurrently. A
+            // crashed ACK may also leave a helpable sequence-bound token.
+            const uint64_t cons = LoadCursorAndHelp(sub.id.value);
             const uint64_t prod =
                 control_->publisher_cursor.load(std::memory_order_acquire);
             if (cons == prod) {
@@ -998,39 +1047,29 @@ public:
                 // bitmap on Abort); skip by advancing only our own cursor.
                 // CAS so a concurrent kDropOldest advance never gets
                 // overwritten with a stale value.
-                uint64_t expected = cons;
-                ss.cursor.compare_exchange_strong(
-                    expected, cons + 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                AdvanceCursorPast(sub.id.value, cons);
                 continue;
             }
-            if (state == static_cast<uint32_t>(SlotState::kRetired)) {
-                // A kRetired slot AT our cursor is always a GC-vs-Reserve
-                // clobber: a legitimate retirement requires every ACK bit
-                // drained (including ours), which would have advanced our
-                // cursor past this slot already. The clobbered transition is
-                // kReady -> kRetired landing right after a fully-committed
-                // new era published kReady, so the immutable fields are
-                // complete and CRC-verifiable. Fall through and deliver it
-                // exactly like kReady: consuming a retired-but-valid slot is
-                // harmless (recycling overwrites the state next era anyway),
-                // while refusing it would wedge this subscriber and, through
-                // the full check, the publisher.
-                if (slot->sequence_num.load(std::memory_order_relaxed) ==
-                    cons) {
+            if (state == static_cast<uint32_t>(SlotState::kRetired) ||
+                state == static_cast<uint32_t>(SlotState::kRetiring)) {
+                // Layout v4 never writes kRetiring, but an injected/recovery
+                // residual must not wedge a live cursor. Likewise kRetired at
+                // our cursor can only be a stale lifecycle hint. Exact sequence,
+                // era publication and CRC are the authority, so deliver a valid
+                // snapshot exactly like kReady.
+                if (slot->sequence_num.load(std::memory_order_relaxed) == cons &&
+                    era_metas_[cons & mask_].payload_era.load(
+                        std::memory_order_acquire) == cons + 1) {
                     IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
                     if (VerifySnapshotCrc(snapshot)) {
-                        return Borrow(this, sub.id, snapshot);
+                        return Borrow(this, sub, snapshot);
                     }
                 }
                 // Genuinely stale or corrupt: skip like corruption below.
-                uint64_t expected = cons;
-                ss.cursor.compare_exchange_strong(
-                    expected, cons + 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                AdvanceCursorPast(sub.id.value, cons);
                 return Status::Error(
                     StatusCode::kCorruption,
-                    "broadcast slot retired under a live cursor (skipped)");
+                    "broadcast slot has stale lifecycle state under a live cursor (skipped)");
             }
             if (state != static_cast<uint32_t>(SlotState::kReady)) {
                 // Not yet published (the publisher is between Reserve and
@@ -1046,10 +1085,7 @@ public:
             // above already published the sequence, so a relaxed load
             // suffices.
             if (slot->sequence_num.load(std::memory_order_relaxed) != cons) {
-                uint64_t expected = cons;
-                ss.cursor.compare_exchange_strong(
-                    expected, cons + 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                AdvanceCursorPast(sub.id.value, cons);
                 return Status::Error(
                     StatusCode::kCorruption,
                     "broadcast slot sequence mismatch (skipped)");
@@ -1059,40 +1095,29 @@ public:
             // (kDropOldest may recycle the slot while we hold the Borrow).
             IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
             if (!VerifySnapshotCrc(snapshot)) {
-                uint64_t expected = cons;
-                ss.cursor.compare_exchange_strong(
-                    expected, cons + 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                AdvanceCursorPast(sub.id.value, cons);
                 return Status::Error(
                     StatusCode::kCorruption,
                     "broadcast slot immutable CRC mismatch (skipped)");
             }
-            return Borrow(this, sub.id, snapshot);
+            return Borrow(this, sub, snapshot);
         }
     }
 
-    // Standalone Ack for a previously polled sequence: clears the
-    // subscriber's ack bit on that slot and, when `seq` equals the
-    // subscriber cursor, advances the cursor and retires fully-acked slots.
-    // A `seq` behind the cursor (overtaken by kDropOldest) still clears the
-    // bit but reports kNotFound, mirroring Borrow::Ack().
+    // Standalone Ack for a previously polled sequence: validates the exact
+    // subscriber generation and slot era before clearing that generation's
+    // bit. Only `seq == cursor` may claim cleanup and advance. A `seq` behind
+    // the cursor (overtaken by kDropOldest) reports kNotFound and never clears
+    // an old or recycled era's bit.
     Status Ack(SubscriberHandle sub, uint64_t seq) noexcept {
-        SubscriberSlot& ss = subs_[sub.id.value];
-        if (ss.state.load(std::memory_order_acquire) !=
-                static_cast<uint32_t>(SubscriberState::kActive) ||
-            ss.generation.load(std::memory_order_acquire) != sub.generation) {
-            return Status::Error(
-                StatusCode::kNotFound,
-                "subscriber not registered or stale generation");
-        }
-        return AckSlot(sub.id, seq);
+        return AckSlot(sub, seq);
     }
 
-    // Installs a process-local notification invoked exactly when this facade
-    // wins a kReady -> kRetiring transition for the expected slot era. The
-    // callback pointer is never stored in shared memory; every attached Runtime
-    // process configures its own facade. The payload Handle is captured before
-    // the slot can be reused.
+    // Installs a process-local notification invoked by the facade that wins the
+    // exact retired-era token. The claim is persisted before invocation: a
+    // process crash may lose that notification, but can neither duplicate it nor
+    // leave a lock that blocks publisher reuse. The callback receives a coherent
+    // local copy from the atomic payload-era sidecar, never live IndexSlot data.
     void SetPayloadRetireObserver(PayloadRetireObserver observer,
                                   void* context) noexcept {
         payload_retire_observer_ = observer;
@@ -1103,63 +1128,59 @@ public:
     // Garbage collection
     // -----------------------------------------------------------------------
 
-    // Scans the window [min subscriber cursor, publisher_cursor) — bounded
-    // by capacity slots — and retires every kReady slot whose ack_bitmap is
-    // fully cleared. Called from Ack() after the cursor advances; also
-    // exposed publicly so eviction/recovery paths (D2-06) and tests can run
-    // it explicitly.
+    // Scans the bounded live window and claims every fully-ACKed logical era.
+    // Retirement is represented by BroadcastEraMeta::retired_era rather than a
+    // transient SlotState. GC therefore never excludes the publisher and cannot
+    // strand the channel if its process dies. The 32-bit SlotState remains a
+    // publication-phase hint; exact retirement authority is the 64-bit era.
     void CollectGarbage() noexcept {
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_acquire);
-        const uint64_t min_cursor = MinCursor();
-        if (min_cursor >= prod) {
-            return;
-        }
-        uint64_t n = prod - min_cursor;
-        if (n > capacity_) {
-            n = capacity_;
-        }
-        for (uint64_t i = 0; i < n; ++i) {
-            const uint64_t seq = min_cursor + i;
+        const uint64_t floor = prod > capacity_ ? prod - capacity_ : 0;
+        for (uint64_t seq = floor; seq < prod; ++seq) {
             const uint64_t phys = seq & mask_;
             IndexSlot* slot = &slots_[phys];
-            if (slot->state.load(std::memory_order_acquire) !=
-                static_cast<uint32_t>(SlotState::kReady)) {
+            const uint32_t state = slot->state.load(std::memory_order_acquire);
+            if (state != static_cast<uint32_t>(SlotState::kReady) &&
+                state != static_cast<uint32_t>(SlotState::kRetired) &&
+                state != static_cast<uint32_t>(SlotState::kRetiring)) {
                 continue;
             }
-            // Sidecar validity: only retire when the slot still carries this
-            // exact sequence; a recycled slot is never touched.
-            if (slot->sequence_num.load(std::memory_order_acquire) != seq) {
+            if (slot->sequence_num.load(std::memory_order_acquire) != seq ||
+                !AllAckedForEra(phys, seq)) {
                 continue;
             }
-            if (metas_[phys].ack_bitmap.AllAcked()) {
-                // Claim a transient kRetiring state before reading payload.
-                // Reserve/TryReserve explicitly wait on this state, so no
-                // producer can overwrite immutable fields until the observer
-                // has consumed the old era's Handle.
-                uint32_t expected = static_cast<uint32_t>(SlotState::kReady);
-                if (!slot->state.compare_exchange_strong(
-                        expected, static_cast<uint32_t>(SlotState::kRetiring),
-                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                    continue;
-                }
-                // The producer may have completed an entire recycle between
-                // the optimistic sequence check above and our CAS (READY has
-                // the same value in every era). Revalidate while kRetiring
-                // excludes all immutable-field writers; never retire a newer
-                // era using an older sidecar observation.
-                if (slot->sequence_num.load(std::memory_order_relaxed) != seq) {
-                    slot->state.store(static_cast<uint32_t>(SlotState::kReady),
-                                      std::memory_order_release);
-                    continue;
-                }
-                const ShmHandle payload = slot->payload;
-                if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
-                    payload_retire_observer_(payload,
-                                             payload_retire_context_);
-                }
-                slot->state.store(static_cast<uint32_t>(SlotState::kRetired),
-                                  std::memory_order_release);
+
+            BroadcastEraMeta& era = era_metas_[phys];
+            const uint64_t token = seq + 1;
+            if (era.payload_era.load(std::memory_order_acquire) != token) {
+                continue;
+            }
+            const uint64_t offset =
+                era.payload_offset.load(std::memory_order_acquire);
+            const uint64_t identity =
+                era.payload_identity.load(std::memory_order_acquire);
+            if (era.payload_era.load(std::memory_order_acquire) != token) {
+                continue;
+            }
+
+            uint64_t retired =
+                era.retired_era.load(std::memory_order_acquire);
+            while (retired < token &&
+                   !era.retired_era.compare_exchange_weak(
+                       retired, token, std::memory_order_acq_rel,
+                       std::memory_order_acquire)) {
+            }
+            if (retired >= token) {
+                continue;
+            }
+
+            const ShmHandle payload{
+                .offset = offset,
+                .generation = static_cast<uint32_t>(identity >> 32),
+                .region_id = static_cast<uint32_t>(identity)};
+            if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
+                payload_retire_observer_(payload, payload_retire_context_);
             }
         }
     }
@@ -1191,11 +1212,12 @@ public:
 
 private:
     BroadcastChannel(ControlBlock* control, IndexSlot* slots,
-                     BroadcastSlotMeta* metas, SubscriberSlot* subs,
-                     uint64_t capacity) noexcept
+                     BroadcastSlotMeta* metas, BroadcastEraMeta* era_metas,
+                     SubscriberSlot* subs, uint64_t capacity) noexcept
         : control_(control),
           slots_(slots),
           metas_(metas),
+          era_metas_(era_metas),
           subs_(subs),
           capacity_(capacity),
           mask_(capacity - 1) {}
@@ -1211,9 +1233,91 @@ private:
             static_cast<unsigned char*>(shm_base) + MetasOffset(capacity));
     }
 
+    static BroadcastEraMeta* EraMetasOf(void* shm_base,
+                                        uint64_t capacity) noexcept {
+        return reinterpret_cast<BroadcastEraMeta*>(
+            static_cast<unsigned char*>(shm_base) + EraMetasOffset(capacity));
+    }
+
     static SubscriberSlot* SubsOf(void* shm_base, uint64_t capacity) noexcept {
         return reinterpret_cast<SubscriberSlot*>(
             static_cast<unsigned char*>(shm_base) + SubsOffset(capacity));
+    }
+
+    static bool IsCursorCleanupToken(uint64_t cursor) noexcept {
+        return (cursor & kCursorCleanupBit) != 0;
+    }
+
+    static uint64_t CursorSequence(uint64_t cursor) noexcept {
+        return cursor & ~kCursorCleanupBit;
+    }
+
+    static uint64_t CursorCleanupToken(uint64_t sequence) noexcept {
+        return sequence | kCursorCleanupBit;
+    }
+
+    // Completes exactly one claimed cursor era. The exact sequence and atomic
+    // payload-era stamp jointly prevent an old helper from touching a recycled
+    // bitmap. Publishing the stable next cursor is last.
+    bool FinishCursorCleanup(uint32_t id, uint64_t sequence) const noexcept {
+        const uint64_t token = CursorCleanupToken(sequence);
+        if (subs_[id].cursor.load(std::memory_order_acquire) != token) {
+            return false;
+        }
+        const uint64_t phys = sequence & mask_;
+        bool cleared = false;
+        if (slots_[phys].sequence_num.load(std::memory_order_acquire) == sequence &&
+            era_metas_[phys].payload_era.load(std::memory_order_acquire) ==
+                sequence + 1) {
+            uint64_t expected_era = sequence + 1;
+            cleared = era_metas_[phys].ack_era[id].compare_exchange_strong(
+                expected_era, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        uint64_t expected = token;
+        subs_[id].cursor.compare_exchange_strong(
+            expected, sequence + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        return cleared;
+    }
+
+    uint64_t LoadCursorAndHelp(uint32_t id) const noexcept {
+        for (;;) {
+            const uint64_t cursor =
+                subs_[id].cursor.load(std::memory_order_acquire);
+            if (!IsCursorCleanupToken(cursor)) {
+                return cursor;
+            }
+            FinishCursorCleanup(id, CursorSequence(cursor));
+        }
+    }
+
+    void HelpAllCursorCleanups() const noexcept {
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            LoadCursorAndHelp(id);
+        }
+    }
+
+    bool AllAckedForEra(uint64_t phys, uint64_t sequence) const noexcept {
+        const uint64_t token = sequence + 1;
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            if (era_metas_[phys].ack_era[id].load(
+                    std::memory_order_acquire) == token) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void AdvanceCursorPast(uint32_t id, uint64_t sequence) const noexcept {
+        uint64_t expected = sequence;
+        if (subs_[id].cursor.compare_exchange_strong(
+                expected, CursorCleanupToken(sequence),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            FinishCursorCleanup(id, sequence);
+        } else if (IsCursorCleanupToken(expected)) {
+            FinishCursorCleanup(id, CursorSequence(expected));
+        }
     }
 
     // Removes one subscriber from future publication snapshots and advances
@@ -1250,8 +1354,7 @@ private:
             const uint32_t id =
                 static_cast<uint32_t>(__builtin_ctzll(remaining));
             remaining &= remaining - 1;
-            const uint64_t cursor =
-                subs_[id].cursor.load(std::memory_order_acquire);
+            const uint64_t cursor = LoadCursorAndHelp(id);
             if (cursor < min_cursor) {
                 min_cursor = cursor;
             }
@@ -1271,8 +1374,7 @@ private:
         const uint64_t floor = (prod > capacity_) ? prod - capacity_ : 0;
         uint64_t min_cursor = prod;
         for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
-            const uint64_t cursor =
-                subs_[id].cursor.load(std::memory_order_acquire);
+            const uint64_t cursor = LoadCursorAndHelp(id);
             if (cursor < min_cursor) {
                 min_cursor = cursor;
             }
@@ -1310,10 +1412,26 @@ private:
         const uint64_t phys = sequence & mask_;
         const SubscriberSetSnapshot snap = SnapshotSubscriberSet();
         metas_[phys].subscriber_set_version = snap.version;
-        // One bit per active subscriber at this instant: exactly the set of
-        // ACKs this message must collect before its slot may retire.
+        // Preserve the publication membership snapshot in the legacy compact
+        // bitmap; v4's mutable cleanup authority is ack_era below.
         metas_[phys].ack_bitmap.bits.store(snap.membership,
                                            std::memory_order_relaxed);
+        BroadcastEraMeta& era = era_metas_[phys];
+        const uint64_t ack_token = sequence + 1;
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            const bool owed = (snap.membership & (uint64_t{1} << id)) != 0;
+            era.ack_era[id].store(owed ? ack_token : 0,
+                                  std::memory_order_relaxed);
+        }
+        era.payload_offset.store(slot->payload.offset,
+                                 std::memory_order_relaxed);
+        const uint64_t identity =
+            (static_cast<uint64_t>(slot->payload.generation) << 32) |
+            static_cast<uint64_t>(slot->payload.region_id);
+        era.payload_identity.store(identity, std::memory_order_relaxed);
+        // Release-publish the coherent payload copy before READY/cursor make
+        // this logical era visible. sequence + 1 reserves zero as invalid.
+        era.payload_era.store(sequence + 1, std::memory_order_release);
         SealIndexSlotImmutableCrc(*slot);
         slot->state.store(static_cast<uint32_t>(SlotState::kReady),
                           std::memory_order_release);
@@ -1324,13 +1442,17 @@ private:
         return Status::Ok();
     }
 
-    // Stamps an ABORTED tombstone and advances the publisher cursor. The
-    // ack_bitmap is cleared: an aborted message has no delivery obligation,
-    // so subscribers skip it without touching the bitmap (design doc 9.6).
+    // Stamps an ABORTED tombstone and advances the publisher cursor. All ACK
+    // metadata is cleared: an aborted message has no delivery obligation.
     Status AbortSlot(IndexSlot* slot) noexcept {
-        metas_[control_->publisher_cursor.load(std::memory_order_relaxed) &
-               mask_]
-            .ack_bitmap.bits.store(0, std::memory_order_relaxed);
+        const uint64_t sequence =
+            control_->publisher_cursor.load(std::memory_order_relaxed);
+        const uint64_t phys = sequence & mask_;
+        metas_[phys].ack_bitmap.bits.store(0, std::memory_order_relaxed);
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            era_metas_[phys].ack_era[id].store(0,
+                                               std::memory_order_relaxed);
+        }
         slot->state.store(static_cast<uint32_t>(SlotState::kAborted),
                           std::memory_order_relaxed);
         control_->publisher_cursor.fetch_add(1, std::memory_order_release);
@@ -1349,69 +1471,116 @@ private:
     // subscriber either wins first (and we re-read) or loses cleanly; the
     // publisher's own cursor never moves backward.
     void ForceDropOldest(uint64_t prod) noexcept {
-        const uint64_t membership =
-            control_->current_membership.load(std::memory_order_acquire);
-        if (membership == 0) {
-            return;  // Unreachable via Reserve (never full), but stay safe.
-        }
-        uint32_t slowest = 0;
-        uint64_t min_cursor = prod;
-        uint64_t remaining = membership;
-        while (remaining != 0) {
-            const uint32_t id =
-                static_cast<uint32_t>(__builtin_ctzll(remaining));
-            remaining &= remaining - 1;
-            const uint64_t cursor =
-                subs_[id].cursor.load(std::memory_order_acquire);
-            if (cursor < min_cursor) {
-                min_cursor = cursor;
-                slowest = id;
+        for (;;) {
+            const uint64_t membership =
+                control_->current_membership.load(std::memory_order_acquire);
+            if (membership == 0) {
+                return;
             }
-        }
-        if (min_cursor >= prod) {
-            return;  // Slowest subscriber is caught up: nothing to drop.
-        }
-        // Clear the victim's bit in every slot it is about to skip: those
-        // slots may then retire in CollectGarbage once every other
-        // subscriber has acked them.
-        for (uint64_t seq = min_cursor; seq < prod; ++seq) {
-            IndexSlot* slot = &slots_[seq & mask_];
-            if (slot->sequence_num.load(std::memory_order_acquire) != seq) {
+            uint32_t slowest = 0;
+            uint64_t min_cursor = prod;
+            uint64_t remaining = membership;
+            while (remaining != 0) {
+                const uint32_t id =
+                    static_cast<uint32_t>(__builtin_ctzll(remaining));
+                remaining &= remaining - 1;
+                const uint64_t cursor = LoadCursorAndHelp(id);
+                if (cursor < min_cursor) {
+                    min_cursor = cursor;
+                    slowest = id;
+                }
+            }
+            if (min_cursor >= prod) {
+                return;
+            }
+
+            // The cursor is the authority to drop. Never clear first: a racing
+            // ACK that wins this CAS changes the actual skipped interval, so a
+            // failed CAS must restart selection without touching any bitmap.
+            uint64_t expected = min_cursor;
+            if (!subs_[slowest].cursor.compare_exchange_strong(
+                    expected, prod, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
                 continue;
             }
-            metas_[seq & mask_].ack_bitmap.Clear(slowest);
+
+            // This is the single publisher, so after its successful cursor CAS
+            // no physical era in [min_cursor, prod) can be recycled until this
+            // loop finishes and Reserve resumes. Clear exactly what this CAS
+            // skipped, and nothing from a failed/stale observation.
+            for (uint64_t seq = min_cursor; seq < prod; ++seq) {
+                IndexSlot* slot = &slots_[seq & mask_];
+                const uint64_t phys = seq & mask_;
+                if (slot->sequence_num.load(std::memory_order_acquire) == seq) {
+                    uint64_t expected_era = seq + 1;
+                    era_metas_[phys].ack_era[slowest].compare_exchange_strong(
+                        expected_era, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                }
+            }
+            CollectGarbage();
+            return;
         }
-        // CAS advance: a concurrent Poll/Ack of the victim may have moved
-        // the cursor forward already; whichever writer wins, the cursor
-        // stays monotonic (both advance it strictly forward).
-        uint64_t expected = min_cursor;
-        subs_[slowest].cursor.compare_exchange_strong(
-            expected, prod, std::memory_order_acq_rel,
-            std::memory_order_acquire);
-        CollectGarbage();
     }
 
-    // Subscriber-side Ack. Clears the ack bit on slot `sequence`; when
-    // `sequence` is the subscriber's current head the cursor advances
-    // (CAS against a racing kDropOldest) and fully-acked slots retire.
-    // A sequence behind the cursor was overtaken by kDropOldest: the bit
-    // is still cleared (idempotent; the drop may already have cleared it)
-    // but the cursor is untouched and kNotFound reports the drop.
-    Status AckSlot(SubscriberId sub, uint64_t sequence) noexcept {
-        SubscriberSlot& ss = subs_[sub.value];
-        const uint64_t cons = ss.cursor.load(std::memory_order_acquire);
-        // Clear unconditionally, including for an overtaken sequence: the
-        // slot may still be live and waiting on this bit to retire.
-        metas_[sequence & mask_].ack_bitmap.Clear(sub.value);
+    // Subscriber-side ACK. Only the exact current cursor may ACK: a Borrow
+    // overtaken by kDropOldest is stale authority and never clears any bit.
+    // The cursor CAS installs a sequence-bound cleanup token before the bitmap
+    // update. Until that token is finished, active fullness checks and Reserve's
+    // help pass keep the physical era from being reused. If this process dies,
+    // any observer can perform the same exact-era clear and advance the cursor.
+    Status AckSlot(SubscriberHandle sub, uint64_t sequence) noexcept {
+        if (sub.id.value >= kMaxSubscribers) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber id out of range");
+        }
+        SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive) ||
+            ss.generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(
+                StatusCode::kNotFound,
+                "subscriber not registered or stale generation");
+        }
+
+        const uint64_t cons = LoadCursorAndHelp(sub.id.value);
         if (sequence != cons) {
             return Status::Error(
                 StatusCode::kNotFound,
-                "message was dropped (overtaken by kDropOldest)");
+                "message was dropped or already acknowledged");
         }
-        uint64_t expected = cons;
-        ss.cursor.compare_exchange_strong(expected, cons + 1,
-                                          std::memory_order_acq_rel,
-                                          std::memory_order_acquire);
+        const uint64_t phys = sequence & mask_;
+        if (control_->publisher_cursor.load(std::memory_order_acquire) <=
+                sequence ||
+            slots_[phys].sequence_num.load(std::memory_order_acquire) !=
+                sequence ||
+            era_metas_[phys].payload_era.load(std::memory_order_acquire) !=
+                sequence + 1) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "message slot is no longer ackable");
+        }
+        // Close the unregister/generation race before installing authority.
+        if (ss.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive) ||
+            ss.generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(
+                StatusCode::kNotFound,
+                "subscriber not registered or stale generation");
+        }
+
+        uint64_t expected = sequence;
+        if (!ss.cursor.compare_exchange_strong(
+                expected, CursorCleanupToken(sequence),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (IsCursorCleanupToken(expected)) {
+                FinishCursorCleanup(sub.id.value, CursorSequence(expected));
+            }
+            return Status::Error(
+                StatusCode::kNotFound,
+                "message was dropped or concurrently acknowledged");
+        }
+
+        FinishCursorCleanup(sub.id.value, sequence);
         CollectGarbage();
         return Status::Ok();
     }
@@ -1419,6 +1588,7 @@ private:
     ControlBlock* control_ = nullptr;
     IndexSlot* slots_ = nullptr;
     BroadcastSlotMeta* metas_ = nullptr;
+    BroadcastEraMeta* era_metas_ = nullptr;
     SubscriberSlot* subs_ = nullptr;
     uint64_t capacity_ = 0;
     uint64_t mask_ = 0;

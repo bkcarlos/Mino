@@ -18,6 +18,7 @@
 #include <limits>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <time.h>
@@ -25,7 +26,9 @@
 
 #include "mino/common/checked_arithmetic.h"
 #include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/allocator/large_object_pool.h"
 #include "mino/shm/recovery/scanner.h"
+#include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/region.h"
 
 namespace mino {
@@ -367,35 +370,182 @@ Status RecoverRegionForAttach(SharedMemoryRegion& region,
             return status;
         };
 
-        const uint64_t allocator_available =
-            region.size() - sb->allocator_offset;
-        void* allocator_base = region.base() + sb->allocator_offset;
-        auto metadata_present = CentralSlabAllocator::HasAllocatorMetadata(
-            allocator_base, allocator_available);
-        if (!metadata_present.ok()) {
-            return fail_owned(metadata_present.status());
+        shm::recovery::RecoveryOwnership ownership{
+            .context = &owner,
+            .is_owner = &RegionRecoveryOwnerIsCurrent,
+            .heartbeat = &RenewRegionRecoveryLease,
+        };
+        auto directory = region.recovery_directory();
+        if (!directory.ok()) {
+            return fail_owned(directory.status());
         }
-        if (*metadata_present) {
-            RegionAllocatorStorage storage{
-                .region_base = region.base(),
-                .region_size = region.size(),
-                .allocator_offset = sb->allocator_offset,
-                .allocator_size = sb->data_offset - sb->allocator_offset,
-                .data_offset = sb->data_offset,
-                .data_size = sb->data_size,
-                .region_id = sb->region_id,
-            };
-            auto allocator = CentralSlabAllocator::AttachInRegion(storage);
-            if (!allocator.ok()) {
-                return fail_owned(allocator.status());
+        const bool references_complete =
+            (directory->flags & kRecoveryDirectoryReferencesComplete) != 0;
+        const std::span<const RecoveryObjectReference> references(
+            directory->references, directory->reference_count);
+
+        struct CentralResource {
+            uint32_t id;
+            CentralSlabAllocator allocator;
+        };
+        struct LargeResource {
+            uint32_t id;
+            LargeObjectPool pool;
+        };
+        std::vector<CentralResource> central_resources;
+        std::vector<LargeResource> large_resources;
+        std::vector<RecoveryResourceDescriptor> cleanup_resources;
+
+        // Validation/attach pass. No repair happens until every descriptor and
+        // every complete-set reference is known to be structurally valid.
+        for (uint32_t i = 0; i < directory->resource_count; ++i) {
+            const RecoveryResourceDescriptor& descriptor =
+                directory->resources[i];
+            Status valid = ValidateRecoveryResourceDescriptor(
+                descriptor, region.size());
+            if (!valid.ok()) {
+                return fail_owned(Status::Error(
+                    StatusCode::kCorruption,
+                    "registered recovery resource is invalid: " +
+                        valid.ToString()));
             }
-            shm::recovery::RecoveryOwnership ownership{
-                .context = &owner,
-                .is_owner = &RegionRecoveryOwnerIsCurrent,
-                .heartbeat = &RenewRegionRecoveryLease,
-            };
+            for (uint32_t j = 0; j < i; ++j) {
+                if (directory->resources[j].resource_id ==
+                    descriptor.resource_id) {
+                    return fail_owned(Status::Error(
+                        StatusCode::kCorruption,
+                        "duplicate recovery resource id"));
+                }
+            }
+            const auto kind =
+                static_cast<RecoveryResourceKind>(descriptor.kind);
+            if (kind == RecoveryResourceKind::kCentralAllocator) {
+                if (descriptor.offset != sb->allocator_offset ||
+                    descriptor.size != sb->data_offset - sb->allocator_offset) {
+                    return fail_owned(Status::Error(
+                        StatusCode::kCorruption,
+                        "Central allocator descriptor does not match Region layout"));
+                }
+                RegionAllocatorStorage storage{
+                    .region_base = region.base(),
+                    .region_size = region.size(),
+                    .allocator_offset = descriptor.offset,
+                    .allocator_size = descriptor.size,
+                    .data_offset = sb->data_offset,
+                    .data_size = sb->data_size,
+                    .region_id = sb->region_id,
+                };
+                auto allocator = CentralSlabAllocator::AttachInRegion(storage);
+                if (!allocator.ok()) {
+                    return fail_owned(allocator.status());
+                }
+                central_resources.push_back(
+                    CentralResource{descriptor.resource_id,
+                                    std::move(*allocator)});
+            } else if (kind == RecoveryResourceKind::kLargeObjectPool) {
+                if (descriptor.offset < sb->data_offset) {
+                    return fail_owned(Status::Error(
+                        StatusCode::kCorruption,
+                        "large pool overlaps Region control metadata"));
+                }
+                auto pool = LargeObjectPool::Attach(LargeObjectPoolStorage{
+                    .region_base = region.base(),
+                    .region_size = region.size(),
+                    .pool_offset = descriptor.offset,
+                    .pool_size = descriptor.size,
+                    .region_id = sb->region_id,
+                });
+                if (!pool.ok()) {
+                    return fail_owned(pool.status());
+                }
+                large_resources.push_back(
+                    LargeResource{descriptor.resource_id, std::move(*pool)});
+            } else {
+                if (descriptor.offset < sb->data_offset ||
+                    descriptor.control_offset < sb->data_offset) {
+                    return fail_owned(Status::Error(
+                        StatusCode::kCorruption,
+                        "cleanup resource overlaps Region control metadata"));
+                }
+                cleanup_resources.push_back(descriptor);
+            }
+        }
+
+        // Compatibility path for callers that initialized the legacy Central
+        // allocator but have not yet registered it. References are necessarily
+        // incomplete here, so normal PUBLISHED slabs remain untouched.
+        if (directory->resource_count == 0) {
+            const uint64_t allocator_size =
+                sb->data_offset - sb->allocator_offset;
+            void* allocator_base = region.base() + sb->allocator_offset;
+            auto present = CentralSlabAllocator::HasAllocatorMetadata(
+                allocator_base, allocator_size);
+            if (!present.ok()) {
+                return fail_owned(present.status());
+            }
+            if (*present) {
+                RegionAllocatorStorage storage{
+                    .region_base = region.base(),
+                    .region_size = region.size(),
+                    .allocator_offset = sb->allocator_offset,
+                    .allocator_size = allocator_size,
+                    .data_offset = sb->data_offset,
+                    .data_size = sb->data_size,
+                    .region_id = sb->region_id,
+                };
+                auto allocator = CentralSlabAllocator::AttachInRegion(storage);
+                if (!allocator.ok()) {
+                    return fail_owned(allocator.status());
+                }
+                central_resources.push_back(
+                    CentralResource{0, std::move(*allocator)});
+            }
+        }
+
+        if (references_complete) {
+            for (const RecoveryObjectReference& reference : references) {
+                bool valid_reference = reference.resource_id != 0 &&
+                                       reference.generation != 0 &&
+                                       reference.reserved == 0;
+                bool matched_resource = false;
+                for (const CentralResource& resource : central_resources) {
+                    if (resource.id != reference.resource_id) {
+                        continue;
+                    }
+                    matched_resource = true;
+                    valid_reference &=
+                        reference.unit_index <
+                            resource.allocator.total_slot_count() &&
+                        resource.allocator.IsSlotOccupiedForRecovery(
+                            reference.unit_index) &&
+                        resource.allocator.AuthoritativeGenerationForRecovery(
+                            reference.unit_index) == reference.generation;
+                }
+                for (const LargeResource& resource : large_resources) {
+                    if (resource.id != reference.resource_id) {
+                        continue;
+                    }
+                    matched_resource = true;
+                    auto handle =
+                        resource.pool.HandleForRecovery(reference.unit_index);
+                    valid_reference &= handle.ok() &&
+                                       handle->generation == reference.generation &&
+                                       resource.pool.InspectPlan(*handle).ok();
+                }
+                valid_reference &= matched_resource;
+                if (!valid_reference) {
+                    return fail_owned(Status::Error(
+                        StatusCode::kCorruption,
+                        "complete recovery reference set contains an invalid unit"));
+                }
+            }
+        }
+
+        uint64_t corruption_count = 0;
+        for (CentralResource& resource : central_resources) {
             auto scanner = shm::recovery::RecoveryScanner::Create(
-                std::move(*allocator), ownership);
+                std::move(resource.allocator), ownership, {}, resource.id,
+                references, references_complete && resource.id != 0);
             if (!scanner.ok()) {
                 return fail_owned(scanner.status());
             }
@@ -403,11 +553,34 @@ Status RecoverRegionForAttach(SharedMemoryRegion& region,
             if (!report.ok()) {
                 return fail_owned(report.status());
             }
-            if (report->corrupted_slab_count != 0) {
-                return fail_owned(Status::Error(
-                    StatusCode::kCorruption,
-                    "allocator recovery did not establish consistency"));
+            corruption_count += report->corrupted_slab_count;
+        }
+        for (LargeResource& resource : large_resources) {
+            auto scanner = shm::recovery::RecoveryScanner::Create(
+                std::move(resource.pool), resource.id, ownership, {}, references,
+                references_complete);
+            if (!scanner.ok()) {
+                return fail_owned(scanner.status());
             }
+            auto report = scanner->Scan();
+            if (!report.ok()) {
+                return fail_owned(report.status());
+            }
+            corruption_count += report->corrupted_slab_count;
+        }
+        for (const RecoveryResourceDescriptor& descriptor : cleanup_resources) {
+            shm::recovery::RecoveryReport report;
+            Status cleaned =
+                shm::recovery::RecoveryScanner::CleanupGenerationScopedResource(
+                    region.base(), region.size(), descriptor, ownership, &report);
+            if (!cleaned.ok()) {
+                return fail_owned(cleaned);
+            }
+        }
+        if (corruption_count != 0) {
+            return fail_owned(Status::Error(
+                StatusCode::kCorruption,
+                "registered resource recovery did not establish consistency"));
         }
 
         // Lease renewal is liveness only. The no-window commit is the exact

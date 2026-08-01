@@ -112,7 +112,8 @@ private:
 
 class SubscriberLeaseCoordinator {
 public:
-    using IdentityProbe = bool (*)(const ProcessIdentity&, void*) noexcept;
+    using IdentityProbe = ProcessIdentityLiveness (*)(const ProcessIdentity&,
+                                                       void*) noexcept;
     using PinCleanup = void (*)(const ProcessIdentity&, void*) noexcept;
 
     SubscriberLeaseCoordinator(BroadcastChannel& channel,
@@ -133,14 +134,15 @@ public:
 
     Status Unregister(SubscriberLeaseHandle handle) noexcept;
 
-    // Evicts expired leases whose exact ProcessIdentity is no longer alive.
-    // Returns the number of completed evictions.
+    // Evicts expired leases only when the exact ProcessIdentity is proven dead.
+    // kAlive and kUnknown both block destructive eviction. Returns the number
+    // of completed evictions.
     uint64_t EvictExpired(uint64_t now_ns, uint64_t lease_ns) noexcept;
 
 private:
-    static bool DefaultIdentityProbe(const ProcessIdentity& identity,
-                                     void*) noexcept {
-        return IsProcessIdentityAlive(identity);
+    static ProcessIdentityLiveness DefaultIdentityProbe(
+        const ProcessIdentity& identity, void*) noexcept {
+        return ProbeProcessIdentity(identity);
     }
 
     void CleanupPins(const ProcessIdentity& owner) noexcept {

@@ -309,7 +309,8 @@ uint64_t SubscriberLeaseCoordinator::EvictExpired(uint64_t now_ns,
             observed->state != SubscriberLeaseState::kActive ||
             now_ns < observed->heartbeat_ns ||
             now_ns - observed->heartbeat_ns < lease_ns ||
-            identity_probe_(observed->owner, identity_probe_context_)) {
+            identity_probe_(observed->owner, identity_probe_context_) !=
+                ProcessIdentityLiveness::kDead) {
             continue;
         }
 

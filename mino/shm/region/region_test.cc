@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -71,6 +72,94 @@ TEST_F(RegionTest, CreateAttachAndDetachLifecycle) {
   EXPECT_EQ(LoadRegionState(*attached->superblock()), RegionState::kActive);
   EXPECT_FALSE(LoadCleanShutdown(*attached->superblock()));
   EXPECT_TRUE(attached->Detach().ok());
+}
+
+TEST_F(RegionTest, RecoveryDirectoryPublishesResourcesAndReferences) {
+  const std::string name = Name("rd");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  auto initial = region->recovery_directory();
+  ASSERT_TRUE(initial.ok()) << initial.status().ToString();
+  EXPECT_EQ(initial->resource_count, 0u);
+  EXPECT_EQ(initial->reference_count, 0u);
+
+  const SuperBlock& sb = *region->superblock();
+  RecoveryResourceDescriptor central{
+      .resource_id = 17,
+      .kind = static_cast<uint32_t>(RecoveryResourceKind::kCentralAllocator),
+      .format_version = 1,
+      .offset = sb.allocator_offset,
+      .size = sb.data_offset - sb.allocator_offset,
+  };
+  ASSERT_TRUE(region->RegisterRecoveryResource(central).ok());
+  const RecoveryObjectReference reference{
+      .resource_id = 17, .unit_index = 3, .generation = 9};
+  ASSERT_TRUE(region->PublishRecoveryReferences(
+                        std::span<const RecoveryObjectReference>(&reference, 1),
+                        /*complete=*/true)
+                  .ok());
+  auto published = region->recovery_directory();
+  ASSERT_TRUE(published.ok()) << published.status().ToString();
+  EXPECT_GT(published->sequence, initial->sequence);
+  ASSERT_EQ(published->resource_count, 1u);
+  EXPECT_EQ(published->resources[0].resource_id, 17u);
+  ASSERT_EQ(published->reference_count, 1u);
+  EXPECT_EQ(published->references[0].unit_index, 3u);
+  EXPECT_NE(published->flags & kRecoveryDirectoryReferencesComplete, 0u);
+}
+
+TEST_F(RegionTest, ConcurrentDirectoryReplacementPublishesOneValidSnapshot) {
+  const std::string name = Name("rt");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  const SuperBlock& sb = *region->superblock();
+  RecoveryResourceDescriptor descriptor{
+      .resource_id = 22,
+      .kind = static_cast<uint32_t>(RecoveryResourceKind::kCentralAllocator),
+      .format_version = 1,
+      .offset = sb.allocator_offset,
+      .size = sb.data_offset - sb.allocator_offset,
+  };
+  std::vector<Status> statuses(8, Status::Error(StatusCode::kInternal));
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    threads.emplace_back([&, i] {
+      RecoveryResourceDescriptor update = descriptor;
+      update.generation = i + 1;
+      statuses[i] = region->RegisterRecoveryResource(update);
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  for (const Status& status : statuses) {
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
+  auto snapshot = region->recovery_directory();
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status().ToString();
+  ASSERT_EQ(snapshot->resource_count, 1u);
+  EXPECT_EQ(snapshot->resources[0].resource_id, 22u);
+  EXPECT_GE(snapshot->resources[0].generation, 1u);
+  EXPECT_LE(snapshot->resources[0].generation, statuses.size());
+}
+
+TEST_F(RegionTest, AttachRejectsPublishedDirectoryCrcCorruption) {
+  const std::string name = Name("rc");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  const SuperBlock& sb = *region->superblock();
+  auto* image = reinterpret_cast<RecoveryDirectoryImage*>(
+      region->base() + sb.directory_offset);
+  const uint64_t word = std::atomic_ref(image->control.published_word)
+                            .load(std::memory_order_acquire);
+  image->snapshots[word & 1u].crc32 ^= 1u;
+
+  RegionAttachOptions options;
+  options.name = name;
+  options.read_only = true;
+  auto attached = SharedMemoryRegion::Attach(options);
+  ASSERT_FALSE(attached.ok());
+  EXPECT_EQ(attached.status().code(), StatusCode::kCorruption);
 }
 
 TEST_F(RegionTest, StaleServiceEpochCannotPublishClosed) {

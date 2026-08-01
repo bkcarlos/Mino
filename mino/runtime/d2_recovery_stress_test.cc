@@ -7,6 +7,7 @@
 #if defined(__unix__) || defined(__APPLE__)
 
 #include "mino/runtime/allocation_journal.h"
+#include "mino/runtime/journal_channel_recovery.h"
 #include "mino/runtime/publisher.h"
 #include "mino/runtime/subscriber.h"
 #include "mino/runtime/subscriber_lease.h"
@@ -72,6 +73,7 @@ struct StaticMessageTraits<D2RecoveryStressMessage> {
 namespace {
 
 constexpr uint64_t kMpscCapacity = 64;
+constexpr uint64_t kMpscChannelId = 0xD213'0000'0000'0001ULL;
 constexpr uint64_t kBroadcastCapacity = 8;
 constexpr size_t kAllocatorBytes = 1u << 20;
 constexpr size_t kJournalBytes = 4096;
@@ -418,7 +420,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
         .publisher_id = static_cast<uint64_t>(scenario),
     };
     Publisher<D2RecoveryStressMessage> publisher(
-        *allocator, *channel, producer, *journal);
+        *allocator, *channel, kMpscChannelId, producer, *journal);
     auto builder = publisher.Allocate();
     if (!builder.ok()) {
         _exit(11);
@@ -444,25 +446,6 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
     _exit(status.ok() ? 0 : 14);
 }
 
-AllocationJournal::CommittedOrphanAction ResolveFromMpsc(
-    const AllocationTransaction&, const PublicationBinding& binding,
-    void* opaque) noexcept {
-    auto* channel = static_cast<MpscChannel*>(opaque);
-    if (binding.channel_kind != PublicationChannelKind::kMpsc ||
-        binding.payload.IsNull()) {
-        return AllocationJournal::CommittedOrphanAction::kDefer;
-    }
-    switch (channel->InspectPublication(binding.sequence, binding.payload)) {
-        case MpscChannel::PublicationVisibility::kVisible:
-            return AllocationJournal::CommittedOrphanAction::kFinalize;
-        case MpscChannel::PublicationVisibility::kNotVisible:
-            return AllocationJournal::CommittedOrphanAction::kRollback;
-        case MpscChannel::PublicationVisibility::kIndeterminate:
-            return AllocationJournal::CommittedOrphanAction::kDefer;
-    }
-    return AllocationJournal::CommittedOrphanAction::kDefer;
-}
-
 class D2RecoveryStressTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -484,6 +467,16 @@ protected:
         auto mpsc = MpscChannel::Init(shared_->mpsc_storage, kMpscCapacity);
         ASSERT_TRUE(mpsc.ok()) << mpsc.status().ToString();
         mpsc_.emplace(*mpsc);
+        recovery_.emplace(*journal_);
+        MpscChannel::ProducerIdentity registration_identity{
+            .owner = ProcessIdentity::Current(),
+            .publisher_id = kMpscChannelId,
+        };
+        Publisher<D2RecoveryStressMessage> registered_publisher(
+            allocator_, *mpsc_, kMpscChannelId, registration_identity,
+            *journal_);
+        ASSERT_TRUE(
+            registered_publisher.RegisterRecoveryChannel(*recovery_).ok());
         auto broadcast = BroadcastChannel::Init(shared_->broadcast_storage,
                                                  kBroadcastCapacity);
         ASSERT_TRUE(broadcast.ok());
@@ -648,14 +641,12 @@ protected:
     void RecoverProducts() {
         (void)mpsc_->AbortOrphanedReservations(NowNs() + 1000,
                                                /*lease_ns=*/1);
-        (void)journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
-                                      &*mpsc_);
+        (void)recovery_->RecoverOrphans();
         // A second pass verifies idempotency and lets kReclaiming/kFinalizing
         // work that was exposed by the first pass reach FREE.
         (void)mpsc_->AbortOrphanedReservations(NowNs() + 1000,
                                                /*lease_ns=*/1);
-        (void)journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
-                                      &*mpsc_);
+        (void)recovery_->RecoverOrphans();
     }
 
     void RunScenario(
@@ -782,7 +773,7 @@ protected:
             .publisher_id = 0xD213000000000000ULL ^ iteration,
         };
         Publisher<D2RecoveryStressMessage> publisher(
-            allocator_, *mpsc_, producer, *journal_);
+            allocator_, *mpsc_, kMpscChannelId, producer, *journal_);
         auto builder = publisher.Allocate();
         ASSERT_TRUE(builder.ok()) << builder.status().ToString();
         const ShmHandle progress_root = builder->handle();
@@ -819,6 +810,7 @@ protected:
     CentralSlabAllocator allocator_;
     std::optional<AllocationJournal> journal_;
     std::optional<MpscChannel> mpsc_;
+    std::optional<JournalChannelRecoveryCoordinator> recovery_;
     std::optional<BroadcastChannel> broadcast_;
     std::optional<SubscriberLeaseTable> leases_;
     pid_t child_pid_ = -1;
@@ -955,8 +947,7 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     ASSERT_TRUE(WaitStopped(deadline));
 
     EXPECT_EQ(mpsc_->AbortOrphanedReservations(NowNs() + 1000, 1), 0u);
-    EXPECT_EQ(journal_->RecoverOrphans(nullptr, nullptr, &ResolveFromMpsc,
-                                      &*mpsc_), 0u);
+    EXPECT_EQ(recovery_->RecoverOrphans(), 0u);
     EXPECT_GT(LiveSlabs(), 0u);
 
     ASSERT_EQ(::kill(child_pid_, SIGCONT), 0);

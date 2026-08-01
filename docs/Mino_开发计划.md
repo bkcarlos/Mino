@@ -91,7 +91,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 全部 13 篇 ADR 达到 ACCEPTED 状态
 - [x] `bazel build //...` 成功（空骨架）
 - [x] `bazel test //...` 通过（含 Status/Result 单测）
-- [x] Linux 本地五配置（debug/release/asan/ubsan/tsan）全绿（2026-08-01，各 57/57）
+- [x] Linux 本地五配置（debug/release/asan/ubsan/tsan）全绿（2026-08-01，修复后各 59/59，无缓存全量回归）
 - [ ] GitHub Actions 五配置首跑全绿并归档结果
 - [x] V-12 原子 ABI Litmus 报告产出（Linux x86-64 必需的 ≤64-bit Lock-free 与跨进程语义 4/4 通过；128-bit 为可选能力且未进入 v1 ABI）
 
@@ -192,8 +192,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
 - [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
 - [x] Publisher/Subscriber 随机 Kill ≥1 小时后恢复扫描无孤儿（`d2_recovery_stress_long_test`，seed 12345，2,959,560 次随机迭代，2026-08-01 Linux x86-64）
-- [x] ASAN/UBSAN/TSAN 全部通过（D2 Runtime/Channel/Allocator/ProcessIdentity 共 15 targets，本地三配置各 15/15）
-- [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；TLC 检查通过）
+- [x] ASAN/UBSAN/TSAN 全部通过（2026-08-01 修复后全仓无缓存回归各 59/59；D2 新增 JournalChannelRecoveryCoordinator、Broadcast era-bound ACK 与三态 Lease 回归）
+- [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；固定 `.cfg` 与 CI 已落地；TLC v1.7.4 实跑通过：MPSC 55,672、Broadcast 1,241、Lease 106,304 个 distinct states）
 
 ---
 

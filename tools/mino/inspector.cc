@@ -27,6 +27,32 @@ namespace mino::tools {
 
 namespace {
 
+// MpmcRing requires a trivially-copyable element type to validate an existing
+// backing. Inspector only needs an opaque element with the exact IndexSlot ABI;
+// the actual storage is interpreted through the authoritative IndexSlot type
+// after MpmcRing::Attach has validated size, alignment, magic, and version.
+struct alignas(alignof(Inspector::IndexSlotView)) InspectableRingElement {
+    std::byte bytes[sizeof(Inspector::IndexSlotView)];
+};
+using InspectableRing = MpmcRing<InspectableRingElement>;
+
+static_assert(sizeof(InspectableRingElement) ==
+              sizeof(Inspector::IndexSlotView));
+static_assert(alignof(InspectableRingElement) ==
+              alignof(Inspector::IndexSlotView));
+static_assert(InspectableRing::RequiredSize(
+                  1, sizeof(InspectableRingElement),
+                  alignof(InspectableRingElement)) ==
+              sizeof(Inspector::RingControlView) +
+                  sizeof(Inspector::RingSlotView));
+
+Result<InspectableRing> AttachInspectableRing(const void* control) {
+    // MpmcRing::Attach is logically read-only but its non-owning view supports
+    // later mutation, so its API accepts void*. Inspector never calls a
+    // mutating operation on the returned view.
+    return InspectableRing::Attach(const_cast<void*>(control));
+}
+
 constexpr std::string_view ObjectStateName(uint32_t value) {
     // Keep in sync with recovery::ObjectStateName (merged when the region
     // and allocator headers land).
@@ -66,8 +92,7 @@ constexpr bool IsProtocolReclaimableState(uint32_t value) {
 }  // namespace
 
 std::string SlotStateName(uint32_t state) {
-    // Ring index-slot states (detailed design 9.5): FREE, RESERVED, WRITING,
-    // READY, ABORTED, RETIRED.
+    // Ring index-slot states from the authoritative SlotState ABI.
     switch (state) {
         case 0:
             return "FREE";
@@ -78,9 +103,11 @@ std::string SlotStateName(uint32_t state) {
         case 3:
             return "READY";
         case 4:
-            return "ABORTED";
-        case 5:
             return "RETIRED";
+        case 5:
+            return "ABORTED";
+        case 6:
+            return "RETIRING";
         default:
             return "INVALID(" + std::to_string(state) + ")";
     }
@@ -200,25 +227,36 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
         }
     }
     for (const auto& ring : inspector.layout_.rings) {
-        if (inspector.At(ring.control_offset, sizeof(RingControlView)) ==
-            nullptr) {
+        const void* control_address =
+            inspector.At(ring.control_offset, sizeof(RingControlView));
+        if (control_address == nullptr) {
             return Status::Error(
                 StatusCode::kInvalidArgument,
                 "ring control block of channel " +
                     std::to_string(ring.channel_id) + " out of bounds");
         }
-        const auto* control = static_cast<const RingControlView*>(
-            inspector.At(ring.control_offset, sizeof(RingControlView)));
-        if (control->magic == RingControlView::kMagic) {
-            if (control->capacity >
-                    std::numeric_limits<uint64_t>::max() / kIndexSlotSize ||
-                inspector.At(ring.slots_offset,
-                             control->capacity * kIndexSlotSize) == nullptr) {
-                return Status::Error(
-                    StatusCode::kInvalidArgument,
-                    "ring slots of channel " +
-                        std::to_string(ring.channel_id) + " out of bounds");
+        auto attached = AttachInspectableRing(control_address);
+        if (!attached.ok()) {
+            // Preserve offline diagnostics for corrupt/unsupported control
+            // blocks; DumpRingBuffer reports the authoritative Attach error.
+            // Misalignment, however, would make any typed control access UB.
+            if (attached.status().code() == StatusCode::kInvalidArgument) {
+                return attached.status();
             }
+            continue;
+        }
+
+        const auto* control = static_cast<const RingControlView*>(control_address);
+        const uint64_t slots_offset =
+            ring.control_offset + sizeof(RingControlView);
+        if (control->capacity >
+                std::numeric_limits<uint64_t>::max() / kRingSlotStride ||
+            inspector.At(slots_offset,
+                         control->capacity * kRingSlotStride) == nullptr) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "ring slots of channel " + std::to_string(ring.channel_id) +
+                    " out of bounds");
         }
     }
     return inspector;
@@ -361,20 +399,24 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
                 "so provide an explicit RingRef/layout sidecar");
     }
 
-    const auto* control = static_cast<const RingControlView*>(
-        At(ref->control_offset, sizeof(RingControlView)));
-    if (control == nullptr) {
+    const void* control_address =
+        At(ref->control_offset, sizeof(RingControlView));
+    if (control_address == nullptr) {
         return Status::Error(StatusCode::kCorruption,
                              "ring control block out of bounds");
     }
-    if (control->magic != RingControlView::kMagic) {
-        return Status::Error(StatusCode::kCorruption,
-                             "ring control block has bad magic (channel " +
-                                 std::to_string(channel_id) + ")");
+    auto attached = AttachInspectableRing(control_address);
+    if (!attached.ok()) {
+        return attached.status();
     }
+
+    const auto* control = static_cast<const RingControlView*>(control_address);
     const uint64_t capacity = control->capacity;
-    if (capacity > std::numeric_limits<uint64_t>::max() / kIndexSlotSize ||
-        At(ref->slots_offset, capacity * kIndexSlotSize) == nullptr) {
+    const uint64_t slots_offset =
+        ref->control_offset + sizeof(RingControlView);
+    if (capacity >
+            std::numeric_limits<uint64_t>::max() / kRingSlotStride ||
+        At(slots_offset, capacity * kRingSlotStride) == nullptr) {
         return Status::Error(StatusCode::kCorruption,
                              "ring slot array is out of bounds");
     }
@@ -387,22 +429,26 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
     dump.pending = dump.enqueue_pos - dump.dequeue_pos;
     dump.elem_size = control->elem_size;
     dump.elem_align = control->elem_align;
-    dump.layout_version = control->layout_version;
+    dump.layout_version =
+        control->layout_version.load(std::memory_order_relaxed);
 
     const std::byte* slots_base =
-        static_cast<const std::byte*>(At(ref->slots_offset, 0));
+        static_cast<const std::byte*>(At(slots_offset, 0));
     dump.slots.reserve(dump.capacity);
     for (uint64_t i = 0; i < dump.capacity; ++i) {
-        const auto* slot = reinterpret_cast<const IndexSlotView*>(
-            slots_base + i * kIndexSlotSize);
+        const auto* ring_slot = reinterpret_cast<const RingSlotView*>(
+            slots_base + i * kRingSlotStride);
+        const auto* slot =
+            reinterpret_cast<const IndexSlotView*>(ring_slot->storage);
         dump.slots.push_back(RingSlotSummary{
-            slot->sequence_num,
+            ring_slot->sequence.load(std::memory_order_acquire),
+            slot->sequence_num.load(std::memory_order_acquire),
             slot->state.load(std::memory_order_acquire),
             slot->msg_type,
             slot->timestamp_ns,
-            slot->payload_offset,
+            slot->payload.offset,
             slot->payload_len,
-            slot->payload_generation,
+            slot->payload.generation,
         });
     }
     return dump;
@@ -457,7 +503,8 @@ Status Inspector::PrintReport(std::ostream& out) const {
         out << "slots (physical order):\n";
         for (uint64_t i = 0; i < dump->slots.size(); ++i) {
             const auto& s = dump->slots[i];
-            out << "  [" << i << "] seq=" << s.sequence
+            out << "  [" << i << "] ring_seq=" << s.ring_sequence
+                << " seq=" << s.sequence
                 << " state=" << SlotStateName(s.state)
                 << " msg_type=" << s.msg_type << " payload_off=0x" << std::hex
                 << s.payload_offset << std::dec << " len=" << s.payload_len

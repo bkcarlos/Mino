@@ -5,8 +5,11 @@
 #include "mino/runtime/delivery_receipt.h"
 
 #include <algorithm>
+#include <cassert>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <utility>
 
@@ -21,6 +24,7 @@ struct DeliveryReceipt::State {
     mutable std::condition_variable condition;
     std::vector<TargetDeliveryStatus> targets;
     std::vector<bool> updated;
+    bool admitted = false;
     bool completed = false;
     bool canceled = false;
     bool orphaned = false;
@@ -41,6 +45,11 @@ struct PublisherIdentityHash {
         combine(value.process.start_time_ns);
         return hash;
     }
+};
+
+struct PublisherReceiptCounts {
+    uint32_t outstanding = 0;
+    uint32_t reserved = 0;
 };
 
 uint32_t RequiredSuccesses(const DeliveryRequirement& requirement,
@@ -83,10 +92,17 @@ struct OutstandingReceiptTable::Impl {
 
     Limits limits;
     mutable std::mutex mutex;
+    // entries contains both reservations and committed outstanding receipts.
+    // admitted distinguishes the latter; reservations preallocate the map node
+    // so Commit cannot fail after local publication.
     std::unordered_map<uint64_t, std::shared_ptr<DeliveryReceipt::State>> entries;
-    std::unordered_map<PublisherReceiptIdentity, uint32_t, PublisherIdentityHash>
+    std::unordered_map<PublisherReceiptIdentity, PublisherReceiptCounts,
+                       PublisherIdentityHash>
         per_publisher;
-    std::atomic<uint64_t> next_id{1};
+    uint32_t reserved = 0;
+    uint64_t next_id = 1;
+    bool id_space_exhausted = false;
+    std::atomic<uint32_t> reserve_failure_point{0};
 };
 
 bool DeliveryStageSatisfies(DeliveryTargetKind target_kind,
@@ -167,6 +183,46 @@ void DeliveryReceipt::CancelWait() noexcept {
     state_->condition.notify_all();
 }
 
+OutstandingReceiptTable::Reservation::Reservation(
+    Reservation&& other) noexcept
+    : table_(other.table_), id_(other.id_) {
+    other.table_ = nullptr;
+    other.id_ = {};
+}
+
+OutstandingReceiptTable::Reservation&
+OutstandingReceiptTable::Reservation::operator=(Reservation&& other) noexcept {
+    if (this != &other) {
+        Cancel();
+        table_ = other.table_;
+        id_ = other.id_;
+        other.table_ = nullptr;
+        other.id_ = {};
+    }
+    return *this;
+}
+
+OutstandingReceiptTable::Reservation::~Reservation() { Cancel(); }
+
+DeliveryReceipt OutstandingReceiptTable::Reservation::Commit(
+    uint64_t source_sequence) && noexcept {
+    assert(table_ != nullptr);
+    OutstandingReceiptTable* table = table_;
+    const ReceiptId id = id_;
+    table_ = nullptr;
+    id_ = {};
+    return table->CommitReservation(id, source_sequence);
+}
+
+void OutstandingReceiptTable::Reservation::Cancel() noexcept {
+    if (table_ == nullptr) {
+        return;
+    }
+    table_->CancelReservation(id_);
+    table_ = nullptr;
+    id_ = {};
+}
+
 OutstandingReceiptTable::OutstandingReceiptTable()
     : OutstandingReceiptTable(Limits{}) {}
 
@@ -175,68 +231,210 @@ OutstandingReceiptTable::OutstandingReceiptTable(Limits limits)
 
 OutstandingReceiptTable::~OutstandingReceiptTable() = default;
 
+void OutstandingReceiptTable::SetReserveFailurePointForTesting(
+    ReserveFailurePointForTesting point) noexcept {
+    impl_->reserve_failure_point.store(static_cast<uint32_t>(point),
+                                       std::memory_order_relaxed);
+}
+
+void OutstandingReceiptTable::SetNextReceiptIdForTesting(uint64_t next_id) {
+    std::lock_guard table_lock(impl_->mutex);
+    impl_->next_id = next_id;
+    impl_->id_space_exhausted = next_id == 0;
+}
+
+Result<OutstandingReceiptTable::Reservation> OutstandingReceiptTable::Reserve(
+    const PublisherReceiptIdentity& publisher,
+    std::span<const DeliveryTarget> targets,
+    const DeliveryRequirement& requirement) {
+    const auto maybe_fail_allocation =
+        [this](ReserveFailurePointForTesting point) {
+            uint32_t expected = static_cast<uint32_t>(point);
+            if (impl_->reserve_failure_point.compare_exchange_strong(
+                    expected,
+                    static_cast<uint32_t>(
+                        ReserveFailurePointForTesting::kNone),
+                    std::memory_order_relaxed)) {
+                throw std::bad_alloc();
+            }
+        };
+
+    try {
+        if (publisher.process.IsZero() || publisher.publisher_id.value == 0) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "receipt publisher identity is invalid");
+        }
+        if (targets.empty() &&
+            requirement.stage != DeliveryStage::kLocalPublished) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "non-local receipt requires at least one target");
+        }
+        if (requirement.completion == CompletionPolicy::kQuorum &&
+            (requirement.quorum == 0 || requirement.quorum > targets.size())) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "receipt quorum is outside the target snapshot");
+        }
+
+        maybe_fail_allocation(ReserveFailurePointForTesting::kState);
+        auto state = std::make_shared<DeliveryReceipt::State>();
+        state->publisher = publisher;
+        state->requirement = requirement;
+        maybe_fail_allocation(ReserveFailurePointForTesting::kTargets);
+        state->targets.reserve(targets.size());
+        maybe_fail_allocation(ReserveFailurePointForTesting::kUpdated);
+        state->updated.reserve(targets.size());
+        for (DeliveryTarget target : targets) {
+            TargetDeliveryStatus status;
+            status.target = target;
+            if (requirement.stage == DeliveryStage::kLocalPublished) {
+                status.reached_stage = DeliveryStage::kLocalPublished;
+                status.status = Status::Ok();
+                state->updated.push_back(true);
+            } else {
+                state->updated.push_back(false);
+            }
+            state->targets.push_back(std::move(status));
+        }
+        state->completed = EvaluateCompletion(*state);
+
+        std::lock_guard table_lock(impl_->mutex);
+        if (impl_->entries.size() >= impl_->limits.max_outstanding) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "outstanding receipt table is full");
+        }
+
+        auto publisher_counts = impl_->per_publisher.find(publisher);
+        if (publisher_counts != impl_->per_publisher.end() &&
+            publisher_counts->second.outstanding +
+                    publisher_counts->second.reserved >=
+                impl_->limits.max_per_publisher) {
+            return Status::Error(
+                StatusCode::kResourceExhausted,
+                "publisher outstanding receipt quota exhausted");
+        }
+        if (publisher_counts == impl_->per_publisher.end() &&
+            impl_->limits.max_per_publisher == 0) {
+            return Status::Error(
+                StatusCode::kResourceExhausted,
+                "publisher outstanding receipt quota exhausted");
+        }
+        if (impl_->id_space_exhausted || impl_->next_id == 0) {
+            impl_->id_space_exhausted = true;
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "receipt id space exhausted");
+        }
+
+        bool inserted_publisher = false;
+        try {
+            if (publisher_counts == impl_->per_publisher.end()) {
+                maybe_fail_allocation(
+                    ReserveFailurePointForTesting::kPublisherEntry);
+                auto inserted = impl_->per_publisher.try_emplace(publisher);
+                publisher_counts = inserted.first;
+                inserted_publisher = inserted.second;
+            }
+
+            while (true) {
+                const uint64_t raw_id = impl_->next_id;
+                state->id = ReceiptId{raw_id};
+                maybe_fail_allocation(
+                    ReserveFailurePointForTesting::kReceiptEntry);
+                const auto inserted = impl_->entries.emplace(raw_id, state);
+                if (inserted.second) {
+                    if (raw_id == std::numeric_limits<uint64_t>::max()) {
+                        impl_->id_space_exhausted = true;
+                    } else {
+                        impl_->next_id = raw_id + 1;
+                    }
+                    ++publisher_counts->second.reserved;
+                    ++impl_->reserved;
+                    return Reservation(this, state->id);
+                }
+
+                if (raw_id == std::numeric_limits<uint64_t>::max()) {
+                    impl_->id_space_exhausted = true;
+                    if (inserted_publisher) {
+                        impl_->per_publisher.erase(publisher_counts);
+                        inserted_publisher = false;
+                    }
+                    return Status::Error(StatusCode::kResourceExhausted,
+                                         "receipt id space exhausted");
+                }
+                impl_->next_id = raw_id + 1;
+            }
+        } catch (const std::bad_alloc&) {
+            if (inserted_publisher) {
+                impl_->per_publisher.erase(publisher_counts);
+            }
+            return Status::Error(StatusCode::kResourceExhausted);
+        }
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
+
+DeliveryReceipt OutstandingReceiptTable::CommitReservation(
+    ReceiptId id, uint64_t source_sequence) noexcept {
+    std::shared_ptr<DeliveryReceipt::State> state;
+    {
+        std::lock_guard table_lock(impl_->mutex);
+        const auto found = impl_->entries.find(id.value);
+        assert(found != impl_->entries.end());
+        assert(!found->second->admitted);
+        state = found->second;
+        state->source_sequence = source_sequence;
+        state->admitted = true;
+
+        auto publisher = impl_->per_publisher.find(state->publisher);
+        assert(publisher != impl_->per_publisher.end());
+        assert(publisher->second.reserved != 0);
+        --publisher->second.reserved;
+        assert(impl_->reserved != 0);
+        --impl_->reserved;
+
+        if (state->completed) {
+            impl_->entries.erase(found);
+            if (publisher->second.outstanding == 0 &&
+                publisher->second.reserved == 0) {
+                impl_->per_publisher.erase(publisher);
+            }
+        } else {
+            ++publisher->second.outstanding;
+        }
+    }
+    return DeliveryReceipt(std::move(state));
+}
+
+void OutstandingReceiptTable::CancelReservation(ReceiptId id) noexcept {
+    std::lock_guard table_lock(impl_->mutex);
+    const auto found = impl_->entries.find(id.value);
+    if (found == impl_->entries.end() || found->second->admitted) {
+        return;
+    }
+    auto publisher = impl_->per_publisher.find(found->second->publisher);
+    assert(publisher != impl_->per_publisher.end());
+    assert(publisher->second.reserved != 0);
+    --publisher->second.reserved;
+    assert(impl_->reserved != 0);
+    --impl_->reserved;
+    impl_->entries.erase(found);
+    if (publisher->second.outstanding == 0 &&
+        publisher->second.reserved == 0) {
+        impl_->per_publisher.erase(publisher);
+    }
+}
+
 Result<DeliveryReceipt> OutstandingReceiptTable::Create(
     const PublisherReceiptIdentity& publisher, uint64_t source_sequence,
     std::span<const DeliveryTarget> targets,
     const DeliveryRequirement& requirement) {
-    if (publisher.process.IsZero() || publisher.publisher_id.value == 0) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "receipt publisher identity is invalid");
+    Result<Reservation> reservation = Reserve(publisher, targets, requirement);
+    if (!reservation.ok()) {
+        return reservation.status();
     }
-    if (targets.empty() && requirement.stage != DeliveryStage::kLocalPublished) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "non-local receipt requires at least one target");
-    }
-    if (requirement.completion == CompletionPolicy::kQuorum &&
-        (requirement.quorum == 0 || requirement.quorum > targets.size())) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "receipt quorum is outside the target snapshot");
-    }
-
-    std::lock_guard table_lock(impl_->mutex);
-    if (impl_->entries.size() >= impl_->limits.max_outstanding) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "outstanding receipt table is full");
-    }
-    uint32_t& publisher_count = impl_->per_publisher[publisher];
-    if (publisher_count >= impl_->limits.max_per_publisher) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "publisher outstanding receipt quota exhausted");
-    }
-
-    const uint64_t raw_id = impl_->next_id.fetch_add(1, std::memory_order_relaxed);
-    if (raw_id == 0) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "receipt id space exhausted");
-    }
-    auto state = std::make_shared<DeliveryReceipt::State>();
-    state->id = ReceiptId{raw_id};
-    state->publisher = publisher;
-    state->source_sequence = source_sequence;
-    state->requirement = requirement;
-    state->targets.reserve(targets.size());
-    state->updated.reserve(targets.size());
-    for (DeliveryTarget target : targets) {
-        TargetDeliveryStatus status;
-        status.target = target;
-        if (requirement.stage == DeliveryStage::kLocalPublished) {
-            status.reached_stage = DeliveryStage::kLocalPublished;
-            status.status = Status::Ok();
-            state->updated.push_back(true);
-        } else {
-            state->updated.push_back(false);
-        }
-        state->targets.push_back(std::move(status));
-    }
-    state->completed = EvaluateCompletion(*state);
-
-    if (!state->completed) {
-        impl_->entries.emplace(raw_id, state);
-        ++publisher_count;
-    } else if (publisher_count == 0) {
-        impl_->per_publisher.erase(publisher);
-    }
-    return DeliveryReceipt(std::move(state));
+    return std::move(*reservation).Commit(source_sequence);
 }
 
 Status OutstandingReceiptTable::Acknowledge(ReceiptId id,
@@ -248,7 +446,7 @@ Status OutstandingReceiptTable::Acknowledge(ReceiptId id,
     {
         std::lock_guard table_lock(impl_->mutex);
         const auto found = impl_->entries.find(id.value);
-        if (found == impl_->entries.end()) {
+        if (found == impl_->entries.end() || !found->second->admitted) {
             return Status::Error(StatusCode::kNotFound,
                                  "outstanding receipt was not found");
         }
@@ -281,7 +479,11 @@ Status OutstandingReceiptTable::Acknowledge(ReceiptId id,
         if (completed) {
             impl_->entries.erase(found);
             auto count = impl_->per_publisher.find(state->publisher);
-            if (count != impl_->per_publisher.end() && --count->second == 0) {
+            assert(count != impl_->per_publisher.end());
+            assert(count->second.outstanding != 0);
+            --count->second.outstanding;
+            if (count->second.outstanding == 0 &&
+                count->second.reserved == 0) {
                 impl_->per_publisher.erase(count);
             }
         }
@@ -292,39 +494,47 @@ Status OutstandingReceiptTable::Acknowledge(ReceiptId id,
 
 uint32_t OutstandingReceiptTable::CleanupPublisher(
     const PublisherReceiptIdentity& publisher) noexcept {
-    std::vector<std::shared_ptr<DeliveryReceipt::State>> removed;
-    {
-        std::lock_guard table_lock(impl_->mutex);
-        for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
-            if (it->second->publisher == publisher) {
-                removed.push_back(it->second);
-                it = impl_->entries.erase(it);
-            } else {
-                ++it;
-            }
+    uint32_t removed = 0;
+    std::lock_guard table_lock(impl_->mutex);
+    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+        if (!it->second->admitted || it->second->publisher != publisher) {
+            ++it;
+            continue;
         }
-        impl_->per_publisher.erase(publisher);
-    }
-    for (const auto& state : removed) {
+
+        const std::shared_ptr<DeliveryReceipt::State> state = it->second;
         {
             std::lock_guard state_lock(state->mutex);
             state->orphaned = true;
         }
+        it = impl_->entries.erase(it);
+        ++removed;
         state->condition.notify_all();
     }
-    return static_cast<uint32_t>(removed.size());
+
+    auto count = impl_->per_publisher.find(publisher);
+    if (count != impl_->per_publisher.end()) {
+        assert(count->second.outstanding == removed);
+        count->second.outstanding = 0;
+        if (count->second.reserved == 0) {
+            impl_->per_publisher.erase(count);
+        }
+    }
+    return removed;
 }
 
 uint32_t OutstandingReceiptTable::outstanding() const noexcept {
     std::lock_guard lock(impl_->mutex);
-    return static_cast<uint32_t>(impl_->entries.size());
+    assert(impl_->entries.size() >= impl_->reserved);
+    return static_cast<uint32_t>(impl_->entries.size() - impl_->reserved);
 }
 
 uint32_t OutstandingReceiptTable::outstanding_for(
     const PublisherReceiptIdentity& publisher) const noexcept {
     std::lock_guard lock(impl_->mutex);
     const auto found = impl_->per_publisher.find(publisher);
-    return found == impl_->per_publisher.end() ? 0u : found->second;
+    return found == impl_->per_publisher.end() ? 0u
+                                               : found->second.outstanding;
 }
 
 }  // namespace mino

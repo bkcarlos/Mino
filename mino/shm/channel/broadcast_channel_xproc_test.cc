@@ -248,15 +248,61 @@ TEST_F(BroadcastChannelXprocTest, FanOutConservationAcrossProcesses) {
             << "subscriber " << s << " lost messages";
     }
     EXPECT_EQ(channel_->Size(), kTotal);
-    // All ACKs collected: the last era of every physical slot retired.
+    // All ACKs collected: the last logical era of every physical slot retired.
     channel_->CollectGarbage();
-    const auto* slots = reinterpret_cast<const IndexSlot*>(
-        shared_->channel_storage + BroadcastChannel::SlotsOffset());
+    const auto* era_metas =
+        reinterpret_cast<const BroadcastChannel::BroadcastEraMeta*>(
+            shared_->channel_storage +
+            BroadcastChannel::EraMetasOffset(kCapacity));
     for (uint64_t i = 0; i < kCapacity; ++i) {
-        EXPECT_EQ(slots[i].state.load(std::memory_order_acquire),
-                  static_cast<uint32_t>(SlotState::kRetired))
+        const uint64_t last_sequence =
+            (kTotal - 1) - ((kTotal - 1 - i) % kCapacity);
+        EXPECT_EQ(era_metas[i].retired_era.load(std::memory_order_acquire),
+                  last_sequence + 1)
             << "slot " << i;
     }
+}
+
+// A subscriber process may die after its cursor CAS acquired exact-era cleanup
+// authority but before clearing ACK responsibility. The parent must help the
+// durable token without waiting for process liveness or touching a newer era.
+TEST_F(BroadcastChannelXprocTest, CrashedAckCleanupTokenIsRecovered) {
+    auto sub = channel_->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+    {
+        auto reservation = channel_->Reserve();
+        ASSERT_TRUE(reservation.ok());
+        FillSlot(*reservation, 0);
+        ASSERT_TRUE(std::move(*reservation).Commit().ok());
+    }
+
+    const pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        auto* subs = reinterpret_cast<BroadcastChannel::SubscriberSlot*>(
+            shared_->channel_storage +
+            BroadcastChannel::SubsOffset(kCapacity));
+        uint64_t expected = 0;
+        if (!subs[0].cursor.compare_exchange_strong(
+                expected, BroadcastChannel::kCursorCleanupBit,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            _exit(kChildApiError);
+        }
+        _exit(kChildOk);
+    }
+    WaitChild(pid);
+
+    auto reservation = channel_->TryReserve();
+    ASSERT_TRUE(reservation.ok()) << reservation.status().ToString();
+    const auto* subs = reinterpret_cast<const BroadcastChannel::SubscriberSlot*>(
+        shared_->channel_storage + BroadcastChannel::SubsOffset(kCapacity));
+    const auto* era_metas =
+        reinterpret_cast<const BroadcastChannel::BroadcastEraMeta*>(
+            shared_->channel_storage +
+            BroadcastChannel::EraMetasOffset(kCapacity));
+    EXPECT_EQ(subs[0].cursor.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(era_metas[0].ack_era[0].load(std::memory_order_acquire), 0u);
+    ASSERT_TRUE(std::move(*reservation).Abort().ok());
 }
 
 // A publisher that Reserve()s and then dies via _exit() never runs its

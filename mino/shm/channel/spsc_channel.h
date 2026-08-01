@@ -640,6 +640,42 @@ public:
     // Observers
     // -----------------------------------------------------------------------
 
+    enum class PublicationVisibility : uint32_t {
+        kNotVisible = 0,
+        kVisible = 1,
+        kIndeterminate = 2,
+    };
+
+    PublicationVisibility InspectPublication(uint64_t sequence,
+                                             ShmHandle payload) const noexcept {
+        const uint64_t consumed =
+            control_->consumer_cursor.load(std::memory_order_acquire);
+        if (consumed > sequence) {
+            // The consumer advances over both committed messages and ABORTED
+            // tombstones. Without a durable per-sequence outcome sidecar, the
+            // cursor alone is not evidence that this publication was visible.
+            return PublicationVisibility::kIndeterminate;
+        }
+        const uint64_t produced =
+            control_->producer_cursor.load(std::memory_order_acquire);
+        if (produced <= sequence) {
+            return PublicationVisibility::kNotVisible;
+        }
+        const IndexSlot& slot = slots_[sequence & mask_];
+        if (slot.sequence_num.load(std::memory_order_acquire) != sequence) {
+            return PublicationVisibility::kIndeterminate;
+        }
+        const uint32_t state = slot.state.load(std::memory_order_acquire);
+        if (state == static_cast<uint32_t>(SlotState::kAborted)) {
+            return PublicationVisibility::kNotVisible;
+        }
+        if (state == static_cast<uint32_t>(SlotState::kReady) &&
+            slot.payload == payload) {
+            return PublicationVisibility::kVisible;
+        }
+        return PublicationVisibility::kIndeterminate;
+    }
+
     bool IsEmpty() const noexcept {
         const uint64_t prod =
             control_->producer_cursor.load(std::memory_order_acquire);
