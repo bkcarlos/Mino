@@ -52,6 +52,7 @@ cc_library(
     hdrs = ["tests/generated/sample.generated.h"],
     deps = [
         "//mino/runtime:runtime_types",
+        "//mino/schema:registry",
         "//mino/schema:wire",
         "//mino/shm/channel:index_slot",
     ],
@@ -71,6 +72,7 @@ cc_library(
     hdrs = ["tests/generated/canonical_wire.generated.h"],
     deps = [
         "//mino/runtime:runtime_types",
+        "//mino/schema:registry",
         "//mino/schema:wire",
         "//mino/shm/channel:index_slot",
     ],
@@ -115,6 +117,7 @@ cc_library(
     hdrs = ["tests/generated/mangling.generated.h"],
     deps = [
         "//mino/runtime:runtime_types",
+        "//mino/schema:registry",
         "//mino/schema:wire",
         "//mino/shm/channel:index_slot",
     ],
@@ -146,6 +149,7 @@ cc_library(
     hdrs = ["tests/generated/sensor_frame.generated.h"],
     deps = [
         "//mino/runtime:runtime_types",
+        "//mino/schema:registry",
         "//mino/schema:wire",
         "//mino/shm/channel:index_slot",
     ],

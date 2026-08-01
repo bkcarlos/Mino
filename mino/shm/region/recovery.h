@@ -119,9 +119,10 @@ private:
 // If CentralSlabAllocator metadata is present, this function runs the real
 // allocator-backed RecoveryScanner while holding this Region's SuperBlock
 // RecoveryOwner. Corruption quarantines the Region before it can become ACTIVE.
-// ACTIVE + clean_shutdown=false is not sufficient proof of a crash because the
-// current SuperBlock has no live-service lease; that ambiguous state is fenced
-// with kWouldBlock rather than running destructive repair.
+// This low-level function never infers a crash from ACTIVE+!clean alone. The
+// v3 Region Attach gate first acquires the unique supervisor lock, validates
+// the old ProcessIdentity as dead, and explicitly publishes ACTIVE->DIRTY.
+// Direct callers that present ACTIVE are fenced with kWouldBlock.
 Status RecoverRegionForAttach(SharedMemoryRegion& region,
                               const ProcessIdentity& self,
                               uint64_t wait_timeout_ms);

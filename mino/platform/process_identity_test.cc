@@ -96,12 +96,18 @@ TEST(ProcessIdentityTest, EpochUniqueAcrossProcesses) {
 TEST(ProcessIdentityTest, LivenessValidatesProcessIncarnation) {
     const ProcessIdentity current = ProcessIdentity::Current();
     EXPECT_TRUE(IsProcessIdentityAlive(current));
+    EXPECT_EQ(ProbeProcessIdentity(current),
+              ProcessIdentityLiveness::kAlive);
 
     ProcessIdentity recycled = current;
     recycled.process_epoch ^= 1u;
     EXPECT_FALSE(IsProcessIdentityAlive(recycled));
+    EXPECT_EQ(ProbeProcessIdentity(recycled),
+              ProcessIdentityLiveness::kDead);
 
     EXPECT_FALSE(IsProcessIdentityAlive(ProcessIdentity{}));
+    EXPECT_EQ(ProbeProcessIdentity(ProcessIdentity{}),
+              ProcessIdentityLiveness::kDead);
 }
 
 TEST(ProcessIdentityTest, EqualityOperators) {

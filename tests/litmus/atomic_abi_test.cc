@@ -7,10 +7,10 @@
 //   1. std::atomic<uint64_t/uint32_t/uint16_t/bool> 为 lock-free；
 //   2. shm_open + mmap 共享内存映射上 placement-new 的 std::atomic<uint64_t>
 //      fetch_add / compare_exchange 行为正确；
-//   3. 128-bit 原子（std::atomic<__int128>）在 x86-64 上 lock-free（需 -mcx16）；
+//   3. 报告 128-bit 原子能力；v1 SHM ABI 不依赖 128-bit 原子，非 lock-free 时禁止使用；
 //   4. 跨进程（fork 共享同一 shm 映射）交替原子操作的 sequential consistency。
 //
-// 平台策略：特性不可用时一律 GTEST_SKIP 并输出原因，不 FAIL。
+// 平台策略：v1 必需能力不可用时 FAIL；可选 128-bit 能力只报告并禁止进入 SHM ABI。
 
 #include <gtest/gtest.h>
 
@@ -216,7 +216,7 @@ TEST(AtomicAbiLockFreeTest, BuiltinWidthsAreLockFree) {
 // V-12-2: 128-bit 原子（__int128）lock-free 验证
 // ---------------------------------------------------------------------------
 
-TEST(AtomicAbiLockFreeTest, AtomicInt128IsLockFree) {
+TEST(AtomicAbiLockFreeTest, AtomicInt128CapabilityIsReported) {
 #if defined(__SIZEOF_INT128__)
 #if MINO_HAS_ATOMIC_I128
   // V-12 的本职是「验证并报告」lock-free 能力，而不是让构建失败：
@@ -246,15 +246,16 @@ TEST(AtomicAbiLockFreeTest, AtomicInt128IsLockFree) {
   } else {
     std::printf("[V-12] 128-bit atomic: lock-free=0 (runtime-lowered, e.g. "
                 "sanitizer/libatomic)\n");
-    GTEST_SKIP() << "SKIP: 128-bit 原子在该配置下被 lower 为运行时调用"
-                    "（TSAN/ASAN 或缺 -mcx16/libatomic），非 lock-free";
+    std::printf("[V-12] 128-bit atomic is optional for v1; "
+                "non-lock-free capability is prohibited from the SHM ABI\n");
   }
 #else
-  GTEST_SKIP() << "SKIP: 编译器未启用 16 字节 CAS（x86-64 需 -mcx16 / "
-                  "CMPXCHG16B）";
+  std::printf("[V-12] optional 128-bit atomic unavailable: compiler has no "
+              "16-byte CAS support; prohibited from the v1 SHM ABI\n");
 #endif
 #else
-  GTEST_SKIP() << "SKIP: 平台不支持 __int128（非 GCC/Clang x86-64 工具链）";
+  std::printf("[V-12] optional 128-bit atomic unavailable: no __int128; "
+              "prohibited from the v1 SHM ABI\n");
 #endif
 }
 

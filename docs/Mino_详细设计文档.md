@@ -441,6 +441,8 @@ public:
 
 `Create` 内部向 Registry 申请持久 `region_id`（Durable High-water Mark，见 13.10），创建成功后通过 `region_id()` 返回；`Attach` 通过名称或显式 ID 解析目标 Region。
 
+SuperBlock v3 采用 supervisor-owner 契约（ADR-0014）：`read_only=true` 支持任意数量跨进程 Attach，且永不修改生命周期或运行恢复扫描；`read_only=false` 请求唯一 writable supervisor role，live supervisor 存在时返回 `kWouldBlock`。v3 ABI 无多进程 writer 注册表，因此独立进程并发 writable Attach 明确不支持，不能以超时 service lease 模拟支持。
+
 ### 6.3 Attach 校验顺序
 
 1. 校验文件/对象权限；
@@ -452,8 +454,9 @@ public:
 7. 校验 Header CRC；
 8. 映射完整 Region；
 9. 校验 Directory Offset、Allocator Offset 和数据区边界；
-10. 检查 `clean_shutdown` 和 `region_epoch`；
-11. 必要时进入恢复流程。
+10. writable Attach 获取唯一 supervisor lock，读取 `service_owner + service_epoch`，并用完整 `ProcessIdentity` 判活；
+11. 仅当 lock 已释放且旧 incarnation 明确死亡时，将 `ACTIVE` 发布为 `DIRTY`；`Alive/Unknown` 禁止 destructive recovery；
+12. 必要时获取 Recovery Ownership 并进入恢复流程。
 
 任何长度加法必须使用 Checked Arithmetic。
 
@@ -474,17 +477,22 @@ SuperBlock
 ├── Lifecycle Control
 │   ├── region_epoch
 │   ├── clean_shutdown
-│   └── recovery_owner
+│   ├── recovery_owner / recovery_lease / recovery_epoch
+│   └── recovery_fence_word
 └── Feature/Compatibility
     ├── feature_flags
-    └── minimum_reader_version
+    ├── minimum_reader_version
+    ├── service_owner       // v3, full ProcessIdentity
+    └── service_fence_word  // v3, {service_epoch, phase}
 ```
 
 `region_uuid` 在 `Create` 时由安全随机源生成，随 Immutable Header 一起初始化并受 Header CRC 保护；Attach 时与 Attach Context 中登记的部署身份比较，不一致直接拒绝。
 
+SuperBlock 固定为 256B。v3 将 v2 的 bytes `[216,256)` compatibility padding 定义为 32B `service_owner` 与 8B `service_fence_word`，v2 既有字段偏移不变。v3 reader 对 v2 仅提供只读 Attach；v2 不具备安全 service liveness/fencing，writable Attach 必须拒绝并要求迁移/重建。
+
 ### 6.5 Recovery Owner
 
-多个进程不能同时恢复同一 Region。SuperBlock 必须包含 `recovery_owner + recovery_epoch + recovery_lease`。恢复流程：
+多个进程不能同时恢复同一 Region。SuperBlock 必须包含 `recovery_owner + recovery_epoch + recovery_lease + recovery_fence_word`。Recovery Lease 只串行化已经进入 `DIRTY/RECOVERING` 的 scanner，不承担 ACTIVE service 判活；service liveness 由 supervisor lock + `ProcessIdentity` 决定，避免长暂停/`SIGSTOP` 被 lease 超时误判。恢复流程：
 
 1. Attach 者发现 Dirty Region 后禁止业务读写；
 2. 通过 CAS 获取 Recovery Ownership；

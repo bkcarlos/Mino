@@ -18,11 +18,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <sstream>
-#include <memory>
+#include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
+#include <unistd.h>
+
+#include "mino/platform/shared_memory.h"
+#include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/region/region.h"
 
 namespace mino::tools {
 namespace {
@@ -117,9 +124,9 @@ public:
         // non-trivially-copyable type.
         new (h) Inspector::SlabHeaderView();
         h->magic = Inspector::kSlabMagic;
-        h->header_version = 1;
+        h->header_version = kSlabHeaderVersion;
         h->class_id = 0;
-        h->generation = 11;
+        h->generation.store(11, std::memory_order_relaxed);
         h->capacity = 128;
         h->object_size = 100;
         h->type_id = 5;
@@ -136,7 +143,7 @@ public:
         // See MakePublished: value-initialization replaces the memset.
         new (h) Inspector::SlabHeaderView();
         h->magic = Inspector::kSlabMagic;
-        h->generation = 4;
+        h->generation.store(4, std::memory_order_relaxed);
         h->object_state.store(0, std::memory_order_release);
         SetBitmap(slot);
     }
@@ -155,33 +162,7 @@ public:
     }
 
     static uint32_t ComputeCrc(const Inspector::SlabHeaderView& h) {
-        struct __attribute__((packed)) ImmutableView {
-            uint32_t magic;
-            uint16_t header_version;
-            uint16_t class_id;
-            uint32_t generation;
-            uint32_t capacity;
-            uint32_t object_size;
-            uint32_t type_id;
-            uint32_t layout_version;
-            uint64_t schema_short_id;
-        } view{h.magic,      h.header_version, h.class_id,
-               h.generation, h.capacity,       h.object_size,
-               h.type_id,    h.layout_version, h.schema_short_id};
-        uint32_t table[256];
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) {
-                c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
-            }
-            table[i] = c;
-        }
-        const auto* bytes = reinterpret_cast<const unsigned char*>(&view);
-        uint32_t crc = 0xFFFFFFFFu;
-        for (size_t i = 0; i < sizeof(view); ++i) {
-            crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
-        }
-        return crc ^ 0xFFFFFFFFu;
+        return ComputeImmutableHeaderCrc(h);
     }
 
 private:
@@ -202,15 +183,186 @@ private:
 
 class InspectorTest : public ::testing::Test {
 protected:
+    std::string RegionName(const char* tag) {
+        static uint32_t sequence = 0;
+        std::string name = "/mi_" + std::to_string(::getpid()) + "_" +
+                           std::to_string(++sequence) + tag;
+        names_.push_back(name);
+        return name;
+    }
+
+    void TearDown() override {
+        for (const std::string& name : names_) {
+            (void)SharedMemorySegment::Unlink(name);
+        }
+    }
+
     InspectorFixture fixture_;
+    std::vector<std::string> names_;
 };
 
-TEST_F(InspectorTest, AttachByNameReturnsUnsupported) {
-    auto result = Inspector::Attach("some_region");
-    ASSERT_FALSE(result.ok());
-    EXPECT_EQ(result.status().code(), StatusCode::kUnsupported);
-    EXPECT_NE(result.status().message().find("--image"),
+TEST_F(InspectorTest, AttachByNameValidatesInputAndMissingRegion) {
+    auto empty = Inspector::Attach("");
+    ASSERT_FALSE(empty.ok());
+    EXPECT_EQ(empty.status().code(), StatusCode::kInvalidArgument);
+
+    auto missing = Inspector::Attach(RegionName("_missing"));
+    ASSERT_FALSE(missing.ok());
+    EXPECT_EQ(missing.status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(InspectorTest, AttachByNameDerivesRealAllocatorLayoutReadOnly) {
+    const std::string name = RegionName("_real");
+    RegionCreateOptions create_options;
+    create_options.name = name;
+    create_options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(create_options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    const SuperBlock& sb = *region->superblock();
+    RegionAllocatorStorage storage{
+        .region_base = region->base(),
+        .region_size = region->size(),
+        .allocator_offset = sb.allocator_offset,
+        .allocator_size = sb.data_offset - sb.allocator_offset,
+        .data_offset = sb.data_offset,
+        .data_size = sb.data_size,
+        .region_id = sb.region_id,
+    };
+    ClassTableConfig config;
+    config.classes = {
+        {.slot_size = 64, .slot_count = 4},
+        {.slot_size = 256, .slot_count = 2},
+    };
+    auto allocator = CentralSlabAllocator::CreateInRegion(storage, config);
+    ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+
+    AllocationRequest request;
+    request.object_size = 32;
+    request.type_id = TypeId{7};
+    request.schema = SchemaIdentity{.short_id = 0x1234, .layout_version = 1};
+    auto handle = allocator->Allocate(request);
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    ASSERT_TRUE(allocator->BeginBuild(*handle).ok());
+    ASSERT_TRUE(allocator->Publish(*handle).ok());
+
+    const RegionState state_before = LoadRegionState(*region->superblock());
+    const bool clean_before = LoadCleanShutdown(*region->superblock());
+    const uint64_t epoch_before = LoadRegionEpoch(*region->superblock());
+    {
+        auto inspector = Inspector::Attach(name);
+        ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+        ASSERT_EQ(inspector->layout().classes.size(), 2u);
+        EXPECT_TRUE(inspector->layout().rings.empty());
+        EXPECT_EQ(inspector->layout().classes[0].slot_count, 4u);
+        EXPECT_EQ(inspector->layout().classes[1].slot_count, 2u);
+
+        auto report = inspector->ScanSlabs();
+        ASSERT_TRUE(report.ok()) << report.status().ToString();
+        EXPECT_EQ(report->total_slots, 6u);
+        EXPECT_EQ(report->ok_count, 1u);
+        EXPECT_EQ(report->free_count, 5u);
+        EXPECT_EQ(report->orphan_count, 0u);
+        EXPECT_EQ(report->inconsistent_count, 0u);
+        EXPECT_EQ(report->corrupt_count, 0u);
+
+        auto ring = inspector->DumpRingBuffer(7);
+        ASSERT_FALSE(ring.ok());
+        EXPECT_EQ(ring.status().code(), StatusCode::kNotFound);
+        EXPECT_NE(ring.status().message().find("explicit RingRef"),
+                  std::string_view::npos);
+    }
+
+    // Destroying the Inspector only unmaps its read-only attachment; it must
+    // not run recovery or publish CLOSED/clean lifecycle state.
+    EXPECT_EQ(LoadRegionState(*region->superblock()), state_before);
+    EXPECT_EQ(LoadCleanShutdown(*region->superblock()), clean_before);
+    EXPECT_EQ(LoadRegionEpoch(*region->superblock()), epoch_before);
+}
+
+TEST_F(InspectorTest, AttachByNameDiagnosesQuarantinedRegionReadOnly) {
+    const std::string name = RegionName("_quarantined");
+    RegionCreateOptions create_options;
+    create_options.name = name;
+    create_options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(create_options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    SuperBlock* sb = region->superblock();
+    RegionAllocatorStorage storage{
+        .region_base = region->base(),
+        .region_size = region->size(),
+        .allocator_offset = sb->allocator_offset,
+        .allocator_size = sb->data_offset - sb->allocator_offset,
+        .data_offset = sb->data_offset,
+        .data_size = sb->data_size,
+        .region_id = sb->region_id,
+    };
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 4}};
+    auto allocator = CentralSlabAllocator::CreateInRegion(storage, config);
+    ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+
+    StoreState(*sb, RegionState::kQuarantined);
+    StoreRecoveryFence(
+        *sb, EncodeRecoveryFence(LoadRecoveryEpoch(*sb),
+                                 RecoveryFencePhase::kQuarantined));
+    const RegionState state_before = LoadRegionState(*sb);
+    const uint64_t epoch_before = LoadRegionEpoch(*sb);
+    const bool clean_before = LoadCleanShutdown(*sb);
+    const uint64_t service_fence_before = LoadServiceFence(*sb);
+    const uint64_t recovery_fence_before = LoadRecoveryFence(*sb);
+
+    {
+        auto inspector = Inspector::Attach(name);
+        ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+        auto report = inspector->ScanSlabs();
+        ASSERT_TRUE(report.ok()) << report.status().ToString();
+        EXPECT_EQ(report->total_slots, 4u);
+        EXPECT_EQ(report->free_count, 4u);
+        EXPECT_EQ(report->corrupt_count, 0u);
+    }
+
+    EXPECT_EQ(LoadRegionState(*sb), state_before);
+    EXPECT_EQ(LoadRegionEpoch(*sb), epoch_before);
+    EXPECT_EQ(LoadCleanShutdown(*sb), clean_before);
+    EXPECT_EQ(LoadServiceFence(*sb), service_fence_before);
+    EXPECT_EQ(LoadRecoveryFence(*sb), recovery_fence_before);
+}
+
+TEST_F(InspectorTest, AttachByNameRejectsRegionWithoutAllocatorMetadata) {
+    const std::string name = RegionName("_empty");
+    RegionCreateOptions options;
+    options.name = name;
+    options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    auto inspector = Inspector::Attach(name);
+    ASSERT_FALSE(inspector.ok());
+    EXPECT_EQ(inspector.status().code(), StatusCode::kNotFound);
+    EXPECT_NE(inspector.status().message().find("allocator metadata"),
               std::string_view::npos);
+    EXPECT_EQ(LoadRegionState(*region->superblock()), RegionState::kActive);
+    EXPECT_FALSE(LoadCleanShutdown(*region->superblock()));
+}
+
+TEST_F(InspectorTest, AttachByNameRejectsCorruptAllocatorMetadataReadOnly) {
+    const std::string name = RegionName("_corrupt");
+    RegionCreateOptions options;
+    options.name = name;
+    options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+    const uint64_t allocator_offset = region->superblock()->allocator_offset;
+    *reinterpret_cast<uint32_t*>(region->base() + allocator_offset) =
+        0xDEADBEEFu;
+
+    auto inspector = Inspector::Attach(name);
+    ASSERT_FALSE(inspector.ok());
+    EXPECT_EQ(inspector.status().code(), StatusCode::kCorruption);
+    EXPECT_EQ(LoadRegionState(*region->superblock()), RegionState::kActive);
+    EXPECT_FALSE(LoadCleanShutdown(*region->superblock()));
 }
 
 TEST_F(InspectorTest, AttachMemoryValidatesBounds) {

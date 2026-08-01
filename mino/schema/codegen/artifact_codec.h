@@ -55,11 +55,16 @@ struct DecodedTypeArtifact {
 
 struct DecodedDescriptorArtifact {
     uint32_t version = 0;
+    // Types physically encoded by this artifact. These are local publication
+    // units, not a shared dependency closure: each descriptor's dependencies()
+    // remains its own exact transitive name+digest closure.
     std::vector<DecodedTypeArtifact> types;
 };
 
-// Encodes logical descriptor fields explicitly in a stable little-endian
-// format. No sizeof/offsetof of a descriptor C++ object enters the artifact.
+// Encodes schema.types() as the artifact's local types. Logical descriptor
+// fields are explicit in a stable little-endian format; no sizeof/offsetof of a
+// descriptor C++ object enters the artifact. A local type may satisfy another
+// local type's dependency, but unrelated local types are never closure members.
 Result<std::string> EncodeDescriptorArtifact(
     const CompiledSchema& schema,
     std::span<const LayoutPlan> layouts) noexcept;

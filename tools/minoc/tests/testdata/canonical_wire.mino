@@ -1,0 +1,16 @@
+syntax = "v1";
+package minoc_wire_test;
+option schema_version = "1.0";
+
+struct Scalars {
+  required int32 delta32 = 1;
+  required int64 delta64 = 2;
+  required uint32 count32 = 3;
+  required uint64 count64 = 4;
+  required fixed32 code32 = 5;
+  required fixed64 code64 = 6;
+  required float sample32 = 7;
+  required double sample64 = 8;
+  required bool active = 9;
+  optional uint32 sequence = 10;
+}

@@ -23,12 +23,11 @@
 //       Run the recovery scanner: reclaim orphan slabs, fix bitmap
 //       inconsistencies, report corruption. Requires recovery ownership.
 //
-// All three commands currently require the region layout sidecar
-// (`--layout <file>`) because //mino/shm/region:region (SuperBlock layout)
-// is still in development; once it lands, layout is derived from the
-// SuperBlock and the flag becomes optional. A region image can be supplied
-// with `--image <file>` (raw bytes of the shared region), which today is
-// the only supported attach mode.
+// `inspect` attaches to a live Region by name and derives slab layout from
+// persisted allocator metadata. `--layout` + `--image` remain available for
+// offline images and are currently required for ring dumps because the Region
+// Directory does not yet persist channel ring locations. `recover` continues
+// to use its explicit recovery sidecar/image path.
 
 #include <cstdint>
 #include <cstdlib>
@@ -59,9 +58,8 @@ USAGE:
 
 OPTIONS:
     --layout <file>   Layout sidecar describing class table and ring buffers.
-                      Required until //mino/shm/region:region lands.
-    --image <file>    Raw region image to attach to. Required until
-                      //mino/shm/region:region lands.
+                      Must be paired with --image; required for ring locations.
+    --image <file>    Raw offline region image. Must be paired with --layout.
     --output <file>   Write the report to <file> instead of stdout.
     --dry-run         (recover only) Scan without repairing.
 )";
@@ -235,14 +233,15 @@ Status Emit(const CommonArgs& args, const std::string& content) {
     return Status::Ok();
 }
 
-// Loads sidecar + image and constructs an Inspector.
+// Attaches by Region name, or loads an explicit sidecar + offline image.
 mino::Result<mino::tools::Inspector> LoadInspector(
     const CommonArgs& args, std::vector<std::byte>* image_storage) {
+    if (args.layout_path.empty() && args.image_path.empty()) {
+        return mino::tools::Inspector::Attach(args.region_name);
+    }
     if (args.layout_path.empty() || args.image_path.empty()) {
-        return Status::Error(
-            StatusCode::kUnsupported,
-            "attaching by region name requires //mino/shm/region:region "
-            "(in development); provide --layout and --image");
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "--layout and --image must be provided together");
     }
     Sidecar sidecar;
     MINO_RETURN_IF_ERROR(ParseSidecar(args.layout_path, &sidecar));
@@ -317,9 +316,8 @@ int CmdRecover(const CommonArgs& args) {
     // Load sidecar + image. The recovery scanner needs the recovery owner
     // offset which the inspector layout does not carry.
     if (args.layout_path.empty() || args.image_path.empty()) {
-        std::cerr << "recover: attaching by region name requires "
-                     "//mino/shm/region:region (in development); provide "
-                     "--layout and --image\n";
+        std::cerr << "recover: live recovery is not exposed by this CLI path; "
+                     "provide --layout and --image\n";
         return 1;
     }
     Sidecar sidecar;

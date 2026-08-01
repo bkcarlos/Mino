@@ -164,25 +164,25 @@ TEST_F(RecoveryOwnerTest, DirtyAttachScansRealRegionAllocatorMetadata) {
       std::memory_order_release);
 
   const uint64_t epoch_before = LoadRegionEpoch(sb);
-  // Explicit DIRTY is the minimum quiescence proof supported by the current
-  // SuperBlock. ACTIVE+in-use is deliberately not auto-recovered.
+  // The fixture already owns the unique writable supervisor role. Exercise the
+  // scanner directly after an explicit DIRTY transition; a second writable
+  // Attach must not bypass the live supervisor lock.
   StoreState(*created.superblock(), RegionState::kDirty);
-  RegionAttachOptions attach_options;
-  attach_options.name = name_;
-  auto attached = SharedMemoryRegion::Attach(attach_options);
-  ASSERT_TRUE(attached.ok()) << attached.status().ToString();
-  EXPECT_EQ(LoadRegionState(*attached->superblock()), RegionState::kActive);
-  EXPECT_EQ(LoadRegionEpoch(*attached->superblock()), epoch_before + 1);
+  Status recovery = RecoverRegionForAttach(
+      created, ProcessIdentity::Current(), /*wait_timeout_ms=*/1000);
+  ASSERT_TRUE(recovery.ok()) << recovery.ToString();
+  EXPECT_EQ(LoadRegionState(*created.superblock()), RegionState::kActive);
+  EXPECT_EQ(LoadRegionEpoch(*created.superblock()), epoch_before + 1);
 
   RegionAllocatorStorage attached_storage{
-      .region_base = attached->base(),
-      .region_size = attached->size(),
-      .allocator_offset = attached->superblock()->allocator_offset,
-      .allocator_size = attached->superblock()->data_offset -
-                        attached->superblock()->allocator_offset,
-      .data_offset = attached->superblock()->data_offset,
-      .data_size = attached->superblock()->data_size,
-      .region_id = attached->region_id(),
+      .region_base = created.base(),
+      .region_size = created.size(),
+      .allocator_offset = created.superblock()->allocator_offset,
+      .allocator_size = created.superblock()->data_offset -
+                        created.superblock()->allocator_offset,
+      .data_offset = created.superblock()->data_offset,
+      .data_size = created.superblock()->data_size,
+      .region_id = created.region_id(),
   };
   auto recovered = CentralSlabAllocator::AttachInRegion(attached_storage);
   ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
@@ -191,8 +191,7 @@ TEST_F(RecoveryOwnerTest, DirtyAttachScansRealRegionAllocatorMetadata) {
   EXPECT_EQ(survivor_view->state, ObjectState::kPublished);
   EXPECT_EQ(recovered->Inspect(*orphan).status().code(),
             StatusCode::kNotFound);
-  EXPECT_EQ(LoadRecoveryLeaseNs(*attached->superblock()), 0u);
-  EXPECT_TRUE(attached->Detach().ok());
+  EXPECT_EQ(LoadRecoveryLeaseNs(*created.superblock()), 0u);
 }
 
 TEST_F(RecoveryOwnerTest, MoveClearsSourceOwnership) {

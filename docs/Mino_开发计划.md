@@ -91,8 +91,9 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 全部 13 篇 ADR 达到 ACCEPTED 状态
 - [x] `bazel build //...` 成功（空骨架）
 - [x] `bazel test //...` 通过（含 Status/Result 单测）
-- [ ] CI 五配置（debug/release/asan/ubsan/tsan）全绿（需推送 GitHub 触发首跑）
-- [x] V-12 原子 ABI Litmus 报告产出（`tests/litmus/` 含 4 用例，CI 首跑产出 Linux x86-64 权威报告）
+- [x] Linux 本地五配置（debug/release/asan/ubsan/tsan）全绿（2026-08-01，各 57/57）
+- [ ] GitHub Actions 五配置首跑全绿并归档结果
+- [x] V-12 原子 ABI Litmus 报告产出（Linux x86-64 必需的 ≤64-bit Lock-free 与跨进程语义 4/4 通过；128-bit 为可选能力且未进入 v1 ABI）
 
 ---
 
@@ -139,7 +140,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 不同进程映射不同虚拟地址时 Handle 正确解析（INV-03，`//mino/shm/region:cross_process_handle_test`：子进程 MAP_FIXED 占坑强制异地址 Attach，解析/payload/stale 拒绝全验，TSAN 通过）
 - [x] MPMC 骨架跨进程守恒/回绕/满空判定测试通过（V-26，`//mino/shm/channel:mpmc_ring_xproc_test`：2P2C fork 进程 10000 条零丢失零重复（~156 次回绕）、满 kResourceExhausted/空 kWouldBlock 跨进程传播）
 - [x] Slab 分配/回收在 TSAN 下无数据竞争（`bazel test --config=tsan //...` 23/23 通过，2026-07-28 macOS arm64）
-- [ ] Kill 压力测试（≥1 小时）：恢复扫描报告孤儿 Slab = 0，可用空间恢复基线（需专门长跑环境）
+- [x] Kill 压力测试（≥1 小时）：`d1_region_recovery_kill_stress_long_test`，seed 67890，1,190,183 次随机恢复迭代，orphan = 0、bitmap/header 一致、survivor 保留、空间恢复基线（2026-08-01 Linux x86-64）
 - [x] 恢复扫描器双 Owner 竞争测试通过（V-11，`//mino/shm/recovery:double_owner_test` fork 双进程竞争/Kill 接管/Lease 失效单赢家）
 
 ---
@@ -157,7 +158,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D2-01 | IndexSlot ABI 定稿 ✅ | 128B 显式 Padding + static_assert、Sidecar 分离、不可变 CRC（`//mino/shm/channel:index_slot`，详设 9.2） | D1-06 | 2d |
 | D2-02 | SPSC Channel ✅ | `//mino/shm/channel:spsc`：单 Producer/Consumer Cursor、Cache Line 分离、发布协议状态机（详设 9.4） | D2-01 | 3d |
 | D2-03 | MPSC Channel ✅ | `//mino/shm/channel:mpsc`：Reservation/Owner Epoch/ABORTED Tombstone（详设 9.5） | D2-01 | 5d |
-| D2-04 | MPSC Producer Crash 恢复 ⚠️ | Reservation Owner 失效 → ABORTED → 队列推进已完成；Builder Allocation Journal/构建阶段孤儿回收仍待补齐（详设 9.5、12.3） | D2-03 | 3d |
+| D2-04 | MPSC Producer Crash 恢复 ✅ | Reservation Owner 失效 → ABORTED → 队列推进；Builder Allocation Journal 覆盖 root/child 构建、提交、回滚与孤儿恢复（详设 9.5、12.3） | D2-03 | 3d |
 | D2-05 | Broadcast Channel ✅ | `//mino/shm/channel:broadcast`：独立 Cursor、ACK Bitmap、Subscriber Set Snapshot（详设 9.6） | D2-01 | 5d |
 | D2-06 | Broadcast Membership ✅ | 注册/注销/Lease 失效与 ACK 责任清理、Generation 绑定（详设 9.6、12.2） | D2-05 | 3d |
 | D2-07 | QueueFullPolicy ✅ | kBlock/kFail/kDropNewest/kDropOldest/kSample 策略实现（`//mino/shm/channel:queue_full_policy` + SPSC 策略执行，详设 9.8） | D2-02 | 2d |
@@ -190,7 +191,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] SPSC 长时间回绕无 ABA、无重复/漏消费（INV-01，`spsc_channel_test` 10000 次回绕 + `spsc_channel_xproc_test` fork 双进程 20000 条 ~312 次回绕零丢失零重复）
 - [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
 - [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
-- [ ] Publisher/Subscriber 随机 Kill ≥1 小时后恢复扫描无孤儿（P1 退出条件）
+- [x] Publisher/Subscriber 随机 Kill ≥1 小时后恢复扫描无孤儿（`d2_recovery_stress_long_test`，seed 12345，2,959,560 次随机迭代，2026-08-01 Linux x86-64）
 - [x] ASAN/UBSAN/TSAN 全部通过（D2 Runtime/Channel/Allocator/ProcessIdentity 共 15 targets，本地三配置各 15/15）
 - [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；TLC 检查通过）
 
@@ -241,13 +242,13 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 5.4 退出条件（DoD）
 
-- [ ] `.idl` 稳定生成 `.generated.h/.cc` + Descriptor
-- [ ] 静态和动态路径产生字节一致的 Canonical Wire 输出（INV-08）
-- [ ] 显式 Field ID、Reserved、递归拒绝全部按规则执行（INV-21）
-- [ ] 兼容性测试矩阵通过（kWireCompatible/kReadCompatible/kWriteCompatible/kIncompatible）
-- [ ] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界
-- [ ] Hermetic CodeGen 跨环境一致（V-07、V-08）
-- [ ] 动态对象图可完整回收（INV 相关）
+- [x] `.idl` 稳定生成 `.generated.h/.cc` + MINODSC2 Descriptor（CodeGen/minoc/golden 测试通过）
+- [ ] 静态和动态路径产生字节一致的 Canonical Wire 输出（INV-08；固定标量与 optional 路径已通过，非空 variable/nested 仍需 resolver/allocator 上下文）
+- [x] 显式 Field ID、Reserved、递归拒绝全部按规则执行（INV-21）
+- [x] 兼容性测试矩阵通过（kWireCompatible/kReadCompatible/kWriteCompatible/kIncompatible）
+- [ ] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界（Hermetic corpus 已通过，长时 sanitizer campaign 待执行）
+- [ ] Hermetic CodeGen 跨环境一致（V-07、V-08；同环境与跨目录已通过，跨机器 hash 待验证）
+- [x] 动态对象图可完整回收（Allocation Journal/ObjectGraphWalker/fork crash recovery 测试通过）
 
 ---
 
@@ -510,7 +511,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | 依赖 | 说明 | 影响 |
 |---|---|---|
 | Bazel/Bazelisk 版本固定 | `.bazelversion` 锁定 | 构建可复现性 |
-| C++20 编译器 | GCC ≥ 12 或 Clang ≥ 15（x86-64 Lock-free 128-bit 原子需要 `-mcx16`） | D0 Toolchain 配置 |
+| C++20 编译器 | GCC ≥ 12 或 Clang ≥ 15；v1 SHM ABI 仅使用已验证 Lock-free 的 ≤64-bit 原子，128-bit 能力需单独验证后方可进入 ABI | D0 Toolchain 配置 |
 | Linux 内核 ≥ 5.x | `shm_open`、`memfd_create`、`fdatasync` 语义 | D1 Platform SHM |
 | TLA+ Toolbox | 形式化验证 | D2（可选但强烈推荐） |
 | 目标硬件 | 性能验证用服务器（NUMA、10GbE+） | D5 SLA、D6 性能 |

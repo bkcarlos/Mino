@@ -47,7 +47,8 @@ namespace mino {
 
 // Constants.
 inline constexpr uint32_t kSuperBlockMagic = 0x4D494E4F;  // "MINO"
-inline constexpr uint16_t kRegionLayoutVersion = 2;
+inline constexpr uint16_t kRegionLayoutVersion = 3;
+inline constexpr uint16_t kOldestReadableRegionLayoutVersion = 2;
 // Byte-order detector: stored at Create; a reader on a different-endian host
 // observes a byte-swapped value and rejects the Region (first version only
 // supports the native little-endian layout).
@@ -104,7 +105,13 @@ struct SuperBlock {
     uint32_t minimum_reader_version; // 200
     uint32_t compat_rsv;             // 204
     uint64_t recovery_fence_word;    // 208: atomic_ref<{epoch, phase}>.
-    std::byte compat_pad[40];        // 216..256
+
+    // v3 supervisor-owner metadata. v2 readers see these bytes as zeroed
+    // compatibility padding. The ProcessIdentity is read/written as four
+    // atomic uint64_t fields, and service_fence_word is the publication and
+    // lifecycle fencing record.
+    ProcessIdentity service_owner;   // 216..248
+    uint64_t service_fence_word;     // 248: atomic_ref<{epoch, phase}>.
 };
 
 // ---- Layout pinning (shared-memory ABI must be fixed) ----
@@ -138,7 +145,12 @@ static_assert(offsetof(SuperBlock, recovery_owner) == 160);
 static_assert(offsetof(SuperBlock, feature_flags) == 192);
 static_assert(offsetof(SuperBlock, minimum_reader_version) == 200);
 static_assert(offsetof(SuperBlock, recovery_fence_word) == 208);
+static_assert(offsetof(SuperBlock, service_owner) == 216);
+static_assert(offsetof(SuperBlock, service_fence_word) == 248);
 static_assert(offsetof(SuperBlock, recovery_fence_word) %
+                  std::atomic_ref<uint64_t>::required_alignment ==
+              0);
+static_assert(offsetof(SuperBlock, service_fence_word) %
                   std::atomic_ref<uint64_t>::required_alignment ==
               0);
 
@@ -274,6 +286,75 @@ inline bool CompareExchangeRecoveryFence(SuperBlock& sb, uint64_t* expected,
         .compare_exchange_strong(*expected, desired,
                                  std::memory_order_acq_rel,
                                  std::memory_order_acquire);
+}
+
+// The v3 service fence protects lifecycle ownership, not ordinary business
+// object ownership. A host-local advisory lock excludes concurrent writable
+// supervisors; this generation token prevents stale Region objects from
+// publishing CLOSED after ownership has changed.
+enum class ServiceFencePhase : uint64_t {
+    kUnowned = 0,
+    kOwned = 1,
+    kClosing = 2,
+};
+inline constexpr uint64_t kServiceFencePhaseBits = 2;
+inline constexpr uint64_t kMaxServiceFenceEpoch =
+    std::numeric_limits<uint64_t>::max() >> kServiceFencePhaseBits;
+
+constexpr uint64_t EncodeServiceFence(uint64_t epoch,
+                                      ServiceFencePhase phase) {
+    return (epoch << kServiceFencePhaseBits) |
+           static_cast<uint64_t>(phase);
+}
+constexpr uint64_t ServiceFenceEpoch(uint64_t word) {
+    return word >> kServiceFencePhaseBits;
+}
+constexpr ServiceFencePhase ServiceFencePhaseOf(uint64_t word) {
+    return static_cast<ServiceFencePhase>(
+        word & ((uint64_t{1} << kServiceFencePhaseBits) - 1));
+}
+inline uint64_t LoadServiceFence(const SuperBlock& sb) {
+    return std::atomic_ref(const_cast<uint64_t&>(sb.service_fence_word))
+        .load(std::memory_order_acquire);
+}
+inline void StoreServiceFence(SuperBlock& sb, uint64_t word) {
+    std::atomic_ref(sb.service_fence_word)
+        .store(word, std::memory_order_release);
+}
+inline bool CompareExchangeServiceFence(SuperBlock& sb, uint64_t* expected,
+                                        uint64_t desired) {
+    return std::atomic_ref(sb.service_fence_word)
+        .compare_exchange_strong(*expected, desired,
+                                 std::memory_order_acq_rel,
+                                 std::memory_order_acquire);
+}
+
+inline ProcessIdentity LoadServiceOwner(const SuperBlock& sb) {
+    ProcessIdentity owner;
+    owner.node_id =
+        std::atomic_ref(const_cast<uint64_t&>(sb.service_owner.node_id))
+            .load(std::memory_order_relaxed);
+    owner.process_id =
+        std::atomic_ref(const_cast<uint64_t&>(sb.service_owner.process_id))
+            .load(std::memory_order_relaxed);
+    owner.process_epoch =
+        std::atomic_ref(const_cast<uint64_t&>(sb.service_owner.process_epoch))
+            .load(std::memory_order_relaxed);
+    owner.start_time_ns =
+        std::atomic_ref(const_cast<uint64_t&>(sb.service_owner.start_time_ns))
+            .load(std::memory_order_relaxed);
+    return owner;
+}
+inline void StoreServiceOwner(SuperBlock& sb,
+                              const ProcessIdentity& owner) {
+    std::atomic_ref(sb.service_owner.node_id)
+        .store(owner.node_id, std::memory_order_relaxed);
+    std::atomic_ref(sb.service_owner.process_id)
+        .store(owner.process_id, std::memory_order_relaxed);
+    std::atomic_ref(sb.service_owner.process_epoch)
+        .store(owner.process_epoch, std::memory_order_relaxed);
+    std::atomic_ref(sb.service_owner.start_time_ns)
+        .store(owner.start_time_ns, std::memory_order_relaxed);
 }
 
 }  // namespace mino

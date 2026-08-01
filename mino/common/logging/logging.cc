@@ -49,21 +49,20 @@ std::shared_ptr<Logger> FallbackLogger() noexcept {
     return logger;
 }
 
-std::shared_ptr<Logger>& GlobalLogger() noexcept {
-    static std::shared_ptr<Logger> logger = FallbackLogger();
+std::atomic<std::shared_ptr<Logger>>& GlobalLogger() noexcept {
+    static std::atomic<std::shared_ptr<Logger>> logger{FallbackLogger()};
     return logger;
 }
 
 }  // namespace
 
 void SetLogger(std::shared_ptr<Logger> logger) noexcept {
-    std::atomic_store_explicit(
-        &GlobalLogger(), logger ? std::move(logger) : FallbackLogger(),
-        std::memory_order_release);
+    GlobalLogger().store(logger ? std::move(logger) : FallbackLogger(),
+                         std::memory_order_release);
 }
 
 std::shared_ptr<Logger> GetLogger() noexcept {
-    return std::atomic_load_explicit(&GlobalLogger(), std::memory_order_acquire);
+    return GlobalLogger().load(std::memory_order_acquire);
 }
 
 bool ShouldLog(LogLevel level) noexcept {

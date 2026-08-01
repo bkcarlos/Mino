@@ -1,4 +1,14 @@
+load("//tools/minoc:minoc.bzl", "mino_cc_codegen")
+
 package(default_visibility = ["//visibility:public"])
+
+mino_cc_codegen(
+    name = "codegen_golden",
+    src = "//mino/schema/codegen:testdata/golden.mino",
+    out_descriptor = "testdata/codegen_golden.descriptor",
+    out_header = "generated/codegen_golden.generated.h",
+    out_source = "generated/codegen_golden.generated.cc",
+)
 
 cc_library(
     name = "fuzz_harness",

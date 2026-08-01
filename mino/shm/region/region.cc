@@ -15,12 +15,14 @@
 #include "mino/shm/region/region.h"
 
 #include <atomic>
+#include <cerrno>
 #include <new>
 #include <random>
 #include <utility>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -111,14 +113,111 @@ uint32_t HostPageSize() {
 #endif
 }
 
+Result<int> TryAcquireSupervisorLock(const std::string& name) {
+#if defined(__unix__) || defined(__APPLE__)
+    const int fd = ::shm_open(name.c_str(), O_RDWR, 0);
+    if (fd < 0) {
+        return Status::Error(StatusCode::kInternal,
+                             "failed to open supervisor lock handle");
+    }
+    (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int lock_errno = errno;
+        ::close(fd);
+        if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "live writable supervisor already attached");
+        }
+        return Status::Error(StatusCode::kInternal,
+                             "failed to acquire supervisor lock");
+    }
+    return fd;
+#else
+    (void)name;
+    return Status::Error(StatusCode::kUnsupported,
+                         "writable supervisor lock unsupported on this platform");
+#endif
+}
+
+void ReleaseSupervisorLock(int fd) noexcept {
+#if defined(__unix__) || defined(__APPLE__)
+    if (fd >= 0) {
+        (void)::flock(fd, LOCK_UN);
+        (void)::close(fd);
+    }
+#else
+    (void)fd;
+#endif
+}
+
 }  // namespace
+
+SharedMemoryRegion::SharedMemoryRegion(SharedMemoryRegion&& other) noexcept {
+    MoveFrom(std::move(other));
+}
+
+SharedMemoryRegion& SharedMemoryRegion::operator=(
+    SharedMemoryRegion&& other) noexcept {
+    if (this != &other) {
+        if (!detached_) {
+            (void)Detach();
+        }
+        MoveFrom(std::move(other));
+    }
+    return *this;
+}
+
+void SharedMemoryRegion::MoveFrom(SharedMemoryRegion&& other) noexcept {
+    segment_ = std::move(other.segment_);
+    region_id_ = other.region_id_;
+    owner_identity_ = other.owner_identity_;
+    service_fence_at_attach_ = other.service_fence_at_attach_;
+    supervisor_lock_fd_ = other.supervisor_lock_fd_;
+    is_supervisor_ = other.is_supervisor_;
+    detached_ = other.detached_;
+
+    other.segment_.reset();
+    other.region_id_ = 0;
+    other.owner_identity_ = ProcessIdentity{};
+    other.service_fence_at_attach_ = 0;
+    other.supervisor_lock_fd_ = -1;
+    other.is_supervisor_ = false;
+    other.detached_ = true;
+}
 
 SharedMemoryRegion::~SharedMemoryRegion() {
     if (!detached_) {
-        // Best-effort detach on destruction. A crash obviously skips this,
-        // which is exactly what the dirty flag detects on next Attach.
-        Detach();
+        // Best-effort detach on destruction. A crash skips this; the kernel
+        // releases the supervisor lock and the next writable Attach proves the
+        // old ProcessIdentity dead before destructive recovery.
+        (void)Detach();
     }
+}
+
+void SharedMemoryRegion::CloseWithoutLifecycleUpdate() noexcept {
+    // If this object already published a new service generation, relinquish
+    // only that generation. Lifecycle state/clean_shutdown are deliberately
+    // untouched so a failed recovery cannot masquerade as a clean detach.
+    if (is_supervisor_ && service_fence_at_attach_ != 0 &&
+        segment_.has_value() && !segment_->read_only()) {
+        SuperBlock* sb = superblock();
+        uint64_t expected = service_fence_at_attach_;
+        const uint64_t closing = EncodeServiceFence(
+            ServiceFenceEpoch(expected), ServiceFencePhase::kClosing);
+        if (CompareExchangeServiceFence(*sb, &expected, closing)) {
+            StoreServiceOwner(*sb, ProcessIdentity{});
+            StoreServiceFence(
+                *sb, EncodeServiceFence(ServiceFenceEpoch(closing),
+                                        ServiceFencePhase::kUnowned));
+        }
+    }
+    detached_ = true;
+    if (segment_.has_value()) {
+        (void)segment_->Close();
+    }
+    ReleaseSupervisorLock(supervisor_lock_fd_);
+    supervisor_lock_fd_ = -1;
+    is_supervisor_ = false;
 }
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Create(
@@ -165,6 +264,8 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     shm_opts.use_huge_pages = options.use_huge_pages;
     MINO_ASSIGN_OR_RETURN(SharedMemorySegment segment,
                           SharedMemorySegment::Create(shm_opts));
+    MINO_ASSIGN_OR_RETURN(const int supervisor_lock_fd,
+                          TryAcquireSupervisorLock(options.name));
 
     // Initialize the SuperBlock (6.1: INITIALIZING). Zero the header region
     // first so all padding/reserved fields are deterministic. Placement
@@ -201,6 +302,9 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     sb->recovery_owner = ProcessIdentity{};
     StoreRecoveryFence(
         *sb, EncodeRecoveryFence(/*epoch=*/1, RecoveryFencePhase::kActive));
+    StoreServiceOwner(*sb, ProcessIdentity::Current());
+    StoreServiceFence(
+        *sb, EncodeServiceFence(/*epoch=*/1, ServiceFencePhase::kOwned));
 
     // Seal the immutable header with its CRC (covers fields [0, 80)).
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
@@ -213,6 +317,9 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     region.segment_ = std::move(segment);
     region.region_id_ = region_id;
     region.owner_identity_ = ProcessIdentity::Current();
+    region.service_fence_at_attach_ = LoadServiceFence(*sb);
+    region.supervisor_lock_fd_ = supervisor_lock_fd;
+    region.is_supervisor_ = true;
     region.detached_ = false;
     return region;
 }
@@ -229,7 +336,8 @@ Status SharedMemoryRegion::ValidateImmutableHeader(
                              "unexpected superblock header size");
     }
     // Step 4: Layout version, byte order, feature flags.
-    if (sb.layout_version != kRegionLayoutVersion) {
+    if (sb.layout_version < kOldestReadableRegionLayoutVersion ||
+        sb.layout_version > kRegionLayoutVersion) {
         return Status::Error(StatusCode::kUnsupported,
                              "unsupported region layout version");
     }
@@ -342,9 +450,20 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     }
 
     // A quarantined Region must not be attached by normal clients (6.5 step 7).
-    if (LoadRegionState(*sb) == RegionState::kQuarantined) {
+    // The explicit diagnostic exception is deliberately gated by read_only so
+    // it can never admit a writable supervisor or enter recovery.
+    if (LoadRegionState(*sb) == RegionState::kQuarantined &&
+        !(options.read_only && options.allow_quarantined_read_only)) {
         return Status::Error(StatusCode::kUnavailable,
                              "region is quarantined");
+    }
+
+    // v2 remains readable, but it has no service-owner identity/fence. A v2
+    // writable Attach therefore cannot prove that destructive recovery is safe.
+    if (!options.read_only && sb->layout_version < kRegionLayoutVersion) {
+        return Status::Error(
+            StatusCode::kUnsupported,
+            "v2 Region supports read-only compatibility only; recreate as v3 for writable supervisor Attach");
     }
 
     SharedMemoryRegion region;
@@ -353,17 +472,80 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     region.owner_identity_ = ProcessIdentity::Current();
     region.detached_ = false;
 
-    // Steps 10-11: check clean_shutdown / region_epoch and, if dirty, run the
-    // recovery flow. Skipped for read-only attaches (they cannot recover).
+    // Steps 10-11: a writable Attach first acquires the unique host-local
+    // supervisor lock. Lock acquisition is the non-time-based proof that no
+    // live writable supervisor still owns this Region. ProcessIdentity then
+    // distinguishes a dead incarnation from PID reuse and catches malformed or
+    // unverifiable metadata before ACTIVE can become DIRTY.
     if (!options.read_only) {
+        auto lock = TryAcquireSupervisorLock(options.name);
+        if (!lock.ok()) {
+            region.CloseWithoutLifecycleUpdate();
+            return lock.status();
+        }
+        region.supervisor_lock_fd_ = *lock;
+        region.is_supervisor_ = true;
+
+        const uint64_t previous_service_fence = LoadServiceFence(*sb);
+        const ServiceFencePhase previous_phase =
+            ServiceFencePhaseOf(previous_service_fence);
+        if (previous_phase != ServiceFencePhase::kOwned &&
+            previous_phase != ServiceFencePhase::kUnowned &&
+            previous_phase != ServiceFencePhase::kClosing) {
+            region.CloseWithoutLifecycleUpdate();
+            return Status::Error(StatusCode::kCorruption,
+                                 "invalid service fence phase");
+        }
+
+        const ProcessIdentity previous_owner = LoadServiceOwner(*sb);
+        if (previous_phase == ServiceFencePhase::kOwned) {
+            const ProcessIdentityLiveness liveness =
+                ProbeProcessIdentity(previous_owner);
+            if (liveness == ProcessIdentityLiveness::kAlive) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kWouldBlock,
+                    "service owner identity is still live; recovery refused");
+            }
+            if (liveness == ProcessIdentityLiveness::kUnknown) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "service owner liveness is unknown; destructive recovery refused");
+            }
+        }
+
+        const uint64_t previous_service_epoch =
+            ServiceFenceEpoch(previous_service_fence);
+        if (previous_service_epoch >= kMaxServiceFenceEpoch) {
+            region.CloseWithoutLifecycleUpdate();
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "service fencing epoch exhausted");
+        }
+        const uint64_t service_fence = EncodeServiceFence(
+            previous_service_epoch + 1, ServiceFencePhase::kOwned);
+        StoreServiceOwner(*sb, region.owner_identity_);
+        StoreServiceFence(*sb, service_fence);
+        region.service_fence_at_attach_ = service_fence;
+
+        // ACTIVE + !clean is recoverable only here: the old supervisor lock is
+        // gone and its exact ProcessIdentity was proven dead. Publish DIRTY
+        // before the allocator scanner can run.
+        if (LoadRegionState(*sb) == RegionState::kActive) {
+            if (LoadCleanShutdown(*sb)) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(StatusCode::kCorruption,
+                                     "ACTIVE Region cannot be cleanly shut down");
+            }
+            StoreState(*sb, RegionState::kDirty);
+        }
+
         Status recovery = RecoverRegionForAttach(
             region, region.owner_identity_, options.recovery_wait_timeout_ms);
         if (!recovery.ok()) {
-            // A failed attach must only unmap; it must not call Detach(), which
-            // would falsely publish clean_shutdown/CLOSED and overwrite the
-            // lifecycle state selected by the recovery state machine.
-            region.detached_ = true;
-            (void)region.segment_->Close();
+            // A failed attach must only unmap and release the supervisor lock;
+            // it must not publish clean shutdown or overwrite recovery state.
+            region.CloseWithoutLifecycleUpdate();
             return recovery;
         }
     }
@@ -371,21 +553,74 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     return region;
 }
 
+Status SharedMemoryRegion::ValidateSupervisorFence() const {
+    if (detached_ || !is_supervisor_ || supervisor_lock_fd_ < 0 ||
+        !segment_.has_value() || segment_->read_only()) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Region is not a writable supervisor attachment");
+    }
+    const SuperBlock* sb = superblock();
+    if (LoadServiceFence(*sb) != service_fence_at_attach_ ||
+        ServiceFencePhaseOf(service_fence_at_attach_) !=
+            ServiceFencePhase::kOwned ||
+        LoadServiceOwner(*sb) != owner_identity_ ||
+        owner_identity_ != ProcessIdentity::Current()) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "writable supervisor service fence is stale");
+    }
+    return Status::Ok();
+}
+
 Status SharedMemoryRegion::Detach() {
     if (detached_) {
         return Status::Ok();
     }
-    detached_ = true;
 
+    Status lifecycle_status = Status::Ok();
     SuperBlock* sb = superblock();
-    if (sb != nullptr && !read_only()) {
-        // Clean shutdown: mark the flag, then transition ACTIVE -> CLOSED
-        // (6.1). The flag is set first so a concurrent Attach observes a clean
-        // state only after we have recorded the transition intent.
-        StoreCleanShutdown(*sb, true);
-        StoreState(*sb, RegionState::kClosed);
+    if (sb != nullptr && !read_only() && is_supervisor_) {
+        lifecycle_status = ValidateSupervisorFence();
+        if (lifecycle_status.ok()) {
+            uint64_t expected = service_fence_at_attach_;
+            const uint64_t closing = EncodeServiceFence(
+                ServiceFenceEpoch(expected), ServiceFencePhase::kClosing);
+            if (!CompareExchangeServiceFence(*sb, &expected, closing)) {
+                lifecycle_status = Status::Error(
+                    StatusCode::kUnavailable,
+                    "service fence changed before clean detach");
+            } else {
+                // The closing fence prevents a stale attachment from racing a
+                // lifecycle update. Only ACTIVE may be cleanly closed; never
+                // overwrite DIRTY/RECOVERING/QUARANTINED during teardown.
+                if (LoadRegionState(*sb) == RegionState::kActive) {
+                    StoreCleanShutdown(*sb, true);
+                    uint32_t active =
+                        static_cast<uint32_t>(RegionState::kActive);
+                    if (!std::atomic_ref(sb->state).compare_exchange_strong(
+                            active,
+                            static_cast<uint32_t>(RegionState::kClosed),
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        StoreCleanShutdown(*sb, false);
+                    }
+                }
+                StoreServiceOwner(*sb, ProcessIdentity{});
+                StoreServiceFence(
+                    *sb, EncodeServiceFence(ServiceFenceEpoch(closing),
+                                            ServiceFencePhase::kUnowned));
+            }
+        }
     }
-    return segment_->Close();
+
+    detached_ = true;
+    Status close_status = segment_->Close();
+    ReleaseSupervisorLock(supervisor_lock_fd_);
+    supervisor_lock_fd_ = -1;
+    is_supervisor_ = false;
+    if (!lifecycle_status.ok()) {
+        return lifecycle_status;
+    }
+    return close_status;
 }
 
 }  // namespace mino

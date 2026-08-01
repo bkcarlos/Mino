@@ -36,6 +36,8 @@
 #if defined(__linux__)
 #include <cerrno>
 #include <cstdlib>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 namespace mino {
@@ -101,9 +103,21 @@ uint64_t ReadProcessStartTimeNs() {
         }
     }
     // Fall through to clock-based fallback below if parsing failed.
+#elif defined(__APPLE__)
+    struct kinfo_proc info {};
+    size_t info_size = sizeof(info);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, ::getpid()};
+    if (::sysctl(mib, 4, &info, &info_size, nullptr, 0) == 0 &&
+        info_size == sizeof(info)) {
+        return static_cast<uint64_t>(info.kp_proc.p_starttime.tv_sec) *
+                   1000000000ull +
+               static_cast<uint64_t>(info.kp_proc.p_starttime.tv_usec) *
+                   1000ull;
+    }
 #endif
-    // Fallback: current realtime. Not robust across PID reuse but provides a
-    // monotonically-distinct value per process start on non-Linux systems.
+    // Last-resort identity value. Platforms without an observable process start
+    // time return kUnknown for other-process liveness, so this value is never
+    // used to justify destructive recovery.
     struct timespec ts;
     ::clock_gettime(CLOCK_REALTIME, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
@@ -174,14 +188,20 @@ uint64_t RandomEpochComponent() {
 }
 
 #if defined(__linux__)
-bool ReadLinuxProcessStartTimeNs(uint64_t process_id,
-                                 uint64_t* start_time_ns) noexcept {
+bool ReadLinuxProcessInfo(uint64_t process_id, uint64_t* start_time_ns,
+                          char* process_state, int* open_error) noexcept {
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/%llu/stat",
                   static_cast<unsigned long long>(process_id));
     FILE* f = std::fopen(path, "r");
     if (f == nullptr) {
+        if (open_error != nullptr) {
+            *open_error = errno;
+        }
         return false;
+    }
+    if (open_error != nullptr) {
+        *open_error = 0;
     }
     char buf[4096];
     const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
@@ -204,6 +224,9 @@ bool ReadLinuxProcessStartTimeNs(uint64_t process_id,
     int field_index = 0;
     for (char* tok = strtok_r(tail, " ", &saveptr); tok != nullptr;
          tok = strtok_r(nullptr, " ", &saveptr), ++field_index) {
+        if (field_index == 0 && process_state != nullptr) {
+            *process_state = tok[0];
+        }
         if (field_index != 19) {
             continue;
         }
@@ -218,6 +241,30 @@ bool ReadLinuxProcessStartTimeNs(uint64_t process_id,
         return true;
     }
     return false;
+}
+#elif defined(__APPLE__)
+ProcessIdentityLiveness ReadAppleProcessStartTimeNs(
+    uint64_t process_id, uint64_t* start_time_ns) noexcept {
+    struct kinfo_proc info {};
+    size_t info_size = sizeof(info);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID,
+                  static_cast<int>(process_id)};
+    if (::sysctl(mib, 4, &info, &info_size, nullptr, 0) != 0) {
+        return errno == ESRCH || errno == ENOENT
+                   ? ProcessIdentityLiveness::kDead
+                   : ProcessIdentityLiveness::kUnknown;
+    }
+    if (info_size == 0) {
+        return ProcessIdentityLiveness::kDead;
+    }
+    if (info.kp_proc.p_stat == SZOMB) {
+        return ProcessIdentityLiveness::kDead;
+    }
+    *start_time_ns =
+        static_cast<uint64_t>(info.kp_proc.p_starttime.tv_sec) *
+            1000000000ull +
+        static_cast<uint64_t>(info.kp_proc.p_starttime.tv_usec) * 1000ull;
+    return ProcessIdentityLiveness::kAlive;
 }
 #endif
 
@@ -251,29 +298,59 @@ ProcessIdentity ComputeCurrentIdentity() {
 
 }  // namespace
 
-bool IsProcessIdentityAlive(const ProcessIdentity& identity) noexcept {
+ProcessIdentityLiveness ProbeProcessIdentity(
+    const ProcessIdentity& identity) noexcept {
     if (identity.IsZero() || identity.process_id == 0) {
-        return false;
+        return ProcessIdentityLiveness::kDead;
     }
     const ProcessIdentity& current = ProcessIdentity::Current();
     if (identity.process_id == current.process_id) {
-        return identity == current;
+        return identity == current ? ProcessIdentityLiveness::kAlive
+                                   : ProcessIdentityLiveness::kDead;
     }
-#if defined(__linux__)
     if (identity.node_id != 0 && current.node_id != 0 &&
         identity.node_id != current.node_id) {
-        return false;
+        return ProcessIdentityLiveness::kDead;
     }
+#if defined(__linux__)
     uint64_t observed_start_ns = 0;
-    return ReadLinuxProcessStartTimeNs(identity.process_id,
-                                       &observed_start_ns) &&
-           observed_start_ns == identity.start_time_ns;
+    char process_state = '\0';
+    int open_error = 0;
+    if (!ReadLinuxProcessInfo(identity.process_id, &observed_start_ns,
+                              &process_state, &open_error)) {
+        return open_error == ENOENT || open_error == ESRCH
+                   ? ProcessIdentityLiveness::kDead
+                   : ProcessIdentityLiveness::kUnknown;
+    }
+    if (process_state == 'Z' || process_state == 'X') {
+        return ProcessIdentityLiveness::kDead;
+    }
+    return observed_start_ns == identity.start_time_ns
+               ? ProcessIdentityLiveness::kAlive
+               : ProcessIdentityLiveness::kDead;
+#elif defined(__APPLE__)
+    uint64_t observed_start_ns = 0;
+    const ProcessIdentityLiveness liveness =
+        ReadAppleProcessStartTimeNs(identity.process_id, &observed_start_ns);
+    if (liveness != ProcessIdentityLiveness::kAlive) {
+        return liveness;
+    }
+    return observed_start_ns == identity.start_time_ns
+               ? ProcessIdentityLiveness::kAlive
+               : ProcessIdentityLiveness::kDead;
 #elif MINO_HAS_POSIX
     const int rc = ::kill(static_cast<pid_t>(identity.process_id), 0);
-    return rc == 0 || errno == EPERM;
+    if (rc != 0 && errno == ESRCH) {
+        return ProcessIdentityLiveness::kDead;
+    }
+    return ProcessIdentityLiveness::kUnknown;
 #else
-    return true;
+    return ProcessIdentityLiveness::kUnknown;
 #endif
+}
+
+bool IsProcessIdentityAlive(const ProcessIdentity& identity) noexcept {
+    return ProbeProcessIdentity(identity) == ProcessIdentityLiveness::kAlive;
 }
 
 const ProcessIdentity& ProcessIdentity::Current() {

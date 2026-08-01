@@ -46,6 +46,7 @@ cc_test(
         "//mino/schema:compiler",
         "//mino/runtime:runtime_types",
         "//mino/schema:layout",
+        "//mino/schema:registry",
         "//mino/schema:wire",
         "//mino/shm/channel:index_slot",
         "@googletest//:gtest_main",

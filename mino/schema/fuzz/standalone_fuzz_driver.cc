@@ -83,8 +83,8 @@ std::vector<std::byte> DescriptorBytes() {
     if (!input) {
         throw std::runtime_error("cannot read MINODSC2 fuzz seed");
     }
-    const std::string artifact(std::istreambuf_iterator<char>(input),
-                               std::istreambuf_iterator<char>());
+    const std::string artifact{std::istreambuf_iterator<char>(input),
+                               std::istreambuf_iterator<char>()};
     return StringBytes(artifact);
 }
 

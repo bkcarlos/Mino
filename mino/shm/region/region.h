@@ -55,10 +55,23 @@ struct RegionCreateOptions {
 };
 
 // Options for SharedMemoryRegion::Attach (design doc section 6.2).
+//
+// v3 attachment contract:
+//   * read_only=true supports any number of concurrent processes and never
+//     participates in lifecycle recovery.
+//   * read_only=false requests the unique supervisor role. It fails with
+//     kWouldBlock while another supervisor process is live. The v3 SuperBlock
+//     has no capacity for a crash-safe multi-writer registration table, so
+//     writable non-supervisor Attach is intentionally unsupported.
 struct RegionAttachOptions {
     std::string name;        // resolved to a region_id via the Registry
     uint32_t region_id = 0;  // or specified explicitly (mutually exclusive)
     bool read_only = false;
+
+    // Diagnostic escape hatch for quarantined Regions. It is honored only when
+    // read_only=true; writable Attach always rejects QUARANTINED before taking
+    // the supervisor lock or changing any lifecycle/fence metadata.
+    bool allow_quarantined_read_only = false;
 
     // How long to wait for an in-progress recovery by another process before
     // giving up (design doc section 6.5 step 4). Zero means do not wait.
@@ -72,8 +85,8 @@ class SharedMemoryRegion {
 public:
     SharedMemoryRegion(const SharedMemoryRegion&) = delete;
     SharedMemoryRegion& operator=(const SharedMemoryRegion&) = delete;
-    SharedMemoryRegion(SharedMemoryRegion&&) noexcept = default;
-    SharedMemoryRegion& operator=(SharedMemoryRegion&&) noexcept = default;
+    SharedMemoryRegion(SharedMemoryRegion&& other) noexcept;
+    SharedMemoryRegion& operator=(SharedMemoryRegion&& other) noexcept;
     ~SharedMemoryRegion();
 
     // Creates a new Region: allocates a persistent region_id, lays out and
@@ -105,11 +118,21 @@ public:
         return reinterpret_cast<const SuperBlock*>(segment_->base());
     }
 
-    // Cleanly detaches: marks clean_shutdown = true, transitions ACTIVE ->
-    // CLOSED (design doc 6.1), and unmaps. Safe to call once.
+    // Cleanly detaches. A writable supervisor first validates its exact v3
+    // service fence, then marks clean_shutdown=true and ACTIVE->CLOSED. A stale
+    // Region object can only unmap; it cannot close a replacement supervisor's
+    // Region. Read-only attachments only unmap.
     Status Detach();
 
-    // The identity used for recovery ownership of this Region in this process.
+    // True for the unique writable supervisor attachment. Mutable Region data
+    // access is valid only while ValidateSupervisorFence() succeeds.
+    bool is_supervisor() const noexcept { return is_supervisor_; }
+    uint64_t service_epoch() const noexcept {
+        return ServiceFenceEpoch(service_fence_at_attach_);
+    }
+    Status ValidateSupervisorFence() const;
+
+    // The identity used for service and recovery ownership in this process.
     const ProcessIdentity& owner_identity() const { return owner_identity_; }
 
 private:
@@ -121,10 +144,15 @@ private:
                                           uint64_t actual_object_size,
                                           uint32_t expected_feature_flags);
     static Status ValidateSubRegionBounds(const SuperBlock& sb);
+    void MoveFrom(SharedMemoryRegion&& other) noexcept;
+    void CloseWithoutLifecycleUpdate() noexcept;
 
     std::optional<SharedMemorySegment> segment_;
     uint32_t region_id_ = 0;
     ProcessIdentity owner_identity_;
+    uint64_t service_fence_at_attach_ = 0;
+    int supervisor_lock_fd_ = -1;
+    bool is_supervisor_ = false;
     bool detached_ = false;
 };
 

@@ -15,8 +15,13 @@
 #include "tools/mino/inspector.h"
 
 #include <atomic>
+#include <limits>
+#include <memory>
 #include <ostream>
 #include <utility>
+
+#include "mino/shm/allocator/central_slab.h"
+#include "mino/shm/region/region.h"
 
 namespace mino::tools {
 
@@ -38,13 +43,24 @@ constexpr std::string_view ObjectStateName(uint32_t value) {
             return "RETIRED";
         case 5:
             return "ABORTING";
+        case 6:
+            return "RECLAIMING";
+        case 7:
+            return "ALLOCATING";
         default:
             return "INVALID";
     }
 }
 
 constexpr bool IsValidPublishedState(uint32_t value) {
-    return value >= 1 && value <= 5;
+    return value >= static_cast<uint32_t>(ObjectState::kAllocated) &&
+           value <= static_cast<uint32_t>(ObjectState::kAborting);
+}
+
+constexpr bool IsProtocolReclaimableState(uint32_t value) {
+    return value == static_cast<uint32_t>(ObjectState::kFree) ||
+           value == static_cast<uint32_t>(ObjectState::kReclaiming) ||
+           value == static_cast<uint32_t>(ObjectState::kAllocating);
 }
 
 }  // namespace
@@ -79,14 +95,72 @@ Result<Inspector> Inspector::Attach(const std::string& region_name) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "region name must not be empty");
     }
-    // //mino/shm/region:region (D1-03) is developed in parallel. When it
-    // lands this becomes SharedMemoryRegion::Attach + layout derivation from
-    // the SuperBlock. The CLI falls back to --image in the meantime.
-    return Status::Error(
-        StatusCode::kUnsupported,
-        "attaching by region name requires //mino/shm/region:region "
-        "(in development); use `mino inspect --image <file>` with a region "
-        "image instead");
+
+    RegionAttachOptions options;
+    options.name = region_name;
+    options.read_only = true;
+    options.allow_quarantined_read_only = true;
+    MINO_ASSIGN_OR_RETURN(SharedMemoryRegion attached,
+                          SharedMemoryRegion::Attach(options));
+    auto region = std::make_shared<SharedMemoryRegion>(std::move(attached));
+
+    const SuperBlock& sb = *region->superblock();
+    const uint64_t allocator_available = region->size() - sb.allocator_offset;
+    const void* allocator_base = region->base() + sb.allocator_offset;
+    MINO_ASSIGN_OR_RETURN(
+        const bool metadata_present,
+        CentralSlabAllocator::HasAllocatorMetadata(allocator_base,
+                                                   allocator_available));
+    if (!metadata_present) {
+        return Status::Error(StatusCode::kNotFound,
+                             "Region allocator metadata is not initialized");
+    }
+
+    RegionAllocatorStorage storage{
+        .region_base = region->base(),
+        .region_size = region->size(),
+        .allocator_offset = sb.allocator_offset,
+        .allocator_size = sb.data_offset - sb.allocator_offset,
+        .data_offset = sb.data_offset,
+        .data_size = sb.data_size,
+        .region_id = sb.region_id,
+    };
+    MINO_ASSIGN_OR_RETURN(CentralSlabAllocator attached_allocator,
+                          CentralSlabAllocator::AttachInRegion(storage));
+    auto allocator = std::make_shared<CentralSlabAllocator>(
+        std::move(attached_allocator));
+
+    Layout layout;
+    layout.classes.resize(allocator->class_count());
+    for (uint32_t class_id = 0; class_id < allocator->class_count();
+         ++class_id) {
+        layout.classes[class_id] = ClassView{
+            .class_id = class_id,
+            .slot_count = 0,
+            .bitmap_offset = 0,
+            .slots_offset = 0,
+            .slot_stride = 0,
+            .reserved = 0,
+        };
+    }
+    // The allocator's persisted class table is authoritative. Padding slots
+    // between 64-bit bitmap shards have class_count() as their sentinel class
+    // id and are intentionally excluded from the Inspector's logical layout.
+    for (uint32_t slot = 0; slot < allocator->total_slot_count(); ++slot) {
+        const uint16_t class_id = allocator->ClassIdForRecovery(slot);
+        if (class_id < layout.classes.size()) {
+            ++layout.classes[class_id].slot_count;
+        }
+    }
+    // The current Region Directory reserves bytes but does not persist channel
+    // ring registrations. Do not guess offsets by scanning for magic: callers
+    // that need ring dumps must continue to provide explicit RingRef metadata.
+
+    Inspector inspector(region->base(), region->size(), std::move(layout),
+                        region_name);
+    inspector.region_ = std::move(region);
+    inspector.allocator_ = std::move(allocator);
+    return inspector;
 }
 
 Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
@@ -99,21 +173,30 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
 
     for (uint32_t i = 0; i < inspector.layout_.classes.size(); ++i) {
         const ClassView& cls = inspector.layout_.classes[i];
-        const uint64_t word_count = (cls.slot_count + 63) / 64;
-        if (inspector.At(cls.bitmap_offset, word_count * 64) == nullptr) {
+        const uint64_t word_count =
+            (static_cast<uint64_t>(cls.slot_count) + 63) / 64;
+        const uint64_t bitmap_extent =
+            word_count == 0 ? 0 : (word_count - 1) * 64 +
+                                      sizeof(std::atomic<uint64_t>);
+        if (inspector.At(cls.bitmap_offset, bitmap_extent) == nullptr) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "bitmap of class " + std::to_string(i) +
                                      " out of bounds");
         }
-        if (cls.slot_count > 0 &&
-            (cls.slot_stride < sizeof(SlabHeaderView) ||
-             inspector.At(cls.slots_offset,
-                          static_cast<uint64_t>(cls.slot_count - 1) *
-                                  cls.slot_stride +
-                              sizeof(SlabHeaderView)) == nullptr)) {
-            return Status::Error(StatusCode::kInvalidArgument,
-                                 "slot array of class " + std::to_string(i) +
-                                     " out of bounds");
+        if (cls.slot_count > 0) {
+            const uint64_t slots_before_last =
+                static_cast<uint64_t>(cls.slot_count - 1) * cls.slot_stride;
+            if (cls.slot_stride < sizeof(SlabHeaderView) ||
+                slots_before_last >
+                    std::numeric_limits<uint64_t>::max() -
+                        sizeof(SlabHeaderView) ||
+                inspector.At(cls.slots_offset,
+                             slots_before_last + sizeof(SlabHeaderView)) ==
+                    nullptr) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "slot array of class " +
+                                         std::to_string(i) + " out of bounds");
+            }
         }
     }
     for (const auto& ring : inspector.layout_.rings) {
@@ -127,7 +210,9 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
         const auto* control = static_cast<const RingControlView*>(
             inspector.At(ring.control_offset, sizeof(RingControlView)));
         if (control->magic == RingControlView::kMagic) {
-            if (inspector.At(ring.slots_offset,
+            if (control->capacity >
+                    std::numeric_limits<uint64_t>::max() / kIndexSlotSize ||
+                inspector.At(ring.slots_offset,
                              control->capacity * kIndexSlotSize) == nullptr) {
                 return Status::Error(
                     StatusCode::kInvalidArgument,
@@ -146,65 +231,109 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
 Result<Inspector::SlabConsistencyReport> Inspector::ScanSlabs() const {
     SlabConsistencyReport report;
 
-    for (uint32_t c = 0; c < layout_.classes.size(); ++c) {
-        const ClassView& cls = layout_.classes[c];
-        for (uint32_t s = 0; s < cls.slot_count; ++s) {
-            ++report.total_slots;
-            const bool occupied = IsBitSet(base_, cls.bitmap_offset, s);
-            const SlabHeaderView* header = SlotAt(cls, s);
+    auto classify = [&](uint32_t class_id, uint32_t slot_index,
+                        bool occupied, const SlabHeaderView& header,
+                        uint32_t authoritative_generation,
+                        bool check_generation) {
+        ++report.total_slots;
+        const uint32_t state =
+            header.object_state.load(std::memory_order_acquire);
+        const uint32_t generation =
+            header.generation.load(std::memory_order_acquire);
+
+        if (!occupied) {
+            if (state == static_cast<uint32_t>(ObjectState::kFree)) {
+                ++report.free_count;
+            } else {
+                ++report.inconsistent_count;
+                report.findings.push_back(SlabFinding{
+                    class_id, slot_index,
+                    SlabFinding::Kind::kInconsistent, state, generation,
+                    "bitmap free but object_state=" +
+                        std::string(ObjectStateName(state))});
+            }
+            return;
+        }
+
+        if (header.magic != kSlabMagic) {
+            ++report.corrupt_count;
+            report.findings.push_back(SlabFinding{
+                class_id, slot_index, SlabFinding::Kind::kCorrupt, state,
+                generation, "bad header magic"});
+            return;
+        }
+
+        if (!IsValidPublishedState(state)) {
+            if (!IsProtocolReclaimableState(state)) {
+                ++report.corrupt_count;
+                report.findings.push_back(SlabFinding{
+                    class_id, slot_index, SlabFinding::Kind::kCorrupt, state,
+                    generation, "unknown object_state"});
+            } else {
+                ++report.orphan_count;
+                report.findings.push_back(SlabFinding{
+                    class_id, slot_index, SlabFinding::Kind::kOrphan, state,
+                    generation,
+                    "bitmap occupied but object_state=" +
+                        std::string(ObjectStateName(state)) +
+                        " (allocation was not durably published, "
+                        "recoverable)"});
+            }
+            return;
+        }
+
+        const bool valid =
+            header.header_version == kSlabHeaderVersion &&
+            header.class_id == class_id &&
+            header.object_size <= header.capacity &&
+            header.immutable_header_crc == ComputeImmutableCrc(header) &&
+            (!check_generation || generation == authoritative_generation);
+        if (!valid) {
+            ++report.corrupt_count;
+            report.findings.push_back(SlabFinding{
+                class_id, slot_index, SlabFinding::Kind::kCorrupt, state,
+                generation,
+                "allocator SlabHeader/generation invariant failed"});
+            return;
+        }
+
+        ++report.ok_count;
+    };
+
+    if (allocator_ != nullptr) {
+        std::vector<uint32_t> next_local_slot(allocator_->class_count(), 0);
+        for (uint32_t global_slot = 0;
+             global_slot < allocator_->total_slot_count(); ++global_slot) {
+            const uint16_t class_id =
+                allocator_->ClassIdForRecovery(global_slot);
+            if (class_id >= allocator_->class_count()) {
+                continue;  // Bitmap shard padding, not a configured slot.
+            }
+            SlabHeaderView header{};
+            if (!allocator_->ReadSlotByIndex(global_slot, &header, nullptr)) {
+                return Status::Error(StatusCode::kInternal,
+                                     "allocator slot disappeared during scan");
+            }
+            classify(
+                class_id, next_local_slot[class_id]++,
+                allocator_->IsSlotOccupiedForRecovery(global_slot), header,
+                allocator_->AuthoritativeGenerationForRecovery(global_slot),
+                /*check_generation=*/true);
+        }
+        return report;
+    }
+
+    for (const ClassView& cls : layout_.classes) {
+        for (uint32_t slot = 0; slot < cls.slot_count; ++slot) {
+            const SlabHeaderView* header = SlotAt(cls, slot);
             if (header == nullptr) {
                 return Status::Error(StatusCode::kInternal,
                                      "slot array moved during scan");
             }
-            const uint32_t state =
-                header->object_state.load(std::memory_order_acquire);
-
-            if (!occupied) {
-                if (state == 0) {
-                    ++report.free_count;
-                } else {
-                    ++report.inconsistent_count;
-                    report.findings.push_back(SlabFinding{
-                        cls.class_id, s, SlabFinding::Kind::kInconsistent,
-                        state, 0,
-                        "bitmap free but object_state=" +
-                            std::string(ObjectStateName(state))});
-                }
-                continue;
-            }
-
-            if (header->magic != kSlabMagic) {
-                ++report.corrupt_count;
-                report.findings.push_back(SlabFinding{
-                    cls.class_id, s, SlabFinding::Kind::kCorrupt, state, 0,
-                    "bad header magic"});
-                continue;
-            }
-
-            if (!IsValidPublishedState(state)) {
-                ++report.orphan_count;
-                report.findings.push_back(SlabFinding{
-                    cls.class_id, s, SlabFinding::Kind::kOrphan, state,
-                    header->generation,
-                    "bitmap occupied but object_state=" +
-                        std::string(ObjectStateName(state)) +
-                        " (generation never published, recoverable)"});
-                continue;
-            }
-
-            if (state == 3 /*PUBLISHED*/ || state == 4 /*RETIRED*/) {
-                const uint32_t crc = ComputeImmutableCrc(*header);
-                if (header->immutable_header_crc != 0 &&
-                    header->immutable_header_crc != crc) {
-                    ++report.corrupt_count;
-                    report.findings.push_back(SlabFinding{
-                        cls.class_id, s, SlabFinding::Kind::kCorrupt, state,
-                        header->generation, "immutable header CRC mismatch"});
-                    continue;
-                }
-            }
-
-            ++report.ok_count;
+            classify(cls.class_id, slot,
+                     IsBitSet(base_, cls.bitmap_offset, slot), *header,
+                     /*authoritative_generation=*/0,
+                     /*check_generation=*/false);
         }
     }
     return report;
@@ -224,9 +353,12 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
         }
     }
     if (ref == nullptr) {
-        return Status::Error(StatusCode::kNotFound,
-                             "no ring buffer registered for channel " +
-                                 std::to_string(channel_id));
+        return Status::Error(
+            StatusCode::kNotFound,
+            "no ring buffer registered for channel " +
+                std::to_string(channel_id) +
+                "; Region metadata does not currently persist ring locations, "
+                "so provide an explicit RingRef/layout sidecar");
     }
 
     const auto* control = static_cast<const RingControlView*>(
@@ -240,10 +372,16 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
                              "ring control block has bad magic (channel " +
                                  std::to_string(channel_id) + ")");
     }
+    const uint64_t capacity = control->capacity;
+    if (capacity > std::numeric_limits<uint64_t>::max() / kIndexSlotSize ||
+        At(ref->slots_offset, capacity * kIndexSlotSize) == nullptr) {
+        return Status::Error(StatusCode::kCorruption,
+                             "ring slot array is out of bounds");
+    }
 
     RingBufferDump dump;
     dump.channel_id = channel_id;
-    dump.capacity = control->capacity;
+    dump.capacity = capacity;
     dump.enqueue_pos = control->enqueue_pos.load(std::memory_order_acquire);
     dump.dequeue_pos = control->dequeue_pos.load(std::memory_order_acquire);
     dump.pending = dump.enqueue_pos - dump.dequeue_pos;
@@ -352,8 +490,8 @@ const Inspector::SlabHeaderView* Inspector::SlotAt(
 
 bool Inspector::IsBitSet(const std::byte* base, uint64_t bitmap_offset,
                          uint32_t index) noexcept {
-    // Bitmap words are 64-byte aligned cache-line words; only the first 8
-    // bytes carry bits.
+    // Legacy offline sidecars place one bitmap word on each cache line. Live
+    // Region attachments use the allocator facade above and do not enter here.
     const auto* word = reinterpret_cast<const std::atomic<uint64_t>*>(
         base + bitmap_offset + static_cast<uint64_t>(index / 64) * 64);
     return (word->load(std::memory_order_acquire) >> (index % 64) & 1ULL) !=
@@ -361,38 +499,7 @@ bool Inspector::IsBitSet(const std::byte* base, uint64_t bitmap_offset,
 }
 
 uint32_t Inspector::ComputeImmutableCrc(const SlabHeaderView& h) noexcept {
-    // CRC32C (Castagnoli, reflected) with the same coverage as the recovery
-    // scanner: magic, version, class, generation, capacity, object_size,
-    // type_id, layout_version, schema_short_id.
-    struct __attribute__((packed)) ImmutableView {
-        uint32_t magic;
-        uint16_t header_version;
-        uint16_t class_id;
-        uint32_t generation;
-        uint32_t capacity;
-        uint32_t object_size;
-        uint32_t type_id;
-        uint32_t layout_version;
-        uint64_t schema_short_id;
-    };
-    ImmutableView view{h.magic,      h.header_version, h.class_id,
-                       h.generation, h.capacity,       h.object_size,
-                       h.type_id,    h.layout_version, h.schema_short_id};
-
-    uint32_t table[256];
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k) {
-            c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
-        }
-        table[i] = c;
-    }
-    const auto* bytes = reinterpret_cast<const unsigned char*>(&view);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < sizeof(view); ++i) {
-        crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
+    return ComputeImmutableHeaderCrc(h);
 }
 
 }  // namespace mino::tools

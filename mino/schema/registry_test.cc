@@ -31,15 +31,43 @@ SchemaHandle OnlyType(Result<CompiledSchema>& compiled) {
     return compiled->types()[0];
 }
 
+Result<std::vector<SchemaHandle>> ExactClosure(
+    const SchemaDescriptor& descriptor,
+    std::span<const SchemaHandle> candidates) {
+    std::vector<SchemaHandle> exact;
+    exact.reserve(descriptor.dependencies().size());
+    for (const DependencyDescriptor& dependency : descriptor.dependencies()) {
+        SchemaHandle resolved;
+        for (const SchemaHandle& candidate : candidates) {
+            if (candidate != nullptr &&
+                candidate->aggregate().full_name() == dependency.full_name() &&
+                candidate->identity().canonical_digest() == dependency.digest()) {
+                resolved = candidate;
+                break;
+            }
+        }
+        if (resolved == nullptr) {
+            return Status::Error(StatusCode::kSchemaMismatch,
+                                 "descriptor dependency closure is unavailable");
+        }
+        exact.push_back(std::move(resolved));
+    }
+    return exact;
+}
+
 Result<std::string> EncodeArtifact(
     const CompiledSchema& schema,
     std::span<const SchemaHandle> descriptor_closure = {}) {
-    const std::span<const SchemaHandle> closure =
+    // schema.types() are the artifact's local types and form a candidate pool;
+    // they are not all members of every local descriptor's exact closure.
+    const std::span<const SchemaHandle> candidates =
         descriptor_closure.empty() ? schema.types() : descriptor_closure;
     std::vector<LayoutPlan> layouts;
     layouts.reserve(schema.types().size());
     for (const SchemaHandle& descriptor : schema.types()) {
-        auto layout = LayoutPlanner::Plan(*descriptor, closure);
+        auto exact = ExactClosure(*descriptor, candidates);
+        if (!exact.ok()) return exact.status();
+        auto layout = LayoutPlanner::Plan(*descriptor, *exact);
         if (!layout.ok()) return layout.status();
         layouts.push_back(std::move(*layout));
     }

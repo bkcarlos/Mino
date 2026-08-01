@@ -88,10 +88,24 @@ static_assert(sizeof(ProcessIdentity) == 32,
 static_assert(std::is_trivially_copyable_v<ProcessIdentity>);
 static_assert(std::is_standard_layout_v<ProcessIdentity>);
 
-// Returns true only when the recorded process incarnation is still alive.
-// Linux validates both PID existence and /proc start time, so a recycled PID
-// cannot impersonate the old owner. Other POSIX platforms conservatively use
-// kill(pid, 0), except that the current process is always compared exactly.
+enum class ProcessIdentityLiveness {
+    kAlive,
+    kDead,
+    // The platform or current permissions cannot safely distinguish this
+    // incarnation from a recycled PID. Destructive recovery must treat this as
+    // live/blocked, never as dead.
+    kUnknown,
+};
+
+// Probes the exact recorded process incarnation. Linux validates PID, process
+// start time, and zombie state through /proc; macOS uses KERN_PROC_PID. A PID
+// that exists with a different start time is kDead (PID reuse), while an
+// uncheckable incarnation is kUnknown.
+ProcessIdentityLiveness ProbeProcessIdentity(
+    const ProcessIdentity& identity) noexcept;
+
+// Compatibility convenience. Unknown is deliberately not reported as alive;
+// recovery code must use ProbeProcessIdentity() and handle kUnknown explicitly.
 bool IsProcessIdentityAlive(const ProcessIdentity& identity) noexcept;
 
 }  // namespace mino

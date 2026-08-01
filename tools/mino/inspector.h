@@ -19,11 +19,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/shm/allocator/slab_header.h"
+
+namespace mino {
+class CentralSlabAllocator;
+class SharedMemoryRegion;
+}
 
 namespace mino::tools {
 
@@ -36,45 +43,18 @@ namespace mino::tools {
 //   - 诊断报告输出 (PrintReport)
 //
 // The Inspector is strictly read-only with respect to allocator/channel
-// payload state. Like RecoveryScanner it works against the shared layout
-// contract (offsets + header prefixes) rather than concrete region/allocator
-// C++ types, because //mino/shm/region:region and
-// //mino/shm/allocator:central_slab are being developed in parallel. The
-// ring-buffer view mirrors the MPMC skeleton control block of detailed
-// design 9.9.
-//
-// Attach modes:
-//   - Attach(name):        reserved for the region agent; currently returns
-//                          kUnsupported with a clear message so the CLI can
-//                          degrade gracefully.
-//   - AttachMemory(...):   fully supported today; used by tests and by the
-//                          CLI when given a region image file.
+// payload state. Attach(name) owns a read-only SharedMemoryRegion mapping and
+// derives slab offsets from the validated, persisted allocator metadata.
+// AttachMemory(...) remains available for offline images and explicit ring
+// layouts. Ring registration is not yet present in the Region Directory, so a
+// name-only attach intentionally leaves Layout::rings empty.
 // ---------------------------------------------------------------------------
 class Inspector {
 public:
-    // Minimal slab header view (identical layout to the recovery scanner's
-    // SlabHeaderPrefix). Duplicated intentionally: tools/ must not depend on
-    // //mino/shm/recovery internals, and the merge with the real SlabHeader
-    // will unify both.
-    struct SlabHeaderView {
-        uint32_t magic;
-        uint16_t header_version;
-        uint16_t class_id;
-        uint32_t generation;
-        std::atomic<uint32_t> object_state;
-        uint32_t capacity;
-        uint32_t object_size;
-        uint32_t type_id;
-        uint32_t layout_version;
-        uint64_t schema_short_id;
-        uint64_t owner_epoch;
-        uint64_t allocation_transaction_id;
-        uint32_t immutable_header_crc;
-        uint32_t reserved;
-        std::atomic<uint32_t> borrow_refcount;
-        std::atomic<uint32_t> pin_refcount;
-    };
-    static constexpr uint32_t kSlabMagic = 0x534C4231;  // "SLB1".
+    // The diagnostic scanner uses the allocator's authoritative shared-memory
+    // ABI rather than maintaining a parallel tools-only header definition.
+    using SlabHeaderView = ::mino::SlabHeader;
+    static constexpr uint32_t kSlabMagic = ::mino::kSlabHeaderMagic;
 
     struct ClassView {
         uint32_t class_id;
@@ -127,10 +107,11 @@ public:
     static constexpr uint32_t kIndexSlotSize = 128;
 
     struct Layout {
-        // Class descriptors are host-side metadata (parsed from a layout
-        // sidecar or, once the region agent lands, derived from the
-        // SuperBlock/allocator metadata). The inspector never reads a
-        // class table from the region itself.
+        // Class descriptors are host-side snapshots parsed from a sidecar or
+        // derived from validated SuperBlock/allocator metadata. For live name
+        // attachments, class_id/slot_count are populated while physical access
+        // remains delegated to the validated allocator facade; offset fields
+        // are therefore zero and must not be reused as an offline sidecar.
         std::vector<ClassView> classes;
         // Ring buffers: channel_id -> (control block, slot array) offsets.
         struct RingRef {
@@ -185,8 +166,10 @@ public:
         std::vector<RingSlotSummary> slots;  // capacity entries, physical order.
     };
 
-    // Reserved for //mino/shm/region:region. Until the region agent lands,
-    // returns kUnsupported so the CLI can point the user at --image.
+    // Opens an existing Region by name in read-only mode, validates its
+    // SuperBlock and allocator metadata, and derives the slab layout. Ring
+    // buffers are not auto-discovered until the Region Directory persists ring
+    // registrations; use AttachMemory with explicit RingRef entries for those.
     static Result<Inspector> Attach(const std::string& region_name);
 
     // Attaches to a caller-provided region image. The Inspector never writes
@@ -230,6 +213,12 @@ private:
     uint64_t size_;
     Layout layout_;
     std::string region_name_;
+    // Non-null only for Attach(name); keeps the read-only mapping alive for
+    // every pointer-based view held by this Inspector.
+    std::shared_ptr<::mino::SharedMemoryRegion> region_;
+    // Validated allocator facade used only through its recovery-facing const
+    // observation methods for live Region attachments.
+    std::shared_ptr<const ::mino::CentralSlabAllocator> allocator_;
 };
 
 // Free helpers shared by PrintReport and the CLI.

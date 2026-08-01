@@ -80,6 +80,70 @@ cc_test(
     ],
 )
 
+# D1 Region/Allocator/RecoveryScanner fork + MAP_SHARED kill stress.
+# The default target is a short smoke. Reproduce failures with:
+#   --test_env=MINO_D1_REGION_RECOVERY_STRESS_SEED=<seed>
+# and adjust duration with MINO_D1_REGION_RECOVERY_STRESS_SECONDS.
+cc_test(
+    name = "d1_region_recovery_kill_stress_test",
+    srcs = ["d1_region_recovery_kill_stress_test.cc"],
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/recovery:scanner",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Explicit one-hour randomized variant, excluded from wildcard CI. Invoke with
+# a finite outer watchdog, for example:
+#   bazel test //mino/shm/region:d1_region_recovery_kill_stress_long_test \
+#     --test_timeout=3660 --test_output=streamed \
+#     --test_env=MINO_D1_REGION_RECOVERY_STRESS_SEED=12345
+cc_test(
+    name = "d1_region_recovery_kill_stress_long_test",
+    srcs = ["d1_region_recovery_kill_stress_test.cc"],
+    args = [
+        "--gtest_filter=D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:"
+        + "D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+    ],
+    env = {"MINO_D1_REGION_RECOVERY_STRESS_SECONDS": "3600"},
+    tags = [
+        "large",
+        "manual",
+    ],
+    timeout = "long",
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/recovery:scanner",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "service_liveness_test",
+    srcs = ["service_liveness_test.cc"],
+    deps = [
+        ":region",
+        ":superblock",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "handle_resolver_test",
     srcs = ["handle_resolver_test.cc"],

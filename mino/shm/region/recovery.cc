@@ -458,9 +458,9 @@ Status RecoverRegionForAttach(SharedMemoryRegion& region,
             return Status::Ok();
         }
         if (state == RegionState::kActive) {
-            // No business-owner lease exists in this SuperBlock version. An
-            // ACTIVE/in-use Region may still have a live process, so destructive
-            // crash recovery cannot be justified from clean_shutdown alone.
+            // ACTIVE is never itself proof of a crash. Writable Attach must
+            // acquire the v3 supervisor lock, prove the recorded incarnation
+            // dead, and publish DIRTY before entering this recovery function.
             return Status::Error(
                 StatusCode::kWouldBlock,
                 "ACTIVE Region may have live service; explicit DIRTY fencing required");

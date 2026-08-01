@@ -13,12 +13,14 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "mino/schema/compiler.h"
 #include "mino/schema/layout.h"
+#include "mino/schema/registry.h"
 
 namespace mino::schema::codegen {
 namespace {
@@ -138,7 +140,33 @@ TEST(CodeGeneratorTest, DescriptorCodecRoundTripsSemanticsAndRejectsTampering) {
     ASSERT_NE(label, nullptr);
     EXPECT_TRUE(label->constraints().snapshot_key());
     ASSERT_TRUE(label->default_value().has_value());
-    EXPECT_EQ(label->default_value()->canonical_value(), "ready");
+    EXPECT_EQ(label->default_value()->kind(), DefaultValue::Kind::kString);
+    EXPECT_EQ(label->default_value()->canonical_value(),
+              std::string("re\0ady", 6));
+    const FieldDescriptor* payload = descriptor.aggregate().FindField(3);
+    ASSERT_NE(payload, nullptr);
+    ASSERT_TRUE(payload->default_value().has_value());
+    EXPECT_EQ(payload->default_value()->kind(), DefaultValue::Kind::kBytes);
+    std::string expected_payload(2, '\0');
+    expected_payload[0] = static_cast<char>(0xff);
+    EXPECT_EQ(payload->default_value()->canonical_value(), expected_payload);
+
+    SchemaRegistry registry;
+    auto registered = registry.RegisterDescriptor(std::as_bytes(std::span(
+        generated->descriptor.data(), generated->descriptor.size())));
+    ASSERT_TRUE(registered.ok()) << registered.status().ToString();
+    const FieldDescriptor* trusted_label =
+        (*registered)->aggregate().FindField(2);
+    ASSERT_NE(trusted_label, nullptr);
+    ASSERT_TRUE(trusted_label->default_value().has_value());
+    EXPECT_EQ(trusted_label->default_value()->canonical_value(),
+              std::string("re\0ady", 6));
+    const FieldDescriptor* trusted_payload =
+        (*registered)->aggregate().FindField(3);
+    ASSERT_NE(trusted_payload, nullptr);
+    ASSERT_TRUE(trusted_payload->default_value().has_value());
+    EXPECT_EQ(trusted_payload->default_value()->canonical_value(),
+              expected_payload);
 
     std::string tampered = generated->descriptor;
     ASSERT_FALSE(tampered.empty());
