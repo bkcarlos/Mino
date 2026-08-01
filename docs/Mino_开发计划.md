@@ -243,11 +243,11 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 ### 5.4 退出条件（DoD）
 
 - [x] `.idl` 稳定生成 `.generated.h/.cc` + MINODSC2 Descriptor（CodeGen/minoc/golden 测试通过）
-- [ ] 静态和动态路径产生字节一致的 Canonical Wire 输出（INV-08；固定标量与 optional 路径已通过，非空 variable/nested 仍需 resolver/allocator 上下文）
+- [x] 静态和动态路径产生字节一致的 Canonical Wire 输出（INV-08；固定标量、optional、非空 string/bytes/vector、nested message/inline struct 与 unknown fields 均通过 pinned resolver + transactional allocator 等价性测试）
 - [x] 显式 Field ID、Reserved、递归拒绝全部按规则执行（INV-21）
 - [x] 兼容性测试矩阵通过（kWireCompatible/kReadCompatible/kWriteCompatible/kIncompatible）
-- [ ] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界（Hermetic corpus 已通过，长时 sanitizer campaign 待执行）
-- [ ] Hermetic CodeGen 跨环境一致（V-07、V-08；同环境与跨目录已通过，跨机器 hash 待验证）
+- [ ] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界（Hermetic corpus 与 ASAN/UBSAN libFuzzer smoke 已通过；每周/手动一小时 campaign workflow 已就绪，首次云端长跑待执行）
+- [ ] Hermetic CodeGen 跨环境一致（V-07、V-08；本地 15 个输出 hash 收集已通过；Ubuntu 22 GCC 12 与 Ubuntu 24 Clang 18 严格 hash 对比 workflow 已就绪，首次云端结果待验证）
 - [x] 动态对象图可完整回收（Allocation Journal/ObjectGraphWalker/fork crash recovery 测试通过）
 
 ---

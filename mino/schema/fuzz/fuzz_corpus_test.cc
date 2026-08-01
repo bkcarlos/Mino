@@ -106,24 +106,7 @@ uint64_t Mix(uint64_t value) {
     return value ^ (value >> 31);
 }
 
-enum class HarnessKind { kIdl, kDescriptor, kCanonicalPayload };
-
-bool IsAllowed(HarnessKind harness, StatusCode code) {
-    if (code == StatusCode::kOk || code == StatusCode::kResourceExhausted) {
-        return true;
-    }
-    if (harness == HarnessKind::kIdl) {
-        return code == StatusCode::kInvalidArgument;
-    }
-    if (harness == HarnessKind::kDescriptor) {
-        return code == StatusCode::kInvalidArgument ||
-               code == StatusCode::kCorruption ||
-               code == StatusCode::kSchemaMismatch ||
-               code == StatusCode::kUnsupported;
-    }
-    return code == StatusCode::kCorruption ||
-           code == StatusCode::kSchemaMismatch;
-}
+using HarnessKind = FuzzHarnessKind;
 
 Status Run(HarnessKind harness, std::span<const std::byte> input) {
     if (harness == HarnessKind::kIdl) return FuzzIdl(input);
@@ -134,7 +117,7 @@ Status Run(HarnessKind harness, std::span<const std::byte> input) {
 void ExpectAllowed(HarnessKind harness, std::span<const std::byte> input,
                    size_t case_index) {
     const Status status = Run(harness, input);
-    EXPECT_TRUE(IsAllowed(harness, status.code()))
+    EXPECT_TRUE(IsExpectedFuzzStatus(harness, status.code()))
         << "case=" << case_index << " status=" << status.ToString();
 }
 

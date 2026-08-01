@@ -89,6 +89,12 @@ build:tsan --copt=-fno-omit-frame-pointer
 build:tsan --copt=-g
 build:tsan --linkopt=-fsanitize=thread
 
+# Clang coverage-guided fuzzing engine. Combine this with exactly one sanitizer
+# configuration, for example: --config=asan --config=fuzz.
+build:fuzz --copt=-fsanitize=fuzzer-no-link
+build:fuzz --linkopt=-fsanitize=fuzzer
+build:fuzz --linkopt=-fsanitize-link-c++-runtime
+
 ###############################################################################
 # coverage
 ###############################################################################

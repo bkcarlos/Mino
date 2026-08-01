@@ -14,3 +14,22 @@ struct Scalars {
   required bool active = 9;
   optional uint32 sequence = 10;
 }
+
+message Child {
+  required int32 id = 1;
+  optional string note = 2 [max_bytes = 32];
+}
+
+struct InlinePoint {
+  required fixed32 x = 1;
+  required fixed32 y = 2;
+}
+
+message GraphValues {
+  required string text = 1 [max_bytes = 64];
+  required bytes payload = 2 [max_bytes = 64];
+  required vector<uint32> values = 3 [max_capacity = 8];
+  required Child child = 4;
+  optional vector<Child> children = 5 [max_capacity = 4];
+  optional InlinePoint point = 6;
+}

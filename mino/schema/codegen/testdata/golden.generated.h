@@ -20,6 +20,7 @@
 
 #include "mino/runtime/message_traits.h"
 #include "mino/shm/channel/index_slot.h"
+#include "mino/schema/dynamic_object.h"
 #include "mino/schema/wire.h"
 
 namespace golden {
@@ -244,9 +245,9 @@ private:
     std::byte* data_;
 };
 
-// Canonical Wire adapter for fixed scalars and empty variable values.
-// Non-empty variables, nested values, and unknown fields require SHM
-// resolution/allocation and are rejected explicitly with kUnsupported.
+// Canonical Wire adapter. The value overloads preserve the legacy
+// fixed/empty-variable behavior. Graph reads consume a root Pin and keep
+// DynamicView local; graph decode allocates through DynamicBuilder.
 class TelemetryWireAdapter final {
 public:
     static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(
@@ -257,6 +258,27 @@ public:
     static ::mino::Result<Telemetry> Decode(
         std::span<const std::byte> bytes,
         const ::mino::schema::WireLimits& limits = {}) noexcept;
+
+    static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(
+        ::mino::ShmHandle root,
+        const ::mino::CentralSlabAllocator& allocator,
+        ::mino::ShmPinToken root_pin,
+        const ::mino::schema::DynamicObjectOptions& options = {}) noexcept;
+    static ::mino::Result<std::vector<std::byte>> Encode(
+        ::mino::ShmHandle root,
+        const ::mino::CentralSlabAllocator& allocator,
+        ::mino::ShmPinToken root_pin,
+        const ::mino::schema::WireLimits& limits = {},
+        const ::mino::schema::DynamicObjectOptions& options = {}) noexcept;
+    static ::mino::Result<::mino::schema::DynamicObject> Decode(
+        std::span<const std::byte> bytes,
+        ::mino::CentralSlabAllocator& allocator,
+        ::mino::AllocationJournal& journal,
+        ::mino::ShmPinTable& pins,
+        const ::mino::schema::WireLimits& wire_limits = {},
+        const ::mino::schema::DynamicObjectOptions& object_options = {},
+        const ::mino::ProcessIdentity& owner =
+            ::mino::ProcessIdentity::Current()) noexcept;
 };
 
 }  // namespace golden

@@ -75,3 +75,19 @@ cc_binary(
         "//mino/common:status",
     ],
 )
+
+# Clang libFuzzer entry point for long-running sanitizer campaigns. This target
+# intentionally has no main function of its own and must be built explicitly
+# with --config=fuzz plus exactly one sanitizer configuration.
+cc_binary(
+    name = "libfuzzer_driver",
+    srcs = ["libfuzzer_driver.cc"],
+    tags = [
+        "large",
+        "manual",
+    ],
+    deps = [
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)

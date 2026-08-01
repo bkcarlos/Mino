@@ -1,0 +1,256 @@
+name: D3 Extended Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 2 * * 0"
+  push:
+    branches: [master, main]
+    paths:
+      - .github/workflows/d3-extended-validation.yml
+      - .bazelrc
+      - MODULE.bazel
+      - MODULE.bazel.lock
+      - mino/schema/**
+      - schemas/**
+      - tools/ci/**
+      - tools/minoc/**
+  pull_request:
+    branches: [master, main]
+    paths:
+      - .github/workflows/d3-extended-validation.yml
+      - .bazelrc
+      - MODULE.bazel
+      - MODULE.bazel.lock
+      - mino/schema/**
+      - schemas/**
+      - tools/ci/**
+      - tools/minoc/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d3-extended-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  codegen:
+    name: CodeGen ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: ubuntu22-gcc12
+            os: ubuntu-22.04
+            cc: gcc-12
+            cxx: g++-12
+            packages: gcc-12 g++-12 libatomic1
+            jobs: 1
+            checkout_path: checkout-gcc
+            tz: UTC
+            source_date_epoch: 0
+          - id: ubuntu24-clang18
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 libatomic1
+            jobs: 4
+            checkout_path: nested/checkout-clang
+            tz: Pacific/Auckland
+            source_date_epoch: 2147483647
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      TZ: ${{ matrix.tz }}
+      LANG: C.UTF-8
+      SOURCE_DATE_EPOCH: ${{ matrix.source_date_epoch }}
+      MINO_CODEGEN_ENV_PROBE: ${{ matrix.id }}
+
+    steps:
+      - name: Checkout into environment-specific path
+        uses: actions/checkout@v4
+        with:
+          path: ${{ matrix.checkout_path }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Run existing hermetic CodeGen tests
+        working-directory: ${{ matrix.checkout_path }}
+        run: |
+          bazel test --config=release --jobs=${{ matrix.jobs }} \
+            //mino/schema/codegen:code_generator_test \
+            //tools/minoc:canonical_wire_generated_test \
+            //tools/minoc:minoc_cli_test \
+            //tools/minoc:cross_directory_generated_test \
+            --test_output=errors
+
+      - name: Build all compared CodeGen output groups
+        working-directory: ${{ matrix.checkout_path }}
+        run: |
+          bazel build --config=release --jobs=${{ matrix.jobs }} \
+            --output_groups=default,descriptor \
+            //tools/minoc:sample_codegen \
+            //tools/minoc:canonical_wire_codegen \
+            //tools/minoc:mangling_codegen \
+            //tools/minoc:sensor_frame_codegen \
+            //mino/schema/fuzz:codegen_golden
+
+      - name: Collect logical artifacts and SHA-256 manifest
+        working-directory: ${{ matrix.checkout_path }}
+        run: |
+          python3 tools/ci/collect_codegen_artifacts.py \
+            --config=release \
+            --out=hermetic-codegen
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "checkout_path=${{ matrix.checkout_path }}"
+            echo "jobs=${{ matrix.jobs }}"
+            echo "tz=${TZ}"
+            echo "source_date_epoch=${SOURCE_DATE_EPOCH}"
+            uname -a
+            bazel --version
+            ${{ matrix.cxx }} --version
+          } > hermetic-codegen/PROVENANCE.txt
+
+      - name: Upload CodeGen bytes and hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3-codegen-${{ matrix.id }}
+          path: ${{ matrix.checkout_path }}/hermetic-codegen
+          if-no-files-found: error
+          retention-days: 90
+
+  compare-codegen:
+    name: Strict CodeGen hash comparison
+    needs: codegen
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Download GCC artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: d3-codegen-ubuntu22-gcc12
+          path: compare/ubuntu22-gcc12
+
+      - name: Download Clang artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: d3-codegen-ubuntu24-clang18
+          path: compare/ubuntu24-clang18
+
+      - name: Require byte-identical logical manifests
+        run: |
+          diff -u \
+            compare/ubuntu22-gcc12/SHA256SUMS \
+            compare/ubuntu24-clang18/SHA256SUMS
+          diff -u \
+            compare/ubuntu22-gcc12/ROOT_SHA256 \
+            compare/ubuntu24-clang18/ROOT_SHA256
+
+  fuzz:
+    name: ${{ matrix.sanitizer }} libFuzzer (1h)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, ubsan]
+
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Clang and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-rt-dev libatomic1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Prepare selector-prefixed seed corpus
+        run: |
+          python3 tools/ci/prepare_d3_fuzz_corpus.py --out=fuzz-corpus
+          mkdir -p fuzz-artifacts fuzz-output
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "sanitizer=${{ matrix.sanitizer }}"
+            echo "seed=${{ github.run_number }}"
+            uname -a
+            bazel --version
+            clang++ --version
+          } > fuzz-output/environment.txt
+
+      - name: Run one-hour sanitizer campaign
+        run: |
+          set -o pipefail
+          bazel run \
+            --config=${{ matrix.sanitizer }} \
+            --config=fuzz \
+            //mino/schema/fuzz:libfuzzer_driver -- \
+            "${GITHUB_WORKSPACE}/fuzz-corpus" \
+            -max_total_time=3600 \
+            -max_len=32769 \
+            -timeout=10 \
+            -rss_limit_mb=4096 \
+            -malloc_limit_mb=512 \
+            -jobs=1 \
+            -workers=1 \
+            -seed=${{ github.run_number }} \
+            -print_final_stats=1 \
+            -artifact_prefix="${GITHUB_WORKSPACE}/fuzz-artifacts/" \
+            2>&1 | tee fuzz-output/fuzz.log
+
+      - name: Require all fuzz harnesses to execute
+        run: |
+          grep -E \
+            'D3 libFuzzer selectors: IDL=[1-9][0-9]* Descriptor=[1-9][0-9]* CanonicalPayload=[1-9][0-9]*' \
+            fuzz-output/fuzz.log
+
+      - name: Minimize surviving corpus
+        run: |
+          mkdir -p fuzz-corpus-minimized
+          bazel run \
+            --config=${{ matrix.sanitizer }} \
+            --config=fuzz \
+            //mino/schema/fuzz:libfuzzer_driver -- \
+            -merge=1 \
+            -timeout=10 \
+            -rss_limit_mb=4096 \
+            -malloc_limit_mb=512 \
+            "${GITHUB_WORKSPACE}/fuzz-corpus-minimized" \
+            "${GITHUB_WORKSPACE}/fuzz-corpus" \
+            >> fuzz-output/fuzz.log 2>&1
+
+      - name: Upload fuzz evidence and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3-fuzz-${{ matrix.sanitizer }}-${{ github.run_id }}
+          path: |
+            fuzz-output/**
+            fuzz-corpus/**
+            fuzz-corpus-minimized/**
+            fuzz-artifacts/**
+          if-no-files-found: warn
+          retention-days: 30

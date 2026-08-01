@@ -6,6 +6,7 @@
 #define MINO_SCHEMA_FUZZ_FUZZ_HARNESS_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 #include "mino/common/status.h"
@@ -17,6 +18,16 @@ namespace mino::schema::fuzz {
 inline constexpr size_t kMaxIdlInputBytes = 16u << 10;
 inline constexpr size_t kMaxDescriptorInputBytes = 32u << 10;
 inline constexpr size_t kMaxCanonicalPayloadBytes = 16u << 10;
+
+enum class FuzzHarnessKind : uint8_t {
+    kIdl = 0,
+    kDescriptor = 1,
+    kCanonicalPayload = 2,
+};
+
+FuzzHarnessKind SelectFuzzHarness(std::span<const std::byte> input) noexcept;
+bool IsExpectedFuzzStatus(FuzzHarnessKind harness,
+                          StatusCode code) noexcept;
 
 // Stable, engine-neutral harness boundaries. Arbitrary input is an expected
 // condition: malformed data is reported as a Status and no exception escapes.

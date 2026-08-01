@@ -47,8 +47,19 @@ namespace {
             std::vector<::mino::schema::DependencyDescriptor>{
             }));
         ::mino::schema::SchemaRegistry registry;
-        return registry.RegisterCompiled(
+        auto registered = registry.RegisterCompiled(
             ::mino::schema::CompiledSchema(std::move(result)));
+        if (!registered.ok()) return registered.status();
+        const auto root = std::find_if(
+            registered->begin(), registered->end(), [](const auto& value) {
+                return value->aggregate().full_name() == "golden.Telemetry";
+            });
+        if (root == registered->end()) {
+            return ::mino::Status::Error(::mino::StatusCode::kInternal,
+                                         "registered wire root is missing");
+        }
+        std::iter_swap(registered->begin(), root);
+        return registered;
     } catch (const std::bad_alloc&) {
         return ::mino::Status::Error(::mino::StatusCode::kResourceExhausted);
     } catch (...) {
@@ -190,4 +201,65 @@ static_assert(std::is_standard_layout_v<::golden::TelemetryObjectHeader>);
                                      "decoded static object is invalid");
     }
     return result;
+}
+
+::mino::Result<::mino::schema::DynamicMessage> golden::TelemetryWireAdapter::ToDynamicMessage(
+    ::mino::ShmHandle root,
+    const ::mino::CentralSlabAllocator& allocator,
+    ::mino::ShmPinToken root_pin,
+    const ::mino::schema::DynamicObjectOptions& options) noexcept {
+    auto descriptors = BuildWireDescriptors_b6f9571dab645216();
+    if (!descriptors.ok()) return descriptors.status();
+    auto layout = ::mino::schema::LayoutPlanner::Plan(
+        **descriptors->begin(), *descriptors);
+    if (!layout.ok()) return layout.status();
+    auto view = ::mino::schema::DynamicView::Create(
+        descriptors->front(), std::move(*layout), root, allocator,
+        std::move(root_pin), *descriptors, options);
+    if (!view.ok()) return view.status();
+    return view->ToDynamicMessage();
+}
+
+::mino::Result<std::vector<std::byte>> golden::TelemetryWireAdapter::Encode(
+    ::mino::ShmHandle root,
+    const ::mino::CentralSlabAllocator& allocator,
+    ::mino::ShmPinToken root_pin,
+    const ::mino::schema::WireLimits& limits,
+    const ::mino::schema::DynamicObjectOptions& options) noexcept {
+    auto descriptors = BuildWireDescriptors_b6f9571dab645216();
+    if (!descriptors.ok()) return descriptors.status();
+    auto layout = ::mino::schema::LayoutPlanner::Plan(
+        **descriptors->begin(), *descriptors);
+    if (!layout.ok()) return layout.status();
+    auto view = ::mino::schema::DynamicView::Create(
+        descriptors->front(), std::move(*layout), root, allocator,
+        std::move(root_pin), *descriptors, options);
+    if (!view.ok()) return view.status();
+    auto message = view->ToDynamicMessage();
+    if (!message.ok()) return message.status();
+    return ::mino::schema::CanonicalWireCodec::Encode(
+        **descriptors->begin(), *message, *descriptors, limits);
+}
+
+::mino::Result<::mino::schema::DynamicObject> golden::TelemetryWireAdapter::Decode(
+    std::span<const std::byte> bytes,
+    ::mino::CentralSlabAllocator& allocator,
+    ::mino::AllocationJournal& journal,
+    ::mino::ShmPinTable& pins,
+    const ::mino::schema::WireLimits& wire_limits,
+    const ::mino::schema::DynamicObjectOptions& object_options,
+    const ::mino::ProcessIdentity& owner) noexcept {
+    auto descriptors = BuildWireDescriptors_b6f9571dab645216();
+    if (!descriptors.ok()) return descriptors.status();
+    auto layout = ::mino::schema::LayoutPlanner::Plan(
+        **descriptors->begin(), *descriptors);
+    if (!layout.ok()) return layout.status();
+    auto message = ::mino::schema::CanonicalWireCodec::Decode(
+        **descriptors->begin(), bytes, *descriptors, wire_limits);
+    if (!message.ok()) return message.status();
+    auto builder = ::mino::schema::DynamicBuilder::FromDynamicMessage(
+        descriptors->front(), std::move(*layout), *message, allocator, journal,
+        ::mino::StaticMessageTraits<::golden::Telemetry>::type_id, *descriptors, owner, object_options);
+    if (!builder.ok()) return builder.status();
+    return builder->Commit(pins);
 }

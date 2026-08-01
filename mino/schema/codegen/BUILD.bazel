@@ -45,6 +45,7 @@ cc_test(
         ":code_generator",
         "//mino/runtime:runtime_types",
         "//mino/schema:compiler",
+        "//mino/schema:dynamic_object",
         "//mino/schema:layout",
         "//mino/schema:registry",
         "//mino/schema:wire",

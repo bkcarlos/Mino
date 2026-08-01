@@ -156,6 +156,7 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
     ],
 )
 
@@ -178,6 +179,7 @@ cc_library(
         "//mino/runtime:allocation_journal",
         "//mino/runtime:shm_shared_ptr",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
     ],
 )
 

@@ -110,6 +110,28 @@ TEST(CodeGeneratorTest, FullProductionGoldenCompilesWithRuntimeContract) {
     auto unsupported = golden::TelemetryWireAdapter::Decode(non_empty_label);
     ASSERT_FALSE(unsupported.ok());
     EXPECT_EQ(unsupported.status().code(), StatusCode::kUnsupported);
+
+    using GraphToDynamic = ::mino::Result<::mino::schema::DynamicMessage> (*)(
+        ::mino::ShmHandle, const ::mino::CentralSlabAllocator&,
+        ::mino::ShmPinToken,
+        const ::mino::schema::DynamicObjectOptions&) noexcept;
+    GraphToDynamic graph_to_dynamic =
+        &golden::TelemetryWireAdapter::ToDynamicMessage;
+    EXPECT_NE(graph_to_dynamic, nullptr);
+    using GraphEncode = ::mino::Result<std::vector<std::byte>> (*)(
+        ::mino::ShmHandle, const ::mino::CentralSlabAllocator&,
+        ::mino::ShmPinToken, const ::mino::schema::WireLimits&,
+        const ::mino::schema::DynamicObjectOptions&) noexcept;
+    GraphEncode graph_encode = &golden::TelemetryWireAdapter::Encode;
+    EXPECT_NE(graph_encode, nullptr);
+    using GraphDecode = ::mino::Result<::mino::schema::DynamicObject> (*)(
+        std::span<const std::byte>, ::mino::CentralSlabAllocator&,
+        ::mino::AllocationJournal&, ::mino::ShmPinTable&,
+        const ::mino::schema::WireLimits&,
+        const ::mino::schema::DynamicObjectOptions&,
+        const ::mino::ProcessIdentity&) noexcept;
+    GraphDecode graph_decode = &golden::TelemetryWireAdapter::Decode;
+    EXPECT_NE(graph_decode, nullptr);
 }
 
 TEST(CodeGeneratorTest, SameInputIsByteForByteDeterministic) {

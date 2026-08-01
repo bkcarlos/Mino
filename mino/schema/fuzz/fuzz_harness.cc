@@ -191,13 +191,39 @@ Status FuzzCanonicalPayload(std::span<const std::byte> input) noexcept {
     }
 }
 
+FuzzHarnessKind SelectFuzzHarness(
+    std::span<const std::byte> input) noexcept {
+    if (input.empty()) return FuzzHarnessKind::kIdl;
+    return static_cast<FuzzHarnessKind>(
+        static_cast<uint8_t>(input.front()) % 3u);
+}
+
+bool IsExpectedFuzzStatus(FuzzHarnessKind harness,
+                          StatusCode code) noexcept {
+    if (code == StatusCode::kOk || code == StatusCode::kResourceExhausted) {
+        return true;
+    }
+    if (harness == FuzzHarnessKind::kIdl) {
+        return code == StatusCode::kInvalidArgument;
+    }
+    if (harness == FuzzHarnessKind::kDescriptor) {
+        return code == StatusCode::kInvalidArgument ||
+               code == StatusCode::kCorruption ||
+               code == StatusCode::kSchemaMismatch ||
+               code == StatusCode::kUnsupported;
+    }
+    return code == StatusCode::kCorruption ||
+           code == StatusCode::kSchemaMismatch;
+}
+
 Status FuzzOneInput(std::span<const std::byte> input) noexcept {
     try {
-        if (input.empty()) return FuzzIdl(input);
-        const uint8_t selector = static_cast<uint8_t>(input.front()) % 3;
-        const auto payload = input.subspan(1);
-        if (selector == 0) return FuzzIdl(payload);
-        if (selector == 1) return FuzzDescriptor(payload);
+        const FuzzHarnessKind harness = SelectFuzzHarness(input);
+        const auto payload = input.empty() ? input : input.subspan(1);
+        if (harness == FuzzHarnessKind::kIdl) return FuzzIdl(payload);
+        if (harness == FuzzHarnessKind::kDescriptor) {
+            return FuzzDescriptor(payload);
+        }
         return FuzzCanonicalPayload(payload);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);

@@ -670,8 +670,20 @@ Status EmitWireDescriptorFactory(
         EmitDescriptorConstruction(*descriptor, source);
     }
     Line(source, "        ::mino::schema::SchemaRegistry registry;");
-    Line(source, "        return registry.RegisterCompiled(");
+    Line(source, "        auto registered = registry.RegisterCompiled(");
     Line(source, "            ::mino::schema::CompiledSchema(std::move(result)));");
+    Line(source, "        if (!registered.ok()) return registered.status();");
+    Line(source, "        const auto root = std::find_if(");
+    Line(source, "            registered->begin(), registered->end(), [](const auto& value) {");
+    Line(source, "                return value->aggregate().full_name() == " +
+                     CppStringLiteral(root.aggregate().full_name()) + ";");
+    Line(source, "            });");
+    Line(source, "        if (root == registered->end()) {");
+    Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kInternal,");
+    Line(source, "                                         \"registered wire root is missing\");");
+    Line(source, "        }");
+    Line(source, "        std::iter_swap(registered->begin(), root);");
+    Line(source, "        return registered;");
     Line(source, "    } catch (const std::bad_alloc&) {");
     Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kResourceExhausted);");
     Line(source, "    } catch (...) {");
@@ -1127,9 +1139,9 @@ Status EmitType(
     Line(header);
 
     if (emit_wire_adapter) {
-        Line(header, "// Canonical Wire adapter for fixed scalars and empty variable values.");
-        Line(header, "// Non-empty variables, nested values, and unknown fields require SHM");
-        Line(header, "// resolution/allocation and are rejected explicitly with kUnsupported.");
+        Line(header, "// Canonical Wire adapter. The value overloads preserve the legacy");
+        Line(header, "// fixed/empty-variable behavior. Graph reads consume a root Pin and keep");
+        Line(header, "// DynamicView local; graph decode allocates through DynamicBuilder.");
         Line(header, "class " + wire_adapter_name + " final {");
         Line(header, "public:");
         Line(header, "    static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(");
@@ -1140,6 +1152,27 @@ Status EmitType(
         Line(header, "    static ::mino::Result<" + type_name + "> Decode(");
         Line(header, "        std::span<const std::byte> bytes,");
         Line(header, "        const ::mino::schema::WireLimits& limits = {}) noexcept;");
+        Line(header);
+        Line(header, "    static ::mino::Result<::mino::schema::DynamicMessage> ToDynamicMessage(");
+        Line(header, "        ::mino::ShmHandle root,");
+        Line(header, "        const ::mino::CentralSlabAllocator& allocator,");
+        Line(header, "        ::mino::ShmPinToken root_pin,");
+        Line(header, "        const ::mino::schema::DynamicObjectOptions& options = {}) noexcept;");
+        Line(header, "    static ::mino::Result<std::vector<std::byte>> Encode(");
+        Line(header, "        ::mino::ShmHandle root,");
+        Line(header, "        const ::mino::CentralSlabAllocator& allocator,");
+        Line(header, "        ::mino::ShmPinToken root_pin,");
+        Line(header, "        const ::mino::schema::WireLimits& limits = {},");
+        Line(header, "        const ::mino::schema::DynamicObjectOptions& options = {}) noexcept;");
+        Line(header, "    static ::mino::Result<::mino::schema::DynamicObject> Decode(");
+        Line(header, "        std::span<const std::byte> bytes,");
+        Line(header, "        ::mino::CentralSlabAllocator& allocator,");
+        Line(header, "        ::mino::AllocationJournal& journal,");
+        Line(header, "        ::mino::ShmPinTable& pins,");
+        Line(header, "        const ::mino::schema::WireLimits& wire_limits = {},");
+        Line(header, "        const ::mino::schema::DynamicObjectOptions& object_options = {},");
+        Line(header, "        const ::mino::ProcessIdentity& owner =");
+        Line(header, "            ::mino::ProcessIdentity::Current()) noexcept;");
         Line(header, "};");
         Line(header);
     }
@@ -1415,6 +1448,74 @@ Status EmitType(
     Line(source, "    return result;");
     Line(source, "}");
     Line(source);
+
+    Line(source, "::mino::Result<::mino::schema::DynamicMessage> " +
+                     qualified_wire_adapter + "::ToDynamicMessage(");
+    Line(source, "    ::mino::ShmHandle root,");
+    Line(source, "    const ::mino::CentralSlabAllocator& allocator,");
+    Line(source, "    ::mino::ShmPinToken root_pin,");
+    Line(source, "    const ::mino::schema::DynamicObjectOptions& options) noexcept {");
+    Line(source, "    auto descriptors = " + WireFactoryName(descriptor) + "();");
+    Line(source, "    if (!descriptors.ok()) return descriptors.status();");
+    Line(source, "    auto layout = ::mino::schema::LayoutPlanner::Plan(");
+    Line(source, "        **descriptors->begin(), *descriptors);");
+    Line(source, "    if (!layout.ok()) return layout.status();");
+    Line(source, "    auto view = ::mino::schema::DynamicView::Create(");
+    Line(source, "        descriptors->front(), std::move(*layout), root, allocator,");
+    Line(source, "        std::move(root_pin), *descriptors, options);");
+    Line(source, "    if (!view.ok()) return view.status();");
+    Line(source, "    return view->ToDynamicMessage();");
+    Line(source, "}");
+    Line(source);
+
+    Line(source, "::mino::Result<std::vector<std::byte>> " +
+                     qualified_wire_adapter + "::Encode(");
+    Line(source, "    ::mino::ShmHandle root,");
+    Line(source, "    const ::mino::CentralSlabAllocator& allocator,");
+    Line(source, "    ::mino::ShmPinToken root_pin,");
+    Line(source, "    const ::mino::schema::WireLimits& limits,");
+    Line(source, "    const ::mino::schema::DynamicObjectOptions& options) noexcept {");
+    Line(source, "    auto descriptors = " + WireFactoryName(descriptor) + "();");
+    Line(source, "    if (!descriptors.ok()) return descriptors.status();");
+    Line(source, "    auto layout = ::mino::schema::LayoutPlanner::Plan(");
+    Line(source, "        **descriptors->begin(), *descriptors);");
+    Line(source, "    if (!layout.ok()) return layout.status();");
+    Line(source, "    auto view = ::mino::schema::DynamicView::Create(");
+    Line(source, "        descriptors->front(), std::move(*layout), root, allocator,");
+    Line(source, "        std::move(root_pin), *descriptors, options);");
+    Line(source, "    if (!view.ok()) return view.status();");
+    Line(source, "    auto message = view->ToDynamicMessage();");
+    Line(source, "    if (!message.ok()) return message.status();");
+    Line(source, "    return ::mino::schema::CanonicalWireCodec::Encode(");
+    Line(source, "        **descriptors->begin(), *message, *descriptors, limits);");
+    Line(source, "}");
+    Line(source);
+
+    Line(source, "::mino::Result<::mino::schema::DynamicObject> " +
+                     qualified_wire_adapter + "::Decode(");
+    Line(source, "    std::span<const std::byte> bytes,");
+    Line(source, "    ::mino::CentralSlabAllocator& allocator,");
+    Line(source, "    ::mino::AllocationJournal& journal,");
+    Line(source, "    ::mino::ShmPinTable& pins,");
+    Line(source, "    const ::mino::schema::WireLimits& wire_limits,");
+    Line(source, "    const ::mino::schema::DynamicObjectOptions& object_options,");
+    Line(source, "    const ::mino::ProcessIdentity& owner) noexcept {");
+    Line(source, "    auto descriptors = " + WireFactoryName(descriptor) + "();");
+    Line(source, "    if (!descriptors.ok()) return descriptors.status();");
+    Line(source, "    auto layout = ::mino::schema::LayoutPlanner::Plan(");
+    Line(source, "        **descriptors->begin(), *descriptors);");
+    Line(source, "    if (!layout.ok()) return layout.status();");
+    Line(source, "    auto message = ::mino::schema::CanonicalWireCodec::Decode(");
+    Line(source, "        **descriptors->begin(), bytes, *descriptors, wire_limits);");
+    Line(source, "    if (!message.ok()) return message.status();");
+    Line(source, "    auto builder = ::mino::schema::DynamicBuilder::FromDynamicMessage(");
+    Line(source, "        descriptors->front(), std::move(*layout), *message, allocator, journal,");
+    Line(source, "        ::mino::StaticMessageTraits<" + qualified_name +
+                     ">::type_id, *descriptors, owner, object_options);");
+    Line(source, "    if (!builder.ok()) return builder.status();");
+    Line(source, "    return builder->Commit(pins);");
+    Line(source, "}");
+    Line(source);
     return Status::Ok();
 }
 
@@ -1462,6 +1563,7 @@ Result<GeneratedArtifacts> CodeGenerator::Generate(
         Line(artifacts.header, "#include \"mino/runtime/message_traits.h\"");
         Line(artifacts.header, "#include \"mino/shm/channel/index_slot.h\"");
         if (options.emit_wire_adapter) {
+            Line(artifacts.header, "#include \"mino/schema/dynamic_object.h\"");
             Line(artifacts.header, "#include \"mino/schema/wire.h\"");
         }
         Line(artifacts.header);
