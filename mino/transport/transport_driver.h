@@ -152,6 +152,7 @@ enum class NetworkProtocol : uint8_t {
     // An RDMA implementation may reuse an IP address for control-plane
     // connection establishment without claiming TCP semantics.
     kRdmaCompatible = 2,
+    kUdp = 3,
 };
 
 // Owned, pointer-free endpoint value suitable for Registry metadata. It is not
@@ -169,6 +170,10 @@ public:
     static Result<EndpointDescriptor> Ipv4Tcp(
         std::span<const std::byte> address, uint16_t port);
     static Result<EndpointDescriptor> Ipv6Tcp(
+        std::span<const std::byte> address, uint16_t port);
+    static Result<EndpointDescriptor> Ipv4Udp(
+        std::span<const std::byte> address, uint16_t port);
+    static Result<EndpointDescriptor> Ipv6Udp(
         std::span<const std::byte> address, uint16_t port);
     static Result<EndpointDescriptor> Ip(
         TransportKind kind, EndpointAddressFamily family,
@@ -246,6 +251,12 @@ struct ListenRequest {
     uint32_t backlog = 1;
 };
 
+struct AcceptRequest {
+    ConnectionId listener_id = kInvalidConnectionId;
+    // Zero is non-blocking. A positive timeout returns kTimeout when it expires.
+    uint32_t timeout_ms = 0;
+};
+
 struct SendRequest {
     ConnectionId connection_id = kInvalidConnectionId;
     // Borrowed only for the duration of Send(); implementations must not retain
@@ -317,6 +328,7 @@ Status ValidateConnectRequest(const ConnectRequest& request,
                               const TransportCapabilities& capabilities);
 Status ValidateListenRequest(const ListenRequest& request,
                              const TransportCapabilities& capabilities);
+Status ValidateAcceptRequest(const AcceptRequest& request);
 Status ValidateSendRequest(const SendRequest& request,
                            const TransportCapabilities& capabilities);
 Status ValidateReceiveRequest(const ReceiveRequest& request);
@@ -357,6 +369,7 @@ public:
     Status Shutdown();
     Result<ConnectionInfo> Connect(const ConnectRequest& request);
     Result<ConnectionInfo> Listen(const ListenRequest& request);
+    Result<ConnectionInfo> Accept(const AcceptRequest& request);
     Result<SendResult> Send(const SendRequest& request);
     Result<ReceiveResult> Poll(const ReceiveRequest& request);
     Result<CompletionPollResult> PollCompletions(
@@ -371,9 +384,13 @@ public:
 
 protected:
     virtual Status DoStart(const DriverConfig& config) = 0;
+    // Called immediately after the base transitions to kStopping and before it
+    // waits for active operations. Implementations must wake blocking waits.
+    virtual void DoRequestStop() noexcept;
     virtual Status DoShutdown() = 0;
     virtual Result<ConnectionInfo> DoConnect(const ConnectRequest& request) = 0;
     virtual Result<ConnectionInfo> DoListen(const ListenRequest& request) = 0;
+    virtual Result<ConnectionInfo> DoAccept(const AcceptRequest& request);
     // The base-assigned operation must be returned unchanged on admission and
     // retained by the driver until its ACK completion is polled.
     virtual Result<SendResult> DoSend(const SendRequest& request,

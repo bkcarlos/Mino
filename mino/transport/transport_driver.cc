@@ -163,6 +163,18 @@ Result<EndpointDescriptor> EndpointDescriptor::Ipv6Tcp(
               NetworkProtocol::kTcp, address, port);
 }
 
+Result<EndpointDescriptor> EndpointDescriptor::Ipv4Udp(
+    std::span<const std::byte> address, uint16_t port) {
+    return Ip(TransportKind::kNetwork, EndpointAddressFamily::kIpv4,
+              NetworkProtocol::kUdp, address, port);
+}
+
+Result<EndpointDescriptor> EndpointDescriptor::Ipv6Udp(
+    std::span<const std::byte> address, uint16_t port) {
+    return Ip(TransportKind::kNetwork, EndpointAddressFamily::kIpv6,
+              NetworkProtocol::kUdp, address, port);
+}
+
 Result<EndpointDescriptor> EndpointDescriptor::Ip(
     TransportKind kind, EndpointAddressFamily family, NetworkProtocol protocol,
     std::span<const std::byte> address, uint16_t port) {
@@ -180,8 +192,10 @@ Result<EndpointDescriptor> EndpointDescriptor::Ip(
     if (port == 0) {
         return Invalid("IP endpoint port must be non-zero");
     }
-    if (kind == TransportKind::kNetwork && protocol != NetworkProtocol::kTcp) {
-        return Invalid("network IP endpoint must use TCP");
+    if (kind == TransportKind::kNetwork &&
+        protocol != NetworkProtocol::kTcp &&
+        protocol != NetworkProtocol::kUdp) {
+        return Invalid("network IP endpoint must use TCP or UDP");
     }
     if (kind == TransportKind::kRdma &&
         protocol != NetworkProtocol::kRdmaCompatible) {
@@ -265,8 +279,9 @@ Status ValidateEndpointDescriptor(const EndpointDescriptor& endpoint) {
         return Invalid("IP endpoint port must be non-zero");
     }
     if (endpoint.kind() == TransportKind::kNetwork &&
-        endpoint.protocol() != NetworkProtocol::kTcp) {
-        return Invalid("network endpoint does not use TCP");
+        endpoint.protocol() != NetworkProtocol::kTcp &&
+        endpoint.protocol() != NetworkProtocol::kUdp) {
+        return Invalid("network endpoint does not use TCP or UDP");
     }
     if (endpoint.kind() == TransportKind::kRdma &&
         endpoint.protocol() != NetworkProtocol::kRdmaCompatible) {
@@ -373,11 +388,13 @@ Result<EndpointDescriptor> ParseEndpointDescriptor(
         return Corrupt("IP endpoint uses the fabric transport kind");
     }
     if (protocol != NetworkProtocol::kTcp &&
-        protocol != NetworkProtocol::kRdmaCompatible) {
+        protocol != NetworkProtocol::kRdmaCompatible &&
+        protocol != NetworkProtocol::kUdp) {
         return Unsupported("serialized network protocol is unsupported");
     }
     if ((kind == TransportKind::kNetwork &&
-         protocol != NetworkProtocol::kTcp) ||
+         protocol != NetworkProtocol::kTcp &&
+         protocol != NetworkProtocol::kUdp) ||
         (kind == TransportKind::kRdma &&
          protocol != NetworkProtocol::kRdmaCompatible)) {
         return Corrupt("serialized endpoint kind and protocol disagree");
@@ -474,6 +491,16 @@ Status ValidateListenRequest(const ListenRequest& request,
     }
     if (request.backlog > kMaxConnections) {
         return Exhausted("listen backlog exceeds the connection bound");
+    }
+    return Status::Ok();
+}
+
+Status ValidateAcceptRequest(const AcceptRequest& request) {
+    if (request.listener_id == kInvalidConnectionId) {
+        return Invalid("accept listener id must be non-zero");
+    }
+    if (request.timeout_ms > kMaxOperationTimeoutMs) {
+        return Invalid("accept timeout exceeds the public maximum");
     }
     return Status::Ok();
 }
@@ -585,6 +612,12 @@ Status ValidateCompletionPollResult(const CompletionPollRequest& request,
         }
     }
     return Status::Ok();
+}
+
+void TransportDriver::DoRequestStop() noexcept {}
+
+Result<ConnectionInfo> TransportDriver::DoAccept(const AcceptRequest&) {
+    return Unsupported("driver does not support Accept");
 }
 
 TransportDriver::ActiveOperation::~ActiveOperation() {
@@ -725,6 +758,11 @@ Status TransportDriver::Shutdown() {
             return Status::Ok();
         }
         state_.store(DriverState::kStopping, std::memory_order_release);
+    }
+
+    DoRequestStop();
+    {
+        std::unique_lock lock(lifecycle_mutex_);
         lifecycle_cv_.wait(lock,
                            [this] { return active_operations_ == 0; });
     }
@@ -789,6 +827,27 @@ Result<ConnectionInfo> TransportDriver::Listen(const ListenRequest& request) {
         if (!ValidateConnectionInfo(*result).ok() || !result->is_listener ||
             result->kind != driver_capabilities.kind) {
             return InvalidDriverResult("driver returned invalid Listen result");
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<ConnectionInfo> TransportDriver::Accept(
+    const AcceptRequest& request) {
+    try {
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        MINO_RETURN_IF_ERROR(ValidateAcceptRequest(request));
+        const TransportCapabilities driver_capabilities = capabilities();
+        MINO_RETURN_IF_ERROR(
+            ValidateDriverCapabilitiesForCall(driver_capabilities));
+        auto result = DoAccept(request);
+        if (!result.ok()) return result.status();
+        if (!ValidateConnectionInfo(*result).ok() || result->is_listener ||
+            result->kind != driver_capabilities.kind) {
+            return InvalidDriverResult("driver returned invalid Accept result");
         }
         return result;
     } catch (const std::bad_alloc&) {

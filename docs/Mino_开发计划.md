@@ -267,7 +267,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-03 | Transport Switcher ✅ | 不可变 Route Handle、显式刷新缓存、kDiscovery/kStatic 双策略、ACL/Schema fail-closed 校验与 Driver 生命周期固定（`//mino/transport:transport_switcher`，详设 15.1~15.2） | D4-01 | 5d |
 | D4-04 | Transport Driver 接口 ✅ | Driver 生命周期/并发 fencing、Capabilities、EndpointDescriptor 显式持久化 codec、异步 Delivery completion（`//mino/transport:transport_driver`，详设 15.3） | D0-14 | 2d |
 | D4-05 | Wire Frame 编解码 ✅ | 80B v1 Header 显式大端 Encoder/Decoder、CRC32C、控制 payload opcode、有界增量 stream decoder（`//mino/bridge:wire_frame`，详设 16.2） | D3-07 | 3d |
-| D4-06 | TCP Driver | 长连接、Length-prefixed Frame、心跳、Partial Read/Write（详设 16.4） | D4-04, D4-05 | 5d |
+| D4-06 | TCP Driver ✅ | 非阻塞长连接、独立 Accept、4B 大端 Length Prefix、有界 Partial Read/Write、Canonical Heartbeat/Idle Timeout、Shutdown 唤醒与失败 completion（`//mino/transport:tcp_driver`，详设 16.4） | D4-04, D4-05 | 5d |
 | D4-07 | Bridge 管线 | Local Subscriber → Encode → Send → Receive → Decode → Remote Publish（详设 16.1） | D4-06 | 5d |
 | D4-08 | Schema 分发与协商 | connection_schema_ref 映射、Descriptor 按需请求、限频（详设 13.9） | D4-07 | 3d |
 | D4-09 | 可靠传输与去重 | Sequence/ACK/Session Epoch/重传窗口/逐来源映射表（详设 16.5） | D4-07 | 5d |
@@ -372,7 +372,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D6-02 | NUMA 感知分配 | NUMA Node 绑定、本地 Class 优先 | D5 | 5d |
 | D6-03 | 批量发布/消费 | 批量 Reserve/Commit、批量 ACK | D5 | 3d |
 | D6-04 | 网络批量收发 | sendmsg/writev、存储批量写 | D5 | 3d |
-| D6-05 | UDP Driver | Fragment ID、分片、重组配额、超时（详设 16.6） | D4-04 | 5d |
+| D6-05 | UDP Driver（基础数据报已实现） | 非阻塞小数据报收发已落地（`//mino/transport:udp_driver`）；Fragment ID、分片、重组配额与超时仍待完成（详设 16.6） | D4-04 | 5d |
 | D6-06 | RDMA Driver | Buffer 注册/Pin/回收独立协议 | D4-04 | 8d |
 | D6-07 | Fabric Driver（IPCF/NTB/CXL） | FabricWindowDriver 实现（详设 15.3、16.7） | D4-04 | 8d |
 | D6-08 | 大对象专用池优化 | Huge Page、DMA/RDMA Buffer 隔离 | D1-10 | 3d |

@@ -77,6 +77,19 @@ private:
     TransportKind kind_;
 };
 
+class NetworkProtocolEndpointMatcher final : public EndpointMatcher {
+public:
+    explicit NetworkProtocolEndpointMatcher(NetworkProtocol protocol) noexcept
+        : protocol_(protocol) {}
+    bool Supports(const EndpointDescriptor& endpoint) const noexcept override {
+        return endpoint.kind() == TransportKind::kNetwork &&
+               endpoint.protocol() == protocol_;
+    }
+
+private:
+    NetworkProtocol protocol_;
+};
+
 struct DriverRegistration {
     uint64_t driver_id = 0;
     uint64_t generation = 0;

@@ -13,6 +13,29 @@ cc_library(
 )
 
 cc_library(
+    name = "tcp_driver",
+    srcs = ["tcp_driver.cc"],
+    hdrs = ["tcp_driver.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/bridge:wire_frame",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "udp_driver",
+    srcs = ["udp_driver.cc"],
+    hdrs = ["udp_driver.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
     name = "transport_switcher",
     srcs = ["transport_switcher.cc"],
     hdrs = ["transport_switcher.h"],
@@ -21,6 +44,25 @@ cc_library(
         "//mino/common:result",
         "//mino/registry:registry",
         "//mino/schema:descriptor",
+    ],
+)
+
+cc_test(
+    name = "tcp_driver_test",
+    srcs = ["tcp_driver_test.cc"],
+    deps = [
+        ":tcp_driver",
+        "//mino/bridge:wire_frame",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "udp_driver_test",
+    srcs = ["udp_driver_test.cc"],
+    deps = [
+        ":udp_driver",
+        "@googletest//:gtest_main",
     ],
 )
 
