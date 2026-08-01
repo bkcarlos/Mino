@@ -262,11 +262,11 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 | # | 任务 | 产出 | 依赖 | 预估 |
 |---|---|---|---|---|
-| D4-01 | Node Registry / Coordinator | 节点注册/发现/健康状态、Topic 元数据管理（详设 14.1~14.2） | D2-08 | 5d |
-| D4-02 | Topic 生命周期管理 | CREATING→ACTIVE→DRAINING→RETIRED→DELETED（详设 14.4） | D4-01 | 3d |
-| D4-03 | Transport Switcher | Route 选择、Route Handle 缓存、kDiscovery/kStatic 双策略（详设 15.1~15.2） | D4-01 | 5d |
-| D4-04 | Transport Driver 接口 | Driver 抽象、Capabilities、EndpointDescriptor（详设 15.3） | D0-14 | 2d |
-| D4-05 | Wire Frame 编解码 | Frame Header 显式 Encoder/Decoder（详设 16.2） | D3-07 | 3d |
+| D4-01 | Node Registry / Coordinator ✅ | 有界单 Authoritative Registry：节点注册/发现、三态健康与 Lease、不可变 Snapshot、Topic 元数据、Durable HWM 接口（`//mino/registry:registry`，详设 14.1~14.2） | D2-08 | 5d |
+| D4-02 | Topic 生命周期管理 ✅ | `CREATING→ACTIVE→DRAINING→RETIRED→DELETED`，版本绑定 readiness/drain proof、owner-bound Pin 与删除门禁（`//mino/registry:registry`，详设 14.4） | D4-01 | 3d |
+| D4-03 | Transport Switcher ✅ | 不可变 Route Handle、显式刷新缓存、kDiscovery/kStatic 双策略、ACL/Schema fail-closed 校验与 Driver 生命周期固定（`//mino/transport:transport_switcher`，详设 15.1~15.2） | D4-01 | 5d |
+| D4-04 | Transport Driver 接口 ✅ | Driver 生命周期/并发 fencing、Capabilities、EndpointDescriptor 显式持久化 codec、异步 Delivery completion（`//mino/transport:transport_driver`，详设 15.3） | D0-14 | 2d |
+| D4-05 | Wire Frame 编解码 ✅ | 80B v1 Header 显式大端 Encoder/Decoder、CRC32C、控制 payload opcode、有界增量 stream decoder（`//mino/bridge:wire_frame`，详设 16.2） | D3-07 | 3d |
 | D4-06 | TCP Driver | 长连接、Length-prefixed Frame、心跳、Partial Read/Write（详设 16.4） | D4-04, D4-05 | 5d |
 | D4-07 | Bridge 管线 | Local Subscriber → Encode → Send → Receive → Decode → Remote Publish（详设 16.1） | D4-06 | 5d |
 | D4-08 | Schema 分发与协商 | connection_schema_ref 映射、Descriptor 按需请求、限频（详设 13.9） | D4-07 | 3d |

@@ -1,2 +1,37 @@
-# Registry and coordinator.
-package(default_visibility = ["//visibility:private"])
+# Registry and single-authority coordinator (D4-01/D4-02).
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "registry",
+    srcs = [
+        "coordinator.cc",
+        "id_allocator.cc",
+        "metadata.cc",
+        "node_registry.cc",
+    ],
+    hdrs = [
+        "coordinator.h",
+        "id_allocator.h",
+        "metadata.h",
+        "node_registry.h",
+        "registry.h",
+    ],
+    deps = [
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/schema:descriptor",
+        "//mino/shm/channel:queue_full_policy",
+        "//mino/transport:transport_driver",
+    ],
+)
+
+cc_test(
+    name = "registry_test",
+    srcs = ["registry_test.cc"],
+    deps = [
+        ":registry",
+        "@googletest//:gtest_main",
+    ],
+)

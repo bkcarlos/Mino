@@ -1,2 +1,45 @@
-# Transport switcher.
-package(default_visibility = ["//visibility:private"])
+# Transport driver abstraction and endpoint persistence codec.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "transport_driver",
+    srcs = ["transport_driver.cc"],
+    hdrs = ["transport_driver.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/runtime:delivery_receipt",
+    ],
+)
+
+cc_library(
+    name = "transport_switcher",
+    srcs = ["transport_switcher.cc"],
+    hdrs = ["transport_switcher.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/common:result",
+        "//mino/registry:registry",
+        "//mino/schema:descriptor",
+    ],
+)
+
+cc_test(
+    name = "transport_switcher_test",
+    srcs = ["transport_switcher_test.cc"],
+    deps = [
+        ":transport_switcher",
+        "//mino/registry:registry",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "transport_driver_test",
+    srcs = ["transport_driver_test.cc"],
+    deps = [
+        ":transport_driver",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)

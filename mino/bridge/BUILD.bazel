@@ -1,2 +1,32 @@
-# Bridge and network protocol.
-package(default_visibility = ["//visibility:private"])
+# Bridge canonical wire frame codec. Socket/TCP drivers are intentionally not
+# part of this package target.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "crc32c",
+    srcs = ["crc32c.cc"],
+    hdrs = ["crc32c.h"],
+)
+
+cc_library(
+    name = "wire_frame",
+    srcs = ["wire_frame.cc"],
+    hdrs = ["wire_frame.h"],
+    deps = [
+        ":crc32c",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "wire_frame_test",
+    size = "small",
+    srcs = ["wire_frame_test.cc"],
+    deps = [
+        ":crc32c",
+        ":wire_frame",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
