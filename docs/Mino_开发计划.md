@@ -246,8 +246,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 静态和动态路径产生字节一致的 Canonical Wire 输出（INV-08；固定标量、optional、非空 string/bytes/vector、nested message/inline struct 与 unknown fields 均通过 pinned resolver + transactional allocator 等价性测试）
 - [x] 显式 Field ID、Reserved、递归拒绝全部按规则执行（INV-21）
 - [x] 兼容性测试矩阵通过（kWireCompatible/kReadCompatible/kWriteCompatible/kIncompatible）
-- [ ] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界（Hermetic corpus 与 ASAN/UBSAN libFuzzer smoke 已通过；每周/手动一小时 campaign workflow 已就绪，首次云端长跑待执行）
-- [ ] Hermetic CodeGen 跨环境一致（V-07、V-08；本地 15 个输出 hash 收集已通过；Ubuntu 22 GCC 12 与 Ubuntu 24 Clang 18 严格 hash 对比 workflow 已就绪，首次云端结果待验证）
+- [x] Fuzz（IDL/Descriptor/Canonical Payload）无 Crash、无越界（GitHub run 30690609322：ASAN/UBSAN libFuzzer 各一小时通过，三个 selector 均执行，corpus minimization 与 artifact 上传完成）
+- [x] Hermetic CodeGen 跨环境一致（V-07、V-08；Ubuntu 22 GCC 12、Ubuntu 24 Clang 18 独立 runner 与本地双 Docker 的 15 个输出一致，ROOT_SHA256=`c3dd21ab06acd9ab10e887b2c9e83c7bee6cc9c31b28e64ec298a967e7e1153d`）
 - [x] 动态对象图可完整回收（Allocation Journal/ObjectGraphWalker/fork crash recovery 测试通过）
 
 ---
