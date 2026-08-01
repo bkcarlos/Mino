@@ -1,0 +1,84 @@
+# Long-running recovery validation is intentionally separate from PR CI.
+# The first push that adds/changes this workflow triggers a run; subsequent
+# runs can be started manually from the GitHub Actions UI.
+name: Two-Hour Recovery Stress
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - .github/workflows/recovery-stress.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  recovery-stress:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 135
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - id: d1
+            name: D1 Region recovery (2h)
+            target: //mino/shm/region:d1_region_recovery_kill_stress_test
+            seconds_env: MINO_D1_REGION_RECOVERY_STRESS_SECONDS
+            seed_env: MINO_D1_REGION_RECOVERY_STRESS_SEED
+            filter: D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals
+          - id: d2
+            name: D2 Runtime recovery (2h)
+            target: //mino/runtime:d2_recovery_stress_test
+            seconds_env: MINO_D2_RECOVERY_STRESS_SECONDS
+            seed_env: MINO_D2_RECOVERY_STRESS_SEED
+            filter: D2RecoveryStressTest.RandomizedTimedRecoveryStress:D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ libatomic1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Cache Bazel output base
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: recovery-stress-${{ runner.os }}-${{ matrix.id }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            recovery-stress-${{ runner.os }}-${{ matrix.id }}-
+            recovery-stress-${{ runner.os }}-
+
+      - name: Run two-hour recovery stress
+        run: |
+          bazel test "${{ matrix.target }}" \
+            --test_timeout=7260 \
+            --test_env="${{ matrix.seconds_env }}=7200" \
+            --test_env="${{ matrix.seed_env }}=${{ github.run_id }}" \
+            --test_arg="--gtest_filter=${{ matrix.filter }}" \
+            --test_output=streamed \
+            --nocache_test_results
+
+      - name: Upload Bazel test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-stress-${{ matrix.id }}-${{ github.run_id }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
+          if-no-files-found: warn
+          retention-days: 14
