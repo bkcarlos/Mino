@@ -40,3 +40,7 @@ python3 tools/ci/collect_codegen_artifacts.py \
   bazel --version
   "${CXX}" --version
 } > /results/hermetic-codegen/PROVENANCE.txt
+
+# The container runs as root while the host orchestrator normally does not.
+# Preserve readable/traversable evidence across the bind mount boundary.
+chmod -R a+rX /results/hermetic-codegen
