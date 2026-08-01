@@ -62,16 +62,16 @@ jobs:
             bazel-${{ runner.os }}-
 
       - name: Build (bazel build //...)
-        run: bazel build --config=${{ matrix.config }} //...
+        run: bazel build --config=gcc12 --config=${{ matrix.config }} //...
 
       - name: Test (bazel test //...)
-        run: bazel test --config=${{ matrix.config }} //... --test_output=errors
+        run: bazel test --config=gcc12 --config=${{ matrix.config }} //... --test_output=errors
 
       # V-12 Litmus 报告：显式运行并输出全部日志，作为 Lock-free 验证证据归档
       - name: V-12 Atomic ABI Litmus report
         if: matrix.config == 'debug' || matrix.config == 'release'
         run: |
-          bazel test --config=${{ matrix.config }} \
+          bazel test --config=gcc12 --config=${{ matrix.config }} \
             //tests/litmus:atomic_abi_test \
             --test_output=all --nocache_test_results
 

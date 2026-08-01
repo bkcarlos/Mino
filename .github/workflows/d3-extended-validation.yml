@@ -49,6 +49,7 @@ jobs:
             cxx: g++-12
             packages: gcc-12 g++-12 libatomic1
             jobs: 1
+            extra_config: --config=gcc12
             checkout_path: checkout-gcc
             tz: UTC
             source_date_epoch: 0
@@ -58,6 +59,7 @@ jobs:
             cxx: clang++-18
             packages: clang-18 libatomic1
             jobs: 4
+            extra_config: ""
             checkout_path: nested/checkout-clang
             tz: Pacific/Auckland
             source_date_epoch: 2147483647
@@ -87,7 +89,7 @@ jobs:
       - name: Run existing hermetic CodeGen tests
         working-directory: ${{ matrix.checkout_path }}
         run: |
-          bazel test --config=release --jobs=${{ matrix.jobs }} \
+          bazel test --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             //mino/schema/codegen:code_generator_test \
             //tools/minoc:canonical_wire_generated_test \
             //tools/minoc:minoc_cli_test \
@@ -97,7 +99,7 @@ jobs:
       - name: Build all compared CodeGen output groups
         working-directory: ${{ matrix.checkout_path }}
         run: |
-          bazel build --config=release --jobs=${{ matrix.jobs }} \
+          bazel build --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             --output_groups=default,descriptor \
             //tools/minoc:sample_codegen \
             //tools/minoc:canonical_wire_codegen \
@@ -179,11 +181,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Clang and build dependencies
+      # GitHub's Ubuntu 22.04 image already provides Clang and compiler-rt.
+      # Only the project runtime dependency needs an explicit package install.
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang libclang-rt-dev libatomic1
+          sudo apt-get install -y --no-install-recommends libatomic1
 
       - name: Setup Bazelisk
         uses: bazelbuild/setup-bazelisk@v3

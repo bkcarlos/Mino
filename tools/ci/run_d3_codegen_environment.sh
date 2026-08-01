@@ -3,14 +3,19 @@ set -euo pipefail
 
 : "${MINO_CODEGEN_JOBS:?MINO_CODEGEN_JOBS must be set}"
 
-bazel test --config=release --jobs="${MINO_CODEGEN_JOBS}" \
+bazel_configs=(--config=release)
+if [[ -n "${MINO_BAZEL_EXTRA_CONFIG:-}" ]]; then
+  bazel_configs+=("--config=${MINO_BAZEL_EXTRA_CONFIG}")
+fi
+
+bazel test "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
   //mino/schema/codegen:code_generator_test \
   //tools/minoc:canonical_wire_generated_test \
   //tools/minoc:minoc_cli_test \
   //tools/minoc:cross_directory_generated_test \
   --test_output=errors
 
-bazel build --config=release --jobs="${MINO_CODEGEN_JOBS}" \
+bazel build "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
   --output_groups=default,descriptor \
   //tools/minoc:sample_codegen \
   //tools/minoc:canonical_wire_codegen \
@@ -26,6 +31,7 @@ python3 tools/ci/collect_codegen_artifacts.py \
   echo "compiler_cc=${CC}"
   echo "compiler_cxx=${CXX}"
   echo "jobs=${MINO_CODEGEN_JOBS}"
+  echo "extra_bazel_config=${MINO_BAZEL_EXTRA_CONFIG:-none}"
   echo "tz=${TZ:-unset}"
   echo "source_date_epoch=${SOURCE_DATE_EPOCH:-unset}"
   echo "workspace=${PWD}"

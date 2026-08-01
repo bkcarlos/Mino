@@ -23,6 +23,7 @@ class Environment:
     cxx: str
     workspace_path: str
     jobs: int
+    extra_bazel_config: str
     timezone: str
     source_date_epoch: int
 
@@ -37,6 +38,7 @@ ENVIRONMENTS = (
         cxx="g++-12",
         workspace_path="/workspace-gcc",
         jobs=1,
+        extra_bazel_config="gcc12",
         timezone="UTC",
         source_date_epoch=0,
     ),
@@ -49,6 +51,7 @@ ENVIRONMENTS = (
         cxx="clang++-18",
         workspace_path="/nested/workspace-clang",
         jobs=4,
+        extra_bazel_config="",
         timezone="Pacific/Auckland",
         source_date_epoch=2147483647,
     ),
@@ -125,6 +128,8 @@ def _run_environment(
         "--network=none",
         "--env",
         f"MINO_CODEGEN_JOBS={environment.jobs}",
+        "--env",
+        f"MINO_BAZEL_EXTRA_CONFIG={environment.extra_bazel_config}",
         "--env",
         f"TZ={environment.timezone}",
         "--env",

@@ -26,6 +26,12 @@ build --host_cxxopt=-Wall
 build --host_cxxopt=-Wextra
 build --host_cxxopt=-Werror
 
+# GCC 12 emits a false positive from libstdc++'s std::variant destructor when a
+# non-active std::string alternative is optimized under -O2. Keep this opt-in
+# so Clang and newer GCC versions retain the full warning set.
+build:gcc12 --cxxopt=-Wno-maybe-uninitialized
+build:gcc12 --host_cxxopt=-Wno-maybe-uninitialized
+
 # Better diagnostics.
 build --copt=-fno-omit-frame-pointer
 
