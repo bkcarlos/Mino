@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 TARGET = "//mino/schema/fuzz:libfuzzer_driver"
 SELECTOR_NAMES = ("IDL", "Descriptor", "CanonicalPayload")
 SELECTOR_PATTERN = re.compile(
