@@ -41,6 +41,7 @@
 #include "mino/common/status.h"
 #include "mino/shm/recovery/scanner.h"
 #include "tools/mino/inspector.h"
+#include "tools/mino/storage_commands.h"
 
 namespace {
 
@@ -55,6 +56,12 @@ USAGE:
     mino inspect <region_name> [--layout <file>] [--image <file>] [--output <file>]
     mino dump-ring <region_name> <channel_id> [--layout <file>] [--image <file>] [--output <file>]
     mino recover <region_name> [--layout <file>] [--image <file>] [--dry-run]
+    mino storage inspect <session_root>
+    mino storage verify <segment> [<segment> ...]
+    mino storage repair <segment> [--dry-run]
+    mino replay <session_root> [--validate-only] [--topic <name|id>] ...
+    mino record <session_root> --recording-id N --owner-id N --owner-epoch N
+                --config-version N --topic <id>:<name> ...
 
 OPTIONS:
     --layout <file>   Layout sidecar describing class table and ring buffers.
@@ -429,6 +436,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string command = argv[1];
+
+    if (command == "storage" || command == "replay" || command == "record") {
+        std::vector<std::string> storage_args;
+        const int first_argument = command == "storage" ? 2 : 1;
+        storage_args.reserve(static_cast<size_t>(argc - first_argument));
+        for (int i = first_argument; i < argc; ++i) {
+            storage_args.emplace_back(argv[i]);
+        }
+        return mino::tools::RunStorageCommand(storage_args, std::cout, std::cerr);
+    }
 
     CommonArgs args;
     int positional[3] = {-1, -1, -1};
