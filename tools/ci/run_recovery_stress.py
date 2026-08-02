@@ -317,6 +317,7 @@ def _run_stress(
     command = [
         bazel,
         "test",
+        "--lockfile_mode=error",
         config.target,
         f"--test_timeout={timeout_seconds}",
         f"--test_env={config.seconds_env}={seconds}",
@@ -458,7 +459,8 @@ if args == ["info", "bazel-testlogs"]:
     print(os.environ["FAKE_TESTLOGS"])
     raise SystemExit(0)
 if args and args[0] == "test":
-    target = args[1][2:].replace(":", "/")
+    target_arg = next(arg for arg in args[1:] if arg.startswith("//"))
+    target = target_arg[2:].replace(":", "/")
     output = Path(os.environ["FAKE_TESTLOGS"]) / target
     output.mkdir(parents=True, exist_ok=True)
     (output / "test.log").write_text("reproducible failure evidence\\n")

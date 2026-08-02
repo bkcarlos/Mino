@@ -1,0 +1,269 @@
+name: Physical Two-Host Mino Validation
+
+# Manual-only. Hosted runners build and compare artifacts; only the two labeled
+# self-hosted runners execute the physical network roles.
+on:
+  workflow_dispatch:
+    inputs:
+      server_address:
+        description: Routable mino-node-a address reachable from mino-node-b
+        required: true
+        type: string
+      client_address:
+        description: Advertised mino-node-b address recorded in the Mino payload
+        required: true
+        type: string
+      port:
+        description: Pre-authorized TCP port on mino-node-a (1024-65535)
+        required: true
+        default: "43191"
+        type: string
+      timeout_seconds:
+        description: Per-role deadline (1800-3600 seconds)
+        required: true
+        default: "1800"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mino-physical-two-host
+  cancel-in-progress: false
+
+jobs:
+  build-server-artifact:
+    name: Build server artifact at locked SHA
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Restore hermetic Bazel cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-hermetic-llvm18-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-hermetic-llvm18-
+            bazel-${{ runner.os }}-
+
+      - name: Build locked hermetic Mino probe
+        run: |
+          bazel build --lockfile_mode=error --config=hermetic --config=release \
+            //tools/ci:mino_two_host_probe
+          mkdir -p physical-binary
+          cp bazel-bin/tools/ci/mino_two_host_probe physical-binary/
+          chmod 0755 physical-binary/mino_two_host_probe
+          printf '%s\n' "${GITHUB_SHA}" > physical-binary/commit.txt
+          (cd physical-binary && sha256sum mino_two_host_probe > mino_two_host_probe.sha256)
+
+      - name: Verify build did not mutate locked inputs
+        run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
+
+      - name: Upload server binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-two-host-build-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binary/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-client-artifact:
+    name: Build client artifact at locked SHA
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Build locked hermetic Mino probe
+        run: |
+          bazel build --lockfile_mode=error --config=hermetic --config=release \
+            //tools/ci:mino_two_host_probe
+          mkdir -p physical-binary
+          cp bazel-bin/tools/ci/mino_two_host_probe physical-binary/
+          chmod 0755 physical-binary/mino_two_host_probe
+          printf '%s\n' "${GITHUB_SHA}" > physical-binary/commit.txt
+          (cd physical-binary && sha256sum mino_two_host_probe > mino_two_host_probe.sha256)
+
+      - name: Verify build did not mutate locked inputs
+        run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
+
+      - name: Upload client binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-two-host-build-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binary/
+          if-no-files-found: error
+          retention-days: 7
+
+  server:
+    name: Mino server on physical mino-node-a
+    needs: [build-server-artifact, build-client-artifact]
+    runs-on: [self-hosted, linux, x64, mino-node-a]
+    environment: physical-two-host
+    timeout-minutes: 75
+    env:
+      MINO_SERVER_ADDRESS: ${{ inputs.server_address }}
+      MINO_TWO_HOST_RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      MINO_PORT: ${{ inputs.port }}
+      MINO_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+    steps:
+      - name: Checkout orchestration at exact SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download server build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binaries/server
+
+      - name: Download client build for byte comparison
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binaries/client
+
+      - name: Verify identical locked binaries
+        run: |
+          grep -Fx "${GITHUB_SHA}" physical-binaries/server/commit.txt
+          grep -Fx "${GITHUB_SHA}" physical-binaries/client/commit.txt
+          (cd physical-binaries/server && sha256sum -c mino_two_host_probe.sha256)
+          (cd physical-binaries/client && sha256sum -c mino_two_host_probe.sha256)
+          cmp physical-binaries/server/mino_two_host_probe \
+            physical-binaries/client/mino_two_host_probe
+          chmod 0755 physical-binaries/server/mino_two_host_probe
+
+      - name: Run real Mino server data path
+        env:
+          MINO_TWO_HOST_TOKEN: ${{ secrets.MINO_TWO_HOST_TOKEN }}
+        run: |
+          umask 077
+          python3 tools/ci/run_two_host_server.py \
+            --binary=physical-binaries/server/mino_two_host_probe \
+            --bind-address=0.0.0.0 \
+            --advertise-address="${MINO_SERVER_ADDRESS}" \
+            --port="${MINO_PORT}" \
+            --timeout-seconds="${MINO_TIMEOUT_SECONDS}" \
+            --manifest=two-host/server/manifest.json \
+            --log=two-host/server/server.log
+
+      - name: Upload server evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-two-host-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: two-host/server/
+          if-no-files-found: warn
+          retention-days: 90
+
+  client:
+    name: Mino client on physical mino-node-b
+    needs: [build-server-artifact, build-client-artifact]
+    runs-on: [self-hosted, linux, x64, mino-node-b]
+    environment: physical-two-host
+    timeout-minutes: 75
+    env:
+      MINO_SERVER_ADDRESS: ${{ inputs.server_address }}
+      MINO_CLIENT_ADDRESS: ${{ inputs.client_address }}
+      MINO_TWO_HOST_RUN_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      MINO_PORT: ${{ inputs.port }}
+      MINO_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+    steps:
+      - name: Checkout orchestration at exact SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download server build for byte comparison
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binaries/server
+
+      - name: Download client build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: physical-binaries/client
+
+      - name: Verify identical locked binaries
+        run: |
+          grep -Fx "${GITHUB_SHA}" physical-binaries/server/commit.txt
+          grep -Fx "${GITHUB_SHA}" physical-binaries/client/commit.txt
+          (cd physical-binaries/server && sha256sum -c mino_two_host_probe.sha256)
+          (cd physical-binaries/client && sha256sum -c mino_two_host_probe.sha256)
+          cmp physical-binaries/server/mino_two_host_probe \
+            physical-binaries/client/mino_two_host_probe
+          chmod 0755 physical-binaries/client/mino_two_host_probe
+
+      - name: Run real Mino client data path with bounded reconnect
+        env:
+          MINO_TWO_HOST_TOKEN: ${{ secrets.MINO_TWO_HOST_TOKEN }}
+        run: |
+          umask 077
+          python3 tools/ci/run_two_host_client.py \
+            --binary=physical-binaries/client/mino_two_host_probe \
+            --server-address="${MINO_SERVER_ADDRESS}" \
+            --advertise-address="${MINO_CLIENT_ADDRESS}" \
+            --port="${MINO_PORT}" \
+            --timeout-seconds="${MINO_TIMEOUT_SECONDS}" \
+            --manifest=two-host/client/manifest.json \
+            --log=two-host/client/client.log
+
+      - name: Upload client evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-two-host-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: two-host/client/
+          if-no-files-found: warn
+          retention-days: 90
+
+  evidence:
+    name: Aggregate evidence (GitHub-hosted; not a physical node)
+    if: always()
+    needs: [server, client]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout manifest tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download server evidence
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/server
+
+      - name: Download client evidence
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/client
+
+      - name: Cross-check Mino data-path evidence and hashes
+        run: |
+          umask 077
+          python3 tools/ci/finalize_two_host_manifest.py \
+            --server-manifest=evidence/server/manifest.json \
+            --client-manifest=evidence/client/manifest.json \
+            --expected-commit="${GITHUB_SHA}" \
+            --out=evidence/final/manifest.json
+
+      - name: Upload final evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-two-host-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90

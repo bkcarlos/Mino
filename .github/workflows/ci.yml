@@ -65,7 +65,7 @@ jobs:
             bazel-${{ runner.os }}-
 
       - name: Build (bazel build //...)
-        run: bazel build --config=gcc12 --config=${{ matrix.config }} //...
+        run: bazel build --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} //...
 
       # Manual targets are skipped by //...; compile the P1 stress binary on
       # PRs without starting its hour-long timed phase.
@@ -74,19 +74,74 @@ jobs:
           github.event_name == 'pull_request' &&
           (matrix.config == 'debug' || matrix.config == 'tsan')
         run: |
-          bazel build --config=gcc12 --config=${{ matrix.config }} \
+          bazel build --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} \
             //mino/shm/channel:mpmc_ring_stress_test
 
+      - name: Verify build did not mutate locked inputs
+        run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
+
       - name: Test (bazel test //...)
-        run: bazel test --config=gcc12 --config=${{ matrix.config }} //... --test_output=errors
+        run: bazel test --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} //... --test_output=errors
 
       # V-12 Litmus 报告：显式运行并输出全部日志，作为 Lock-free 验证证据归档
       - name: V-12 Atomic ABI Litmus report
         if: matrix.config == 'debug' || matrix.config == 'release'
         run: |
-          bazel test --config=gcc12 --config=${{ matrix.config }} \
+          bazel test --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} \
             //tests/litmus:atomic_abi_test \
             --test_output=all --nocache_test_results
+
+  # Downloaded, version-pinned LLVM/Clang. This is separate from the host GCC
+  # matrix so the existing compatibility signal remains intact.
+  hermetic-build-test:
+    name: Hermetic LLVM 18.1.8 (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Cache Bazel output base
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-hermetic-llvm18-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-hermetic-llvm18-
+            bazel-${{ runner.os }}-
+
+      - name: Query current-platform LLVM toolchain
+        run: bazel query --lockfile_mode=error @mino_llvm//:all
+
+      - name: Record actual hermetic Clang compiler version
+        run: |
+          bazel build --lockfile_mode=error --config=hermetic \
+            //tools/ci:hermetic_clang_version
+          mkdir -p hermetic-toolchain-evidence
+          cp bazel-bin/tools/ci/hermetic-clang-version.txt \
+            hermetic-toolchain-evidence/
+          cat hermetic-toolchain-evidence/hermetic-clang-version.txt
+
+      - name: Build with hermetic LLVM
+        run: bazel build --lockfile_mode=error --config=hermetic --config=debug //...
+
+      - name: Verify build did not mutate locked inputs
+        run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
+
+      - name: Test with hermetic LLVM
+        run: bazel test --lockfile_mode=error --config=hermetic --config=debug //... --test_output=errors
+
+      - name: Upload compiler version evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hermetic-clang-version-${{ github.run_id }}-${{ github.run_attempt }}
+          path: hermetic-toolchain-evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
   tooling-smoke:
     name: Extended CI tooling smoke
@@ -111,6 +166,9 @@ jobs:
           python3 tools/ci/run_extended_long_test.py --self-test
           python3 tools/ci/run_recovery_stress.py --self-test
           python3 tools/ci/run_tla_validation.py --self-test
+          python3 tools/ci/run_two_host_server.py --self-test
+          python3 tools/ci/run_two_host_client.py --self-test
+          python3 tools/ci/finalize_two_host_manifest.py --self-test
 
   # -------------------------------------------------------------------------
   # Lint：buildifier 检查 BUILD / .bzl / WORKSPACE 文件格式（可选）

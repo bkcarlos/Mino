@@ -8,14 +8,14 @@ if [[ -n "${MINO_BAZEL_EXTRA_CONFIG:-}" ]]; then
   bazel_configs+=("--config=${MINO_BAZEL_EXTRA_CONFIG}")
 fi
 
-bazel test "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
+bazel test --lockfile_mode=error "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
   //mino/schema/codegen:code_generator_test \
   //tools/minoc:canonical_wire_generated_test \
   //tools/minoc:minoc_cli_test \
   //tools/minoc:cross_directory_generated_test \
   --test_output=errors
 
-bazel build "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
+bazel build --lockfile_mode=error "${bazel_configs[@]}" --jobs="${MINO_CODEGEN_JOBS}" \
   --output_groups=default,descriptor \
   //tools/minoc:sample_codegen \
   //tools/minoc:canonical_wire_codegen \

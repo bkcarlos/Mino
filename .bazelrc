@@ -7,9 +7,9 @@
 
 common --enable_bzlmod
 
-# Use the BCR git mirror instead of https://bcr.bazel.build: the local Java
-# TLS stack fails the handshake with bcr.bazel.build (curl is unaffected).
-# The mirror serves identical content and keeps MODULE.bazel.lock stable.
+# The local Java TLS stack cannot reach bcr.bazel.build reliably, so use its git
+# mirror. CI uses --lockfile_mode=error and MODULE.bazel.lock verifies every
+# registry file checksum; moving mirror content therefore cannot update builds.
 common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main
 
 # C++20 for target and exec-platform C++ compilation. Code-generation tools
@@ -31,6 +31,13 @@ build --host_cxxopt=-Werror
 # so Clang and newer GCC versions retain the full warning set.
 build:gcc12 --cxxopt=-Wno-maybe-uninitialized
 build:gcc12 --host_cxxopt=-Wno-maybe-uninitialized
+
+# Opt-in downloaded LLVM/Clang toolchain. The :all pattern expands only to
+# targets generated for the current host, so toolchain resolution works without
+# forcing Linux, so `bazel query` and builds keep working on macOS. The
+# toolchain is not globally registered; existing host compiler configs remain
+# unchanged unless --config=hermetic is present.
+build:hermetic --extra_toolchains=@mino_llvm//:all
 
 # Better diagnostics.
 build --copt=-fno-omit-frame-pointer

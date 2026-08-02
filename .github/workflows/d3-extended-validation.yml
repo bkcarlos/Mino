@@ -105,7 +105,7 @@ jobs:
         run: |
           mkdir -p codegen-logs
           set +e
-          bazel test --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
+          bazel test --lockfile_mode=error --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             //mino/schema/codegen:code_generator_test \
             //tools/minoc:canonical_wire_generated_test \
             //tools/minoc:minoc_cli_test \
@@ -122,7 +122,7 @@ jobs:
         run: |
           mkdir -p codegen-logs
           set +e
-          bazel build --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
+          bazel build --lockfile_mode=error --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             --output_groups=default,descriptor \
             //tools/minoc:sample_codegen \
             //tools/minoc:canonical_wire_codegen \
@@ -132,6 +132,11 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
           exit "${code}"
+
+      - name: Verify CodeGen build did not mutate locked inputs
+        if: always()
+        working-directory: ${{ matrix.checkout_path }}
+        run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
 
       - name: Collect logical CodeGen artifacts
         id: codegen-collect

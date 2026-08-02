@@ -255,6 +255,7 @@ def _campaign_command(
     return [
         bazel,
         "run",
+        "--lockfile_mode=error",
         f"--config={sanitizer}",
         "--config=fuzz",
         TARGET,
@@ -282,6 +283,7 @@ def _merge_command(
     return [
         bazel,
         "run",
+        "--lockfile_mode=error",
         f"--config={sanitizer}",
         "--config=fuzz",
         TARGET,

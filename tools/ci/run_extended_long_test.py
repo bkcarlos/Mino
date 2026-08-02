@@ -38,6 +38,7 @@ class Suite:
 
 def _common_test_options(timeout_seconds: int) -> list[str]:
     return [
+        "--lockfile_mode=error",
         "--config=gcc12",
         f"--test_timeout={timeout_seconds}",
         "--test_output=streamed",
@@ -51,6 +52,7 @@ def _mpmc_command(bazel: str, remaining_seconds: int) -> list[str]:
     return [
         bazel,
         "test",
+        "--lockfile_mode=error",
         "--config=gcc12",
         "--config=tsan",
         "//mino/shm/channel:mpmc_ring_stress_test",

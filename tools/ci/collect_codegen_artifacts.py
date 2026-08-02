@@ -83,6 +83,7 @@ def _query_outputs(bazel: str, config: str, workspace: Path) -> dict[str, Path]:
     command = [
         bazel,
         "cquery",
+        "--lockfile_mode=error",
         expression,
         f"--config={config}",
         "--output=files",

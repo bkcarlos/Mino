@@ -163,6 +163,7 @@ def _command(
     command = [
         bazel,
         "test",
+        "--lockfile_mode=error",
         f"--package_path=%workspace%{os.pathsep}{overlay}",
         TARGET,
         f"--test_timeout={timeout}",

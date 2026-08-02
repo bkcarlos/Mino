@@ -3,9 +3,27 @@ module(
     version = "0.1.0",
 )
 
-bazel_dep(name = "rules_cc", version = "0.0.9")
+bazel_dep(name = "rules_cc", version = "0.1.2")
 bazel_dep(name = "googletest", version = "1.15.2")
 bazel_dep(name = "platforms", version = "0.0.10")
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "spdlog", version = "1.15.3")
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
+
+# Opt-in hermetic Clang/LLVM toolchain. It is deliberately not registered
+# globally: --config=hermetic selects it while host GCC/Apple Clang remain the
+# default. LLVM 18.1.8 has official Linux x86_64/aarch64 and Apple arm64
+# archives; Intel macOS is pinned to the last official compatible archive.
+bazel_dep(name = "toolchains_llvm", version = "1.4.0")
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    name = "mino_llvm",
+    cxx_standard = {"": "c++20"},
+    llvm_versions = {
+        "": "18.1.8",
+        "darwin-aarch64": "18.1.8",
+        "darwin-x86_64": "15.0.7",
+    },
+)
+use_repo(llvm, "mino_llvm", "mino_llvm_llvm")

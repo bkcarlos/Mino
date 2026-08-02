@@ -1,0 +1,20 @@
+package(default_visibility = ["//visibility:private"])
+
+genrule(
+    name = "hermetic_clang_version",
+    outs = ["hermetic-clang-version.txt"],
+    cmd = "$(location @mino_llvm_llvm//:bin/clang) --version > $@",
+    tags = ["manual"],
+    tools = ["@mino_llvm_llvm//:bin/clang"],
+)
+
+cc_binary(
+    name = "mino_two_host_probe",
+    srcs = ["mino_two_host_probe.cc"],
+    deps = [
+        "//mino/bridge:bridge_connection_manager",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/transport:tcp_driver",
+    ],
+)
