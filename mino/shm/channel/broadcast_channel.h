@@ -20,7 +20,7 @@
 // Single publisher / N subscriber fan-out over shared memory. Every active
 // subscriber receives every published message exactly once; each subscriber
 // advances its own cursor and ACKs through a per-slot, per-subscriber exact-era
-// token (layout v4). BroadcastSlotMeta::ack_bitmap remains the immutable
+// token (layout v5). BroadcastSlotMeta::ack_bitmap remains the immutable
 // membership snapshot for diagnostics/compatibility, not cleanup authority.
 //
 // Publication protocol (design doc 9.6):
@@ -54,11 +54,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 #include "mino/common/ids.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/platform/process_identity.h"
 #include "mino/shm/channel/index_slot.h"
 #include "mino/shm/channel/queue_full_policy.h"
 #include "mino/shm/channel/spsc_channel.h"  // detail::SpinPause
@@ -67,17 +69,18 @@ namespace mino {
 
 class BroadcastChannel {
 public:
-    using PayloadRetireObserver = void (*)(ShmHandle, void*) noexcept;
+    using PayloadRetireObserver = Status (*)(ShmHandle, void*) noexcept;
+    using RetirePersistenceHook = void (*)(uint64_t, void*) noexcept;
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "BroadcastChannel requires lock-free 64-bit atomics");
 
     static constexpr uint64_t kCacheLineSize = 64;
     static constexpr uint64_t kMagic = 0x4D49'4E4F'4252'4443ULL;  // "MINOBRDC"
-    // v4: recoverable sequence-bound cursor cleanup tokens replace kRetiring,
-    // and a per-slot atomic era record lets GC snapshot payload handles without
-    // excluding (or ever wedging) the publisher. v3 used kRetiring for that
-    // exclusion; v2 added heartbeat generation binding and kRegistering.
-    static constexpr uint32_t kLayoutVersion = 4;
+    // v6 adds owner-bound recoverable Borrow records, all-or-nothing DropOldest
+    // transactions, ordered Gap publication, and retryable payload retirement.
+    // v5 added generation-bound Gap statistics; v4 introduced exact-era ACK
+    // cleanup and atomic payload snapshots.
+    static constexpr uint32_t kLayoutVersion = 6;
     static constexpr uint32_t kMaxSubscribers = kBroadcastMaxSubscribers;  // 64
     // Stable cursors are ordinary logical sequences. The high bit denotes a
     // recoverable in-progress cleanup for the sequence in the low 63 bits.
@@ -115,10 +118,18 @@ public:
         alignas(kCacheLineSize) std::atomic<uint64_t> current_membership{0};
         std::atomic<uint64_t> set_version{0};
         unsigned char pad2[kCacheLineSize - 8 - 8] = {};
+
+        // -- Line 3: single-publisher, helpable DropOldest transaction -------
+        // drop_control encodes {sequence + 1, phase}; the remaining fields are
+        // immutable while phase is prepared/committing.
+        alignas(kCacheLineSize) std::atomic<uint64_t> drop_control{0};
+        std::atomic<uint64_t> drop_sequence{0};
+        std::atomic<uint64_t> drop_targets{0};
+        unsigned char pad3[kCacheLineSize - 8 - 8 - 8] = {};
     };
 
-    static_assert(sizeof(ControlBlock) == 3 * kCacheLineSize,
-                  "ControlBlock must occupy exactly three cache lines");
+    static_assert(sizeof(ControlBlock) == 4 * kCacheLineSize,
+                  "ControlBlock must occupy exactly four cache lines");
     static_assert(alignof(ControlBlock) == kCacheLineSize);
     static_assert(std::is_standard_layout_v<ControlBlock>);
     static_assert(offsetof(ControlBlock, publisher_cursor) == kCacheLineSize,
@@ -165,11 +176,41 @@ public:
         // eviction/re-registration may write late, but the new generation will
         // never trust that timestamp (D2-06 generation-bound lease cleanup).
         std::atomic<uint64_t> heartbeat_generation{0};
-        unsigned char pad1[kCacheLineSize - 8 - 8 - 4 - 4 - 8 - 8] = {};
+        std::atomic<uint64_t> lease_epoch{0};
+        unsigned char pad1[kCacheLineSize - 8 - 8 - 4 - 4 - 8 - 8 - 8] = {};
+
+        // -- Line C: generation-bound, transaction-published Gap ------------
+        alignas(kCacheLineSize) std::atomic<uint64_t> gap_generation{0};
+        std::atomic<uint64_t> latest_gap_first_sequence{0};
+        std::atomic<uint64_t> latest_gap_next_sequence{0};
+        std::atomic<uint64_t> gap_events{0};
+        std::atomic<uint64_t> gap_messages{0};
+        std::atomic<uint64_t> observed_gap_events{0};
+        std::atomic<uint64_t> gap_committed_era{0};
+        unsigned char pad2[kCacheLineSize - 7 * 8] = {};
+
+        // -- Line D: recoverable Borrow record -------------------------------
+        // borrow_control encodes {sequence + 1, phase}. Metadata is published
+        // before phase becomes active and is immutable until exact-token clear.
+        alignas(kCacheLineSize) std::atomic<uint64_t> borrow_control{0};
+        std::atomic<uint64_t> borrow_generation{0};
+        std::atomic<uint64_t> borrow_lease_epoch{0};
+        std::atomic<uint64_t> borrow_owner_node_id{0};
+        std::atomic<uint64_t> borrow_owner_process_id{0};
+        std::atomic<uint64_t> borrow_owner_process_epoch{0};
+        std::atomic<uint64_t> borrow_owner_start_time_ns{0};
+        unsigned char pad3[kCacheLineSize - 7 * 8] = {};
+
+        // -- Line E: per-target Drop transaction preparation ----------------
+        alignas(kCacheLineSize) std::atomic<uint64_t> drop_claim{0};
+        std::atomic<uint64_t> drop_generation{0};
+        std::atomic<uint64_t> drop_gap_events{0};
+        std::atomic<uint64_t> drop_gap_messages{0};
+        unsigned char pad4[kCacheLineSize - 4 * 8] = {};
     };
 
-    static_assert(sizeof(SubscriberSlot) == 2 * kCacheLineSize,
-                  "SubscriberSlot must occupy exactly two cache lines");
+    static_assert(sizeof(SubscriberSlot) == 5 * kCacheLineSize,
+                  "SubscriberSlot must occupy exactly five cache lines");
     static_assert(alignof(SubscriberSlot) == kCacheLineSize);
     static_assert(std::is_standard_layout_v<SubscriberSlot>);
     static_assert(offsetof(SubscriberSlot, cursor) == 0,
@@ -183,9 +224,18 @@ public:
     static_assert(offsetof(SubscriberSlot, heartbeat_generation) ==
                       kCacheLineSize + 8 + 8 + 4 + 4 + 8,
                   "heartbeat generation must remain in line B");
+    static_assert(offsetof(SubscriberSlot, gap_generation) ==
+                      2 * kCacheLineSize,
+                  "Gap state must start the slot's third cache line");
+    static_assert(offsetof(SubscriberSlot, borrow_control) ==
+                      3 * kCacheLineSize,
+                  "Borrow state must start the slot's fourth cache line");
+    static_assert(offsetof(SubscriberSlot, drop_claim) ==
+                      4 * kCacheLineSize,
+                  "Drop state must start the slot's fifth cache line");
 
     // -----------------------------------------------------------------------
-    // Broadcast-only era sidecar (layout v4)
+    // Broadcast-only era sidecar (layout v4+)
     // -----------------------------------------------------------------------
     //
     // The payload copy is split into lock-free 64-bit atomics. payload_era is a
@@ -230,7 +280,7 @@ public:
         return SlotsOffset() + capacity * sizeof(IndexSlot);
     }
 
-    // Byte offset of the layout-v4 era sidecar array.
+    // Byte offset of the layout-v4+ era sidecar array.
     static constexpr uint64_t EraMetasOffset(uint64_t capacity) {
         return MetasOffset(capacity) + capacity * sizeof(BroadcastSlotMeta);
     }
@@ -286,6 +336,9 @@ public:
         control->publisher_cursor.store(0, std::memory_order_relaxed);
         control->current_membership.store(0, std::memory_order_relaxed);
         control->set_version.store(0, std::memory_order_relaxed);
+        control->drop_control.store(0, std::memory_order_relaxed);
+        control->drop_sequence.store(0, std::memory_order_relaxed);
+        control->drop_targets.store(0, std::memory_order_relaxed);
 
         IndexSlot* slots = SlotsOf(shm_base);
         for (uint64_t i = 0; i < capacity; ++i) {
@@ -340,6 +393,31 @@ public:
             subs[i].heartbeat_ns.store(0, std::memory_order_relaxed);
             subs[i].heartbeat_generation.store(0,
                                                std::memory_order_relaxed);
+            subs[i].lease_epoch.store(0, std::memory_order_relaxed);
+            subs[i].gap_generation.store(0, std::memory_order_relaxed);
+            subs[i].latest_gap_first_sequence.store(0,
+                                                    std::memory_order_relaxed);
+            subs[i].latest_gap_next_sequence.store(0,
+                                                   std::memory_order_relaxed);
+            subs[i].gap_events.store(0, std::memory_order_relaxed);
+            subs[i].gap_messages.store(0, std::memory_order_relaxed);
+            subs[i].observed_gap_events.store(0,
+                                              std::memory_order_relaxed);
+            subs[i].gap_committed_era.store(0, std::memory_order_relaxed);
+            subs[i].borrow_control.store(0, std::memory_order_relaxed);
+            subs[i].borrow_generation.store(0, std::memory_order_relaxed);
+            subs[i].borrow_lease_epoch.store(0, std::memory_order_relaxed);
+            subs[i].borrow_owner_node_id.store(0, std::memory_order_relaxed);
+            subs[i].borrow_owner_process_id.store(0,
+                                                  std::memory_order_relaxed);
+            subs[i].borrow_owner_process_epoch.store(
+                0, std::memory_order_relaxed);
+            subs[i].borrow_owner_start_time_ns.store(
+                0, std::memory_order_relaxed);
+            subs[i].drop_claim.store(0, std::memory_order_relaxed);
+            subs[i].drop_generation.store(0, std::memory_order_relaxed);
+            subs[i].drop_gap_events.store(0, std::memory_order_relaxed);
+            subs[i].drop_gap_messages.store(0, std::memory_order_relaxed);
         }
 
         // Publish: release so every plain/relaxed write above is visible to
@@ -399,6 +477,20 @@ public:
         uint64_t generation = 0;
     };
 
+    struct Gap {
+        SubscriberId subscriber_id;
+        uint64_t generation = 0;
+        uint64_t first_sequence = 0;
+        uint64_t next_sequence = 0;
+        uint64_t total_events = 0;
+        uint64_t total_messages = 0;
+    };
+
+    struct SubscriberStats {
+        uint64_t gap_events = 0;
+        uint64_t gap_messages = 0;
+    };
+
     // Registers subscriber `id` and returns its handle. The join cut point
     // is the current publisher_cursor: the new subscriber receives only
     // messages published from now on (no history replay). Id reuse is safe:
@@ -413,12 +505,17 @@ public:
     // Errors:
     //   kResourceExhausted : id >= kMaxSubscribers.
     //   kAlreadyExists     : id is currently registered (state kActive).
-    Result<SubscriberHandle> RegisterSubscriber(SubscriberId id,
-                                                uint64_t now_ns) noexcept {
+    Result<SubscriberHandle> RegisterSubscriber(
+        SubscriberId id, const ProcessIdentity& owner,
+        uint64_t now_ns) noexcept {
         if (id.value >= kMaxSubscribers) {
             return Status::Error(
                 StatusCode::kResourceExhausted,
                 "subscriber id exceeds kBroadcastMaxSubscribers");
+        }
+        if (owner.IsZero()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "subscriber owner identity is zero");
         }
         SubscriberSlot& sub = subs_[id.value];
         // Claim a private transitional state first. Publishing kActive before
@@ -438,10 +535,41 @@ public:
             std::memory_order_relaxed);
         const uint64_t generation =
             sub.generation.load(std::memory_order_relaxed) + 1;
+        const uint64_t lease_epoch =
+            sub.lease_epoch.load(std::memory_order_relaxed) + 1;
+        if (generation == 0 || lease_epoch == 0) {
+            sub.state.store(static_cast<uint32_t>(SubscriberState::kFree),
+                            std::memory_order_release);
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "subscriber generation or lease exhausted");
+        }
         sub.generation.store(generation, std::memory_order_relaxed);
+        sub.lease_epoch.store(lease_epoch, std::memory_order_relaxed);
         sub.heartbeat_ns.store(now_ns, std::memory_order_relaxed);
         sub.heartbeat_generation.store(generation,
                                        std::memory_order_relaxed);
+        sub.gap_generation.store(generation, std::memory_order_relaxed);
+        sub.latest_gap_first_sequence.store(0, std::memory_order_relaxed);
+        sub.latest_gap_next_sequence.store(0, std::memory_order_relaxed);
+        sub.gap_events.store(0, std::memory_order_relaxed);
+        sub.gap_messages.store(0, std::memory_order_relaxed);
+        sub.observed_gap_events.store(0, std::memory_order_relaxed);
+        sub.gap_committed_era.store(0, std::memory_order_relaxed);
+        sub.borrow_control.store(0, std::memory_order_relaxed);
+        sub.borrow_generation.store(0, std::memory_order_relaxed);
+        sub.borrow_lease_epoch.store(0, std::memory_order_relaxed);
+        sub.borrow_owner_node_id.store(owner.node_id,
+                                       std::memory_order_relaxed);
+        sub.borrow_owner_process_id.store(owner.process_id,
+                                          std::memory_order_relaxed);
+        sub.borrow_owner_process_epoch.store(owner.process_epoch,
+                                             std::memory_order_relaxed);
+        sub.borrow_owner_start_time_ns.store(owner.start_time_ns,
+                                             std::memory_order_relaxed);
+        sub.drop_claim.store(0, std::memory_order_relaxed);
+        sub.drop_generation.store(0, std::memory_order_relaxed);
+        sub.drop_gap_events.store(0, std::memory_order_relaxed);
+        sub.drop_gap_messages.store(0, std::memory_order_relaxed);
 
         // Membership CAS: the publisher or another registrar may be flipping
         // other bits concurrently; CAS keeps each bit flip atomic. set_version
@@ -469,8 +597,14 @@ public:
     // monotonic clock. Call sites that do not exercise lease expiry (the
     // common case) stay free of time plumbing; the explicit overload above
     // remains for the Coordinator (D2-08) and for tests that drive time.
+    Result<SubscriberHandle> RegisterSubscriber(SubscriberId id,
+                                                uint64_t now_ns) noexcept {
+        return RegisterSubscriber(id, ProcessIdentity::Current(), now_ns);
+    }
+
     Result<SubscriberHandle> RegisterSubscriber(SubscriberId id) noexcept {
-        return RegisterSubscriber(id, MonotonicNowNs());
+        return RegisterSubscriber(id, ProcessIdentity::Current(),
+                                  MonotonicNowNs());
     }
 
     // Unregisters the subscriber. The generation must match the handle
@@ -500,6 +634,20 @@ public:
             return Status::Error(StatusCode::kNotFound,
                                  "subscriber is not registered");
         }
+        const Status borrow_cleanup =
+            ClearDeadBorrow(SubscriberHandle{id, generation});
+        if (!borrow_cleanup.ok()) {
+            sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                            std::memory_order_release);
+            return borrow_cleanup;
+        }
+        HelpDropTransaction();
+        if (sub.drop_claim.load(std::memory_order_acquire) != 0) {
+            sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                            std::memory_order_release);
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "subscriber participates in a Drop transaction");
+        }
 
         RemoveMembershipBit(id.value);
         ClearStaleAcks(id);
@@ -507,6 +655,56 @@ public:
         sub.state.store(static_cast<uint32_t>(SubscriberState::kFree),
                         std::memory_order_release);
         return Status::Ok();
+    }
+
+    // Clears a crashed Borrow only when its exact ProcessIdentity is proven
+    // dead. kAlive/kUnknown remain blocked. The record is additionally bound to
+    // subscriber generation and channel lease epoch, so stale recovery cannot
+    // clear a reused subscriber incarnation.
+    Status ClearDeadBorrow(SubscriberHandle handle) noexcept {
+        if (handle.id.value >= kMaxSubscribers) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber id out of range");
+        }
+        SubscriberSlot& sub = subs_[handle.id.value];
+        if (sub.generation.load(std::memory_order_acquire) !=
+            handle.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber generation mismatch");
+        }
+        for (;;) {
+            const uint64_t control =
+                sub.borrow_control.load(std::memory_order_acquire);
+            if (control == 0) {
+                return Status::Ok();
+            }
+            if (ProtocolPhase(control) == kBorrowClaiming) {
+                uint64_t expected = control;
+                sub.borrow_control.compare_exchange_strong(
+                    expected, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+                continue;
+            }
+            if (ProtocolPhase(control) != kBorrowActive ||
+                sub.borrow_generation.load(std::memory_order_acquire) !=
+                    handle.generation ||
+                sub.borrow_lease_epoch.load(std::memory_order_acquire) !=
+                    sub.lease_epoch.load(std::memory_order_acquire)) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "Borrow binding is not safely recoverable");
+            }
+            const ProcessIdentity owner = LoadBorrowOwner(sub);
+            if (ProbeProcessIdentity(owner) != ProcessIdentityLiveness::kDead) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "Borrow owner is alive or liveness is unknown");
+            }
+            uint64_t expected = control;
+            if (sub.borrow_control.compare_exchange_strong(
+                    expected, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return Status::Ok();
+            }
+        }
     }
 
     // Clears this subscriber's outstanding responsibilities by walking its
@@ -519,6 +717,15 @@ public:
             return 0;
         }
         SubscriberSlot& sub = subs_[id.value];
+        const uint64_t generation =
+            sub.generation.load(std::memory_order_acquire);
+        if (!ClearDeadBorrow(SubscriberHandle{id, generation}).ok()) {
+            return 0;
+        }
+        HelpDropTransaction();
+        if (sub.drop_claim.load(std::memory_order_acquire) != 0) {
+            return 0;
+        }
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_acquire);
         uint64_t cleared = 0;
@@ -673,6 +880,18 @@ public:
                                 std::memory_order_release);
                 continue;
             }
+            if (!ClearDeadBorrow(SubscriberHandle{SubscriberId{id}, generation})
+                     .ok()) {
+                sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                                std::memory_order_release);
+                continue;
+            }
+            HelpDropTransaction();
+            if (sub.drop_claim.load(std::memory_order_acquire) != 0) {
+                sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
+                                std::memory_order_release);
+                continue;
+            }
             // (b) The cleanup below is bound to the exact registration being
             // evicted without needing to re-read the generation: holding
             // kEvicting blocks re-registration (the Register CAS requires
@@ -718,6 +937,7 @@ public:
             : channel_(other.channel_),
               slot_(other.slot_),
               sequence_(other.sequence_),
+              dropped_messages_(other.dropped_messages_),
               active_(other.active_) {
             other.channel_ = nullptr;
             other.slot_ = nullptr;
@@ -729,6 +949,7 @@ public:
                 channel_ = other.channel_;
                 slot_ = other.slot_;
                 sequence_ = other.sequence_;
+                dropped_messages_ = other.dropped_messages_;
                 active_ = other.active_;
                 other.channel_ = nullptr;
                 other.slot_ = nullptr;
@@ -750,6 +971,7 @@ public:
         // Logical sequence of this reservation (physical slot index =
         // sequence % capacity).
         uint64_t sequence() const noexcept { return sequence_; }
+        uint64_t dropped_messages() const noexcept { return dropped_messages_; }
 
         // Stamps the subscriber-set snapshot into the slot's sidecar, seals
         // the immutable CRC, publishes the slot kReady and advances the
@@ -788,9 +1010,9 @@ public:
     private:
         friend class BroadcastChannel;
         Reservation(BroadcastChannel* channel, IndexSlot* slot,
-                    uint64_t sequence) noexcept
+                    uint64_t sequence, uint64_t dropped_messages = 0) noexcept
             : channel_(channel), slot_(slot), sequence_(sequence),
-              active_(true) {}
+              dropped_messages_(dropped_messages), active_(true) {}
 
         void AbortIfActive() noexcept {
             if (active_) {
@@ -803,6 +1025,7 @@ public:
         BroadcastChannel* channel_ = nullptr;
         IndexSlot* slot_ = nullptr;
         uint64_t sequence_ = 0;
+        uint64_t dropped_messages_ = 0;
         bool active_ = false;
     };
 
@@ -827,11 +1050,14 @@ public:
         // Single publisher: no CAS needed to claim our own cursor slot.
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_relaxed);
-        if (prod >= kCursorCleanupBit) {
+        if (prod >= (kCursorCleanupBit >> 1) - 1) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "broadcast sequence space exhausted");
         }
+        HelpDropTransaction();
 
+        uint64_t dropped_messages = 0;
+        uint64_t last_dropped_era = 0;
         if (IsFullAt(prod)) {
             switch (policy) {
                 case QueueFullPolicy::kFail:
@@ -852,11 +1078,18 @@ public:
                         StatusCode::kDegraded,
                         "broadcast channel full: newest message dropped");
                 case QueueFullPolicy::kDropOldest:
-                    // A membership race or tied slowest cursors may require
-                    // more than one successful drop before the physical slot
-                    // is reusable. Every drop CASes its victim cursor first.
+                    // Tied slowest cursors may all owe the oldest era. Advance
+                    // one exact era at a time, and fail conservatively if no
+                    // active generation owns a valid, published candidate.
                     while (IsFullAt(prod)) {
-                        ForceDropOldest(prod);
+                        Result<uint64_t> dropped = ForceDropOldest(prod);
+                        if (!dropped.ok()) {
+                            return dropped.status();
+                        }
+                        if (*dropped != 0 && *dropped != last_dropped_era) {
+                            last_dropped_era = *dropped;
+                            ++dropped_messages;
+                        }
                     }
                     break;
                 case QueueFullPolicy::kSample: {
@@ -878,6 +1111,7 @@ public:
             }
         }
 
+        MINO_RETURN_IF_ERROR(EnsureReusableSlot(prod));
         IndexSlot* slot = &slots_[prod & mask_];
         // The channel was not full, so every active subscriber cursor is
         // already past this physical slot's previous occupant (or there are
@@ -896,7 +1130,7 @@ public:
         era_metas_[prod & mask_].payload_era.store(0,
                                                    std::memory_order_release);
         slot->sequence_num.store(prod, std::memory_order_relaxed);
-        return Reservation(this, slot, prod);
+        return Reservation(this, slot, prod, dropped_messages);
     }
 
     // Non-blocking reservation attempt: kWouldBlock if the channel is full.
@@ -904,14 +1138,16 @@ public:
     Result<Reservation> TryReserve() noexcept {
         const uint64_t prod =
             control_->publisher_cursor.load(std::memory_order_relaxed);
-        if (prod >= kCursorCleanupBit) {
+        if (prod >= (kCursorCleanupBit >> 1) - 1) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "broadcast sequence space exhausted");
         }
+        HelpDropTransaction();
         if (IsFullAt(prod)) {
             return Status::Error(StatusCode::kWouldBlock,
                                  "broadcast channel full");
         }
+        MINO_RETURN_IF_ERROR(EnsureReusableSlot(prod));
         IndexSlot* slot = &slots_[prod & mask_];
         // Cursor cleanup and GC are both helpable/non-exclusive in layout v4,
         // so a stale kRetiring value from a crashed legacy-style operation is
@@ -954,6 +1190,7 @@ public:
         }
         Borrow& operator=(Borrow&& other) noexcept {
             if (this != &other) {
+                ReleaseIfActive();
                 channel_ = other.channel_;
                 subscriber_ = other.subscriber_;
                 snapshot_ = other.snapshot_;
@@ -963,6 +1200,8 @@ public:
             }
             return *this;
         }
+
+        ~Borrow() { ReleaseIfActive(); }
 
         const IndexSlotSnapshot* slot() const noexcept { return &snapshot_; }
         const IndexSlotSnapshot* operator->() const noexcept {
@@ -987,7 +1226,10 @@ public:
             active_ = false;
             BroadcastChannel* ch = channel_;
             channel_ = nullptr;
-            return ch->AckSlot(subscriber_, snapshot_.sequence_num);
+            const Status status =
+                ch->AckSlot(subscriber_, snapshot_.sequence_num);
+            ch->ReleaseBorrowClaim(subscriber_, snapshot_.sequence_num);
+            return status;
         }
 
     private:
@@ -996,6 +1238,15 @@ public:
                const IndexSlotSnapshot& snapshot) noexcept
             : channel_(channel), subscriber_(subscriber), snapshot_(snapshot),
               active_(true) {}
+
+        void ReleaseIfActive() noexcept {
+            if (active_) {
+                active_ = false;
+                channel_->ReleaseBorrowClaim(subscriber_,
+                                             snapshot_.sequence_num);
+                channel_ = nullptr;
+            }
+        }
 
         BroadcastChannel* channel_ = nullptr;
         SubscriberHandle subscriber_;
@@ -1009,13 +1260,17 @@ public:
     //   kWouldBlock      : the subscriber has caught up with the publisher.
     //   kNotFound        : the subscriber is not registered or the
     //                      generation does not match (stale handle).
+    //   kDegraded        : DropOldest advanced this generation; LastGap() and
+    //                      GetSubscriberStats() expose the affected era/counts.
     //   kCorruption      : a slot failed its sequence or CRC check; the
     //                      subscriber's cursor was advanced past it so the
     //                      channel keeps making progress.
     //
     // Aborted tombstones are transparently skipped (ACK metadata carries no
     // delivery obligation for them, so only the cursor advances).
-    Result<Borrow> Poll(SubscriberHandle sub) noexcept {
+    Result<Borrow> Poll(
+        SubscriberHandle sub,
+        const ProcessIdentity& borrower = ProcessIdentity::Current()) noexcept {
         if (sub.id.value >= kMaxSubscribers) {
             return Status::Error(StatusCode::kNotFound,
                                  "subscriber id out of range");
@@ -1028,8 +1283,20 @@ public:
                 StatusCode::kNotFound,
                 "subscriber not registered or stale generation");
         }
+        HelpDropTransaction();
+        if (ConsumePendingGap(sub)) {
+            return Status::Error(
+                StatusCode::kDegraded,
+                "broadcast subscriber observed a DropOldest gap");
+        }
         while (true) {
-            // The cursor may be CAS-advanced by kDropOldest concurrently. A
+            HelpDropTransaction();
+            if (ConsumePendingGap(sub)) {
+                return Status::Error(
+                    StatusCode::kDegraded,
+                    "broadcast subscriber observed a DropOldest gap");
+            }
+            // The cursor may be advanced by a committed Drop transaction. A
             // crashed ACK may also leave a helpable sequence-bound token.
             const uint64_t cons = LoadCursorAndHelp(sub.id.value);
             const uint64_t prod =
@@ -1062,7 +1329,10 @@ public:
                         std::memory_order_acquire) == cons + 1) {
                     IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
                     if (VerifySnapshotCrc(snapshot)) {
-                        return Borrow(this, sub, snapshot);
+                        if (TryClaimBorrow(sub, cons, borrower)) {
+                            return Borrow(this, sub, snapshot);
+                        }
+                        continue;
                     }
                 }
                 // Genuinely stale or corrupt: skip like corruption below.
@@ -1100,6 +1370,9 @@ public:
                     StatusCode::kCorruption,
                     "broadcast slot immutable CRC mismatch (skipped)");
             }
+            if (!TryClaimBorrow(sub, cons, borrower)) {
+                continue;
+            }
             return Borrow(this, sub, snapshot);
         }
     }
@@ -1113,6 +1386,63 @@ public:
         return AckSlot(sub, seq);
     }
 
+    Result<Gap> LastGap(SubscriberHandle sub) const noexcept {
+        if (!IsActiveGeneration(sub)) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber not registered or stale generation");
+        }
+        const SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.gap_generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber generation has no Gap state");
+        }
+        const uint64_t events = ss.gap_events.load(std::memory_order_acquire);
+        if (events == 0) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber has not observed a Gap");
+        }
+        Gap gap{
+            .subscriber_id = sub.id,
+            .generation = sub.generation,
+            .first_sequence =
+                ss.latest_gap_first_sequence.load(std::memory_order_acquire),
+            .next_sequence =
+                ss.latest_gap_next_sequence.load(std::memory_order_acquire),
+            .total_events = events,
+            .total_messages =
+                ss.gap_messages.load(std::memory_order_acquire),
+        };
+        if (!IsActiveGeneration(sub) ||
+            ss.gap_generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber generation changed while reading Gap");
+        }
+        return gap;
+    }
+
+    Result<SubscriberStats> GetSubscriberStats(
+        SubscriberHandle sub) const noexcept {
+        if (!IsActiveGeneration(sub)) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber not registered or stale generation");
+        }
+        const SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.gap_generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber generation has no statistics");
+        }
+        SubscriberStats stats{
+            .gap_events = ss.gap_events.load(std::memory_order_acquire),
+            .gap_messages = ss.gap_messages.load(std::memory_order_acquire),
+        };
+        if (!IsActiveGeneration(sub) ||
+            ss.gap_generation.load(std::memory_order_acquire) != sub.generation) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "subscriber generation changed while reading statistics");
+        }
+        return stats;
+    }
+
     // Installs a process-local notification invoked by the facade that wins the
     // exact retired-era token. The claim is persisted before invocation: a
     // process crash may lose that notification, but can neither duplicate it nor
@@ -1122,6 +1452,12 @@ public:
                                   void* context) noexcept {
         payload_retire_observer_ = observer;
         payload_retire_context_ = context;
+    }
+
+    void SetRetirePersistenceHookForTesting(
+        RetirePersistenceHook hook, void* context = nullptr) noexcept {
+        retire_persistence_hook_ = hook;
+        retire_persistence_context_ = context;
     }
 
     // -----------------------------------------------------------------------
@@ -1164,14 +1500,10 @@ public:
                 continue;
             }
 
-            uint64_t retired =
-                era.retired_era.load(std::memory_order_acquire);
-            while (retired < token &&
-                   !era.retired_era.compare_exchange_weak(
-                       retired, token, std::memory_order_acq_rel,
-                       std::memory_order_acquire)) {
+            if (era.retired_era.load(std::memory_order_acquire) >= token) {
+                continue;
             }
-            if (retired >= token) {
+            if (payload_retire_observer_ == nullptr) {
                 continue;
             }
 
@@ -1179,10 +1511,53 @@ public:
                 .offset = offset,
                 .generation = static_cast<uint32_t>(identity >> 32),
                 .region_id = static_cast<uint32_t>(identity)};
-            if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
-                payload_retire_observer_(payload, payload_retire_context_);
+            if (!payload.IsNull()) {
+                const Status retired =
+                    payload_retire_observer_(payload, payload_retire_context_);
+                if (!retired.ok()) {
+                    continue;
+                }
+            }
+            if (retire_persistence_hook_ != nullptr) {
+                retire_persistence_hook_(seq, retire_persistence_context_);
+            }
+            uint64_t retired =
+                era.retired_era.load(std::memory_order_acquire);
+            while (retired < token &&
+                   !era.retired_era.compare_exchange_weak(
+                       retired, token, std::memory_order_acq_rel,
+                       std::memory_order_acquire)) {
             }
         }
+    }
+
+    Status EnsureReusableSlot(uint64_t sequence) noexcept {
+        if (sequence < capacity_) {
+            return Status::Ok();
+        }
+        const uint64_t previous = sequence - capacity_;
+        BroadcastEraMeta& era = era_metas_[sequence & mask_];
+        const uint64_t token = previous + 1;
+        const uint64_t payload_era =
+            era.payload_era.load(std::memory_order_acquire);
+        if (payload_era == 0) {
+            return Status::Ok();
+        }
+        if (payload_era != token) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast physical slot has an unexpected era");
+        }
+        if (era.retired_era.load(std::memory_order_acquire) >= token) {
+            return Status::Ok();
+        }
+        CollectGarbage();
+        return era.retired_era.load(std::memory_order_acquire) >= token
+                   ? Status::Ok()
+                   : Status::Error(
+                         StatusCode::kWouldBlock,
+                         payload_retire_observer_ == nullptr
+                             ? "broadcast payload retirement has no observer"
+                             : "broadcast payload retirement is pending retry");
     }
 
     // -----------------------------------------------------------------------
@@ -1254,6 +1629,38 @@ private:
 
     static uint64_t CursorCleanupToken(uint64_t sequence) noexcept {
         return sequence | kCursorCleanupBit;
+    }
+
+    static constexpr uint64_t kProtocolPhaseMask = 0x3;
+    static constexpr uint64_t kBorrowClaiming = 1;
+    static constexpr uint64_t kBorrowActive = 2;
+    static constexpr uint64_t kDropPrepared = 1;
+    static constexpr uint64_t kDropCommitting = 2;
+
+    static uint64_t ProtocolToken(uint64_t sequence,
+                                  uint64_t phase) noexcept {
+        return ((sequence + 1) << 2) | phase;
+    }
+
+    static uint64_t ProtocolPhase(uint64_t control) noexcept {
+        return control & kProtocolPhaseMask;
+    }
+
+    static uint64_t ProtocolSequence(uint64_t control) noexcept {
+        return (control >> 2) - 1;
+    }
+
+    static ProcessIdentity LoadBorrowOwner(
+        const SubscriberSlot& sub) noexcept {
+        return ProcessIdentity{
+            .node_id = sub.borrow_owner_node_id.load(std::memory_order_acquire),
+            .process_id =
+                sub.borrow_owner_process_id.load(std::memory_order_acquire),
+            .process_epoch =
+                sub.borrow_owner_process_epoch.load(std::memory_order_acquire),
+            .start_time_ns =
+                sub.borrow_owner_start_time_ns.load(std::memory_order_acquire),
+        };
     }
 
     // Completes exactly one claimed cursor era. The exact sequence and atomic
@@ -1459,68 +1866,309 @@ private:
         return Status::Ok();
     }
 
-    // kDropOldest (design doc 9.8): force the slowest active subscriber
-    // forward past the oldest unconsumed slot, clearing its ack bit in
-    // every slot it jumps over. The jumped subscriber later observes its
-    // cursor moved (or finds a recycled slot with a sequence mismatch,
-    // reported as kCorruption); a Borrow it still holds keeps a valid
-    // snapshot and its late Ack reports kNotFound. The payload is NOT
-    // reclaimed here (design doc 9.8: only after no borrows remain).
-    //
-    // The cursor advance uses CAS so a racing Poll/Ack of the same
-    // subscriber either wins first (and we re-read) or loses cleanly; the
-    // publisher's own cursor never moves backward.
-    void ForceDropOldest(uint64_t prod) noexcept {
-        for (;;) {
-            const uint64_t membership =
-                control_->current_membership.load(std::memory_order_acquire);
-            if (membership == 0) {
-                return;
-            }
-            uint32_t slowest = 0;
-            uint64_t min_cursor = prod;
-            uint64_t remaining = membership;
-            while (remaining != 0) {
-                const uint32_t id =
-                    static_cast<uint32_t>(__builtin_ctzll(remaining));
-                remaining &= remaining - 1;
-                const uint64_t cursor = LoadCursorAndHelp(id);
-                if (cursor < min_cursor) {
-                    min_cursor = cursor;
-                    slowest = id;
-                }
-            }
-            if (min_cursor >= prod) {
-                return;
-            }
+    bool DropTargetsSequence(uint64_t control, uint32_t id,
+                             uint64_t sequence) const noexcept {
+        return control != 0 && ProtocolSequence(control) == sequence &&
+               (control_->drop_targets.load(std::memory_order_acquire) &
+                (uint64_t{1} << id)) != 0;
+    }
 
-            // The cursor is the authority to drop. Never clear first: a racing
-            // ACK that wins this CAS changes the actual skipped interval, so a
-            // failed CAS must restart selection without touching any bitmap.
-            uint64_t expected = min_cursor;
-            if (!subs_[slowest].cursor.compare_exchange_strong(
-                    expected, prod, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                continue;
-            }
-
-            // This is the single publisher, so after its successful cursor CAS
-            // no physical era in [min_cursor, prod) can be recycled until this
-            // loop finishes and Reserve resumes. Clear exactly what this CAS
-            // skipped, and nothing from a failed/stale observation.
-            for (uint64_t seq = min_cursor; seq < prod; ++seq) {
-                IndexSlot* slot = &slots_[seq & mask_];
-                const uint64_t phys = seq & mask_;
-                if (slot->sequence_num.load(std::memory_order_acquire) == seq) {
-                    uint64_t expected_era = seq + 1;
-                    era_metas_[phys].ack_era[slowest].compare_exchange_strong(
-                        expected_era, 0, std::memory_order_acq_rel,
-                        std::memory_order_acquire);
-                }
-            }
-            CollectGarbage();
+    void AbortPreparedDrop(uint64_t control) noexcept {
+        if (ProtocolPhase(control) != kDropPrepared ||
+            control_->drop_control.load(std::memory_order_acquire) != control) {
             return;
         }
+        const uint64_t sequence = ProtocolSequence(control);
+        uint64_t targets =
+            control_->drop_targets.load(std::memory_order_acquire);
+        while (targets != 0) {
+            const uint32_t id = static_cast<uint32_t>(__builtin_ctzll(targets));
+            targets &= targets - 1;
+            uint64_t expected = sequence + 1;
+            subs_[id].drop_claim.compare_exchange_strong(
+                expected, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        uint64_t expected = control;
+        control_->drop_control.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+    void HelpDropTransaction() noexcept {
+        const uint64_t control =
+            control_->drop_control.load(std::memory_order_acquire);
+        if (control == 0 || ProtocolPhase(control) != kDropCommitting) {
+            return;
+        }
+        const uint64_t sequence = ProtocolSequence(control);
+        if (control_->drop_sequence.load(std::memory_order_acquire) != sequence) {
+            return;
+        }
+        const uint64_t targets =
+            control_->drop_targets.load(std::memory_order_acquire);
+        const uint64_t phys = sequence & mask_;
+        const uint32_t state =
+            slots_[phys].state.load(std::memory_order_acquire);
+        const bool tombstone =
+            state == static_cast<uint32_t>(SlotState::kAborted);
+
+        // Gap publication is the first externally visible commit phase. Every
+        // target receives an idempotent absolute statistics snapshot before any
+        // ACK or cursor can advance.
+        uint64_t remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            SubscriberSlot& sub = subs_[id];
+            if (sub.drop_claim.load(std::memory_order_acquire) != sequence + 1 ||
+                sub.generation.load(std::memory_order_acquire) !=
+                    sub.drop_generation.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!tombstone &&
+                sub.gap_committed_era.load(std::memory_order_acquire) <
+                    sequence + 1) {
+                sub.latest_gap_first_sequence.store(
+                    sequence, std::memory_order_relaxed);
+                sub.latest_gap_next_sequence.store(
+                    sequence + 1, std::memory_order_relaxed);
+                sub.gap_messages.store(
+                    sub.drop_gap_messages.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                sub.gap_events.store(
+                    sub.drop_gap_events.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                sub.gap_committed_era.store(sequence + 1,
+                                            std::memory_order_release);
+            }
+        }
+
+        // Only after all target Gaps are release-published may exact ACKs clear
+        // and cursors become visible at sequence + 1.
+        remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            uint64_t expected_era = sequence + 1;
+            era_metas_[phys].ack_era[id].compare_exchange_strong(
+                expected_era, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            uint64_t expected = sequence;
+            subs_[id].cursor.compare_exchange_strong(
+                expected, sequence + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            uint64_t expected = sequence + 1;
+            subs_[id].drop_claim.compare_exchange_strong(
+                expected, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        uint64_t expected = control;
+        control_->drop_control.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        CollectGarbage();
+    }
+
+    // DropOldest first preflights every subscriber tied at the minimum cursor.
+    // Preparation and target claims never alter ACK/cursor/Gap state. Only the
+    // single prepared->committing CAS makes the transaction helpable; completion
+    // then follows Gap -> ACK -> cursor order.
+    Result<uint64_t> ForceDropOldest(uint64_t prod) noexcept {
+        uint64_t existing =
+            control_->drop_control.load(std::memory_order_acquire);
+        if (ProtocolPhase(existing) == kDropCommitting) {
+            HelpDropTransaction();
+            return ProtocolSequence(existing) + 1;
+        }
+        if (ProtocolPhase(existing) == kDropPrepared) {
+            AbortPreparedDrop(existing);
+        }
+
+        const uint64_t membership =
+            control_->current_membership.load(std::memory_order_acquire);
+        if (membership == 0) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast has no active oldest candidate");
+        }
+        uint64_t min_cursor = prod;
+        uint64_t remaining = membership;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            const uint64_t cursor = LoadCursorAndHelp(id);
+            if (cursor < min_cursor) {
+                min_cursor = cursor;
+            }
+        }
+        if (min_cursor >= prod) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast has no lagging oldest candidate");
+        }
+
+        const uint64_t phys = min_cursor & mask_;
+        IndexSlot& slot = slots_[phys];
+        const uint32_t state = slot.state.load(std::memory_order_acquire);
+        const bool tombstone =
+            state == static_cast<uint32_t>(SlotState::kAborted);
+        const bool published =
+            state == static_cast<uint32_t>(SlotState::kReady) ||
+            state == static_cast<uint32_t>(SlotState::kRetired) ||
+            state == static_cast<uint32_t>(SlotState::kRetiring);
+        if (slot.sequence_num.load(std::memory_order_acquire) != min_cursor ||
+            (!tombstone &&
+             (!published ||
+              era_metas_[phys].payload_era.load(std::memory_order_acquire) !=
+                  min_cursor + 1))) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast oldest era is not safely published");
+        }
+
+        uint64_t targets = 0;
+        remaining = membership;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            SubscriberSlot& sub = subs_[id];
+            if (sub.cursor.load(std::memory_order_acquire) != min_cursor) {
+                continue;
+            }
+            const uint64_t generation =
+                sub.generation.load(std::memory_order_acquire);
+            const uint64_t gap_events =
+                sub.gap_events.load(std::memory_order_acquire);
+            const uint64_t gap_messages =
+                sub.gap_messages.load(std::memory_order_acquire);
+            if (sub.state.load(std::memory_order_acquire) !=
+                    static_cast<uint32_t>(SubscriberState::kActive) ||
+                generation == 0 ||
+                sub.borrow_control.load(std::memory_order_acquire) != 0 ||
+                sub.drop_claim.load(std::memory_order_acquire) != 0 ||
+                (!tombstone &&
+                 era_metas_[phys].ack_era[id].load(std::memory_order_acquire) !=
+                     min_cursor + 1) ||
+                gap_events == std::numeric_limits<uint64_t>::max() ||
+                gap_messages == std::numeric_limits<uint64_t>::max()) {
+                return Status::Error(
+                    StatusCode::kWouldBlock,
+                    "a tied slow subscriber failed DropOldest preflight");
+            }
+            sub.drop_generation.store(generation, std::memory_order_relaxed);
+            sub.drop_gap_events.store(gap_events + (tombstone ? 0 : 1),
+                                      std::memory_order_relaxed);
+            sub.drop_gap_messages.store(gap_messages + (tombstone ? 0 : 1),
+                                        std::memory_order_relaxed);
+            targets |= uint64_t{1} << id;
+        }
+        if (targets == 0 ||
+            control_->current_membership.load(std::memory_order_acquire) !=
+                membership) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "DropOldest membership changed during preflight");
+        }
+
+        // Full second validation closes Poll/Ack/unregister races before the
+        // prepared transaction is published. No subscriber has moved yet.
+        remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            SubscriberSlot& sub = subs_[id];
+            if (sub.state.load(std::memory_order_acquire) !=
+                    static_cast<uint32_t>(SubscriberState::kActive) ||
+                sub.generation.load(std::memory_order_acquire) !=
+                    sub.drop_generation.load(std::memory_order_relaxed) ||
+                sub.cursor.load(std::memory_order_acquire) != min_cursor ||
+                sub.borrow_control.load(std::memory_order_acquire) != 0 ||
+                sub.drop_claim.load(std::memory_order_acquire) != 0) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "DropOldest preflight became stale");
+            }
+        }
+
+        control_->drop_sequence.store(min_cursor, std::memory_order_relaxed);
+        control_->drop_targets.store(targets, std::memory_order_relaxed);
+        const uint64_t prepared = ProtocolToken(min_cursor, kDropPrepared);
+        uint64_t idle = 0;
+        if (!control_->drop_control.compare_exchange_strong(
+                idle, prepared, std::memory_order_release,
+                std::memory_order_acquire)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "another Drop transaction is active");
+        }
+
+        uint64_t claimed = 0;
+        remaining = targets;
+        while (remaining != 0) {
+            const uint32_t id =
+                static_cast<uint32_t>(__builtin_ctzll(remaining));
+            remaining &= remaining - 1;
+            SubscriberSlot& sub = subs_[id];
+            uint64_t expected_claim = 0;
+            if (!sub.drop_claim.compare_exchange_strong(
+                    expected_claim, min_cursor + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire) ||
+                sub.state.load(std::memory_order_acquire) !=
+                    static_cast<uint32_t>(SubscriberState::kActive) ||
+                sub.generation.load(std::memory_order_acquire) !=
+                    sub.drop_generation.load(std::memory_order_acquire) ||
+                sub.cursor.load(std::memory_order_acquire) != min_cursor ||
+                sub.borrow_control.load(std::memory_order_acquire) != 0) {
+                uint64_t rollback = claimed;
+                while (rollback != 0) {
+                    const uint32_t rollback_id =
+                        static_cast<uint32_t>(__builtin_ctzll(rollback));
+                    rollback &= rollback - 1;
+                    uint64_t token = min_cursor + 1;
+                    subs_[rollback_id].drop_claim.compare_exchange_strong(
+                        token, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                }
+                if (expected_claim == 0) {
+                    uint64_t token = min_cursor + 1;
+                    sub.drop_claim.compare_exchange_strong(
+                        token, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                }
+                uint64_t expected_prepared = prepared;
+                control_->drop_control.compare_exchange_strong(
+                    expected_prepared, 0, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "DropOldest target claim failed");
+            }
+            claimed |= uint64_t{1} << id;
+        }
+
+        const uint64_t committing =
+            ProtocolToken(min_cursor, kDropCommitting);
+        uint64_t expected_prepared = prepared;
+        if (!control_->drop_control.compare_exchange_strong(
+                expected_prepared, committing, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            AbortPreparedDrop(prepared);
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "DropOldest commit authority was lost");
+        }
+        HelpDropTransaction();
+        return tombstone ? 0 : min_cursor + 1;
     }
 
     // Subscriber-side ACK. Only the exact current cursor may ACK: a Borrow
@@ -1529,6 +2177,108 @@ private:
     // update. Until that token is finished, active fullness checks and Reserve's
     // help pass keep the physical era from being reused. If this process dies,
     // any observer can perform the same exact-era clear and advance the cursor.
+    bool IsActiveGeneration(SubscriberHandle sub) const noexcept {
+        if (sub.id.value >= kMaxSubscribers) {
+            return false;
+        }
+        const SubscriberSlot& ss = subs_[sub.id.value];
+        return ss.state.load(std::memory_order_acquire) ==
+                   static_cast<uint32_t>(SubscriberState::kActive) &&
+               ss.generation.load(std::memory_order_acquire) == sub.generation;
+    }
+
+    bool TryClaimBorrow(SubscriberHandle sub, uint64_t sequence,
+                        const ProcessIdentity& owner) noexcept {
+        if (owner.IsZero()) {
+            return false;
+        }
+        SubscriberSlot& ss = subs_[sub.id.value];
+        const uint64_t drop =
+            control_->drop_control.load(std::memory_order_acquire);
+        if (!IsActiveGeneration(sub) ||
+            ss.cursor.load(std::memory_order_acquire) != sequence ||
+            ss.drop_claim.load(std::memory_order_acquire) != 0 ||
+            DropTargetsSequence(drop, sub.id.value, sequence)) {
+            return false;
+        }
+        const uint64_t claiming = ProtocolToken(sequence, kBorrowClaiming);
+        uint64_t expected = 0;
+        if (!ss.borrow_control.compare_exchange_strong(
+                expected, claiming, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        ss.borrow_generation.store(sub.generation, std::memory_order_relaxed);
+        ss.borrow_lease_epoch.store(
+            ss.lease_epoch.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
+        ss.borrow_owner_node_id.store(owner.node_id,
+                                      std::memory_order_relaxed);
+        ss.borrow_owner_process_id.store(owner.process_id,
+                                         std::memory_order_relaxed);
+        ss.borrow_owner_process_epoch.store(owner.process_epoch,
+                                            std::memory_order_relaxed);
+        ss.borrow_owner_start_time_ns.store(owner.start_time_ns,
+                                            std::memory_order_relaxed);
+        const uint64_t active = ProtocolToken(sequence, kBorrowActive);
+        expected = claiming;
+        if (!ss.borrow_control.compare_exchange_strong(
+                expected, active, std::memory_order_release,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        const uint64_t current_drop =
+            control_->drop_control.load(std::memory_order_acquire);
+        if (!IsActiveGeneration(sub) ||
+            ss.cursor.load(std::memory_order_acquire) != sequence ||
+            ss.drop_claim.load(std::memory_order_acquire) != 0 ||
+            DropTargetsSequence(current_drop, sub.id.value, sequence)) {
+            ReleaseBorrowClaim(sub, sequence);
+            return false;
+        }
+        return true;
+    }
+
+    void ReleaseBorrowClaim(SubscriberHandle sub, uint64_t sequence) noexcept {
+        if (sub.id.value >= kMaxSubscribers) {
+            return;
+        }
+        SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.generation.load(std::memory_order_acquire) != sub.generation ||
+            ss.borrow_generation.load(std::memory_order_acquire) !=
+                sub.generation ||
+            ss.borrow_lease_epoch.load(std::memory_order_acquire) !=
+                ss.lease_epoch.load(std::memory_order_acquire)) {
+            return;
+        }
+        uint64_t expected = ProtocolToken(sequence, kBorrowActive);
+        ss.borrow_control.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+    bool ConsumePendingGap(SubscriberHandle sub) noexcept {
+        SubscriberSlot& ss = subs_[sub.id.value];
+        if (ss.gap_generation.load(std::memory_order_acquire) != sub.generation) {
+            return false;
+        }
+        if (ss.gap_committed_era.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        uint64_t observed =
+            ss.observed_gap_events.load(std::memory_order_acquire);
+        const uint64_t events = ss.gap_events.load(std::memory_order_acquire);
+        while (observed < events) {
+            if (ss.observed_gap_events.compare_exchange_weak(
+                    observed, events, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
     Status AckSlot(SubscriberHandle sub, uint64_t sequence) noexcept {
         if (sub.id.value >= kMaxSubscribers) {
             return Status::Error(StatusCode::kNotFound,
@@ -1541,6 +2291,17 @@ private:
             return Status::Error(
                 StatusCode::kNotFound,
                 "subscriber not registered or stale generation");
+        }
+
+        const uint64_t drop =
+            control_->drop_control.load(std::memory_order_acquire);
+        if (DropTargetsSequence(drop, sub.id.value, sequence)) {
+            if (ProtocolPhase(drop) == kDropCommitting) {
+                HelpDropTransaction();
+            }
+            return Status::Error(
+                StatusCode::kWouldBlock,
+                "message participates in a DropOldest transaction");
         }
 
         const uint64_t cons = LoadCursorAndHelp(sub.id.value);
@@ -1594,6 +2355,8 @@ private:
     uint64_t mask_ = 0;
     PayloadRetireObserver payload_retire_observer_ = nullptr;
     void* payload_retire_context_ = nullptr;
+    RetirePersistenceHook retire_persistence_hook_ = nullptr;
+    void* retire_persistence_context_ = nullptr;
 };
 
 static_assert(std::is_trivially_copyable_v<BroadcastChannel>,

@@ -53,16 +53,16 @@ namespace {
 using Control = BroadcastChannel::ControlBlock;
 using EraMeta = BroadcastChannel::BroadcastEraMeta;
 using SubSlot = BroadcastChannel::SubscriberSlot;
-static_assert(sizeof(Control) == 3 * 64,
-              "control block must occupy exactly three cache lines");
+static_assert(sizeof(Control) == 4 * 64,
+              "control block must occupy exactly four cache lines");
 static_assert(alignof(Control) == 64);
 static_assert(std::is_standard_layout_v<Control>);
 static_assert(offsetof(Control, publisher_cursor) == 64,
               "publisher cursor must start its own cache line");
 static_assert(offsetof(Control, current_membership) == 128,
               "membership must start its own cache line");
-static_assert(sizeof(SubSlot) == 2 * 64,
-              "subscriber slot must occupy exactly two cache lines");
+static_assert(sizeof(SubSlot) == 5 * 64,
+              "subscriber slot must occupy exactly five cache lines");
 static_assert(alignof(SubSlot) == 64);
 static_assert(std::is_standard_layout_v<SubSlot>);
 static_assert(offsetof(SubSlot, cursor) == 0,
@@ -77,16 +77,16 @@ TEST(BroadcastLayoutTest, RequiredSizeMatchesLayout) {
     // ControlBlock -> IndexSlot[cap] -> BroadcastSlotMeta[cap] ->
     // BroadcastEraMeta[cap] -> SubscriberSlot[64].
     constexpr uint64_t kCap = 8;
-    EXPECT_EQ(BroadcastChannel::SlotsOffset(), 3u * 64u);
-    EXPECT_EQ(BroadcastChannel::MetasOffset(kCap), 3u * 64u + kCap * 128u);
+    EXPECT_EQ(BroadcastChannel::SlotsOffset(), 4u * 64u);
+    EXPECT_EQ(BroadcastChannel::MetasOffset(kCap), 4u * 64u + kCap * 128u);
     EXPECT_EQ(BroadcastChannel::EraMetasOffset(kCap),
-              3u * 64u + kCap * 128u + kCap * 16u);
+              4u * 64u + kCap * 128u + kCap * 16u);
     EXPECT_EQ(BroadcastChannel::SubsOffset(kCap),
-              3u * 64u + kCap * 128u + kCap * 16u +
+              4u * 64u + kCap * 128u + kCap * 16u +
                   kCap * sizeof(EraMeta));
     EXPECT_EQ(BroadcastChannel::RequiredSize(kCap),
-              3u * 64u + kCap * 128u + kCap * 16u +
-                  kCap * sizeof(EraMeta) + kBroadcastMaxSubscribers * 128u);
+              4u * 64u + kCap * 128u + kCap * 16u +
+                  kCap * sizeof(EraMeta) + kBroadcastMaxSubscribers * 320u);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,18 +172,20 @@ struct BlockingRetireObserverContext {
     ShmHandle observed_payload{};
 };
 
-void BlockingRetireObserver(ShmHandle payload, void* opaque) noexcept {
+Status BlockingRetireObserver(ShmHandle payload, void* opaque) noexcept {
     auto* context = static_cast<BlockingRetireObserverContext*>(opaque);
     context->observed_payload = payload;
     context->entered.store(true, std::memory_order_release);
     while (!context->release.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
+    return Status::Ok();
 }
 
-void CountingRetireObserver(ShmHandle, void* opaque) noexcept {
+Status CountingRetireObserver(ShmHandle, void* opaque) noexcept {
     static_cast<std::atomic<uint64_t>*>(opaque)->fetch_add(
         1, std::memory_order_relaxed);
+    return Status::Ok();
 }
 
 // Monotonic clock used throughout the membership tests: registration,
@@ -560,42 +562,33 @@ TEST(BroadcastAckBitmapTest, ClaimedRetireEraAfterCrashIsAtMostOnceAndHelpFree) 
     EXPECT_EQ(f.slots()[0].sequence_num.load(), 4u);
 }
 
-TEST(BroadcastAckBitmapTest,
-     StaleBorrowCannotAckReusedSubscriberGenerationOrSlotEra) {
+TEST(BroadcastAckBitmapTest, ActiveBorrowBlocksDropAndSubscriberReuse) {
     ChannelFixture<4> f;
     auto ch = BroadcastChannel::Init(f.storage, 4);
     ASSERT_TRUE(ch.ok());
     auto stale = Register(*ch, 0);
-    auto keeper = Register(*ch, 1);
-
-    Publish(*ch, 0);
-    auto held = ch->Poll(stale);
-    ASSERT_TRUE(held.ok());
-    ASSERT_EQ(held.value()->sequence_num, 0u);
-
-    // Tear down id 0 while its Borrow survives, then reuse the id. The fresh
-    // generation joins at sequence 1 and owes ACKs only from that point on.
-    ASSERT_TRUE(ch->UnregisterSubscriber(stale.id, stale.generation).ok());
-    auto fresh = Register(*ch, 0);
-    ASSERT_NE(fresh.generation, stale.generation);
-    for (uint32_t sequence = 1; sequence < 4; ++sequence) {
+    for (uint32_t sequence = 0; sequence < 4; ++sequence) {
         Publish(*ch, sequence);
     }
 
-    // Let the publisher reuse physical slot 0 for sequence 4. Both current
-    // subscribers owe the new message, so its fresh bitmap is 0b11.
-    auto keeper_zero = ch->Poll(keeper);
-    ASSERT_TRUE(keeper_zero.ok());
-    ASSERT_TRUE(std::move(keeper_zero.value()).Ack().ok());
-    Publish(*ch, 4);
-    ASSERT_EQ(f.slots()[0].sequence_num.load(), 4u);
-    ASSERT_EQ(f.ack_bits(4), 0b11u);
+    {
+        auto held = ch->Poll(stale);
+        ASSERT_TRUE(held.ok());
+        ASSERT_EQ(held->slot()->sequence_num, 0u);
+        EXPECT_EQ(ch->UnregisterSubscriber(stale.id, stale.generation).code(),
+                  StatusCode::kWouldBlock);
+        auto blocked = ch->Reserve(QueueFullPolicy::kDropOldest);
+        ASSERT_FALSE(blocked.ok());
+        EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+        EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 0u);
+        EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 0u);
+    }
 
-    // The old Borrow carries generation 1 and sequence 0. It must reject both
-    // stale authorities and leave generation 2's sequence-4 bit untouched.
-    EXPECT_EQ(std::move(held.value()).Ack().code(), StatusCode::kNotFound);
-    EXPECT_EQ(f.ack_bits(4), 0b11u);
-    EXPECT_EQ(f.subs()[0].cursor.load(), 1u);
+    ASSERT_TRUE(ch->UnregisterSubscriber(stale.id, stale.generation).ok());
+    auto fresh = Register(*ch, 0);
+    ASSERT_NE(fresh.generation, stale.generation);
+    EXPECT_EQ(ch->Ack(stale, 0).code(), StatusCode::kNotFound);
+    EXPECT_EQ(ch->GetSubscriberStats(fresh)->gap_messages, 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -815,68 +808,125 @@ TEST(BroadcastPolicyTest, DropNewestReportsDegraded) {
     }
 }
 
-TEST(BroadcastPolicyTest, DropOldestAdvancesSlowestAndLateAckNotFound) {
+TEST(BroadcastPolicyTest, DropOldestAdvancesOneEraAndReportsGap) {
     ChannelFixture<4> f;
     auto ch = BroadcastChannel::Init(f.storage, 4);
     ASSERT_TRUE(ch.ok());
-    auto a = Register(*ch, 0);  // will be the slowest: holds an unacked borrow
-    auto b = Register(*ch, 1);  // fast
+    auto a = Register(*ch, 0);  // slow at sequence 0
+    auto b = Register(*ch, 1);  // one era ahead
 
     for (uint32_t i = 0; i < 4; ++i) {
         Publish(*ch, i);
     }
-    EXPECT_TRUE(ch->IsFull());
-
-    // The fast subscriber acks message 0, leaving subscriber 0 as the unique
-    // slowest (cursor 0) while it holds an unacked borrow of message 0.
     {
         auto borrow = ch->Poll(b);
         ASSERT_TRUE(borrow.ok());
-        ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
+        ASSERT_TRUE(std::move(*borrow).Ack().ok());
     }
-    auto held = ch->Poll(a);
-    ASSERT_TRUE(held.ok());
-    EXPECT_EQ(held.value()->sequence_num, 0u);
+    auto res = ch->Reserve(QueueFullPolicy::kDropOldest);
+    ASSERT_TRUE(res.ok()) << res.status().ToString();
+    EXPECT_EQ(res->dropped_messages(), 1u);
+    FillSlot(*res, 4);
+    ASSERT_TRUE(std::move(*res).Commit().ok());
 
-    // kDropOldest: subscriber 0 (cursor 0) is forced to the head (4) and its
-    // bit is cleared on every jumped slot; the publish succeeds.
-    {
-        auto res = ch->Reserve(QueueFullPolicy::kDropOldest);
-        ASSERT_TRUE(res.ok()) << res.status().ToString();
-        FillSlot(res.value(), 4);
-        ASSERT_TRUE(std::move(res.value()).Commit().ok());
-    }
-    EXPECT_EQ(f.subs()[0].cursor.load(), 4u);
-    // The drop cleared subscriber 0's bit on the three slots it jumped over
-    // (seq 1..3 in physical slots 1..3; bit 1 still outstanding). Slot 0
-    // itself was immediately recycled for message 4 and carries a fresh
-    // 0b11 bitmap stamped by Commit.
-    EXPECT_EQ(f.ack_bits(1), 0b10u);
-    EXPECT_EQ(f.ack_bits(2), 0b10u);
-    EXPECT_EQ(f.ack_bits(3), 0b10u);
+    EXPECT_EQ(f.subs()[0].cursor.load(), 1u);
+    EXPECT_EQ(f.ack_bits(1), 0b11u);
+    EXPECT_EQ(f.ack_bits(2), 0b11u);
+    EXPECT_EQ(f.ack_bits(3), 0b11u);
     EXPECT_EQ(f.ack_bits(4), 0b11u);
 
-    // The held borrow still sees ITS message (snapshot semantics); its late
-    // Ack reports kNotFound and moves no cursor. Because physical slot 0 now
-    // carries sequence 4, the old sequence-0 ACK must not clear the new era's
-    // subscriber-0 bit.
-    EXPECT_EQ(held.value()->msg_type, 0x4000u + 0u);
-    auto late = std::move(held.value()).Ack();
-    EXPECT_EQ(late.code(), StatusCode::kNotFound);
-    EXPECT_EQ(f.subs()[0].cursor.load(), 4u);
+    auto gap_signal = ch->Poll(a);
+    ASSERT_FALSE(gap_signal.ok());
+    EXPECT_EQ(gap_signal.status().code(), StatusCode::kDegraded);
+    auto gap = ch->LastGap(a);
+    ASSERT_TRUE(gap.ok()) << gap.status().ToString();
+    EXPECT_EQ(gap->generation, a.generation);
+    EXPECT_EQ(gap->first_sequence, 0u);
+    EXPECT_EQ(gap->next_sequence, 1u);
+    EXPECT_EQ(gap->total_events, 1u);
+    EXPECT_EQ(gap->total_messages, 1u);
+    auto stats = ch->GetSubscriberStats(a);
+    ASSERT_TRUE(stats.ok());
+    EXPECT_EQ(stats->gap_events, 1u);
+    EXPECT_EQ(stats->gap_messages, 1u);
+
+    EXPECT_EQ(f.subs()[0].cursor.load(), 1u);
     EXPECT_EQ(f.ack_bits(4), 0b11u);
 
-    // Subscriber 0 resumes at the head: it sees message 4 next.
-    auto borrow = ch->Poll(a);
-    ASSERT_TRUE(borrow.ok());
-    EXPECT_EQ(borrow.value()->sequence_num, 4u);
-    ASSERT_TRUE(std::move(borrow.value()).Ack().ok());
-
-    // The fast subscriber continues in order from its own cursor.
+    auto a1 = ch->Poll(a);
+    ASSERT_TRUE(a1.ok());
+    EXPECT_EQ(a1->slot()->sequence_num, 1u);
+    ASSERT_TRUE(std::move(*a1).Ack().ok());
     auto b1 = ch->Poll(b);
     ASSERT_TRUE(b1.ok());
-    EXPECT_EQ(b1.value()->sequence_num, 1u);
-    ASSERT_TRUE(std::move(b1.value()).Ack().ok());
+    EXPECT_EQ(b1->slot()->sequence_num, 1u);
+    ASSERT_TRUE(std::move(*b1).Ack().ok());
+}
+
+TEST(BroadcastPolicyTest, DropOldestCountsOneMessageAcrossTiedSubscribers) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto a = Register(*ch, 0);
+    auto b = Register(*ch, 1);
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+
+    auto res = ch->Reserve(QueueFullPolicy::kDropOldest);
+    ASSERT_TRUE(res.ok()) << res.status().ToString();
+    EXPECT_EQ(res->dropped_messages(), 1u);
+    FillSlot(*res, 4);
+    ASSERT_TRUE(std::move(*res).Commit().ok());
+
+    EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(f.subs()[1].cursor.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(ch->GetSubscriberStats(a)->gap_messages, 1u);
+    EXPECT_EQ(ch->GetSubscriberStats(b)->gap_messages, 1u);
+    EXPECT_EQ(ch->Poll(a).status().code(), StatusCode::kDegraded);
+    EXPECT_EQ(ch->Poll(b).status().code(), StatusCode::kDegraded);
+}
+
+TEST(BroadcastPolicyTest, DropOldestWithoutValidEraReturnsWouldBlock) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto sub = Register(*ch, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+
+    f.era_metas()[0].payload_era.store(0, std::memory_order_release);
+    auto blocked = ch->Reserve(QueueFullPolicy::kDropOldest);
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 0u);
+    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 0u);
+    EXPECT_EQ(ch->GetSubscriberStats(sub)->gap_messages, 0u);
+}
+
+TEST(BroadcastPolicyTest, GapStatisticsAreBoundToSubscriberGeneration) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto stale = Register(*ch, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+    auto res = ch->Reserve(QueueFullPolicy::kDropOldest);
+    ASSERT_TRUE(res.ok());
+    ASSERT_TRUE(std::move(*res).Abort().ok());
+    ASSERT_EQ(ch->GetSubscriberStats(stale)->gap_messages, 1u);
+
+    ASSERT_TRUE(ch->UnregisterSubscriber(stale.id, stale.generation).ok());
+    auto fresh = Register(*ch, 0);
+    ASSERT_NE(fresh.generation, stale.generation);
+    EXPECT_EQ(ch->LastGap(stale).status().code(), StatusCode::kNotFound);
+    auto fresh_stats = ch->GetSubscriberStats(fresh);
+    ASSERT_TRUE(fresh_stats.ok());
+    EXPECT_EQ(fresh_stats->gap_events, 0u);
+    EXPECT_EQ(fresh_stats->gap_messages, 0u);
+    EXPECT_EQ(ch->Poll(fresh).status().code(), StatusCode::kWouldBlock);
 }
 
 TEST(BroadcastPolicyTest, ConcurrentAckAndDropNeverClearNewEra) {

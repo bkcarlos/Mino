@@ -305,6 +305,52 @@ TEST_F(BroadcastChannelXprocTest, CrashedAckCleanupTokenIsRecovered) {
     ASSERT_TRUE(std::move(*reservation).Abort().ok());
 }
 
+TEST_F(BroadcastChannelXprocTest, DropOldestGapAndStatisticsCrossProcess) {
+    auto sub = channel_->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+    for (uint64_t i = 0; i < kCapacity; ++i) {
+        auto reservation = channel_->Reserve();
+        ASSERT_TRUE(reservation.ok());
+        FillSlot(*reservation, i);
+        ASSERT_TRUE(std::move(*reservation).Commit().ok());
+    }
+
+    const pid_t publisher = fork();
+    ASSERT_NE(publisher, -1) << "fork failed";
+    if (publisher == 0) {
+        auto attached = BroadcastChannel::Attach(shared_->channel_storage);
+        if (!attached.ok()) {
+            _exit(kChildApiError);
+        }
+        auto reservation = attached->Reserve(QueueFullPolicy::kDropOldest);
+        if (!reservation.ok() || reservation->dropped_messages() != 1) {
+            _exit(kChildApiError);
+        }
+        FillSlot(*reservation, kCapacity);
+        if (!std::move(*reservation).Commit().ok()) {
+            _exit(kChildApiError);
+        }
+        _exit(kChildOk);
+    }
+    WaitChild(publisher);
+
+    auto gap_signal = channel_->Poll(*sub);
+    ASSERT_FALSE(gap_signal.ok());
+    EXPECT_EQ(gap_signal.status().code(), StatusCode::kDegraded);
+    auto gap = channel_->LastGap(*sub);
+    ASSERT_TRUE(gap.ok()) << gap.status().ToString();
+    EXPECT_EQ(gap->generation, sub->generation);
+    EXPECT_EQ(gap->first_sequence, 0u);
+    EXPECT_EQ(gap->next_sequence, 1u);
+    EXPECT_EQ(gap->total_events, 1u);
+    EXPECT_EQ(gap->total_messages, 1u);
+
+    auto next = channel_->Poll(*sub);
+    ASSERT_TRUE(next.ok()) << next.status().ToString();
+    EXPECT_EQ(next->slot()->sequence_num, 1u);
+    EXPECT_TRUE(std::move(*next).Ack().ok());
+}
+
 // A publisher that Reserve()s and then dies via _exit() never runs its
 // Reservation destructor, so the slot stays kWriting with the publisher
 // cursor un-advanced. The parent stamps the ABORTED tombstone and advances

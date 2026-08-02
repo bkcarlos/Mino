@@ -42,6 +42,7 @@ public:
           pin_table_(other.pin_table_),
           pin_owner_(other.pin_owner_),
           borrow_(std::move(other.borrow_)),
+          borrow_pin_(std::move(other.borrow_pin_)),
           value_(other.value_),
           metadata_(other.metadata_),
           payload_cleanup_by_channel_(other.payload_cleanup_by_channel_),
@@ -60,6 +61,7 @@ public:
             pin_table_ = other.pin_table_;
             pin_owner_ = other.pin_owner_;
             borrow_ = std::move(other.borrow_);
+            borrow_pin_ = std::move(other.borrow_pin_);
             value_ = other.value_;
             metadata_ = other.metadata_;
             payload_cleanup_by_channel_ = other.payload_cleanup_by_channel_;
@@ -90,17 +92,23 @@ public:
             return Status::Error(StatusCode::kUnsupported,
                                  "subscriber has no Pin table");
         }
-        Result<ShmSharedPtr<T>> pinned = ShmSharedPtr<T>::Pin(
-            *pin_table_, metadata_.payload, pin_owner_);
-        if (!pinned.ok()) {
-            return pinned.status();
+        ShmSharedPtr<T> pinned;
+        if (borrow_pin_.active()) {
+            pinned = std::move(borrow_pin_);
+        } else {
+            Result<ShmSharedPtr<T>> acquired = ShmSharedPtr<T>::Pin(
+                *pin_table_, metadata_.payload, pin_owner_);
+            if (!acquired.ok()) {
+                return acquired.status();
+            }
+            pinned = std::move(*acquired);
         }
         const Status ack = std::move(*this).Ack();
         if (!ack.ok()) {
-            pinned->Release().ok();
+            pinned.Release().ok();
             return ack;
         }
-        return std::move(*pinned);
+        return std::move(pinned);
     }
 
     Status Ack() && noexcept {
@@ -115,6 +123,7 @@ public:
             [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
         Status retire = Status::Ok();
         Status reclaim = Status::Ok();
+        Status release_pin = Status::Ok();
         if (!payload_cleanup_by_channel_) {
             retire = allocator_->Retire(metadata_.payload);
             if (retire.ok() &&
@@ -122,6 +131,9 @@ public:
                  pin_table_->PinCount(metadata_.payload) == 0)) {
                 reclaim = allocator_->Reclaim(metadata_.payload);
             }
+        }
+        if (borrow_pin_.active()) {
+            release_pin = borrow_pin_.Release();
         }
         allocator_ = nullptr;
         pin_table_ = nullptr;
@@ -133,7 +145,10 @@ public:
         if (!retire.ok()) {
             return retire;
         }
-        return reclaim;
+        if (!reclaim.ok()) {
+            return reclaim;
+        }
+        return release_pin;
     }
 
 private:
@@ -142,12 +157,14 @@ private:
     template <typename ChannelBorrow>
     BorrowedMessage(CentralSlabAllocator* allocator, ShmPinTable* pin_table,
                     const ProcessIdentity& pin_owner, ChannelBorrow&& borrow,
-                    const T* value, MessageMetadata metadata,
+                    ShmSharedPtr<T>&& borrow_pin, const T* value,
+                    MessageMetadata metadata,
                     bool payload_cleanup_by_channel) noexcept
         : allocator_(allocator),
           pin_table_(pin_table),
           pin_owner_(pin_owner),
           borrow_(std::forward<ChannelBorrow>(borrow)),
+          borrow_pin_(std::move(borrow_pin)),
           value_(value),
           metadata_(metadata),
           payload_cleanup_by_channel_(payload_cleanup_by_channel),
@@ -164,6 +181,9 @@ private:
     ProcessIdentity pin_owner_;
     std::variant<SpscChannel::Borrow, MpscChannel::Borrow,
                  BroadcastChannel::Borrow> borrow_;
+    // Runtime Broadcast Borrows hold a Pin before exposing the payload pointer.
+    // DropOldest may retire the payload, but reclamation waits for this Pin.
+    ShmSharedPtr<T> borrow_pin_;
     const T* value_ = nullptr;
     MessageMetadata metadata_;
     bool payload_cleanup_by_channel_ = false;
@@ -229,11 +249,30 @@ public:
             return ResolveBorrow(std::move(*borrow));
         }
         Result<BroadcastChannel::Borrow> borrow =
-            std::get<BroadcastChannel*>(channel_)->Poll(broadcast_subscriber_);
+            std::get<BroadcastChannel*>(channel_)->Poll(
+                broadcast_subscriber_, pin_owner_);
         if (!borrow.ok()) {
             return borrow.status();
         }
         return ResolveBorrow(std::move(*borrow));
+    }
+
+    Result<BroadcastChannel::Gap> LastBroadcastGap() const noexcept {
+        if (!std::holds_alternative<BroadcastChannel*>(channel_)) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "subscriber is not bound to Broadcast");
+        }
+        return std::get<BroadcastChannel*>(channel_)->LastGap(
+            broadcast_subscriber_);
+    }
+
+    Result<BroadcastChannel::SubscriberStats> BroadcastStats() const noexcept {
+        if (!std::holds_alternative<BroadcastChannel*>(channel_)) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "subscriber is not bound to Broadcast");
+        }
+        return std::get<BroadcastChannel*>(channel_)->GetSubscriberStats(
+            broadcast_subscriber_);
     }
 
     Result<BorrowedMessage<T>> Poll(
@@ -304,30 +343,58 @@ private:
             return metadata_status;
         }
 
-        Result<SlabView> slab = allocator_->Inspect(slot.payload);
-        if (!slab.ok()) {
-            std::move(borrow).Ack().ok();
-            return slab.status();
-        }
-        if (slab->state != ObjectState::kPublished ||
-            slab->object_size != sizeof(T) || slab->capacity < sizeof(T) ||
-            slab->type_id != StaticMessageTraits<T>::type_id ||
-            slab->schema_short_id != StaticMessageTraits<T>::schema_short_id ||
-            slab->layout_version != StaticMessageTraits<T>::layout_version ||
-            slab->data == nullptr) {
-            std::move(borrow).Ack().ok();
-            return Status::Error(StatusCode::kSchemaMismatch,
-                                 "payload slab does not match static message traits");
-        }
-
         constexpr bool kChannelManagedCleanup =
             std::is_same_v<std::remove_cvref_t<ChannelBorrow>,
                            BroadcastChannel::Borrow>;
+        ShmSharedPtr<T> borrow_pin;
+        const T* value = nullptr;
+        if constexpr (kChannelManagedCleanup) {
+            if (pin_table_ == nullptr) {
+                std::move(borrow).Ack().ok();
+                return Status::Error(StatusCode::kUnsupported,
+                                     "Broadcast subscriber requires a Pin table");
+            }
+            Result<ShmSharedPtr<T>> pinned = ShmSharedPtr<T>::Pin(
+                *pin_table_, slot.payload, pin_owner_);
+            if (!pinned.ok()) {
+                const Status ack = std::move(borrow).Ack();
+                if (ack.code() == StatusCode::kNotFound) {
+                    auto gap = std::get<BroadcastChannel*>(channel_)->LastGap(
+                        broadcast_subscriber_);
+                    if (gap.ok()) {
+                        return Status::Error(
+                            StatusCode::kDegraded,
+                            "broadcast payload was dropped before Borrow Pin");
+                    }
+                }
+                return pinned.status();
+            }
+            value = pinned->get();
+            borrow_pin = std::move(*pinned);
+        } else {
+            Result<SlabView> slab = allocator_->Inspect(slot.payload);
+            if (!slab.ok()) {
+                std::move(borrow).Ack().ok();
+                return slab.status();
+            }
+            if (slab->state != ObjectState::kPublished ||
+                slab->object_size != sizeof(T) || slab->capacity < sizeof(T) ||
+                slab->type_id != StaticMessageTraits<T>::type_id ||
+                slab->schema_short_id != StaticMessageTraits<T>::schema_short_id ||
+                slab->layout_version != StaticMessageTraits<T>::layout_version ||
+                slab->data == nullptr) {
+                std::move(borrow).Ack().ok();
+                return Status::Error(
+                    StatusCode::kSchemaMismatch,
+                    "payload slab does not match static message traits");
+            }
+            value = static_cast<const T*>(slab->data);
+        }
+
         return BorrowedMessage<T>(
             allocator_, pin_table_, pin_owner_,
-            std::forward<ChannelBorrow>(borrow),
-            static_cast<const T*>(slab->data), MetadataFromSlot(slot),
-            kChannelManagedCleanup);
+            std::forward<ChannelBorrow>(borrow), std::move(borrow_pin), value,
+            MetadataFromSlot(slot), kChannelManagedCleanup);
     }
 
     static Status ValidateMetadata(const IndexSlotSnapshot& slot) noexcept {

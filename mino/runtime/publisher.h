@@ -567,6 +567,12 @@ private:
             return AbortWith(builder, reservation.status());
         }
 
+        uint64_t dropped_messages = 0;
+        if constexpr (std::is_same_v<Reservation,
+                                     BroadcastChannel::Reservation>) {
+            dropped_messages = reservation->dropped_messages();
+        }
+
         const Status published =
             builder.journal_ == nullptr
                 ? allocator_->Publish(builder.handle_)
@@ -625,6 +631,10 @@ private:
         if (locally_published != nullptr) {
             *locally_published = true;
         }
+        if (dropped_messages != 0) {
+            dropped_count_.fetch_add(dropped_messages,
+                                     std::memory_order_relaxed);
+        }
         published_count_.fetch_add(1, std::memory_order_relaxed);
         return Status::Ok();
     }
@@ -679,11 +689,6 @@ private:
     Result<BroadcastChannel::Reservation> ReserveBroadcast(
         Deadline deadline) noexcept {
         BroadcastChannel* channel = std::get<BroadcastChannel*>(channel_);
-        if (options_.queue_full_policy == QueueFullPolicy::kDropOldest) {
-            return Status::Error(
-                StatusCode::kUnsupported,
-                "Runtime Broadcast requires Borrow tracking before DropOldest");
-        }
         if (options_.queue_full_policy != QueueFullPolicy::kBlock) {
             return channel->Reserve(options_.queue_full_policy,
                                     options_.sample_rate);

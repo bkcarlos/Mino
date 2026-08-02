@@ -640,6 +640,217 @@ TEST_F(RuntimeSpscTest, BroadcastTransferDelaysFinalReclaim) {
               StatusCode::kNotFound);
 }
 
+TEST_F(RuntimeSpscTest,
+       BroadcastDropOldestReturnsWouldBlockForLongBorrow) {
+    constexpr uint64_t kCapacity = 4;
+    auto broadcast_memory =
+        AllocateAligned(BroadcastChannel::RequiredSize(kCapacity));
+    auto broadcast = BroadcastChannel::Init(broadcast_memory.get(), kCapacity);
+    ASSERT_TRUE(broadcast.ok());
+    auto handle = broadcast->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(handle.ok());
+
+    auto pin_memory = AllocateAligned(ShmPinTable::RequiredSize());
+    auto pins = ShmPinTable::Init(pin_memory.get(), ShmPinTable::RequiredSize(),
+                                  allocator_);
+    ASSERT_TRUE(pins.ok());
+
+    PublisherOptions options;
+    options.queue_full_policy = QueueFullPolicy::kDropOldest;
+    Publisher<RuntimeTestMessage> publisher(allocator_, *broadcast, *pins,
+                                            options);
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *broadcast, *handle,
+                                              *pins);
+    for (uint64_t id = 1; id <= kCapacity; ++id) {
+        auto builder = publisher.Allocate();
+        ASSERT_TRUE(builder.ok());
+        (*builder)->id = id;
+        ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+    }
+
+    auto held = subscriber.TryPoll();
+    ASSERT_TRUE(held.ok()) << held.status().ToString();
+    const ShmHandle oldest = held->metadata().payload;
+    ASSERT_EQ((*held)->id, 1u);
+    EXPECT_EQ(pins->PinCount(oldest), 1u);
+
+    auto replacement = publisher.Allocate();
+    ASSERT_TRUE(replacement.ok());
+    (*replacement)->id = 5;
+    const ShmHandle rejected = replacement->handle();
+    const Status blocked = publisher.PublishLocal(std::move(*replacement));
+    EXPECT_EQ(blocked.code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(publisher.published_count(), 4u);
+    EXPECT_EQ(publisher.dropped_count(), 0u);
+    EXPECT_EQ(allocator_.Inspect(rejected).status().code(),
+              StatusCode::kNotFound);
+
+    auto published = allocator_.Inspect(oldest);
+    ASSERT_TRUE(published.ok()) << published.status().ToString();
+    EXPECT_EQ(published->state, ObjectState::kPublished);
+    EXPECT_EQ((*held)->id, 1u) << "long Borrow must keep payload readable";
+    EXPECT_EQ(subscriber.LastBroadcastGap().status().code(),
+              StatusCode::kNotFound);
+
+    EXPECT_TRUE(std::move(*held).Ack().ok());
+    EXPECT_EQ(pins->PinCount(oldest), 0u);
+    EXPECT_EQ(allocator_.Inspect(oldest).status().code(), StatusCode::kNotFound);
+
+    auto retry = publisher.Allocate();
+    ASSERT_TRUE(retry.ok());
+    (*retry)->id = 5;
+    EXPECT_TRUE(publisher.PublishLocal(std::move(*retry)).ok());
+    EXPECT_EQ(publisher.published_count(), 5u);
+    EXPECT_EQ(publisher.dropped_count(), 0u);
+}
+
+TEST_F(RuntimeSpscTest,
+       BroadcastDropOldestDefersReclaimForTransferredPin) {
+    constexpr uint64_t kCapacity = 2;
+    auto broadcast_memory =
+        AllocateAligned(BroadcastChannel::RequiredSize(kCapacity));
+    auto broadcast = BroadcastChannel::Init(broadcast_memory.get(), kCapacity);
+    ASSERT_TRUE(broadcast.ok());
+    auto pinning_handle = broadcast->RegisterSubscriber(SubscriberId{0});
+    auto slow_handle = broadcast->RegisterSubscriber(SubscriberId{1});
+    ASSERT_TRUE(pinning_handle.ok() && slow_handle.ok());
+
+    auto pin_memory = AllocateAligned(ShmPinTable::RequiredSize());
+    auto pins = ShmPinTable::Init(pin_memory.get(), ShmPinTable::RequiredSize(),
+                                  allocator_);
+    ASSERT_TRUE(pins.ok());
+    PublisherOptions options;
+    options.queue_full_policy = QueueFullPolicy::kDropOldest;
+    Publisher<RuntimeTestMessage> publisher(allocator_, *broadcast, *pins,
+                                            options);
+    Subscriber<RuntimeTestMessage> pinning(
+        allocator_, *broadcast, *pinning_handle, *pins);
+    Subscriber<RuntimeTestMessage> slow(allocator_, *broadcast, *slow_handle,
+                                        *pins);
+
+    for (uint64_t id = 1; id <= kCapacity; ++id) {
+        auto builder = publisher.Allocate();
+        ASSERT_TRUE(builder.ok());
+        (*builder)->id = id;
+        ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+    }
+    auto borrowed = pinning.TryPoll();
+    ASSERT_TRUE(borrowed.ok());
+    const ShmHandle oldest = borrowed->metadata().payload;
+    auto pinned = std::move(*borrowed).Transfer();
+    ASSERT_TRUE(pinned.ok()) << pinned.status().ToString();
+    EXPECT_EQ(pins->PinCount(oldest), 1u);
+
+    auto replacement = publisher.Allocate();
+    ASSERT_TRUE(replacement.ok());
+    (*replacement)->id = 3;
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*replacement)).ok());
+    EXPECT_EQ(publisher.dropped_count(), 1u);
+    auto retired = allocator_.Inspect(oldest);
+    ASSERT_TRUE(retired.ok());
+    EXPECT_EQ(retired->state, ObjectState::kRetired);
+    EXPECT_EQ((*pinned)->id, 1u);
+
+    auto gap_signal = slow.TryPoll();
+    ASSERT_FALSE(gap_signal.ok());
+    EXPECT_EQ(gap_signal.status().code(), StatusCode::kDegraded);
+    ASSERT_TRUE(pinned->Release().ok());
+    EXPECT_EQ(allocator_.Inspect(oldest).status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
+    constexpr uint64_t kCapacity = 4;
+    constexpr uint64_t kMessages = 200;
+    auto broadcast_memory =
+        AllocateAligned(BroadcastChannel::RequiredSize(kCapacity));
+    auto broadcast = BroadcastChannel::Init(broadcast_memory.get(), kCapacity);
+    ASSERT_TRUE(broadcast.ok());
+    auto handle = broadcast->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(handle.ok());
+    auto pin_memory = AllocateAligned(ShmPinTable::RequiredSize());
+    auto pins = ShmPinTable::Init(pin_memory.get(), ShmPinTable::RequiredSize(),
+                                  allocator_);
+    ASSERT_TRUE(pins.ok());
+
+    PublisherOptions options;
+    options.queue_full_policy = QueueFullPolicy::kDropOldest;
+    Publisher<RuntimeTestMessage> publisher(allocator_, *broadcast, *pins,
+                                            options);
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *broadcast, *handle,
+                                              *pins);
+    std::atomic<bool> publisher_done{false};
+    std::atomic<uint64_t> failures{0};
+    std::atomic<uint64_t> gap_signals{0};
+
+    std::thread publishing([&]() {
+        for (uint64_t id = 1; id <= kMessages;) {
+            auto builder = publisher.Allocate();
+            if (!builder.ok()) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            (*builder)->id = id;
+            const Status status = publisher.PublishLocal(std::move(*builder));
+            if (status.ok()) {
+                ++id;
+                continue;
+            }
+            if (status.code() != StatusCode::kWouldBlock) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            std::this_thread::yield();
+        }
+        publisher_done.store(true, std::memory_order_release);
+    });
+
+    std::thread consuming([&]() {
+        while (publisher.dropped_count() == 0 &&
+               !publisher_done.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        uint64_t last_id = 0;
+        for (;;) {
+            auto message = subscriber.TryPoll();
+            if (message.ok()) {
+                if ((*message)->id <= last_id) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                last_id = (*message)->id;
+                const Status ack = std::move(*message).Ack();
+                if (!ack.ok()) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
+            if (message.status().code() == StatusCode::kDegraded) {
+                gap_signals.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (message.status().code() != StatusCode::kWouldBlock) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (publisher_done.load(std::memory_order_acquire)) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    publishing.join();
+    consuming.join();
+    ASSERT_EQ(failures.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(publisher.published_count(), kMessages);
+    EXPECT_GT(publisher.dropped_count(), 0u);
+    EXPECT_GT(gap_signals.load(std::memory_order_relaxed), 0u);
+    auto stats = subscriber.BroadcastStats();
+    ASSERT_TRUE(stats.ok()) << stats.status().ToString();
+    EXPECT_EQ(stats->gap_messages, publisher.dropped_count());
+    EXPECT_EQ(stats->gap_events, stats->gap_messages);
+    EXPECT_LE(gap_signals.load(std::memory_order_relaxed), stats->gap_events);
+}
+
 TEST_F(RuntimeSpscTest, MpscRuntimeSupportsConcurrentPublishers) {
     constexpr uint64_t kCapacity = 64;
     auto mpsc_memory = AllocateAligned(MpscChannel::RequiredSize(kCapacity));

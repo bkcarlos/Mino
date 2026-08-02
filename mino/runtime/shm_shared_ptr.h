@@ -165,8 +165,8 @@ public:
     // the payload unavailable to new Pins and reclaims immediately only when
     // no live Pin remains.
     Status RetirePayload(ShmHandle handle) noexcept;
-    static void RetirePayloadCallback(ShmHandle handle,
-                                      void* context) noexcept;
+    static Status RetirePayloadCallback(ShmHandle handle,
+                                        void* context) noexcept;
 
 private:
     friend class ShmPinToken;

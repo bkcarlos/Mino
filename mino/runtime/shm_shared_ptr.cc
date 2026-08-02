@@ -1691,15 +1691,22 @@ void ShmPinTable::CleanupOwnerCallback(const ProcessIdentity& owner,
 
 Status ShmPinTable::RetirePayload(ShmHandle handle) noexcept {
     const Status retired = allocator_->Retire(handle);
-    if (!retired.ok()) return retired;
+    if (!retired.ok() && retired.code() != StatusCode::kNotFound) {
+        return retired;
+    }
+    if (retired.code() == StatusCode::kNotFound) {
+        return Status::Ok();
+    }
     return MaybeReclaim(handle);
 }
 
-void ShmPinTable::RetirePayloadCallback(ShmHandle handle,
-                                        void* context) noexcept {
-    if (context != nullptr) {
-        static_cast<ShmPinTable*>(context)->RetirePayload(handle).ok();
+Status ShmPinTable::RetirePayloadCallback(ShmHandle handle,
+                                          void* context) noexcept {
+    if (context == nullptr) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "payload retire context is null");
     }
+    return static_cast<ShmPinTable*>(context)->RetirePayload(handle);
 }
 
 bool ShmPinTable::HasPinOrPublicationGuard(ShmHandle handle) const noexcept {

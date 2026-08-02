@@ -263,7 +263,7 @@ SubscriberLeaseCoordinator::SubscriberLeaseCoordinator(
 Result<SubscriberLeaseHandle> SubscriberLeaseCoordinator::Register(
     SubscriberId id, const ProcessIdentity& owner, uint64_t now_ns) noexcept {
     Result<BroadcastChannel::SubscriberHandle> subscriber =
-        channel_->RegisterSubscriber(id, now_ns);
+        channel_->RegisterSubscriber(id, owner, now_ns);
     if (!subscriber.ok()) {
         return subscriber.status();
     }
