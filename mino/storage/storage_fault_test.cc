@@ -766,15 +766,29 @@ TEST(D5StorageFaultTest, PausedDiskKeepsBufferingBoundedAndAppliesPolicy) {
     EXPECT_EQ(consumer_status.load(std::memory_order_acquire), StatusCode::kOk);
     EXPECT_EQ((*writer)->durable_records(), 1u);
 
-    auto second = pool->TryDequeue();
-    ASSERT_TRUE(second.ok()) << second.status().ToString();
-    EXPECT_EQ(second->user_tag(), 2u);
-    second->Reset();
-    auto third = pool->TryDequeue();
-    ASSERT_TRUE(third.ok()) << third.status().ToString();
-    EXPECT_EQ(third->user_tag(), 3u);
-    third->Reset();
+    auto append_buffered = [&](uint64_t expected_tag,
+                               uint64_t ingestion_sequence) {
+        auto handle = pool->TryDequeue();
+        ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+        EXPECT_EQ(handle->user_tag(), expected_tag);
+        Record record = SampleRecord(ingestion_sequence, handle->size());
+        std::copy(handle->bytes().begin(), handle->bytes().end(),
+                  record.payload.begin());
+        ASSERT_TRUE((*writer)->Append(record, 200 + ingestion_sequence).ok());
+        handle->Reset();
+    };
+    append_buffered(2, 2);
+    append_buffered(3, 3);
     EXPECT_EQ(pool->TryDequeue().status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ((*writer)->durable_records(), 3u);
+
+    auto durable = ScanSegment(path);
+    ASSERT_TRUE(durable.ok()) << durable.status().ToString();
+    EXPECT_TRUE(durable->clean());
+    EXPECT_EQ(durable->records_scanned, 3u);
+    EXPECT_TRUE(durable->has_last_complete_sequence);
+    EXPECT_EQ(durable->last_complete_sequence, 3u);
+    EXPECT_EQ(durable->file_size, std::filesystem::file_size(path));
 }
 
 }  // namespace

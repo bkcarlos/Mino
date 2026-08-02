@@ -6,8 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -15,6 +18,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace mino {
 
@@ -67,9 +72,12 @@ RecorderSubscriberOptions TestOptions(
             .schema_version = kSchemaVersion,
             .layout_version = kLayoutVersion,
         },
+        .schema_ref = 9,
+        .source_identity = MessageSource{11, 22, 33, 0, 0},
         .full_policy = policy,
         .max_canonical_payload_bytes = 1024,
         .pending_retry_timeout = 5ms,
+        .pending_store = nullptr,
     };
 }
 
@@ -300,6 +308,29 @@ private:
     std::vector<std::string>* events_;
 };
 
+class FailingPendingStore final : public RecorderPendingStore {
+public:
+    Status Save(const RecorderPersistedPendingRecord& record) noexcept override {
+        saved = record;
+        ++save_calls;
+        return save_status;
+    }
+    Result<std::optional<RecorderPersistedPendingRecord>> Load() noexcept override {
+        return restored;
+    }
+    Status Clear() noexcept override {
+        ++clear_calls;
+        return Status::Ok();
+    }
+
+    Status save_status =
+        Status::Error(StatusCode::kUnavailable, "injected journal failure");
+    std::optional<RecorderPersistedPendingRecord> restored;
+    std::optional<RecorderPersistedPendingRecord> saved;
+    size_t save_calls = 0;
+    size_t clear_calls = 0;
+};
+
 class RecorderSubscriberTest : public ::testing::Test {
 protected:
     RecorderSubscriberTest()
@@ -525,6 +556,43 @@ TEST_F(RecorderSubscriberTest,
 }
 
 TEST_F(RecorderSubscriberTest,
+       JournalSaveFailureRetainsBorrowAndNeverAcksUntilSaveSucceeds) {
+    sink.actions.push_back({FakeSink::ActionKind::kTimeout, {}});
+    sink.actions.push_back({FakeSink::ActionKind::kAccepted, {}});
+    FailingPendingStore store;
+    RecorderSubscriberOptions options = TestOptions(BufferFullPolicy::kBlock);
+    options.pending_store = &store;
+    auto created = RecorderSubscriber<TestMessage>::Create(
+        options, &source, &encoder, &resolver, &sink, &clock);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+
+    auto failed = (*created)->TryRecord();
+    ASSERT_TRUE(failed.ok()) << failed.status().ToString();
+    EXPECT_EQ(failed->status.code(), StatusCode::kUnavailable);
+    EXPECT_FALSE(failed->ack_attempted);
+    EXPECT_FALSE(failed->source_acked());
+    EXPECT_TRUE(failed->pending);
+    EXPECT_EQ(events, (std::vector<std::string>{
+                          "borrow", "validate", "source", "encode", "reserve"}));
+
+    store.save_status = Status::Ok();
+    events.clear();
+    auto persisted = (*created)->TryRecord();
+    ASSERT_TRUE(persisted.ok()) << persisted.status().ToString();
+    EXPECT_TRUE(persisted->source_acked());
+    EXPECT_TRUE(persisted->pending);
+    EXPECT_EQ(events, (std::vector<std::string>{"ack"}));
+
+    events.clear();
+    auto flushed = (*created)->TryRecord();
+    ASSERT_TRUE(flushed.ok()) << flushed.status().ToString();
+    EXPECT_EQ(flushed->disposition, RecorderRecordDisposition::kBuffered);
+    EXPECT_FALSE(flushed->pending);
+    EXPECT_EQ(source.calls, 1u);
+    EXPECT_EQ(store.clear_calls, 1u);
+}
+
+TEST_F(RecorderSubscriberTest,
        BlockedPendingRecordPreservesPriorAckFailureAcrossFlush) {
     source.ack_status =
         Status::Error(StatusCode::kUnavailable, "ack failed");
@@ -578,6 +646,47 @@ TEST(RecorderSubscriberOptionsTest, RejectsUnboundedOrIncompleteConfiguration) {
     options.pending_retry_timeout = std::chrono::minutes(2);
     EXPECT_EQ(ValidateRecorderSubscriberOptions(options).code(),
               StatusCode::kInvalidArgument);
+}
+
+TEST(RecorderSubscriberRecoveryTest,
+     RejectsJournalThatDoesNotMatchTopicSchemaRefSourceOrPayloadLimit) {
+    std::vector<std::string> events;
+    FakeBorrowSource source(&events);
+    FakeEncoder encoder(&events);
+    FakeSourceResolver resolver(&events);
+    FakeSink sink(&events);
+    FakeClock clock;
+    FailingPendingStore store;
+    const std::vector<std::byte> payload{
+        std::byte{0x08}, std::byte{0x2a}, std::byte{0x10}, std::byte{0x01}};
+    RecorderPersistedPendingRecord pending;
+    pending.metadata = RecorderRecordMetadata{
+        .schema = TestOptions().schema,
+        .topic_id = TopicId{19},
+        .source = MessageSource{11, 999, 33, 44, 55},
+        .ingestion_timestamp_ns = 999,
+        .payload_size = static_cast<uint32_t>(payload.size()),
+        .payload_crc = RecorderPayloadCrc32c(payload),
+    };
+    pending.schema_ref = TestOptions().schema_ref;
+    pending.payload = payload;
+    pending.user_tag = 44;
+    store.restored = pending;
+
+    RecorderSubscriberOptions options = TestOptions();
+    options.pending_store = &store;
+    auto rejected = RecorderSubscriber<TestMessage>::Create(
+        options, &source, &encoder, &resolver, &sink, &clock);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kSchemaMismatch);
+    EXPECT_EQ(source.calls, 0u);
+
+    store.restored->metadata.source = MessageSource{11, 22, 33, 44, 55};
+    options.max_canonical_payload_bytes = payload.size() - 1;
+    rejected = RecorderSubscriber<TestMessage>::Create(
+        options, &source, &encoder, &resolver, &sink, &clock);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kSchemaMismatch);
 }
 
 TEST(RecorderBufferPoolSinkTest,
@@ -640,6 +749,62 @@ TEST(RecorderBufferPoolSinkTest,
     EXPECT_EQ(std::vector<std::byte>(dequeued->bytes().begin(),
                                      dequeued->bytes().end()),
               payload);
+}
+
+TEST(FileRecorderPendingStoreTest, RestoresPendingBeforePollingAndClearsOnCommit) {
+    static std::atomic<uint64_t> sequence{0};
+    const char* temporary = std::getenv("TEST_TMPDIR");
+    const std::filesystem::path base =
+        temporary == nullptr ? std::filesystem::temp_directory_path()
+                             : std::filesystem::path(temporary);
+    const std::filesystem::path journal =
+        base / ("mino_pending_store_" +
+                std::to_string(static_cast<uint64_t>(::getpid())) + "_" +
+                std::to_string(sequence.fetch_add(1))) /
+        "source.pending";
+    auto store = FileRecorderPendingStore::Open(journal);
+    ASSERT_TRUE(store.ok()) << store.status().ToString();
+    auto duplicate_owner = FileRecorderPendingStore::Open(journal);
+    ASSERT_FALSE(duplicate_owner.ok());
+    EXPECT_EQ(duplicate_owner.status().code(), StatusCode::kUnavailable);
+
+    const std::vector<std::byte> payload{
+        std::byte{0x08}, std::byte{0x2a}, std::byte{0x10}, std::byte{0x01}};
+    RecorderPersistedPendingRecord persisted;
+    persisted.metadata = RecorderRecordMetadata{
+        .schema = TestOptions().schema,
+        .topic_id = TopicId{19},
+        .source = MessageSource{11, 22, 33, 44, 55},
+        .ingestion_timestamp_ns = 999,
+        .payload_size = static_cast<uint32_t>(payload.size()),
+        .payload_crc = RecorderPayloadCrc32c(payload),
+    };
+    persisted.schema_ref = TestOptions().schema_ref;
+    persisted.payload = payload;
+    persisted.user_tag = 44;
+    persisted.ack_attempted = true;
+    persisted.ack_code = StatusCode::kOk;
+    ASSERT_TRUE((*store)->Save(persisted).ok());
+
+    std::vector<std::string> events;
+    FakeBorrowSource source(&events);
+    FakeEncoder encoder(&events);
+    FakeSourceResolver resolver(&events);
+    FakeSink sink(&events);
+    FakeClock clock;
+    RecorderSubscriberOptions options = TestOptions();
+    options.pending_store = store->get();
+    auto subscriber = RecorderSubscriber<TestMessage>::Create(
+        options, &source, &encoder, &resolver, &sink, &clock);
+    ASSERT_TRUE(subscriber.ok()) << subscriber.status().ToString();
+    EXPECT_TRUE((*subscriber)->has_pending());
+
+    auto flushed = (*subscriber)->TryRecord();
+    ASSERT_TRUE(flushed.ok()) << flushed.status().ToString();
+    EXPECT_EQ(flushed->disposition, RecorderRecordDisposition::kBuffered);
+    EXPECT_EQ(source.calls, 0u);
+    EXPECT_FALSE((*subscriber)->has_pending());
+    EXPECT_FALSE(std::filesystem::exists(journal));
 }
 
 TEST(RecorderPayloadCrc32cTest, MatchesStandardCheckVector) {

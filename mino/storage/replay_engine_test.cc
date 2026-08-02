@@ -160,6 +160,29 @@ void WriteBytes(const std::filesystem::path& path,
     ASSERT_TRUE(output.good());
 }
 
+struct ReplayPathReplacement {
+    std::filesystem::path backup;
+    bool replaced = false;
+};
+
+Status ReplaceReplayPathAfterScan(const std::filesystem::path& path,
+                                  void* context) {
+    auto* replacement = static_cast<ReplayPathReplacement*>(context);
+    std::error_code error;
+    std::filesystem::rename(path, replacement->backup, error);
+    if (error) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "test could not rename scanned replay segment");
+    }
+    std::filesystem::copy_file(replacement->backup, path, error);
+    if (error) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "test could not install replacement replay segment");
+    }
+    replacement->replaced = true;
+    return Status::Ok();
+}
+
 struct PublishedMessage {
     std::string target_namespace;
     std::string topic_name;
@@ -439,6 +462,87 @@ TEST(ReplayEngineTest, CorruptSegmentFailsClosedBeforeAnyPublish) {
     ASSERT_FALSE(engine.ok());
     EXPECT_EQ(engine.status().code(), StatusCode::kCorruption);
     EXPECT_TRUE(publisher.messages.empty());
+}
+
+TEST(ReplayEngineTest, InstallsNormalPublisherAfterValidationBeforePlayback) {
+    const std::filesystem::path directory = TestDirectory("adapter_install");
+    const std::vector<Record> records = {
+        SampleRecord(10, 0, 1, 100, 1, 1, 100, 1)};
+    const std::filesystem::path path =
+        WriteSegment(directory, "one.mino", 10, 0, 1, 10, records);
+    ReplayOptions options;
+    options.playback.mode = ReplayPlaybackMode::kStep;
+
+    auto engine = ReplayEngine::Create({path}, Manifest(), options);
+    ASSERT_TRUE(engine.ok()) << engine.status().ToString();
+    EXPECT_FALSE((*engine)->has_publisher_adapter());
+    auto missing = (*engine)->Step();
+    ASSERT_FALSE(missing.ok());
+    EXPECT_EQ(missing.status().code(), StatusCode::kUnsupported);
+
+    CapturingPublisher publisher;
+    ASSERT_TRUE((*engine)->InstallPublisherAdapter(&publisher).ok());
+    EXPECT_TRUE((*engine)->has_publisher_adapter());
+    auto advanced = (*engine)->Step();
+    ASSERT_TRUE(advanced.ok()) << advanced.status().ToString();
+    EXPECT_TRUE(*advanced);
+    ASSERT_EQ(publisher.messages.size(), 1u);
+    EXPECT_FALSE((*engine)->InstallPublisherAdapter(&publisher).ok());
+}
+
+TEST(ReplayEngineTest, CountsPublishedRecordBeforeSurfacingPrefetchError) {
+    const std::filesystem::path directory = TestDirectory("prefetch_error");
+    const std::vector<Record> records = {
+        SampleRecord(10, 0, 1, 100, 1, 1, 100, 1),
+        SampleRecord(10, 0, 2, 200, 1, 2, 200, 1),
+    };
+    std::vector<std::byte> bytes = SegmentBytes(10, 0, 1, 10, records);
+    const std::filesystem::path path = directory / "two.mino";
+    WriteBytes(path, bytes);
+    ReplayOptions options;
+    options.playback.mode = ReplayPlaybackMode::kStep;
+    CapturingPublisher publisher;
+    auto engine = ReplayEngine::Create({path}, Manifest(), &publisher, options);
+    ASSERT_TRUE(engine.ok()) << engine.status().ToString();
+
+    auto scanned = ScanSegment(path);
+    ASSERT_TRUE(scanned.ok()) << scanned.status().ToString();
+    ASSERT_EQ(scanned->records.size(), 2u);
+    const size_t damage = static_cast<size_t>(
+        scanned->records[1].record_offset + 112u);
+    ASSERT_LT(damage, bytes.size());
+    bytes[damage] ^= std::byte{1};
+    WriteBytes(path, bytes);
+
+    auto first = (*engine)->Step();
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    EXPECT_TRUE(*first);
+    EXPECT_EQ((*engine)->published_records(), 1u);
+    ASSERT_EQ(publisher.messages.size(), 1u);
+
+    auto terminal = (*engine)->Step();
+    ASSERT_FALSE(terminal.ok());
+    EXPECT_EQ(terminal.status().code(), StatusCode::kCorruption);
+    EXPECT_EQ((*engine)->published_records(), 1u);
+}
+
+TEST(SegmentReplayReaderTest, RejectsReopenedDescriptorIdentityMismatch) {
+    const std::filesystem::path directory = TestDirectory("reader_identity");
+    const std::vector<Record> records = {
+        SampleRecord(10, 0, 1, 100, 1, 1, 100, 1)};
+    const std::filesystem::path path =
+        WriteSegment(directory, "replaceable.mino", 10, 0, 1, 10, records);
+    ReplayPathReplacement replacement{
+        .backup = directory / "scanned.mino",
+    };
+
+    auto reader = SegmentReplayReader::OpenForTesting(
+        path, {}, ReplaceReplayPathAfterScan, &replacement);
+    EXPECT_TRUE(replacement.replaced);
+    ASSERT_FALSE(reader.ok());
+    EXPECT_EQ(reader.status().code(), StatusCode::kUnavailable);
+    EXPECT_NE(reader.status().message().find("device/inode"),
+              std::string_view::npos);
 }
 
 TEST(SegmentReplayReaderTest, DecodesFullEnvelopeAndDetectsPostScanDamage) {

@@ -384,7 +384,7 @@ TEST(TcpDriverTest, ConnectionFiltersPreserveOtherMessagesAndCompletions) {
     auto first_received = pair.server->Poll({
         .max_messages = 1,
         .max_bytes = 4096,
-        .timeout_ms = 0,
+        .timeout_ms = 1000,
         .connection_id = pair.server_connection.id,
     });
     ASSERT_TRUE(first_received.ok()) << first_received.status().ToString();

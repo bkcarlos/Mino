@@ -153,16 +153,55 @@ Status SetCloseOnExec(int fd) {
 #endif
 }
 
-Result<uint64_t> FileSize(int fd, const std::filesystem::path& path) {
+Result<struct stat> FileAttributes(int fd,
+                                   const std::filesystem::path& path) {
     struct stat attributes {};
     if (::fstat(fd, &attributes) != 0) {
         return IoError("cannot stat segment", path);
     }
-    if (attributes.st_size < 0) {
+    if (!S_ISREG(attributes.st_mode) || attributes.st_size < 0) {
         return Status::Error(StatusCode::kCorruption,
-                             "segment has a negative file size");
+                             "segment is not a regular file with valid size");
     }
-    return static_cast<uint64_t>(attributes.st_size);
+    return attributes;
+}
+
+Result<uint64_t> FileSize(int fd, const std::filesystem::path& path) {
+    Result<struct stat> attributes = FileAttributes(fd, path);
+    if (!attributes.ok()) return attributes.status();
+    return static_cast<uint64_t>(attributes->st_size);
+}
+
+Status ValidateExpectedIdentity(int fd, const std::filesystem::path& path,
+                                const SegmentRepairOptions& options) {
+    const bool has_expected_identity =
+        options.expected_device.has_value() || options.expected_inode.has_value();
+    if (has_expected_identity &&
+        (!options.expected_device.has_value() ||
+         !options.expected_inode.has_value())) {
+        return Invalid("segment repair identity must include device and inode");
+    }
+    if (!has_expected_identity && !options.require_single_link) {
+        return Status::Ok();
+    }
+
+    Result<struct stat> attributes = FileAttributes(fd, path);
+    if (!attributes.ok()) return attributes.status();
+    if (has_expected_identity &&
+        (static_cast<uint64_t>(attributes->st_dev) !=
+             *options.expected_device ||
+         static_cast<uint64_t>(attributes->st_ino) !=
+             *options.expected_inode)) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "segment inode/device changed after non-destructive validation");
+    }
+    if (options.require_single_link && attributes->st_nlink != 1) {
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "destructive standalone repair rejects hard-linked segments");
+    }
+    return Status::Ok();
 }
 
 class SegmentReader final {
@@ -621,11 +660,13 @@ Result<SegmentRecoveryReport> ScanFd(
         EncodedRecordSize(0, options.format_limits);
     if (!minimum_record.ok()) return minimum_record.status();
 
-    Result<uint64_t> size = FileSize(fd, path);
-    if (!size.ok()) return size.status();
+    Result<struct stat> attributes = FileAttributes(fd, path);
+    if (!attributes.ok()) return attributes.status();
 
     SegmentRecoveryReport report;
-    report.file_size = *size;
+    report.file_size = static_cast<uint64_t>(attributes->st_size);
+    report.file_device = static_cast<uint64_t>(attributes->st_dev);
+    report.file_inode = static_cast<uint64_t>(attributes->st_ino);
     report.scan_start_offset = kEncodedSegmentHeaderSize;
     report.last_complete_offset = kEncodedSegmentHeaderSize;
 
@@ -794,12 +835,15 @@ Status TruncateSegment(const std::filesystem::path& path, uint64_t size,
         Result<int> opened = OpenSegment(path, true);
         if (!opened.ok()) return opened.status();
         const ScopedFd fd(*opened);
+        MINO_RETURN_IF_ERROR(
+            ValidateExpectedIdentity(fd.get(), path, options));
         Result<uint64_t> current_size = FileSize(fd.get(), path);
         if (!current_size.ok()) return current_size.status();
         if (size > *current_size) {
             return Invalid("truncate size cannot extend a segment");
         }
-        return TruncateAndSync(fd.get(), path, size, options);
+        MINO_RETURN_IF_ERROR(TruncateAndSync(fd.get(), path, size, options));
+        return ValidateExpectedIdentity(fd.get(), path, options);
     } catch (const std::bad_alloc&) {
         return Exhausted("cannot allocate segment truncate error state");
     } catch (const std::length_error&) {
@@ -815,6 +859,8 @@ Result<SegmentRecoveryReport> RepairSegment(
         Result<int> opened = OpenSegment(path, true);
         if (!opened.ok()) return opened.status();
         const ScopedFd fd(*opened);
+        MINO_RETURN_IF_ERROR(
+            ValidateExpectedIdentity(fd.get(), path, repair_options));
         Result<SegmentRecoveryReport> scanned =
             ScanFd(fd.get(), path, recovery_options);
         if (!scanned.ok()) return scanned.status();
@@ -823,6 +869,8 @@ Result<SegmentRecoveryReport> RepairSegment(
                                  scanned->reason_detail);
         }
         if (scanned->disposition == SegmentRecoveryDisposition::kClean) {
+            MINO_RETURN_IF_ERROR(ValidateExpectedIdentity(
+                fd.get(), path, repair_options));
             return std::move(*scanned);
         }
 
@@ -836,6 +884,8 @@ Result<SegmentRecoveryReport> RepairSegment(
         const Status repaired = TruncateAndSync(
             fd.get(), path, scanned->last_complete_offset, repair_options);
         if (!repaired.ok()) return repaired;
+        MINO_RETURN_IF_ERROR(
+            ValidateExpectedIdentity(fd.get(), path, repair_options));
         scanned->repaired = true;
         return std::move(*scanned);
     } catch (const std::bad_alloc&) {

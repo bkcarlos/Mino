@@ -134,11 +134,71 @@ TEST(ControlPayloadCodecTest, SessionHelloChecksLimitsBeforeEntryAllocation) {
     EXPECT_EQ(decoded.status().code(), StatusCode::kResourceExhausted);
 
     SessionHello duplicate;
+    duplicate.sender_session_epoch = 1;
+    duplicate.receiver_session_epoch = 2;
     duplicate.sources = {
         SessionHelloSource{SourceIdentity{1, 2, 3}, 4},
         SessionHelloSource{SourceIdentity{1, 2, 3}, 5},
     };
     auto encoded = ControlPayloadCodec::EncodeSessionHello(duplicate);
+    ASSERT_FALSE(encoded.ok());
+    EXPECT_EQ(encoded.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(ControlPayloadCodecTest,
+     SessionDiscoveryGoldenVectorAndRejectsIdentityOrVersionMismatch) {
+    const SessionDiscovery discovery{
+        .session_epoch = 0x0102030405060708ull,
+        .node_id = NodeId{0x1112131415161718ull},
+        .process_identity = ProcessIdentity{
+            .node_id = 0x1112131415161718ull,
+            .process_id = 0x2122232425262728ull,
+            .process_epoch = 0x3132333435363738ull,
+            .start_time_ns = 0x4142434445464748ull,
+        },
+        .lease_epoch = 0x5152535455565758ull,
+        .node_config_version = 0x6162636465666768ull,
+    };
+    auto encoded = ControlPayloadCodec::EncodeSessionDiscovery(discovery);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    EXPECT_EQ(encoded->size(), kSessionDiscoveryPayloadWireSize);
+    EXPECT_EQ(Hex(*encoded),
+              "0001000000000000"
+              "0102030405060708"
+              "1112131415161718"
+              "1112131415161718"
+              "2122232425262728"
+              "3132333435363738"
+              "4142434445464748"
+              "5152535455565758"
+              "6162636465666768");
+    auto decoded = ControlPayloadCodec::DecodeSessionDiscovery(*encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(*decoded, discovery);
+
+    for (size_t length = 0; length < encoded->size(); ++length) {
+        auto truncated = ControlPayloadCodec::DecodeSessionDiscovery(
+            std::span<const std::byte>(*encoded).first(length));
+        EXPECT_FALSE(truncated.ok()) << "length=" << length;
+    }
+    (*encoded)[1] = std::byte{2};
+    EXPECT_EQ(ControlPayloadCodec::DecodeSessionDiscovery(*encoded)
+                  .status()
+                  .code(),
+              StatusCode::kCorruption);
+
+    SessionDiscovery mismatched = discovery;
+    mismatched.process_identity.node_id = 99;
+    auto rejected =
+        ControlPayloadCodec::EncodeSessionDiscovery(mismatched);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(ControlPayloadCodecTest, SessionHelloRejectsZeroEpochDiscoveryOverload) {
+    SessionHello hello;
+    hello.sender_session_epoch = 1;
+    auto encoded = ControlPayloadCodec::EncodeSessionHello(hello);
     ASSERT_FALSE(encoded.ok());
     EXPECT_EQ(encoded.status().code(), StatusCode::kInvalidArgument);
 }

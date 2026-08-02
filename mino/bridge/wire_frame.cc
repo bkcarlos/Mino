@@ -102,6 +102,7 @@ bool IsValidFrameType(FrameType type) noexcept {
         case FrameType::kAck:
         case FrameType::kHeartbeat:
         case FrameType::kSessionHello:
+        case FrameType::kSessionDiscovery:
             return true;
     }
     return false;

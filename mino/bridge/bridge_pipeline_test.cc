@@ -762,6 +762,55 @@ TEST(BridgePipelineTest, CorruptWireFrameClosesTransportWithoutPublication) {
     EXPECT_TRUE(pair.b_ingress.frames.empty());
 }
 
+TEST(BridgePipelineTest, SessionDiscoveryIsConnectionOwnerOnlyAndFailsClosed) {
+    ConnectedPipelines pair = MakePipelines();
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    auto payload = ControlPayloadCodec::EncodeSessionDiscovery(
+        SessionDiscovery{
+            .session_epoch = 999,
+            .node_id = NodeId{101},
+            .process_identity = ProcessIdentity{
+                .node_id = 101,
+                .process_id = 102,
+                .process_epoch = 103,
+                .start_time_ns = 104,
+            },
+            .lease_epoch = 105,
+            .node_config_version = 106,
+        });
+    ASSERT_TRUE(payload.ok()) << payload.status().ToString();
+    WireFrame discovery;
+    discovery.header.frame_type = FrameType::kSessionDiscovery;
+    discovery.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                             FlagValue(FrameFlag::kPayloadCrcPresent);
+    discovery.payload = std::move(*payload);
+    auto encoded = WireFrameCodec::Encode(discovery);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    ASSERT_TRUE(pair.a_driver
+                    ->SendUntracked(transport::UntrackedSendRequest{
+                        .connection_id = pair.a_connection.id,
+                        .payload = *encoded,
+                    })
+                    .ok());
+
+    Status rejected = Status::Ok();
+    for (size_t i = 0; i < 200; ++i) {
+        BridgePumpBudget budget;
+        budget.now_ns = 10'000'000'000ull + i * 1'000'000;
+        auto pumped = pair.b->Pump(budget);
+        if (!pumped.ok()) {
+            rejected = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(rejected.code(), StatusCode::kCorruption);
+}
+
 TEST(BridgePipelineTest, TransientRemoteBackpressureRetainsAndRetriesFrame) {
     ConnectedPipelines pair = MakePipelines();
     ASSERT_NE(pair.a, nullptr);

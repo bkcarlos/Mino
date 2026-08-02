@@ -173,6 +173,11 @@ void CaptureAck(const TopicWriterAck& ack, void* context) noexcept {
     }
 }
 
+int FailDirectorySync(int, void*) noexcept {
+    errno = EIO;
+    return -1;
+}
+
 struct WriterFixture {
     std::filesystem::path root;
     std::unique_ptr<RecorderBufferPool> pool;
@@ -181,8 +186,9 @@ struct WriterFixture {
     AckState ack;
     std::unique_ptr<TopicWriter> writer;
 
-    explicit WriterFixture(std::string_view name,
-                           SegmentWriterOptions segment_options = {})
+    explicit WriterFixture(
+        std::string_view name, SegmentWriterOptions segment_options = {},
+        TopicWriterDirectorySyncHook directory_sync_hook = nullptr)
         : root(TestDirectory(name)) {
         RecorderBufferPoolOptions pool_options;
         pool_options.global_byte_limit = 64u * 1024u;
@@ -212,6 +218,7 @@ struct WriterFixture {
         options.partition_id = 0;
         options.writer_id = 44;
         options.segment_options = segment_options;
+        options.directory_sync_hook = directory_sync_hook;
         options.schema_resolver = ResolveSchema;
         options.schema_resolver_context = &resolver;
         options.ack_callback = CaptureAck;
@@ -474,6 +481,30 @@ std::ptrdiff_t FailSecondWrite(int fd, const std::byte* data, size_t size,
         return -1;
     }
     return static_cast<std::ptrdiff_t>(::write(fd, data, size));
+}
+
+TEST(TopicWriterTest,
+     SegmentDirectorySyncFailurePublishesNoCheckpointOrDurableAck) {
+    SegmentWriterOptions options;
+    options.batch_bytes = 0;
+    options.batch_records = 0;
+    options.flush_interval_ns = 0;
+    options.sync_policy = SegmentSyncPolicy::kPerRecord;
+    WriterFixture fixture("directory_sync_error", options,
+                          FailDirectorySync);
+    ASSERT_NE(fixture.writer, nullptr);
+    ASSERT_TRUE(fixture.writer->Start(100).ok());
+    fixture.Enqueue(1, 1, Payload(1));
+
+    auto failed = fixture.writer->Pump(101);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.status().code(), StatusCode::kUnavailable);
+    EXPECT_EQ(fixture.writer->state(), TopicWriterState::kError);
+    EXPECT_TRUE(fixture.ack.acks.empty());
+    EXPECT_FALSE(fixture.manifest->snapshot().checkpoint.has_value());
+    ASSERT_EQ(fixture.manifest->snapshot().segments.size(), 1u);
+    EXPECT_EQ(fixture.manifest->snapshot().segments[0].state,
+              SegmentPersistentState::kCreating);
 }
 
 TEST(TopicWriterTest, SegmentWriteFailurePoisonsWriterPermanently) {

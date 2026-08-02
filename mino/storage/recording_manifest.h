@@ -229,9 +229,14 @@ public:
     // verifies that the candidate is an untracked regular non-symlink file and
     // persists it directly in SEALED state. Quarantine atomically renames an
     // untracked candidate to <name>.orphan and fsyncs the segments directory.
-    Status AdoptSealedOrphan(SegmentManifestEntry sealed_segment) noexcept;
+    Status AdoptSealedOrphan(
+        SegmentManifestEntry sealed_segment,
+        std::optional<uint64_t> expected_device = std::nullopt,
+        std::optional<uint64_t> expected_inode = std::nullopt) noexcept;
     Result<std::filesystem::path> QuarantineOrphan(
-        const std::filesystem::path& relative_path) noexcept;
+        const std::filesystem::path& relative_path,
+        std::optional<uint64_t> expected_device = std::nullopt,
+        std::optional<uint64_t> expected_inode = std::nullopt) noexcept;
 
     Result<SegmentManifestEntry> FindSegment(uint64_t segment_id) const noexcept;
     const PartitionManifestSnapshot& snapshot() const noexcept { return snapshot_; }

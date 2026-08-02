@@ -18,6 +18,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # -------------------------------------------------------------------------
   # 构建 + 测试矩阵：五配置分 job（sanitizer 之间互斥，禁止同进程叠加）
@@ -64,6 +67,16 @@ jobs:
       - name: Build (bazel build //...)
         run: bazel build --config=gcc12 --config=${{ matrix.config }} //...
 
+      # Manual targets are skipped by //...; compile the P1 stress binary on
+      # PRs without starting its hour-long timed phase.
+      - name: Compile manual MPMC stress target
+        if: >-
+          github.event_name == 'pull_request' &&
+          (matrix.config == 'debug' || matrix.config == 'tsan')
+        run: |
+          bazel build --config=gcc12 --config=${{ matrix.config }} \
+            //mino/shm/channel:mpmc_ring_stress_test
+
       - name: Test (bazel test //...)
         run: bazel test --config=gcc12 --config=${{ matrix.config }} //... --test_output=errors
 
@@ -74,6 +87,30 @@ jobs:
           bazel test --config=gcc12 --config=${{ matrix.config }} \
             //tests/litmus:atomic_abi_test \
             --test_output=all --nocache_test_results
+
+  tooling-smoke:
+    name: Extended CI tooling smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Python and shell syntax checks
+        run: |
+          python3 -m compileall -q tools/ci
+          bash -n tools/ci/run_d3_codegen_environment.sh
+
+      - name: Runner self-tests
+        run: |
+          python3 tools/ci/collect_codegen_artifacts.py --self-test
+          python3 tools/ci/prepare_d3_fuzz_corpus.py --self-test
+          python3 tools/ci/run_d3_codegen_docker_check.py --self-test
+          python3 tools/ci/run_d3_fuzz_campaign.py --self-test
+          python3 tools/ci/run_d5_storage_fault_campaign.py --self-test
+          python3 tools/ci/run_extended_long_test.py --self-test
+          python3 tools/ci/run_recovery_stress.py --self-test
+          python3 tools/ci/run_tla_validation.py --self-test
 
   # -------------------------------------------------------------------------
   # Lint：buildifier 检查 BUILD / .bzl / WORKSPACE 文件格式（可选）

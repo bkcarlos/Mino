@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <new>
@@ -54,9 +55,68 @@ struct RecorderRecordResult {
     }
 };
 
+struct RecorderPersistedPendingRecord {
+    RecorderRecordMetadata metadata;
+    // Session-local schema ref bound to metadata.schema. Journal recovery must
+    // never infer this mapping from a digest alone.
+    uint32_t schema_ref = 0;
+    std::vector<std::byte> payload;
+    uint64_t user_tag = 0;
+    bool ack_attempted = false;
+    StatusCode ack_code = StatusCode::kOk;
+};
+
+class RecorderPendingStore {
+public:
+    virtual ~RecorderPendingStore() = default;
+    virtual Status Save(
+        const RecorderPersistedPendingRecord& record) noexcept = 0;
+    virtual Result<std::optional<RecorderPersistedPendingRecord>> Load()
+        noexcept = 0;
+    virtual Status Clear() noexcept = 0;
+};
+
+// Durable single-record journal used by a production RecorderSubscriber. Save
+// atomically writes+syncs the journal and its parent directory; Clear unlinks
+// and syncs the parent. One store path must be unique per installed source.
+class FileRecorderPendingStore final : public RecorderPendingStore {
+public:
+    static Result<std::unique_ptr<FileRecorderPendingStore>> Open(
+        std::filesystem::path journal_path) noexcept;
+
+    ~FileRecorderPendingStore() override;
+    FileRecorderPendingStore(const FileRecorderPendingStore&) = delete;
+    FileRecorderPendingStore& operator=(const FileRecorderPendingStore&) = delete;
+
+    Status Save(const RecorderPersistedPendingRecord& record) noexcept override;
+    Result<std::optional<RecorderPersistedPendingRecord>> Load()
+        noexcept override;
+    Status Clear() noexcept override;
+
+private:
+    FileRecorderPendingStore(std::filesystem::path journal_path,
+                             std::string filename, int directory_fd,
+                             int owner_lock_fd) noexcept
+        : journal_path_(std::move(journal_path)),
+          filename_(std::move(filename)),
+          directory_fd_(directory_fd),
+          owner_lock_fd_(owner_lock_fd) {}
+
+    std::filesystem::path journal_path_;
+    std::string filename_;
+    int directory_fd_ = -1;
+    int owner_lock_fd_ = -1;
+};
+
 struct RecorderSubscriberOptions {
     TopicId topic_id{};
     RecorderSchemaMetadata schema;
+    // Required with pending_store. The journal binds the full session-local
+    // schema mapping instead of recovering from digest/version heuristics.
+    uint32_t schema_ref = 0;
+    // Required with pending_store. Only node/publisher/epoch participate in the
+    // installed source identity; sequence/timestamps remain per-message fields.
+    std::optional<MessageSource> source_identity;
     BufferFullPolicy full_policy = BufferFullPolicy::kBlock;
     size_t max_canonical_payload_bytes = 16u * 1024u * 1024u;
 
@@ -64,6 +124,9 @@ struct RecorderSubscriberOptions {
     // SHM Borrow is active is always attempted with a zero timeout.
     std::chrono::nanoseconds pending_retry_timeout =
         std::chrono::milliseconds(100);
+    // RecorderService requires a durable store because kBlock releases/ACKs the
+    // runtime borrow after copying canonical bytes into pending ownership.
+    RecorderPendingStore* pending_store = nullptr;
 };
 
 Status ValidateRecorderSubscriberOptions(
@@ -326,9 +389,21 @@ public:
                                  "recorder subscriber dependency is null");
         }
         try {
-            return std::unique_ptr<RecorderSubscriber>(new RecorderSubscriber(
-                std::move(options), source, encoder, source_resolver, sink,
-                clock));
+            auto subscriber = std::unique_ptr<RecorderSubscriber>(
+                new RecorderSubscriber(std::move(options), source, encoder,
+                                       source_resolver, sink, clock));
+            if (subscriber->options_.pending_store != nullptr) {
+                Result<std::optional<RecorderPersistedPendingRecord>> restored =
+                    subscriber->options_.pending_store->Load();
+                if (!restored.ok()) return restored.status();
+                if (restored->has_value()) {
+                    const Status valid = subscriber->ValidateRestoredPending(
+                        restored->value());
+                    if (!valid.ok()) return valid;
+                    subscriber->pending_ = std::move(restored->value());
+                }
+            }
+            return subscriber;
         } catch (const std::bad_alloc&) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "cannot allocate recorder subscriber");
@@ -346,6 +421,7 @@ public:
     Result<RecorderRecordResult> TryRecord() noexcept {
         std::unique_ptr<RecorderBorrow<T>> borrow;
         try {
+            if (held_borrow_ != nullptr) return PersistHeldBorrow();
             if (pending_.has_value()) return FlushPending();
 
             Result<std::unique_ptr<RecorderBorrow<T>>> acquired =
@@ -356,7 +432,7 @@ public:
                 return Status::Error(StatusCode::kInternal,
                                      "borrow source returned no active borrow");
             }
-            return RecordBorrow(*borrow);
+            return RecordBorrow(borrow);
         } catch (const std::bad_alloc&) {
             if (borrow != nullptr && borrow->active()) {
                 RecorderRecordResult result;
@@ -378,15 +454,20 @@ public:
     size_t pending_bytes() const noexcept {
         return pending_.has_value() ? pending_->payload.size() : 0;
     }
+    bool pending_persistence_configured() const noexcept {
+        return options_.pending_store != nullptr;
+    }
+    Status PersistPending() noexcept {
+        if (!pending_.has_value()) return Status::Ok();
+        if (options_.pending_store == nullptr) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "recorder pending store is not configured");
+        }
+        return options_.pending_store->Save(*pending_);
+    }
 
 private:
-    struct PendingRecord {
-        RecorderRecordMetadata metadata;
-        std::vector<std::byte> payload;
-        uint64_t user_tag = 0;
-        bool ack_attempted = false;
-        StatusCode ack_code = StatusCode::kOk;
-    };
+    using PendingRecord = RecorderPersistedPendingRecord;
 
     RecorderSubscriber(RecorderSubscriberOptions options,
                        RecorderBorrowSource<T>* source,
@@ -403,6 +484,31 @@ private:
     static bool ValidSource(const MessageSource& source) noexcept {
         return source.node_id != 0 && source.publisher_id != 0 &&
                source.publisher_epoch != 0;
+    }
+
+    static bool SameSourceIdentity(const MessageSource& left,
+                                   const MessageSource& right) noexcept {
+        return left.node_id == right.node_id &&
+               left.publisher_id == right.publisher_id &&
+               left.publisher_epoch == right.publisher_epoch;
+    }
+
+    Status ValidateRestoredPending(const PendingRecord& pending) const noexcept {
+        if (pending.schema_ref != options_.schema_ref ||
+            pending.metadata.topic_id != options_.topic_id ||
+            pending.metadata.schema != options_.schema ||
+            !options_.source_identity.has_value() ||
+            !SameSourceIdentity(pending.metadata.source,
+                                *options_.source_identity) ||
+            pending.metadata.payload_size != pending.payload.size() ||
+            pending.payload.size() > options_.max_canonical_payload_bytes ||
+            pending.metadata.payload_crc != RecorderPayloadCrc32c(pending.payload) ||
+            pending.user_tag != pending.metadata.source.source_sequence) {
+            return Status::Error(
+                StatusCode::kSchemaMismatch,
+                "pending recorder journal does not match installed source/session");
+        }
+        return Status::Ok();
     }
 
     Status ValidateMetadata(const MessageMetadata& metadata) const noexcept {
@@ -428,7 +534,8 @@ private:
     }
 
     Result<RecorderRecordResult> RecordBorrow(
-        RecorderBorrow<T>& borrow) {
+        std::unique_ptr<RecorderBorrow<T>>& owned_borrow) {
+        RecorderBorrow<T>& borrow = *owned_borrow;
         RecorderRecordResult result;
 
         const Status metadata_status = ValidateMetadata(borrow.metadata());
@@ -454,6 +561,13 @@ private:
             result.status = Status::Error(
                 StatusCode::kInvalidArgument,
                 "recorder source identity is incomplete");
+            return AckAndReturn(std::move(result), borrow);
+        }
+        if (options_.source_identity.has_value() &&
+            !SameSourceIdentity(*source, *options_.source_identity)) {
+            result.status = Status::Error(
+                StatusCode::kPermissionDenied,
+                "recorder message source does not own this pending journal");
             return AckAndReturn(std::move(result), borrow);
         }
 
@@ -500,11 +614,23 @@ private:
                 admission_blocked) {
                 pending_.emplace(PendingRecord{
                     .metadata = record,
+                    .schema_ref = options_.schema_ref,
                     .payload = std::move(*encoded),
                     .user_tag = user_tag,
                 });
                 result.disposition = RecorderRecordDisposition::kBlocked;
                 result.pending = true;
+                if (options_.pending_store != nullptr) {
+                    const Status persisted = PersistPending();
+                    if (!persisted.ok()) {
+                        result.disposition = RecorderRecordDisposition::kFailed;
+                        result.status = persisted;
+                        // The source Borrow remains live until the exact journal
+                        // record is durable. Returning must not implicitly ACK it.
+                        held_borrow_ = std::move(owned_borrow);
+                        return result;
+                    }
+                }
             } else if ((options_.full_policy ==
                             BufferFullPolicy::kDropNewest ||
                         options_.full_policy ==
@@ -543,6 +669,33 @@ private:
         return AckAndReturn(std::move(result), borrow);
     }
 
+    RecorderRecordResult PersistHeldBorrow() {
+        RecorderRecordResult result;
+        result.disposition = RecorderRecordDisposition::kFailed;
+        result.pending = pending_.has_value();
+        if (!pending_.has_value() || held_borrow_ == nullptr ||
+            !held_borrow_->active()) {
+            result.status = Status::Error(
+                StatusCode::kInternal,
+                "pending journal retry lost its active source borrow");
+            return result;
+        }
+        result.metadata = pending_->metadata;
+        const Status persisted = PersistPending();
+        if (!persisted.ok()) {
+            result.status = persisted;
+            return result;
+        }
+        result.disposition = RecorderRecordDisposition::kBlocked;
+        result.status = Status::Error(StatusCode::kWouldBlock,
+                                      "pending recorder journal became durable");
+        result = AckAndReturn(std::move(result), *held_borrow_);
+        pending_->ack_attempted = result.ack_attempted;
+        pending_->ack_code = result.ack_status.code();
+        held_borrow_.reset();
+        return result;
+    }
+
     RecorderRecordResult FlushPending() {
         PendingRecord& pending = *pending_;
         RecorderRecordResult result;
@@ -569,7 +722,6 @@ private:
                 result.pending = true;
             } else {
                 result.disposition = RecorderRecordDisposition::kFailed;
-                pending_.reset();
             }
             if (!result.ack_status.ok()) {
                 result.disposition = RecorderRecordDisposition::kFailed;
@@ -584,17 +736,28 @@ private:
                 result.status = Status::Ok();
                 break;
             case BufferAdmission::kDroppedNewest:
-                result.disposition = RecorderRecordDisposition::kDropped;
+                result.disposition = RecorderRecordDisposition::kFailed;
                 result.status = Status::Error(
-                    StatusCode::kResourceExhausted,
-                    "pending recorder message was dropped");
-                break;
+                    StatusCode::kUnavailable,
+                    "pending recorder message cannot be dropped");
+                result.pending = true;
+                return result;
             case BufferAdmission::kRecordingFailed:
                 result.disposition = RecorderRecordDisposition::kFailed;
                 result.status = Status::Error(
                     StatusCode::kUnavailable,
                     "recording failed while flushing pending message");
-                break;
+                result.pending = true;
+                return result;
+        }
+        if (options_.pending_store != nullptr) {
+            const Status cleared = options_.pending_store->Clear();
+            if (!cleared.ok()) {
+                result.disposition = RecorderRecordDisposition::kFailed;
+                result.status = cleared;
+                result.pending = true;
+                return result;
+            }
         }
         pending_.reset();
         if (!result.ack_status.ok()) {
@@ -610,6 +773,7 @@ private:
     RecorderBufferSink* sink_ = nullptr;
     RecorderClock* clock_ = nullptr;
     std::optional<PendingRecord> pending_;
+    std::unique_ptr<RecorderBorrow<T>> held_borrow_;
 };
 
 }  // namespace mino::storage

@@ -143,8 +143,11 @@ Status SyncRecoveryDirectory(const std::filesystem::path& path) {
     return Status::Ok();
 }
 
-Status VerifyRecoveryFile(int fd, const std::filesystem::path& path,
-                          std::optional<uint64_t> expected_size) {
+Status VerifyRecoveryFile(
+    int fd, const std::filesystem::path& path,
+    std::optional<uint64_t> expected_size,
+    std::optional<uint64_t> expected_device = std::nullopt,
+    std::optional<uint64_t> expected_inode = std::nullopt) {
     struct stat info {};
     if (::fstat(fd, &info) != 0) {
         return RecoveryIoError("cannot stat recovery segment", path);
@@ -155,6 +158,15 @@ Status VerifyRecoveryFile(int fd, const std::filesystem::path& path,
     if (expected_size.has_value() &&
         static_cast<uint64_t>(info.st_size) != *expected_size) {
         return Unavailable("recovery segment size changed before append");
+    }
+    if (expected_device.has_value() != expected_inode.has_value()) {
+        return Invalid("recovery identity requires device and inode");
+    }
+    if (expected_device.has_value() &&
+        (static_cast<uint64_t>(info.st_dev) != *expected_device ||
+         static_cast<uint64_t>(info.st_ino) != *expected_inode)) {
+        return Unavailable(
+            "recovery segment inode/device changed after validation");
     }
     return Status::Ok();
 }
@@ -178,11 +190,14 @@ Status CreateRecoverySegment(const std::filesystem::path& path,
 
 Status AppendRecoveryRecord(const std::filesystem::path& path,
                             uint64_t expected_size,
+                            uint64_t expected_device,
+                            uint64_t expected_inode,
                             std::span<const std::byte> record) {
     const int fd = ::open(path.c_str(), RecoveryOpenFlags(false));
     if (fd < 0) return RecoveryIoError("cannot open recovery segment", path);
     const ScopedRecoveryFd scoped(fd);
-    Status status = VerifyRecoveryFile(fd, path, expected_size);
+    Status status = VerifyRecoveryFile(fd, path, expected_size,
+                                       expected_device, expected_inode);
     if (!status.ok()) return status;
     status = WriteAllRecovery(fd, path, record);
     if (!status.ok()) return status;
@@ -1055,7 +1070,11 @@ private:
                 *recovered, snapshot.partition, active);
             if (!identity.ok()) return identity;
             if (recovered->repairable()) {
-                recovered = RepairSegment(path, recovery_options);
+                SegmentRepairOptions repair_options;
+                repair_options.expected_device = recovered->file_device;
+                repair_options.expected_inode = recovered->file_inode;
+                recovered =
+                    RepairSegment(path, recovery_options, repair_options);
             } else if (!recovered->clean()) {
                 return Corruption(recovered->reason_detail);
             }
@@ -1104,8 +1123,9 @@ private:
                 Result<std::vector<std::byte>> encoded_gap =
                     RecoveryGapRecord(snapshot.partition, active, now_ns);
                 if (!encoded_gap.ok()) return encoded_gap.status();
-                Status appended =
-                    AppendRecoveryRecord(path, actual_size, *encoded_gap);
+                Status appended = AppendRecoveryRecord(
+                    path, actual_size, recovered->file_device,
+                    recovered->file_inode, *encoded_gap);
                 if (!appended.ok()) return appended;
                 if (actual_size > std::numeric_limits<uint64_t>::max() -
                                       encoded_gap->size()) {
@@ -1119,7 +1139,11 @@ private:
                     return Corruption(
                         "active manifest progress exceeds recovered segment");
                 }
-                Status synced = TruncateSegment(path, actual_size);
+                SegmentRepairOptions repair_options;
+                repair_options.expected_device = recovered->file_device;
+                repair_options.expected_inode = recovered->file_inode;
+                Status synced =
+                    TruncateSegment(path, actual_size, repair_options);
                 if (!synced.ok()) return synced;
             }
         }
@@ -1172,8 +1196,11 @@ private:
             return Corruption(
                 "sealed manifest does not match recovered segment file");
         }
+        SegmentRepairOptions repair_options;
+        repair_options.expected_device = report->file_device;
+        repair_options.expected_inode = report->file_inode;
         Status synced = TruncateSegment(
-            root / sealed.relative_path, report->file_size);
+            root / sealed.relative_path, report->file_size, repair_options);
         if (!synced.ok()) return synced;
         return manifest.UpdateCheckpoint(DurableCheckpoint{
             .segment_id = sealed.segment_id,

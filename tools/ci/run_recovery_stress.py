@@ -167,6 +167,9 @@ def _ci_provenance(environment: Mapping[str, str]) -> dict[str, Optional[str]]:
         "GITHUB_REPOSITORY",
         "GITHUB_WORKFLOW",
         "GITHUB_EVENT_NAME",
+        "GITHUB_JOB",
+        "GITHUB_REF",
+        "GITHUB_SHA",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_NUMBER",
         "GITHUB_RUN_ATTEMPT",
@@ -332,16 +335,20 @@ def _run_stress(
         "commit": _git_commit(workspace, process_environment),
         "target": config.target,
         "seed": seed,
+        "seed_consumed": True,
         "duration_seconds": seconds,
+        "requested_duration_seconds": seconds,
         "bazel_test_timeout_seconds": timeout_seconds,
         "start_time_utc": started_at,
         "end_time_utc": None,
         "elapsed_seconds": None,
         "exit_code": None,
+        "outcome": "running",
         "status": "running",
         "command": command,
         "toolchain": _toolchain(workspace, bazel, process_environment),
         "ci": _ci_provenance(process_environment),
+        "github": _ci_provenance(process_environment),
         "testlogs_root": str(testlogs),
         "test_logs": {},
         "test_log_hashes": {},
@@ -363,6 +370,17 @@ def _run_stress(
     finally:
         try:
             records, hashes = _copy_test_evidence(testlogs, config, output)
+            console_log = output / "bazel-console.log"
+            console_hash = _sha256(console_log) if console_log.is_file() else None
+            records["bazel-console.log"] = {
+                "artifact": console_log.name if console_log.is_file() else None,
+                "sha256": console_hash,
+                "size_bytes": (
+                    console_log.stat().st_size if console_log.is_file() else None
+                ),
+                "source": str(console_log),
+            }
+            hashes["bazel-console.log"] = console_hash
         except Exception as error:  # Keep the primary result even if copying fails.
             records = {}
             hashes = {}
@@ -377,7 +395,12 @@ def _run_stress(
                 "end_time_utc": _utc_now(),
                 "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
                 "exit_code": exit_code,
-                "status": "passed" if exit_code == 0 and not internal_error else "failed",
+                "outcome": (
+                    "passed" if exit_code == 0 and not internal_error else "failed"
+                ),
+                "status": (
+                    "passed" if exit_code == 0 and not internal_error else "failed"
+                ),
                 "test_logs": records,
                 "test_log_hashes": hashes,
             }
@@ -462,12 +485,14 @@ raise SystemExit(2)
         assert exit_code == 7
         manifest = json.loads((output / "manifest.json").read_text())
         assert manifest["status"] == "failed"
+        assert manifest["outcome"] == "failed"
         assert manifest["exit_code"] == 7
+        assert manifest["seed_consumed"]
         assert manifest["seed"] == 123456789
         assert manifest["duration_seconds"] == 2
         assert manifest["target"] == CONFIGS["d1"].target
         assert manifest["start_time_utc"] and manifest["end_time_utc"]
-        for name in ("test.log", "test.xml"):
+        for name in ("test.log", "test.xml", "bazel-console.log"):
             assert (output / name).is_file()
             assert manifest["test_log_hashes"][name] == _sha256(output / name)
         assert _positive_seconds("7200") == 7200

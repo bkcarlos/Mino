@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "mino/common/result.h"
@@ -187,6 +188,14 @@ public:
         const std::filesystem::path& path,
         const SegmentFormatLimits& limits = {});
 
+    using PostScanHookForTesting = Status (*)(
+        const std::filesystem::path& path, void* context);
+    // Deterministically exercises changes between ScanSegment and the replay
+    // descriptor open. Production callers use Open().
+    static Result<std::unique_ptr<SegmentReplayReader>> OpenForTesting(
+        const std::filesystem::path& path, const SegmentFormatLimits& limits,
+        PostScanHookForTesting post_scan_hook, void* hook_context);
+
     ~SegmentReplayReader();
     SegmentReplayReader(const SegmentReplayReader&) = delete;
     SegmentReplayReader& operator=(const SegmentReplayReader&) = delete;
@@ -208,6 +217,10 @@ public:
     void Reset() noexcept { next_record_ = 0; }
 
 private:
+    static Result<std::unique_ptr<SegmentReplayReader>> OpenImpl(
+        const std::filesystem::path& path, const SegmentFormatLimits& limits,
+        PostScanHookForTesting post_scan_hook, void* hook_context);
+
     SegmentReplayReader(std::filesystem::path path, int fd,
                         SegmentRecoveryReport report,
                         SegmentFormatLimits limits) noexcept;
@@ -226,12 +239,27 @@ public:
         RecordingManifestSnapshot manifest, ReplayPublisherAdapter* publisher,
         ReplayOptions options = {}, ReplaySchemaResolver* schema_resolver = nullptr,
         ReplayClock* clock = nullptr, ReplaySleeper* sleeper = nullptr);
+    // Creates and prevalidates replay input without a publish destination. A
+    // normal publisher adapter must be installed before Run/Step.
+    static Result<std::unique_ptr<ReplayEngine>> Create(
+        std::vector<std::filesystem::path> segment_paths,
+        RecordingManifestSnapshot manifest, ReplayOptions options = {},
+        ReplaySchemaResolver* schema_resolver = nullptr,
+        ReplayClock* clock = nullptr, ReplaySleeper* sleeper = nullptr) {
+        return Create(std::move(segment_paths), std::move(manifest), nullptr,
+                      std::move(options), schema_resolver, clock, sleeper);
+    }
 
     ~ReplayEngine();
     ReplayEngine(const ReplayEngine&) = delete;
     ReplayEngine& operator=(const ReplayEngine&) = delete;
     ReplayEngine(ReplayEngine&&) = delete;
     ReplayEngine& operator=(ReplayEngine&&) = delete;
+
+    // Installs the normal publish boundary after session/segment validation and
+    // before playback starts. The adapter is not owned and must outlive playback.
+    Status InstallPublisherAdapter(ReplayPublisherAdapter* publisher) noexcept;
+    bool has_publisher_adapter() const noexcept;
 
     // Timed mode drains all matching records. Step mode must use Step().
     Result<size_t> Run();

@@ -13,7 +13,12 @@ on:
       - MODULE.bazel.lock
       - mino/schema/**
       - schemas/**
-      - tools/ci/**
+      - tools/ci/collect_codegen_artifacts.py
+      - tools/ci/docker/**
+      - tools/ci/prepare_d3_fuzz_corpus.py
+      - tools/ci/run_d3_codegen_docker_check.py
+      - tools/ci/run_d3_codegen_environment.sh
+      - tools/ci/run_d3_fuzz_campaign.py
       - tools/minoc/**
   pull_request:
     branches: [master, main]
@@ -24,7 +29,12 @@ on:
       - MODULE.bazel.lock
       - mino/schema/**
       - schemas/**
-      - tools/ci/**
+      - tools/ci/collect_codegen_artifacts.py
+      - tools/ci/docker/**
+      - tools/ci/prepare_d3_fuzz_corpus.py
+      - tools/ci/run_d3_codegen_docker_check.py
+      - tools/ci/run_d3_codegen_environment.sh
+      - tools/ci/run_d3_fuzz_campaign.py
       - tools/minoc/**
 
 permissions:
@@ -32,7 +42,7 @@ permissions:
 
 concurrency:
   group: d3-extended-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   codegen:
@@ -86,33 +96,55 @@ jobs:
       - name: Setup Bazelisk
         uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
+      - name: Record CodeGen evidence start
+        run: echo "CODEGEN_STARTED_EPOCH=$(date +%s)" >> "${GITHUB_ENV}"
+
       - name: Run existing hermetic CodeGen tests
+        id: codegen-test
         working-directory: ${{ matrix.checkout_path }}
         run: |
+          mkdir -p codegen-logs
+          set +e
           bazel test --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             //mino/schema/codegen:code_generator_test \
             //tools/minoc:canonical_wire_generated_test \
             //tools/minoc:minoc_cli_test \
             //tools/minoc:cross_directory_generated_test \
-            --test_output=errors
+            --test_output=errors 2>&1 | tee codegen-logs/test.log
+          code=${PIPESTATUS[0]}
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit "${code}"
 
       - name: Build all compared CodeGen output groups
+        id: codegen-build
+        if: always()
         working-directory: ${{ matrix.checkout_path }}
         run: |
+          mkdir -p codegen-logs
+          set +e
           bazel build --config=release ${{ matrix.extra_config }} --jobs=${{ matrix.jobs }} \
             --output_groups=default,descriptor \
             //tools/minoc:sample_codegen \
             //tools/minoc:canonical_wire_codegen \
             //tools/minoc:mangling_codegen \
             //tools/minoc:sensor_frame_codegen \
-            //mino/schema/fuzz:codegen_golden
+            //mino/schema/fuzz:codegen_golden 2>&1 | tee codegen-logs/build.log
+          code=${PIPESTATUS[0]}
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit "${code}"
 
-      - name: Collect logical artifacts and SHA-256 manifest
+      - name: Collect logical CodeGen artifacts
+        id: codegen-collect
+        if: always()
         working-directory: ${{ matrix.checkout_path }}
         run: |
+          set +e
           python3 tools/ci/collect_codegen_artifacts.py \
             --config=release \
             --out=hermetic-codegen
+          code=$?
+          mkdir -p hermetic-codegen
+          cp codegen-logs/*.log hermetic-codegen/ 2>/dev/null || true
           {
             echo "commit=${GITHUB_SHA}"
             echo "runner_os=${RUNNER_OS}"
@@ -125,8 +157,126 @@ jobs:
             bazel --version
             ${{ matrix.cxx }} --version
           } > hermetic-codegen/PROVENANCE.txt
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit "${code}"
+
+      - name: Write CodeGen artifact manifest
+        if: always()
+        working-directory: ${{ matrix.checkout_path }}
+        env:
+          CODEGEN_ENVIRONMENT: ${{ matrix.id }}
+          CODEGEN_EXTRA_CONFIG: ${{ matrix.extra_config }}
+          CODEGEN_JOBS: ${{ matrix.jobs }}
+          CODEGEN_TEST_EXIT_CODE: ${{ steps.codegen-test.outputs.exit_code }}
+          CODEGEN_BUILD_EXIT_CODE: ${{ steps.codegen-build.outputs.exit_code }}
+          CODEGEN_COLLECT_EXIT_CODE: ${{ steps.codegen-collect.outputs.exit_code }}
+          CODEGEN_TEST_OUTCOME: ${{ steps.codegen-test.outcome }}
+          CODEGEN_BUILD_OUTCOME: ${{ steps.codegen-build.outcome }}
+          CODEGEN_COLLECT_OUTCOME: ${{ steps.codegen-collect.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import time
+
+          output = Path("hermetic-codegen")
+          output.mkdir(parents=True, exist_ok=True)
+          logs = {}
+          for name in ("test.log", "build.log"):
+              path = output / name
+              logs[name] = {
+                  "sha256": (
+                      hashlib.sha256(path.read_bytes()).hexdigest()
+                      if path.is_file() else None
+                  ),
+                  "size_bytes": path.stat().st_size if path.is_file() else None,
+              }
+          def step_exit_code(name):
+              raw = os.environ.get(name, "")
+              try:
+                  return int(raw)
+              except ValueError:
+                  return 125
+
+          exit_codes = {
+              "test": step_exit_code("CODEGEN_TEST_EXIT_CODE"),
+              "build": step_exit_code("CODEGEN_BUILD_EXIT_CODE"),
+              "collect": step_exit_code("CODEGEN_COLLECT_EXIT_CODE"),
+          }
+          overall_exit_code = next(
+              (code for code in exit_codes.values() if code != 0), 0
+          )
+          extra_config = os.environ["CODEGEN_EXTRA_CONFIG"]
+          config = ["--config=release"]
+          if extra_config:
+              config.append(extra_config)
+          jobs = f"--jobs={os.environ['CODEGEN_JOBS']}"
+          manifest = {
+              "schema_version": 1,
+              "suite": "d3-codegen-determinism",
+              "environment": os.environ["CODEGEN_ENVIRONMENT"],
+              "commit": os.environ["GITHUB_SHA"],
+              "seed": None,
+              "seed_consumed": False,
+              "command": [
+                  [
+                      "bazel", "test", *config, jobs,
+                      "//mino/schema/codegen:code_generator_test",
+                      "//tools/minoc:canonical_wire_generated_test",
+                      "//tools/minoc:minoc_cli_test",
+                      "//tools/minoc:cross_directory_generated_test",
+                      "--test_output=errors",
+                  ],
+                  [
+                      "bazel", "build", *config, jobs,
+                      "--output_groups=default,descriptor",
+                      "//tools/minoc:sample_codegen",
+                      "//tools/minoc:canonical_wire_codegen",
+                      "//tools/minoc:mangling_codegen",
+                      "//tools/minoc:sensor_frame_codegen",
+                      "//mino/schema/fuzz:codegen_golden",
+                  ],
+              ],
+              "requested_duration_seconds": None,
+              "elapsed_seconds": round(
+                  time.time()
+                  - int(os.environ.get("CODEGEN_STARTED_EPOCH", int(time.time()))),
+                  3,
+              ),
+              "outcome": "passed" if overall_exit_code == 0 else "failed",
+              "exit_code": overall_exit_code,
+              "step_exit_codes": exit_codes,
+              "step_outcomes": {
+                  "test": os.environ.get("CODEGEN_TEST_OUTCOME"),
+                  "build": os.environ.get("CODEGEN_BUILD_OUTCOME"),
+                  "collect": os.environ.get("CODEGEN_COLLECT_OUTCOME"),
+              },
+              "github": {
+                  key.lower(): os.environ.get(key)
+                  for key in (
+                      "GITHUB_ACTIONS", "GITHUB_EVENT_NAME", "GITHUB_JOB",
+                      "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_WORKFLOW",
+                      "GITHUB_RUN_ATTEMPT",
+                      "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_SHA",
+                      "RUNNER_ARCH", "RUNNER_NAME", "RUNNER_OS",
+                  )
+              },
+              "logs": logs,
+              "generated_outputs_root_sha256": (
+                  (output / "ROOT_SHA256").read_text(encoding="ascii").strip()
+                  if (output / "ROOT_SHA256").is_file() else None
+              ),
+          }
+          (output / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Upload CodeGen bytes and hashes
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: d3-codegen-${{ matrix.id }}
@@ -336,8 +486,6 @@ jobs:
       - name: Setup Bazelisk
         uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
 
-      - name: Self-test fuzz campaign tooling
-        run: python3 tools/ci/run_d3_fuzz_campaign.py --self-test
 
       - name: Run sanitizer fuzz campaign
         run: |

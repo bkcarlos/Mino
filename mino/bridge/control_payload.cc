@@ -96,6 +96,13 @@ bool ValidDisposition(AckDisposition disposition) noexcept {
     return false;
 }
 
+bool ValidDiscoveryIdentity(const SessionDiscovery& discovery) noexcept {
+    return discovery.session_epoch != 0 && discovery.node_id.value != 0 &&
+           !discovery.process_identity.IsZero() &&
+           discovery.process_identity.node_id == discovery.node_id.value &&
+           discovery.lease_epoch != 0 && discovery.node_config_version != 0;
+}
+
 bool HasDuplicateSources(const std::vector<SessionHelloSource>& sources) {
     for (size_t i = 0; i < sources.size(); ++i) {
         for (size_t j = i + 1; j < sources.size(); ++j) {
@@ -207,6 +214,10 @@ Result<std::vector<std::byte>> ControlPayloadCodec::EncodeSessionHello(
     try {
         auto size = HelloWireSize(hello.sources.size(), limits, false);
         if (!size.ok()) return size.status();
+        if (hello.sender_session_epoch == 0 ||
+            hello.receiver_session_epoch == 0) {
+            return Invalid("session hello epochs must be nonzero");
+        }
         if (HasDuplicateSources(hello.sources)) {
             return Invalid("session hello contains a duplicate source");
         }
@@ -259,6 +270,10 @@ Result<SessionHello> ControlPayloadCodec::DecodeSessionHello(
         SessionHello hello;
         hello.sender_session_epoch = ReadBe64(payload, 8);
         hello.receiver_session_epoch = ReadBe64(payload, 16);
+        if (hello.sender_session_epoch == 0 ||
+            hello.receiver_session_epoch == 0) {
+            return Corruption("session hello epochs must be nonzero");
+        }
         hello.dedup_state_lost = (flags & kHelloDedupStateLost) != 0;
         hello.sources.reserve(count);
         size_t offset = kSessionHelloHeaderWireSize;
@@ -278,6 +293,60 @@ Result<SessionHello> ControlPayloadCodec::DecodeSessionHello(
     } catch (const std::length_error&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
+}
+
+Result<std::vector<std::byte>> ControlPayloadCodec::EncodeSessionDiscovery(
+    const SessionDiscovery& discovery) noexcept {
+    try {
+        if (!ValidDiscoveryIdentity(discovery)) {
+            return Invalid("session discovery identity is incomplete");
+        }
+        std::vector<std::byte> output(kSessionDiscoveryPayloadWireSize);
+        WriteBe16(output, 0, kSessionDiscoveryPayloadVersion);
+        WriteBe16(output, 2, 0);
+        WriteBe32(output, 4, 0);
+        WriteBe64(output, 8, discovery.session_epoch);
+        WriteBe64(output, 16, discovery.node_id.value);
+        WriteBe64(output, 24, discovery.process_identity.node_id);
+        WriteBe64(output, 32, discovery.process_identity.process_id);
+        WriteBe64(output, 40, discovery.process_identity.process_epoch);
+        WriteBe64(output, 48, discovery.process_identity.start_time_ns);
+        WriteBe64(output, 56, discovery.lease_epoch);
+        WriteBe64(output, 64, discovery.node_config_version);
+        return output;
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
+
+Result<SessionDiscovery> ControlPayloadCodec::DecodeSessionDiscovery(
+    std::span<const std::byte> payload) noexcept {
+    if (payload.size() != kSessionDiscoveryPayloadWireSize) {
+        return Corruption("session discovery payload has noncanonical length");
+    }
+    if (ReadBe16(payload, 0) != kSessionDiscoveryPayloadVersion) {
+        return Corruption("session discovery payload version is unsupported");
+    }
+    if (ReadBe16(payload, 2) != 0 || ReadBe32(payload, 4) != 0) {
+        return Corruption("session discovery payload has nonzero reserved bits");
+    }
+    SessionDiscovery discovery;
+    discovery.session_epoch = ReadBe64(payload, 8);
+    discovery.node_id = NodeId{ReadBe64(payload, 16)};
+    discovery.process_identity = ProcessIdentity{
+        .node_id = ReadBe64(payload, 24),
+        .process_id = ReadBe64(payload, 32),
+        .process_epoch = ReadBe64(payload, 40),
+        .start_time_ns = ReadBe64(payload, 48),
+    };
+    discovery.lease_epoch = ReadBe64(payload, 56);
+    discovery.node_config_version = ReadBe64(payload, 64);
+    if (!ValidDiscoveryIdentity(discovery)) {
+        return Corruption("session discovery identity is incomplete");
+    }
+    return discovery;
 }
 
 }  // namespace mino::bridge

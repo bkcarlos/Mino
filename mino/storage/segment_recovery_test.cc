@@ -334,6 +334,25 @@ TEST(SegmentRecoveryTest, RepairTruncatesAndSyncsOnlyIncompleteTail) {
     EXPECT_EQ(std::filesystem::file_size(corrupt_path), size_before);
 }
 
+TEST(SegmentRecoveryTest, DestructiveOperationsRejectDifferentValidatedInode) {
+    const std::vector<Record> records = {SampleRecord(1)};
+    const std::vector<std::byte> bytes = SegmentBytes(records);
+    const std::filesystem::path path = TestPath("identity_guard");
+    WriteFile(path, bytes);
+    auto scanned = ScanSegment(path);
+    ASSERT_TRUE(scanned.ok()) << scanned.status().ToString();
+
+    SegmentRepairOptions options;
+    options.expected_device = scanned->file_device;
+    options.expected_inode = scanned->file_inode + 1;
+    const uint64_t before = std::filesystem::file_size(path);
+    EXPECT_EQ(TruncateSegment(path, kEncodedSegmentHeaderSize, options).code(),
+              StatusCode::kUnavailable);
+    EXPECT_EQ(std::filesystem::file_size(path), before);
+    EXPECT_EQ(RepairSegment(path, {}, options).status().code(),
+              StatusCode::kUnavailable);
+}
+
 TEST(SegmentRecoveryTest, ExplicitTruncateRejectsExtensionAndSyncsSuccess) {
     const std::vector<Record> records = {SampleRecord(1)};
     const std::vector<std::byte> bytes = SegmentBytes(records);

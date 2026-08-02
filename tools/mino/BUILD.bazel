@@ -28,6 +28,7 @@ cc_library(
         "//mino/storage:recording_manifest",
         "//mino/storage:replay_engine",
         "//mino/storage:segment_recovery",
+        "//mino/schema/codegen:artifact_codec",
     ],
 )
 
@@ -39,6 +40,9 @@ cc_test(
         "//mino/common:status",
         "//mino/storage:recording_manifest",
         "//mino/storage:segment_format",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
         "@googletest//:gtest_main",
     ],
 )

@@ -53,6 +53,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _git_commit(workspace: Path) -> str | None:
+    result = _run_capture(["git", "rev-parse", "HEAD"], workspace)
+    output = result.get("output")
+    if result.get("exit_code") == 0 and isinstance(output, str):
+        candidate = output.splitlines()[-1]
+        if len(candidate) == 40:
+            return candidate
+    return os.environ.get("GITHUB_SHA")
+
+
 def _hash_tree(directory: Path) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     if directory.is_dir():
@@ -114,6 +124,7 @@ def _environment(
         "GITHUB_JOB",
         "GITHUB_REF",
         "GITHUB_REPOSITORY",
+        "GITHUB_WORKFLOW",
         "GITHUB_RUN_ATTEMPT",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_NUMBER",
@@ -438,8 +449,42 @@ def _run_campaign(args: argparse.Namespace) -> int:
         artifact_hashes_sha = _write_json(artifact_hashes_path, artifact_hashes)
 
         finished_at = _utc_now()
+        elapsed_seconds = round(time.monotonic() - started_monotonic, 3)
+        log_evidence = {
+            path.name: {
+                "sha256": _sha256_file(path) if path.is_file() else None,
+                "size_bytes": path.stat().st_size if path.is_file() else None,
+            }
+            for path in (prepare_log, fuzz_log, minimize_log)
+        }
         manifest = {
             "schema_version": 1,
+            "commit": _git_commit(workspace),
+            "seed": args.seed,
+            "seed_consumed": True,
+            "command": campaign_command,
+            "requested_duration_seconds": args.seconds,
+            "elapsed_seconds": elapsed_seconds,
+            "outcome": outcome,
+            "exit_code": return_code,
+            "github": {
+                key.lower(): os.environ.get(key)
+                for key in (
+                    "GITHUB_ACTIONS",
+                    "GITHUB_EVENT_NAME",
+                    "GITHUB_JOB",
+                    "GITHUB_REF",
+                    "GITHUB_REPOSITORY",
+                    "GITHUB_WORKFLOW",
+                    "GITHUB_RUN_ATTEMPT",
+                    "GITHUB_RUN_ID",
+                    "GITHUB_RUN_NUMBER",
+                    "GITHUB_SHA",
+                    "RUNNER_ARCH",
+                    "RUNNER_NAME",
+                    "RUNNER_OS",
+                )
+            },
             "campaign": {
                 "target": TARGET,
                 "sanitizer": args.sanitizer,
@@ -448,7 +493,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
                 "minimize_corpus": args.minimize,
                 "started_at": started_at,
                 "finished_at": finished_at,
-                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                "elapsed_seconds": elapsed_seconds,
             },
             "commands": {
                 "prepare": prepare_command,
@@ -462,6 +507,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
                 "all_selectors_exercised": all_exercised,
             },
             "evidence": {
+                "logs": log_evidence,
                 "environment": {
                     "path": environment_path.name,
                     "sha256": environment_sha,
@@ -522,6 +568,13 @@ def _self_test() -> None:
             "Descriptor": None,
             "CanonicalPayload": None,
         }
+        previous_sha = os.environ.get("GITHUB_SHA")
+        os.environ["GITHUB_SHA"] = "a" * 40
+        assert _git_commit(root) == "a" * 40
+        if previous_sha is None:
+            del os.environ["GITHUB_SHA"]
+        else:
+            os.environ["GITHUB_SHA"] = previous_sha
 
         output = root / "output"
         _prepare_output(output, clean=False)

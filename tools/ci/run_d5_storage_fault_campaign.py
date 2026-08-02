@@ -5,19 +5,22 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 TARGET = "//d5_storage_fault_campaign:storage_fault_test"
+ROUNDS_SCOPE = "D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit"
 MARKER = ".d5-storage-fault-campaign"
 MAX_ROUNDS = 1000
 UINT64_MAX = (1 << 64) - 1
@@ -37,6 +40,46 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _git_commit(workspace: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return os.environ.get("GITHUB_SHA")
+    candidate = result.stdout.strip().splitlines()
+    if result.returncode == 0 and candidate and len(candidate[-1]) == 40:
+        return candidate[-1]
+    return os.environ.get("GITHUB_SHA")
+
+
+def _github_provenance(environment: Mapping[str, str]) -> dict[str, str | None]:
+    names = (
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_JOB",
+        "GITHUB_REF",
+        "GITHUB_REPOSITORY",
+        "GITHUB_WORKFLOW",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_NUMBER",
+        "GITHUB_SHA",
+        "RUNNER_ARCH",
+        "RUNNER_NAME",
+        "RUNNER_OS",
+    )
+    return {name.lower(): environment.get(name) for name in names}
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -96,6 +139,17 @@ def _create_overlay(workspace: Path, root: Path) -> None:
     package.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, package / source.name)
     (package / "BUILD.bazel").write_text(_overlay_build(), encoding="utf-8")
+
+
+def _filter_selects_rounds_test(gtest_filter: str | None) -> bool:
+    if gtest_filter is None:
+        return True
+    positive_filters = gtest_filter.split("-", 1)[0].split(":")
+    return any(
+        fnmatch.fnmatchcase(ROUNDS_SCOPE, pattern)
+        for pattern in positive_filters
+        if pattern
+    )
 
 
 def _command(
@@ -198,23 +252,39 @@ def _run(args: argparse.Namespace) -> int:
     started_at = _utc_now()
     started_monotonic = time.monotonic()
     source = workspace / "mino/storage/storage_fault_test.cc"
+    seed_consumed = _filter_selects_rounds_test(args.gtest_filter)
     exit_code = 125
     try:
         exit_code = _stream(command, workspace, log_path)
     finally:
+        elapsed_seconds = round(time.monotonic() - started_monotonic, 3)
         manifest = {
             "schema_version": 1,
+            "commit": _git_commit(workspace),
+            "seed": args.seed if seed_consumed else None,
+            "requested_seed": args.seed,
+            "seed_consumed": seed_consumed,
+            "seed_scope": ROUNDS_SCOPE if seed_consumed else None,
+            "command": command,
+            "requested_duration_seconds": None,
+            "test_timeout_seconds": timeout,
+            "elapsed_seconds": elapsed_seconds,
+            "outcome": "passed" if exit_code == 0 else "failed",
+            "exit_code": exit_code,
+            "github": _github_provenance(os.environ),
             "campaign": {
                 "target": TARGET,
                 "rounds": args.rounds,
-                "seed": args.seed,
+                "rounds_scope": ROUNDS_SCOPE,
+                "seed": args.seed if seed_consumed else None,
+                "requested_seed": args.seed,
+                "seed_scope": ROUNDS_SCOPE if seed_consumed else None,
                 "timeout_seconds": timeout,
                 "gtest_filter": args.gtest_filter,
                 "started_at": started_at,
                 "finished_at": _utc_now(),
-                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                "elapsed_seconds": elapsed_seconds,
             },
-            "command": command,
             "result": {
                 "outcome": "passed" if exit_code == 0 else "failed",
                 "exit_code": exit_code,
@@ -223,6 +293,7 @@ def _run(args: argparse.Namespace) -> int:
                 "console_log": {
                     "path": log_path.name,
                     "sha256": _sha256(log_path) if log_path.is_file() else None,
+                    "size_bytes": log_path.stat().st_size if log_path.is_file() else None,
                 },
                 "test_source": {
                     "path": str(source.relative_to(workspace)),
@@ -297,6 +368,14 @@ def _self_test() -> None:
         assert command[-1] == "--test_arg=--gtest_filter=Suite.Test"
         assert _positive_rounds(str(MAX_ROUNDS)) == MAX_ROUNDS
         assert _seed(str(UINT64_MAX)) == UINT64_MAX
+        assert ROUNDS_SCOPE in _command(
+            "bazel", overlay, 7, 9, 260, ROUNDS_SCOPE
+        )[-1]
+        assert _filter_selects_rounds_test(None)
+        assert _filter_selects_rounds_test(ROUNDS_SCOPE)
+        assert _filter_selects_rounds_test("D5StorageFaultTest.Sigkill*")
+        assert not _filter_selects_rounds_test("OtherSuite.OtherTest")
+        assert _git_commit(workspace) == os.environ.get("GITHUB_SHA")
         for invalid in ("0", str(MAX_ROUNDS + 1), "not-a-number"):
             try:
                 _positive_rounds(invalid)

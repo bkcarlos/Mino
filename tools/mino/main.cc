@@ -58,10 +58,12 @@ USAGE:
     mino recover <region_name> [--layout <file>] [--image <file>] [--dry-run]
     mino storage inspect <session_root>
     mino storage verify <segment> [<segment> ...]
-    mino storage repair <segment> [--dry-run]
-    mino replay <session_root> [--validate-only] [--topic <name|id>] ...
-    mino record <session_root> --recording-id N --owner-id N --owner-epoch N
-                --config-version N --topic <id>:<name> ...
+    mino storage repair <segment> [--apply --standalone]
+    mino replay <session_root> [--validate-only] [--topic <name|id>]
+                [--segment <tracked>] [--unsafe-standalone-segment] ...
+    mino record create <session_root> --recording-id N --owner-id N --owner-epoch N
+                       --config-version N --topic <id>:<name> ...
+    mino record run <session_root>
 
 OPTIONS:
     --layout <file>   Layout sidecar describing class table and ring buffers.
@@ -444,7 +446,9 @@ int main(int argc, char** argv) {
         for (int i = first_argument; i < argc; ++i) {
             storage_args.emplace_back(argv[i]);
         }
-        return mino::tools::RunStorageCommand(storage_args, std::cout, std::cerr);
+        const mino::tools::StorageCommandServices services{};
+        return mino::tools::RunStorageCommand(storage_args, std::cout, std::cerr,
+                                              services);
     }
 
     CommonArgs args;

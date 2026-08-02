@@ -22,13 +22,13 @@ permissions:
 
 concurrency:
   group: formal-validation-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tla-validation:
-    name: TLC v1.7.4
+    name: TLC v1.7.4 (${{ github.event_name == 'pull_request' && 'bounded PR model' || 'all models' }})
     runs-on: ubuntu-22.04
-    timeout-minutes: 70
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 10 || 70 }}
     env:
       TLA_VERSION: 1.7.4
       TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
@@ -52,14 +52,28 @@ jobs:
             "https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
           printf '%s  %s\n' "${TLA_SHA256}" "${TLA_JAR}" | sha256sum --check --strict -
 
-      - name: Run all formal models
+      - name: Run bounded PR model
+        if: github.event_name == 'pull_request'
         env:
           TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
         run: |
           python3 tools/ci/run_tla_validation.py \
             --jar "${TLA_JAR}" \
             --out formal-validation \
-            --timeout-seconds 1200
+            --model BroadcastMembership \
+            --timeout-seconds 300 \
+            --total-timeout-seconds 360
+
+      - name: Run all formal models
+        if: github.event_name != 'pull_request'
+        env:
+          TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
+        run: |
+          python3 tools/ci/run_tla_validation.py \
+            --jar "${TLA_JAR}" \
+            --out formal-validation \
+            --timeout-seconds 1200 \
+            --total-timeout-seconds 3600
 
       - name: Upload formal validation evidence
         if: always()

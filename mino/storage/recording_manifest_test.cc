@@ -310,7 +310,7 @@ TEST(PartitionManifestTest, EnforcesStateMachineCheckpointAndOrphanApis) {
     EXPECT_FALSE((*manifest)->AddSegment(traversal).ok());
 
     SegmentManifestEntry orphan =
-        Segment(2, SegmentPersistentState::kSealed, 20, 25);
+        Segment(2, SegmentPersistentState::kSealed, 13, 18);
     WriteByte(root / orphan.relative_path);
     ASSERT_TRUE((*manifest)->AdoptSealedOrphan(orphan).ok());
 

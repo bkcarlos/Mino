@@ -18,9 +18,8 @@
 // CI run and meant to be executed explicitly (ideally for minutes, and under
 // --config=tsan). Run it with:
 //
-//   bazel test //mino/shm/channel:mpmc_ring_stress_test \
-//       --test_timeout=3600 \
-//       --test_env=MPMC_STRESS_DURATION_SEC=60
+//   bazel test //mino/shm/channel:mpmc_ring_stress_test
+//       --test_timeout=3600 --test_env=MPMC_STRESS_DURATION_SEC=60
 //
 // Configuration via environment variables:
 //   MPMC_STRESS_DURATION_SEC   wall-clock seconds for the timed phase

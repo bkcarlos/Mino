@@ -1,0 +1,134 @@
+# Supplementary long-running suites. D1/D2 recovery remains in
+# recovery-stress.yml; D3 fuzz/CodeGen and TLA remain in their existing
+# scheduled workflows so the same hour-long campaign is never duplicated.
+name: Extended Long-Running Validation
+
+on:
+  schedule:
+    - cron: "41 1 * * 6"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Per-suite wall-clock budget in seconds (0-7200; default 1h)
+        required: false
+        default: "3600"
+        type: string
+      seed:
+        description: D5 seed; extended suites record it as unconsumed
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-long-running-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extended-suite:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - suite: d1-mpmc-tsan
+            name: D1 MPMC TSAN stress
+          - suite: d2-subscriber-broadcast-kill
+            name: D2 subscriber/broadcast kill soak
+          - suite: d4-two-node-reconnect
+            name: D4 two-node/reconnect soak
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      LONG_TEST_SECONDS: ${{ inputs.duration_seconds || '3600' }}
+      LONG_TEST_REQUESTED_SEED: ${{ inputs.seed || github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 libatomic1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Cache Bazel output base
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/bazel
+          key: extended-${{ runner.os }}-${{ matrix.suite }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            extended-${{ runner.os }}-${{ matrix.suite }}-
+            extended-${{ runner.os }}-
+
+      - name: Run extended suite
+        run: |
+          python3 tools/ci/run_extended_long_test.py "${{ matrix.suite }}" \
+            --seconds="${LONG_TEST_SECONDS}" \
+            --seed="${LONG_TEST_REQUESTED_SEED}" \
+            --out="extended-results/${{ matrix.suite }}"
+
+      - name: Upload extended evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: extended-results/${{ matrix.suite }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  d5-fault-campaign:
+    name: D5 SIGKILL recovery campaign (100 rounds)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      D5_FAULT_SEED: ${{ inputs.seed || github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 libatomic1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Cache Bazel output base
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/bazel
+          key: d5-fault-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion') }}
+          restore-keys: |
+            d5-fault-${{ runner.os }}-
+
+      - name: Run D5 SIGKILL recovery campaign
+        run: |
+          python3 tools/ci/run_d5_storage_fault_campaign.py \
+            --rounds=100 \
+            --seed="${D5_FAULT_SEED}" \
+            --gtest-filter=D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit \
+            --out=extended-results/d5-fault-campaign \
+            --clean
+
+      - name: Upload D5 fault evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-d5-fault-${{ github.run_id }}-${{ github.run_attempt }}
+          path: extended-results/d5-fault-campaign/
+          if-no-files-found: warn
+          retention-days: 90

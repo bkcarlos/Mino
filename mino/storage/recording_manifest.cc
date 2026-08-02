@@ -1456,7 +1456,9 @@ Status PartitionManifest::UpdateCheckpoint(
 }
 
 Status PartitionManifest::AdoptSealedOrphan(
-    SegmentManifestEntry sealed_segment) noexcept {
+    SegmentManifestEntry sealed_segment,
+    std::optional<uint64_t> expected_device,
+    std::optional<uint64_t> expected_inode) noexcept {
     try {
         if (sealed_segment.state != SegmentPersistentState::kSealed) {
             return Invalid("only a verified sealed orphan may be adopted");
@@ -1471,8 +1473,40 @@ Status PartitionManifest::AdoptSealedOrphan(
                                      "orphan is already tracked");
             }
         }
+        const uint64_t expected_first = snapshot_.segments.empty()
+                                            ? 1
+                                            : snapshot_.segments.back()
+                                                      .last_ingestion_sequence ==
+                                                  std::numeric_limits<uint64_t>::max()
+                                              ? 0
+                                              : snapshot_.segments.back()
+                                                        .last_ingestion_sequence +
+                                                    1;
+        if (expected_first == 0 ||
+            sealed_segment.first_ingestion_sequence != expected_first) {
+            return Invalid(
+                "orphan first sequence must exactly follow the previous segment; "
+                "non-contiguous adoption requires an explicit validated Gap");
+        }
         MINO_RETURN_IF_ERROR(InspectRelativePath(
             root_, sealed_segment.relative_path, true));
+        if (expected_device.has_value() != expected_inode.has_value()) {
+            return Invalid("orphan identity requires both device and inode");
+        }
+        if (expected_device.has_value()) {
+            struct stat attributes {};
+            const std::filesystem::path path =
+                root_ / sealed_segment.relative_path;
+            if (::lstat(path.c_str(), &attributes) != 0) {
+                return IoError("cannot revalidate orphan", path);
+            }
+            if (!S_ISREG(attributes.st_mode) ||
+                static_cast<uint64_t>(attributes.st_dev) != *expected_device ||
+                static_cast<uint64_t>(attributes.st_ino) != *expected_inode) {
+                return Unavailable(
+                    "orphan inode/device changed after validation");
+            }
+        }
         return AddSegment(std::move(sealed_segment));
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -1482,7 +1516,9 @@ Status PartitionManifest::AdoptSealedOrphan(
 }
 
 Result<std::filesystem::path> PartitionManifest::QuarantineOrphan(
-    const std::filesystem::path& relative_path) noexcept {
+    const std::filesystem::path& relative_path,
+    std::optional<uint64_t> expected_device,
+    std::optional<uint64_t> expected_inode) noexcept {
     try {
         if (poisoned_) return Unavailable("partition manifest is poisoned");
         MINO_RETURN_IF_ERROR(ValidateSegmentPath(
@@ -1493,6 +1529,22 @@ Result<std::filesystem::path> PartitionManifest::QuarantineOrphan(
             }
         }
         MINO_RETURN_IF_ERROR(InspectRelativePath(root_, relative_path, true));
+        if (expected_device.has_value() != expected_inode.has_value()) {
+            return Invalid("orphan identity requires both device and inode");
+        }
+        if (expected_device.has_value()) {
+            struct stat attributes {};
+            const std::filesystem::path path = root_ / relative_path;
+            if (::lstat(path.c_str(), &attributes) != 0) {
+                return IoError("cannot revalidate orphan", path);
+            }
+            if (!S_ISREG(attributes.st_mode) ||
+                static_cast<uint64_t>(attributes.st_dev) != *expected_device ||
+                static_cast<uint64_t>(attributes.st_ino) != *expected_inode) {
+                return Unavailable(
+                    "orphan inode/device changed after validation");
+            }
+        }
         const std::filesystem::path quarantined =
             std::filesystem::path(relative_path.generic_string() + ".orphan");
         MINO_RETURN_IF_ERROR(ValidateBasicRelativePath(

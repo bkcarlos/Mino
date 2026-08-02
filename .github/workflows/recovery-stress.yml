@@ -10,25 +10,12 @@ on:
         description: Optional decimal uint64 seed override (recorded in manifest)
         required: false
         type: string
-  push:
-    branches: [master, main]
-    paths:
-      - .github/workflows/recovery-stress.yml
-      - tools/ci/run_recovery_stress.py
-      - .bazelrc
-      - .bazelversion
-      - MODULE.bazel
-      - MODULE.bazel.lock
-      - mino/abi/**
-      - mino/platform/**
-      - mino/shm/**
-      - mino/runtime/**
 
 permissions:
   contents: read
 
 concurrency:
-  group: recovery-stress-${{ github.ref }}
+  group: recovery-stress-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

@@ -52,12 +52,17 @@ public:
     ShmHandle handle() const noexcept { return handle_; }
     const ProcessIdentity& owner() const noexcept { return owner_; }
     const void* data() const noexcept { return data_; }
+    uint32_t record_index_for_testing() const noexcept { return record_index_; }
+    uint64_t record_reservation_for_testing() const noexcept {
+        return record_reservation_;
+    }
 
 private:
     friend class ShmPinTable;
 
     ShmPinToken(ShmPinTable* table, uint32_t record_index,
-                uint64_t record_state, ShmHandle handle,
+                uint64_t record_state, uint64_t record_reservation,
+                ShmHandle handle,
                 const ProcessIdentity& owner, const void* data) noexcept;
 
     void Disarm() noexcept;
@@ -65,6 +70,7 @@ private:
     ShmPinTable* table_ = nullptr;
     uint32_t record_index_ = 0;
     uint64_t record_state_ = 0;
+    uint64_t record_reservation_ = 0;
     ShmHandle handle_;
     ProcessIdentity owner_;
     const void* data_ = nullptr;
@@ -79,10 +85,46 @@ public:
     static constexpr uint32_t kMaxPinsPerProcess = 4096;
     static constexpr uint32_t kPinCapacity = 16384;
 
+    // Version 5 adds per-bucket recoverable cleanup descriptors and a
+    // recoverable global mutator-registration lock on top of generation-checked
+    // token recovery. Attach deliberately rejects all older layouts.
+    static constexpr uint32_t kLayoutVersion = 5;
+    static constexpr uint32_t kMutatorCapacity = 256;
+
+    enum class PinFaultPointForTesting : uint32_t {
+        kMutatorBeforeRegistrationLock,
+        kMutatorSlotWriting,
+        kMutatorIdentityReady,
+        kMutatorActivePublished,
+        kOwnerCleanupOdd,
+        kRecordClaimed,
+        kRecordMetadataReady,
+        kRecordPrepared,
+        kObjectQuotaLocked,
+        kObjectQuotaCommitted,
+        kObjectInspected,
+        kOwnerQuotaLocked,
+        kOwnerQuotaCommitted,
+        kRecordActive,
+        kRecordReleasing,
+        kOwnerQuotaReleaseLocked,
+        kObjectQuotaReleaseLocked,
+        kRecordStateCleared,
+    };
+    using PinFaultInjectorForTesting = void (*)(PinFaultPointForTesting,
+                                                void*) noexcept;
+
+    // Process-local hook. Tests may terminate the process from the callback to
+    // exercise shared-memory recovery at deterministic state boundaries.
+    static void SetFaultInjectorForTesting(
+        PinFaultInjectorForTesting injector, void* context = nullptr) noexcept;
+
     // Forward-declared shared layout nodes. Their fields remain defined only in
     // the implementation file; the names are public so layout helper functions
     // can be kept outside the process-local facade.
     struct SharedControl;
+    struct SharedMutator;
+    struct SharedCleanup;
     struct SharedRecord;
 
     static size_t RequiredSize() noexcept;
@@ -92,6 +134,9 @@ public:
     static Result<ShmPinTable> Attach(void* shm_base, size_t shm_size,
                                       CentralSlabAllocator& allocator);
 
+    // `owner` is the logical lease owner and may differ from the process
+    // executing Pin(). Crash recovery separately records and probes the actual
+    // mutator ProcessIdentity::Current().
     Result<ShmPinToken> Pin(
         ShmHandle handle, const ShmPinContract& contract,
         const ProcessIdentity& owner = ProcessIdentity::Current()) noexcept;
@@ -101,9 +146,14 @@ public:
     uint32_t PinCount(ShmHandle handle) const noexcept;
     uint32_t OwnerPinCount(const ProcessIdentity& owner) const noexcept;
 
-    // Releases every record bound to the exact process incarnation. Returns
-    // the number of records removed. Retired objects whose final Pin is removed
-    // are reclaimed before this method returns (best effort for callback use).
+    // Releases every record bound to the exact logical process incarnation.
+    // Cleanup linearizes while its owner fence is odd: every Pin ordered before
+    // the odd->even publication is either removed or fails before Active, and
+    // Pins that observe the odd interval are rejected. A Pin that observes the
+    // newly published even epoch is ordered after Cleanup, even if its invocation
+    // overlaps the final return instructions.
+    // Returns the number of records removed. Retired objects whose final Pin is
+    // removed are reclaimed before this method returns (best effort).
     uint32_t CleanupOwner(const ProcessIdentity& owner) noexcept;
 
     // SubscriberLeaseCoordinator::PinCleanup-compatible adapter. Pass the
@@ -121,24 +171,39 @@ public:
 private:
     friend class ShmPinToken;
 
-    ShmPinTable(SharedControl* control, SharedRecord* records,
+    ShmPinTable(SharedControl* control, SharedMutator* mutators,
+                SharedCleanup* cleanups, SharedRecord* records,
                 CentralSlabAllocator* allocator) noexcept
-        : control_(control), records_(records), allocator_(allocator) {}
+        : control_(control),
+          mutators_(mutators),
+          cleanups_(cleanups),
+          records_(records),
+          allocator_(allocator) {}
 
     Result<ShmPinToken> CloneToken(const ShmPinToken& source) noexcept;
     Result<ShmPinToken> AcquireRecord(ShmHandle handle,
                                       const ProcessIdentity& owner,
-                                      const void* data,
-                                      uint32_t object_bucket) noexcept;
+                                      const ShmPinContract* contract,
+                                      bool allow_retired) noexcept;
     static bool ReclaimGuardCallback(ShmHandle handle,
                                      void* context) noexcept;
-    Status ReleaseRecord(uint32_t record_index, uint64_t record_state,
-                         ShmHandle handle,
+    Status ReleaseRecord(uint32_t record_index, uint64_t* record_state,
+                         uint64_t* record_reservation, ShmHandle handle,
                          const ProcessIdentity& owner) noexcept;
     Status MaybeReclaim(ShmHandle handle) noexcept;
     bool HasPinOrPublicationGuard(ShmHandle handle) const noexcept;
+    Status RecoverRecord(uint32_t record_index, uint64_t state,
+                         uint64_t reservation) noexcept;
+    uint32_t FinishOwnerCleanup(const ProcessIdentity& owner,
+                                uint32_t owner_bucket,
+                                uint64_t cleanup_token) noexcept;
+    Result<uint32_t> EnsureCurrentMutator() noexcept;
+    void RecoverDeadMutatorsOnAttach() noexcept;
+    void RecoverDeadCleanupsOnAttach() noexcept;
 
     SharedControl* control_ = nullptr;
+    SharedMutator* mutators_ = nullptr;
+    SharedCleanup* cleanups_ = nullptr;
     SharedRecord* records_ = nullptr;
     CentralSlabAllocator* allocator_ = nullptr;
 };

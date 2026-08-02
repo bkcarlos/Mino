@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include <array>
@@ -15,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <span>
 #include <string>
@@ -22,6 +25,9 @@
 #include <vector>
 
 #include "mino/common/status.h"
+#include "mino/schema/codegen/artifact_codec.h"
+#include "mino/schema/compiler.h"
+#include "mino/schema/layout.h"
 #include "mino/storage/recording_manifest.h"
 #include "mino/storage/segment_format.h"
 
@@ -58,11 +64,37 @@ void Append(std::vector<std::byte>* output,
     output->insert(output->end(), bytes.begin(), bytes.end());
 }
 
-storage::Record SampleRecord() {
+struct TestArtifact {
+    schema::SchemaIdentity identity;
+    std::vector<std::byte> bytes;
+};
+
+Result<TestArtifact> CompileArtifact() {
+    Result<schema::CompiledSchema> compiled = schema::SchemaCompiler::Compile(
+        "option schema_version = \"1.0\"; package cli; "
+        "message Event { uint64 value = 1; }");
+    if (!compiled.ok()) return compiled.status();
+    std::vector<schema::LayoutPlan> layouts;
+    for (const auto& descriptor : compiled->types()) {
+        Result<schema::LayoutPlan> layout =
+            schema::LayoutPlanner::Plan(*descriptor, {});
+        if (!layout.ok()) return layout.status();
+        layouts.push_back(std::move(*layout));
+    }
+    Result<std::string> encoded =
+        schema::codegen::EncodeDescriptorArtifact(*compiled, layouts);
+    if (!encoded.ok()) return encoded.status();
+    const std::span<const std::byte> bytes = std::as_bytes(
+        std::span<const char>(encoded->data(), encoded->size()));
+    return TestArtifact{.identity = compiled->types()[0]->identity(),
+                        .bytes = std::vector<std::byte>(bytes.begin(), bytes.end())};
+}
+
+storage::Record SampleRecord(const schema::SchemaIdentity& identity) {
     storage::Record record;
     record.header.schema_ref = 1;
-    record.header.schema_version = 1;
-    record.header.layout_version = 1;
+    record.header.schema_version = identity.schema_version();
+    record.header.layout_version = identity.layout_version();
     record.header.topic_id = 10;
     record.header.partition_id = 0;
     record.header.ingestion_sequence = 1;
@@ -76,7 +108,8 @@ storage::Record SampleRecord() {
     return record;
 }
 
-std::vector<std::byte> SegmentBytes() {
+std::vector<std::byte> SegmentBytes(
+    const schema::SchemaIdentity& identity) {
     const storage::SegmentHeader header{
         .flags = 0,
         .recording_id = 7,
@@ -88,7 +121,7 @@ std::vector<std::byte> SegmentBytes() {
     };
     auto encoded_header = storage::EncodeSegmentHeader(header);
     EXPECT_TRUE(encoded_header.ok()) << encoded_header.status().ToString();
-    auto encoded_record = storage::EncodeRecord(SampleRecord());
+    auto encoded_record = storage::EncodeRecord(SampleRecord(identity));
     EXPECT_TRUE(encoded_record.ok()) << encoded_record.status().ToString();
     if (!encoded_header.ok() || !encoded_record.ok()) return {};
     std::vector<std::byte> bytes = *encoded_header;
@@ -112,32 +145,34 @@ struct SessionFixture {
     std::filesystem::path root;
     std::filesystem::path segment;
     std::filesystem::path descriptor;
+    std::optional<schema::SchemaIdentity> identity;
 };
 
 SessionFixture CreateSession(std::string_view name) {
     SessionFixture fixture;
+    Result<TestArtifact> artifact = CompileArtifact();
+    EXPECT_TRUE(artifact.ok()) << artifact.status().ToString();
+    if (!artifact.ok()) return fixture;
+    fixture.identity = artifact->identity;
     fixture.root = TestDirectory(name);
     const std::filesystem::path partition =
         fixture.root / "topics/10/partitions/0000";
     std::filesystem::create_directories(partition / "segments");
     std::filesystem::create_directories(fixture.root / "schemas");
     fixture.segment = partition / "segments/00000001.mino";
-    const std::vector<std::byte> bytes = SegmentBytes();
+    const std::vector<std::byte> bytes = SegmentBytes(artifact->identity);
     WriteBytes(fixture.segment, bytes);
 
     storage::SchemaRefSnapshot schema;
     schema.schema_ref = 1;
-    schema.schema_version = 1;
-    schema.layout_version = 1;
-    for (size_t index = 0; index < schema.canonical_digest.size(); ++index) {
-        schema.canonical_digest[index] = static_cast<std::byte>(index + 1);
-    }
+    schema.schema_version = artifact->identity.schema_version();
+    schema.layout_version = artifact->identity.layout_version();
+    schema.canonical_digest = artifact->identity.canonical_digest();
     schema.descriptor_path =
         std::filesystem::path("schemas") /
         (DigestHex(schema.canonical_digest) + ".schema");
     fixture.descriptor = fixture.root / schema.descriptor_path;
-    const std::array<std::byte, 1> descriptor = {std::byte{1}};
-    WriteBytes(fixture.descriptor, descriptor);
+    WriteBytes(fixture.descriptor, artifact->bytes);
 
     auto recording = storage::RecordingManifest::Create(
         fixture.root,
@@ -202,6 +237,19 @@ public:
     std::string topic_name;
 };
 
+class CapturingRecorderLauncher final : public RecorderServiceLauncher {
+public:
+    Status Run(const std::filesystem::path& session_root) noexcept override {
+        ++calls;
+        root = session_root;
+        return result;
+    }
+
+    size_t calls = 0;
+    std::filesystem::path root;
+    Status result = Status::Ok();
+};
+
 TEST(StorageCommandsTest, ParserHasStableUsageExitCode) {
     std::ostringstream out;
     std::ostringstream err;
@@ -217,7 +265,7 @@ TEST(StorageCommandsTest, RecordCreatesConfigAndInspectShowsTopicNameAndId) {
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(RunStorageCommand(
-                  {"record", root.string(), "--recording-id", "11",
+                  {"record", "create", root.string(), "--recording-id", "11",
                    "--owner-id", "12", "--owner-epoch", "1",
                    "--config-version", "3", "--created-at-ns", "99",
                    "--topic", "10:camera.front", "--partitions", "2"},
@@ -235,9 +283,9 @@ TEST(StorageCommandsTest, RecordCreatesConfigAndInspectShowsTopicNameAndId) {
 
     out.str("");
     err.str("");
-    EXPECT_EQ(RunStorageCommand({"record", root.string(), "--validate-only",
-                                 "--recording-id", "11", "--topic",
-                                 "10:camera.front"},
+    EXPECT_EQ(RunStorageCommand({"record", "create", root.string(),
+                                 "--validate-only", "--recording-id", "11",
+                                 "--topic", "10:camera.front"},
                                 out, err),
               kStorageExitSuccess)
         << err.str();
@@ -258,7 +306,9 @@ TEST(StorageCommandsTest, VerifyChecksManifestSchemaAndCorruption) {
     EXPECT_EQ(RunStorageCommand({"verify", fixture.segment.string()}, out, err),
               kStorageExitFailure);
 
-    std::vector<std::byte> damaged = SegmentBytes();
+    Result<TestArtifact> artifact = CompileArtifact();
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    std::vector<std::byte> damaged = SegmentBytes(artifact->identity);
     ASSERT_GT(damaged.size(), storage::kEncodedSegmentHeaderSize + 112);
     damaged[storage::kEncodedSegmentHeaderSize + 112] ^= std::byte{1};
     const std::filesystem::path standalone =
@@ -270,8 +320,24 @@ TEST(StorageCommandsTest, VerifyChecksManifestSchemaAndCorruption) {
               kStorageExitInvalidData);
 }
 
-TEST(StorageCommandsTest, RepairDryRunDoesNotModifyAndRepairTruncatesTail) {
-    std::vector<std::byte> incomplete = SegmentBytes();
+TEST(StorageCommandsTest, VerifyRejectsMalformedDescriptorArtifact) {
+    const SessionFixture fixture = CreateSession("bad_descriptor");
+    const std::array<std::byte, 8> invalid = {
+        std::byte{'M'}, std::byte{'I'}, std::byte{'N'}, std::byte{'O'},
+        std::byte{'D'}, std::byte{'S'}, std::byte{'C'}, std::byte{'2'},
+    };
+    WriteBytes(fixture.descriptor, invalid);
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(RunStorageCommand({"verify", fixture.segment.string()}, out, err),
+              kStorageExitInvalidData);
+    EXPECT_NE(err.str().find("descriptor artifact"), std::string::npos);
+}
+
+TEST(StorageCommandsTest, RepairDefaultsDryRunAndRequiresApplyToModify) {
+    Result<TestArtifact> artifact = CompileArtifact();
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    std::vector<std::byte> incomplete = SegmentBytes(artifact->identity);
     ASSERT_GT(incomplete.size(), storage::kEncodedSegmentHeaderSize + 1);
     incomplete.resize(incomplete.size() - 1);
     const std::filesystem::path path =
@@ -281,20 +347,98 @@ TEST(StorageCommandsTest, RepairDryRunDoesNotModifyAndRepairTruncatesTail) {
 
     std::ostringstream out;
     std::ostringstream err;
-    EXPECT_EQ(RunStorageCommand({"repair", path.string(), "--dry-run"}, out,
-                                err),
+    EXPECT_EQ(RunStorageCommand({"repair", path.string()}, out, err),
               kStorageExitInvalidData)
         << err.str();
+    EXPECT_EQ(std::filesystem::file_size(path), before);
+    EXPECT_NE(out.str().find("mode=dry-run"), std::string::npos);
+    EXPECT_NE(out.str().find("modified=false"), std::string::npos);
+
+    out.str("");
+    err.str("");
+    EXPECT_EQ(RunStorageCommand({"repair", path.string(), "--apply"}, out, err),
+              kStorageExitPermissionDenied);
     EXPECT_EQ(std::filesystem::file_size(path), before);
 
     out.str("");
     err.str("");
-    EXPECT_EQ(RunStorageCommand({"repair", path.string()}, out, err),
+    EXPECT_EQ(RunStorageCommand({"repair", path.string(), "--apply",
+                                 "--standalone"},
+                                out, err),
               kStorageExitSuccess)
         << err.str();
     EXPECT_EQ(std::filesystem::file_size(path),
               storage::kEncodedSegmentHeaderSize);
     EXPECT_NE(out.str().find("repaired=true"), std::string::npos);
+    EXPECT_NE(out.str().find("mode=apply-standalone"), std::string::npos);
+    EXPECT_NE(out.str().find("modified=true"), std::string::npos);
+}
+
+TEST(StorageCommandsTest, RepairApplyRequiresExclusiveOwnershipLock) {
+    Result<TestArtifact> artifact = CompileArtifact();
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    std::vector<std::byte> incomplete = SegmentBytes(artifact->identity);
+    incomplete.resize(incomplete.size() - 1);
+    const std::filesystem::path path =
+        TestDirectory("repair_lock") / "incomplete.mino";
+    WriteBytes(path, incomplete);
+    const uint64_t before = std::filesystem::file_size(path);
+    const std::filesystem::path lock_path =
+        std::filesystem::path(path.string() + ".repair.owner.lock");
+    const int lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0600);
+    ASSERT_GE(lock_fd, 0);
+    ASSERT_EQ(::flock(lock_fd, LOCK_EX | LOCK_NB), 0);
+
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(RunStorageCommand(
+                  {"repair", path.string(), "--apply", "--standalone"},
+                  out, err),
+              kStorageExitFailure);
+    EXPECT_EQ(std::filesystem::file_size(path), before);
+    static_cast<void>(::close(lock_fd));
+}
+
+TEST(StorageCommandsTest, RepairApplyRejectsHardLinkedStandaloneSegment) {
+    Result<TestArtifact> artifact = CompileArtifact();
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    std::vector<std::byte> incomplete = SegmentBytes(artifact->identity);
+    incomplete.resize(incomplete.size() - 1);
+    const std::filesystem::path directory = TestDirectory("repair_hard_link");
+    const std::filesystem::path path = directory / "incomplete.mino";
+    const std::filesystem::path alias = directory / "alias.mino";
+    WriteBytes(path, incomplete);
+    std::error_code link_error;
+    std::filesystem::create_hard_link(path, alias, link_error);
+    ASSERT_FALSE(link_error) << link_error.message();
+    const uint64_t before = std::filesystem::file_size(path);
+
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(RunStorageCommand(
+                  {"repair", path.string(), "--apply", "--standalone"},
+                  out, err),
+              kStorageExitPermissionDenied);
+    EXPECT_EQ(std::filesystem::file_size(path), before);
+    EXPECT_EQ(std::filesystem::file_size(alias), before);
+    EXPECT_NE(err.str().find("hard-linked"), std::string::npos);
+}
+
+TEST(StorageCommandsTest, RepairApplyRejectsSessionTrackedSegment) {
+    const SessionFixture fixture = CreateSession("tracked_repair");
+    ASSERT_TRUE(fixture.identity.has_value());
+    std::vector<std::byte> incomplete = SegmentBytes(*fixture.identity);
+    incomplete.resize(incomplete.size() - 1);
+    WriteBytes(fixture.segment, incomplete);
+    const uint64_t before = std::filesystem::file_size(fixture.segment);
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(RunStorageCommand({"repair", fixture.segment.string(), "--apply",
+                                 "--standalone"},
+                                out, err),
+              kStorageExitPermissionDenied);
+    EXPECT_EQ(std::filesystem::file_size(fixture.segment), before);
+    EXPECT_NE(err.str().find("SessionRecoveryCoordinator"), std::string::npos);
 }
 
 TEST(StorageCommandsTest, ReplayUsesAdapterFiltersAndRequiresLiveAuthorization) {
@@ -304,8 +448,9 @@ TEST(StorageCommandsTest, ReplayUsesAdapterFiltersAndRequiresLiveAuthorization) 
     std::ostringstream err;
     EXPECT_EQ(RunStorageCommand(
                   {"replay", fixture.root.string(), "--step", "--topic",
-                   "camera.front"},
-                  out, err, &adapter),
+                   "camera.front", "--segment", fixture.segment.string()},
+                  out, err,
+                  StorageCommandServices{.replay_adapter = &adapter}),
               kStorageExitSuccess)
         << err.str();
     EXPECT_EQ(adapter.published, 1u);
@@ -325,6 +470,66 @@ TEST(StorageCommandsTest, ReplayUsesAdapterFiltersAndRequiresLiveAuthorization) 
                                 out, err, &adapter),
               kStorageExitSuccess)
         << err.str();
+}
+
+TEST(StorageCommandsTest, ReplayStandaloneSegmentRequiresUnsafeAndForbidsLive) {
+    const SessionFixture fixture = CreateSession("standalone_replay");
+    const std::filesystem::path standalone =
+        TestDirectory("standalone_segment") / "outside.mino";
+    ASSERT_TRUE(fixture.identity.has_value());
+    WriteBytes(standalone, SegmentBytes(*fixture.identity));
+    std::ostringstream out;
+    std::ostringstream err;
+
+    EXPECT_EQ(RunStorageCommand({"replay", fixture.root.string(), "--segment",
+                                 standalone.string(), "--validate-only"},
+                                out, err),
+              kStorageExitPermissionDenied);
+
+    out.str("");
+    err.str("");
+    EXPECT_EQ(RunStorageCommand(
+                  {"replay", fixture.root.string(), "--segment",
+                   standalone.string(), "--unsafe-standalone-segment",
+                   "--validate-only"},
+                  out, err),
+              kStorageExitSuccess)
+        << err.str();
+
+    CapturingAdapter adapter;
+    out.str("");
+    err.str("");
+    EXPECT_EQ(RunStorageCommand(
+                  {"replay", fixture.root.string(), "--segment",
+                   standalone.string(), "--unsafe-standalone-segment", "--live",
+                   "--authorize-live"},
+                  out, err,
+                  StorageCommandServices{.replay_adapter = &adapter}),
+              kStorageExitPermissionDenied);
+    EXPECT_EQ(adapter.published, 0u);
+}
+
+TEST(StorageCommandsTest, RecordRunRequiresAndUsesInstalledServiceLauncher) {
+    const std::filesystem::path root = TestDirectory("record_run");
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(RunStorageCommand({"record", "run", root.string()}, out, err),
+              kStorageExitFailure);
+    EXPECT_NE(err.str().find("no RecorderService launcher is installed"),
+              std::string::npos);
+
+    CapturingRecorderLauncher launcher;
+    out.str("");
+    err.str("");
+    EXPECT_EQ(RunStorageCommand(
+                  {"record", "run", root.string()}, out, err,
+                  StorageCommandServices{
+                      .recorder_service_launcher = &launcher}),
+              kStorageExitSuccess)
+        << err.str();
+    EXPECT_EQ(launcher.calls, 1u);
+    EXPECT_EQ(launcher.root, root);
+    EXPECT_NE(out.str().find("recording service exited"), std::string::npos);
 }
 
 TEST(StorageCommandsTest, VerifyRejectsSymlinkedSchema) {

@@ -43,6 +43,9 @@ enum class FrameType : uint32_t {
     kAck = 3,
     kHeartbeat = 4,
     kSessionHello = 5,
+    // Consumed only by the connection owner before BridgePipeline is bound.
+    // Older codecs reject this unknown opcode, preserving fail-closed rollout.
+    kSessionDiscovery = 6,
 };
 
 enum class FrameFlag : uint16_t {

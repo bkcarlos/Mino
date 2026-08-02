@@ -4,8 +4,14 @@
 
 #include "mino/storage/topic_writer.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <new>
@@ -706,6 +712,11 @@ Status TopicWriter::EnsureSegmentLocked(uint64_t first_sequence,
         options_.partition_root / relative_path, header, now_ns,
         options_.segment_options);
     if (!created.ok()) return created.status();
+    // fdatasync on the Segment makes file contents durable but does not persist
+    // the new directory entry. No durable checkpoint or ACK may cross this
+    // boundary until the segments directory itself is synced.
+    status = SyncSegmentsDirectoryLocked();
+    if (!status.ok()) return status;
 
     entry.state = SegmentPersistentState::kOpen;
     status = partition_manifest_->UpdateSegment(entry);
@@ -719,6 +730,53 @@ Status TopicWriter::EnsureSegmentLocked(uint64_t first_sequence,
     next_segment_id_ =
         segment_id == std::numeric_limits<uint64_t>::max() ? 0
                                                            : segment_id + 1;
+    return Status::Ok();
+}
+
+Status TopicWriter::SyncSegmentsDirectoryLocked() {
+    const std::filesystem::path directory =
+        options_.partition_root / "segments";
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(directory.c_str(), flags);
+    if (fd < 0) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "cannot open TopicWriter segments directory: " +
+                std::string(std::strerror(errno)));
+    }
+    struct stat attributes {};
+    if (::fstat(fd, &attributes) != 0 || !S_ISDIR(attributes.st_mode)) {
+        const int saved_errno = errno;
+        static_cast<void>(::close(fd));
+        errno = saved_errno;
+        return Status::Error(StatusCode::kUnavailable,
+                             "TopicWriter segments path changed type");
+    }
+    int result = 0;
+    do {
+        result = options_.directory_sync_hook == nullptr
+                     ? ::fsync(fd)
+                     : options_.directory_sync_hook(
+                           fd, options_.directory_sync_context);
+    } while (result != 0 && errno == EINTR);
+    const int saved_errno = errno;
+    static_cast<void>(::close(fd));
+    errno = saved_errno;
+    if (result != 0) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "cannot fsync TopicWriter segments directory: " +
+                std::string(std::strerror(errno)));
+    }
     return Status::Ok();
 }
 

@@ -36,6 +36,7 @@ cc_library(
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/platform:process_identity",
     ],
 )
 
@@ -62,6 +63,19 @@ cc_library(
         ":wire_frame",
         "//mino/common:result",
         "//mino/registry:registry",
+        "//mino/transport:transport_driver",
+    ],
+)
+
+cc_library(
+    name = "bridge_connection_manager",
+    srcs = ["bridge_runtime/connection_manager.cc"],
+    hdrs = ["bridge_runtime/connection_manager.h"],
+    deps = [
+        ":bridge_pipeline",
+        "//mino/common:result",
+        "//mino/runtime:bus",
+        "//mino/schema:canonical",
         "//mino/transport:transport_driver",
     ],
 )
@@ -97,6 +111,30 @@ cc_test(
         "//mino/schema:canonical",
         "//mino/schema:compiler",
         "//mino/schema:dynamic_value",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "listener_hub_test",
+    srcs = ["listener_hub_test.cc"],
+    deps = [
+        ":bridge_connection_manager",
+        "//mino/transport:tcp_driver",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "connection_manager_test",
+    srcs = ["connection_manager_test.cc"],
+    deps = [
+        ":bridge_connection_manager",
+        "//mino/registry:registry",
+        "//mino/runtime:bus",
+        "//mino/schema:canonical",
+        "//mino/transport:tcp_driver",
+        "//mino/transport:transport_switcher",
         "@googletest//:gtest_main",
     ],
 )

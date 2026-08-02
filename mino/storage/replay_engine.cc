@@ -257,6 +257,19 @@ SegmentReplayReader::~SegmentReplayReader() {
 
 Result<std::unique_ptr<SegmentReplayReader>> SegmentReplayReader::Open(
     const std::filesystem::path& path, const SegmentFormatLimits& limits) {
+    return OpenImpl(path, limits, nullptr, nullptr);
+}
+
+Result<std::unique_ptr<SegmentReplayReader>>
+SegmentReplayReader::OpenForTesting(
+    const std::filesystem::path& path, const SegmentFormatLimits& limits,
+    PostScanHookForTesting post_scan_hook, void* hook_context) {
+    return OpenImpl(path, limits, post_scan_hook, hook_context);
+}
+
+Result<std::unique_ptr<SegmentReplayReader>> SegmentReplayReader::OpenImpl(
+    const std::filesystem::path& path, const SegmentFormatLimits& limits,
+    PostScanHookForTesting post_scan_hook, void* hook_context) {
     try {
         SegmentRecoveryOptions recovery_options;
         recovery_options.format_limits = limits;
@@ -269,6 +282,10 @@ Result<std::unique_ptr<SegmentReplayReader>> SegmentReplayReader::Open(
         }
         if (!scanned->metadata_is_complete) {
             return Corruption("replay requires complete segment metadata");
+        }
+        if (post_scan_hook != nullptr) {
+            const Status hooked = post_scan_hook(path, hook_context);
+            if (!hooked.ok()) return hooked;
         }
 
         const int fd = ::open(path.c_str(), ReadOnlyFlags());
@@ -284,6 +301,14 @@ Result<std::unique_ptr<SegmentReplayReader>> SegmentReplayReader::Open(
             const Status status = IoError("cannot stat replay segment", path);
             static_cast<void>(::close(fd));
             return status;
+        }
+        if (!S_ISREG(attributes.st_mode) ||
+            static_cast<uint64_t>(attributes.st_dev) != scanned->file_device ||
+            static_cast<uint64_t>(attributes.st_ino) != scanned->file_inode) {
+            static_cast<void>(::close(fd));
+            return Status::Error(
+                StatusCode::kUnavailable,
+                "replay segment device/inode changed after validation");
         }
         if (attributes.st_size < 0 ||
             static_cast<uint64_t>(attributes.st_size) != scanned->file_size) {
@@ -482,6 +507,11 @@ struct ReplayEngine::Impl {
 
     Result<bool> ReplayOne() {
         if (terminal_error.has_value()) return *terminal_error;
+        if (publisher == nullptr) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "no normal replay publisher adapter is installed");
+        }
         if (ready.empty()) return false;
 
         const Candidate& candidate = ready.top();
@@ -543,8 +573,9 @@ struct ReplayEngine::Impl {
         ready.pop();
         const Status primed = PrimeStream(stream_index);
         if (!primed.ok()) {
+            // Publish already crossed the external side-effect boundary. Report
+            // that success now and surface prefetch damage on the next advance.
             terminal_error = primed;
-            return *terminal_error;
         }
         return true;
     }
@@ -561,7 +592,6 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
     ReplayOptions options, ReplaySchemaResolver* schema_resolver,
     ReplayClock* clock, ReplaySleeper* sleeper) {
     try {
-        if (publisher == nullptr) return Invalid("replay publisher is null");
         if (!std::isfinite(options.playback.speed) ||
             options.playback.speed <= 0.0) {
             return Invalid("replay speed must be finite and greater than zero");
@@ -718,6 +748,20 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
     } catch (const std::length_error&) {
         return Exhausted("replay engine input is too large");
     }
+}
+
+Status ReplayEngine::InstallPublisherAdapter(
+    ReplayPublisherAdapter* publisher) noexcept {
+    if (publisher == nullptr) return Invalid("replay publisher is null");
+    if (published_records_ != 0 || impl_->schedule_started) {
+        return Invalid("replay publisher cannot change after playback starts");
+    }
+    impl_->publisher = publisher;
+    return Status::Ok();
+}
+
+bool ReplayEngine::has_publisher_adapter() const noexcept {
+    return impl_->publisher != nullptr;
 }
 
 Result<size_t> ReplayEngine::Run() {

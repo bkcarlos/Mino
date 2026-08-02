@@ -5,6 +5,7 @@
 #include "tools/mino/storage_commands.h"
 
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -20,6 +21,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -33,6 +35,7 @@
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/schema/codegen/artifact_codec.h"
 #include "mino/storage/recording_manifest.h"
 #include "mino/storage/segment_recovery.h"
 
@@ -110,12 +113,20 @@ int ReadFlags() noexcept {
 
 class ScopedFd final {
 public:
-    explicit ScopedFd(int fd) noexcept : fd_(fd) {}
+    explicit ScopedFd(int fd = -1) noexcept : fd_(fd) {}
     ~ScopedFd() {
         if (fd_ >= 0) static_cast<void>(::close(fd_));
     }
     ScopedFd(const ScopedFd&) = delete;
     ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this == &other) return *this;
+        if (fd_ >= 0) static_cast<void>(::close(fd_));
+        fd_ = std::exchange(other.fd_, -1);
+        return *this;
+    }
 
     int get() const noexcept { return fd_; }
 
@@ -123,8 +134,83 @@ private:
     int fd_ = -1;
 };
 
+Result<ScopedFd> AcquireDestructiveRepairLock(
+    const std::filesystem::path& segment_path) {
+    const std::filesystem::path lock_path =
+        std::filesystem::path(segment_path.string() + ".repair.owner.lock");
+    int flags = O_RDWR | O_CREAT;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(lock_path.c_str(), flags, 0600);
+    if (fd < 0) return IoStatus("cannot open destructive repair lock", lock_path);
+    ScopedFd lock(fd);
+    struct stat attributes {};
+    if (::fstat(fd, &attributes) != 0 || !S_ISREG(attributes.st_mode)) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "destructive repair lock is not a regular file");
+    }
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "segment already has a destructive repair owner");
+        }
+        return IoStatus("cannot acquire destructive repair lock", lock_path);
+    }
+    return lock;
+}
+
+Status ValidateScannedIdentity(const std::filesystem::path& path,
+                               const SegmentRecoveryReport& report) {
+    struct stat attributes {};
+    if (::lstat(path.c_str(), &attributes) != 0) {
+        return IoStatus("cannot revalidate segment identity", path);
+    }
+    if (!S_ISREG(attributes.st_mode) ||
+        static_cast<uint64_t>(attributes.st_dev) != report.file_device ||
+        static_cast<uint64_t>(attributes.st_ino) != report.file_inode) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "segment inode/device changed after validation");
+    }
+    return Status::Ok();
+}
+
+Status ValidateNoSymlinkAncestors(const std::filesystem::path& path,
+                                  bool final_must_be_regular) {
+    if (!IsBoundedPath(path)) return Invalid("path is empty or too long");
+    std::error_code error;
+    const std::filesystem::path absolute =
+        std::filesystem::absolute(path, error).lexically_normal();
+    if (error || absolute.empty()) return Invalid("path cannot be made absolute");
+    std::filesystem::path current = absolute.root_path();
+    for (const std::filesystem::path& component : absolute.relative_path()) {
+        current /= component;
+        struct stat info {};
+        if (::lstat(current.c_str(), &info) != 0) {
+            return IoStatus("cannot inspect path", current);
+        }
+        if (S_ISLNK(info.st_mode)) {
+            return Status::Error(StatusCode::kPermissionDenied,
+                                 "path traverses a symbolic link");
+        }
+    }
+    struct stat final_info {};
+    if (::lstat(absolute.c_str(), &final_info) != 0) {
+        return IoStatus("cannot inspect path", absolute);
+    }
+    if (final_must_be_regular && !S_ISREG(final_info.st_mode)) {
+        return Invalid("path is not a regular file");
+    }
+    return Status::Ok();
+}
+
 Status ValidateDirectory(const std::filesystem::path& path) {
     if (!IsBoundedPath(path)) return Invalid("path is empty or too long");
+    MINO_RETURN_IF_ERROR(ValidateNoSymlinkAncestors(path, false));
     struct stat info {};
     if (::lstat(path.c_str(), &info) != 0) {
         return IoStatus("cannot inspect directory", path);
@@ -297,15 +383,65 @@ Result<uint32_t> PartitionDirectoryId(std::string_view name) {
 }
 
 Status ValidateDescriptorFiles(const LoadedSession& session) {
+    std::map<uint32_t, storage::SchemaRefSnapshot> refs;
+    std::map<std::filesystem::path,
+             std::vector<const storage::SchemaRefSnapshot*>> by_artifact;
     for (const storage::TopicTableEntry& topic : session.manifest.topics) {
         for (const storage::SchemaRefSnapshot& schema : topic.schema_snapshot) {
+            if (schema.schema_ref == 0) {
+                return Corruption("schema snapshot uses reserved ref zero");
+            }
+            const auto [known, inserted] = refs.emplace(schema.schema_ref, schema);
+            if (!inserted && known->second != schema) {
+                return Corruption(
+                    "session schema ref maps to multiple descriptor identities");
+            }
             const Status safe_path = ValidatePathBelowRoot(
                 session.root, schema.descriptor_path, true, false);
             if (!safe_path.ok()) return safe_path;
-            Result<std::vector<std::byte>> descriptor = ReadRegularFile(
-                session.root / schema.descriptor_path, 16u * 1024u * 1024u);
-            if (!descriptor.ok()) return descriptor.status();
-            if (descriptor->empty()) return Corruption("schema descriptor is empty");
+            by_artifact[schema.descriptor_path].push_back(&schema);
+        }
+    }
+
+    for (const auto& [relative_path, expected] : by_artifact) {
+        Result<std::vector<std::byte>> descriptor = ReadRegularFile(
+            session.root / relative_path, 16u * 1024u * 1024u);
+        if (!descriptor.ok()) return descriptor.status();
+        const std::string_view bytes(
+            reinterpret_cast<const char*>(descriptor->data()),
+            descriptor->size());
+        Result<schema::codegen::DecodedDescriptorArtifact> decoded =
+            schema::codegen::DecodeAndValidate(bytes);
+        if (!decoded.ok()) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "schema descriptor artifact is invalid: " +
+                                     decoded.status().ToString());
+        }
+        if (decoded->version != schema::codegen::kDescriptorArtifactVersion) {
+            return Corruption("schema descriptor artifact version is unsupported");
+        }
+        for (const storage::SchemaRefSnapshot* snapshot : expected) {
+            const bool matched = std::any_of(
+                decoded->types.begin(), decoded->types.end(),
+                [snapshot](const schema::codegen::DecodedTypeArtifact& type) {
+                    if (type.descriptor == nullptr) return false;
+                    const schema::SchemaIdentity& identity =
+                        type.descriptor->identity();
+                    return identity.canonical_digest() ==
+                               snapshot->canonical_digest &&
+                           identity.schema_version() ==
+                               snapshot->schema_version &&
+                           identity.layout_version() ==
+                               snapshot->layout_version &&
+                           type.layout.layout_version ==
+                               snapshot->layout_version;
+                });
+            if (!matched) {
+                return Status::Error(
+                    StatusCode::kSchemaMismatch,
+                    "descriptor artifact digest/version/layout does not match schema ref " +
+                        std::to_string(snapshot->schema_ref));
+            }
         }
     }
     return Status::Ok();
@@ -370,8 +506,11 @@ Result<LoadedSession> LoadSession(const std::filesystem::path& root,
             if (!partition.ok()) return partition.status();
             if (partition->partition.recording_id !=
                     session.manifest.session.recording_id ||
+                partition->partition.owner_epoch !=
+                    session.manifest.session.owner_epoch ||
                 partition->partition.topic_id != topic.topic_id ||
-                partition->partition.partition_id != *directory_id) {
+                partition->partition.partition_id != *directory_id ||
+                partition->partition.config_version > topic.config_version) {
                 return Corruption(
                     "partition manifest identity differs from its session path");
             }
@@ -591,9 +730,10 @@ Status ValidateAgainstSession(const std::filesystem::path& segment_path,
         return Corruption("segment writer differs from partition manifest");
     }
     if (!is_snapshot &&
-        tracked->first_ingestion_sequence !=
-            initial.segment_header.first_ingestion_sequence) {
-        return Corruption("segment first sequence differs from partition manifest");
+        (tracked->first_ingestion_sequence !=
+             initial.segment_header.first_ingestion_sequence ||
+         tracked->created_at_ns != initial.segment_header.created_at_ns)) {
+        return Corruption("segment header differs from partition manifest");
     }
 
     const std::filesystem::path relative_path =
@@ -612,6 +752,15 @@ Status ValidateAgainstSession(const std::filesystem::path& segment_path,
     Result<SegmentRecoveryReport> rescanned =
         storage::ScanSegment(segment_path, options);
     if (!rescanned.ok()) return rescanned.status();
+    if (!is_snapshot && rescanned->clean() &&
+        tracked->state != storage::SegmentPersistentState::kCreating &&
+        tracked->state != storage::SegmentPersistentState::kOpen &&
+        (tracked->size_bytes != rescanned->file_size ||
+         !rescanned->has_last_complete_sequence ||
+         tracked->last_ingestion_sequence !=
+             rescanned->last_complete_sequence)) {
+        return Corruption("sealed segment progress differs from manifest");
+    }
     for (const storage::SegmentRecordOffset& record : rescanned->records) {
         if ((record.flags & storage::kRecordFlagGap) != 0) continue;
         const auto schema = std::find_if(
@@ -705,12 +854,24 @@ int CmdVerify(const std::vector<std::string>& args, std::ostream& out,
 
 int CmdRepair(const std::vector<std::string>& args, std::ostream& out,
               std::ostream& err) {
-    bool dry_run = false;
+    bool apply = false;
+    bool explicit_dry_run = false;
+    bool standalone = false;
     std::optional<std::filesystem::path> path;
     for (size_t index = 1; index < args.size(); ++index) {
-        if (args[index] == "--dry-run") {
-            if (dry_run) return Fail("repair", Invalid("duplicate --dry-run"), err);
-            dry_run = true;
+        if (args[index] == "--apply") {
+            if (apply) return Fail("repair", Invalid("duplicate --apply"), err);
+            apply = true;
+        } else if (args[index] == "--dry-run") {
+            if (explicit_dry_run) {
+                return Fail("repair", Invalid("duplicate --dry-run"), err);
+            }
+            explicit_dry_run = true;
+        } else if (args[index] == "--standalone") {
+            if (standalone) {
+                return Fail("repair", Invalid("duplicate --standalone"), err);
+            }
+            standalone = true;
         } else if (!args[index].empty() && args[index].front() == '-') {
             return Fail("repair", Invalid("unknown flag: " + args[index]), err);
         } else if (path.has_value()) {
@@ -719,15 +880,78 @@ int CmdRepair(const std::vector<std::string>& args, std::ostream& out,
             path = args[index];
         }
     }
+    if (apply && explicit_dry_run) {
+        return Fail("repair", Invalid("--apply conflicts with --dry-run"), err);
+    }
     if (!path.has_value()) {
         return Fail("repair",
-                    Invalid("usage: storage repair <segment> [--dry-run]"), err);
+                    Invalid("usage: storage repair <segment> [--apply --standalone]"),
+                    err);
     }
-    Result<SegmentRecoveryReport> report =
-        dry_run ? storage::ScanSegment(*path) : storage::RepairSegment(*path);
+    if (standalone && !apply) {
+        return Fail("repair", Invalid("--standalone requires --apply"), err);
+    }
+    const Status safe_path = ValidateNoSymlinkAncestors(*path, true);
+    if (!safe_path.ok()) return Fail("repair", safe_path, err);
+    const std::optional<std::filesystem::path> session_root =
+        InferSessionRoot(*path);
+    if (apply && session_root.has_value()) {
+        return Fail(
+            "repair",
+            Status::Error(
+                StatusCode::kPermissionDenied,
+                "session-shaped/tracked segments must be repaired by SessionRecoveryCoordinator"),
+            err);
+    }
+    if (apply && !standalone) {
+        return Fail(
+            "repair",
+            Status::Error(
+                StatusCode::kPermissionDenied,
+                "destructive standalone repair requires explicit --standalone"),
+            err);
+    }
+
+    std::optional<ScopedFd> repair_lock;
+    if (apply) {
+        Result<ScopedFd> acquired = AcquireDestructiveRepairLock(*path);
+        if (!acquired.ok()) return Fail("repair", acquired.status(), err);
+        repair_lock.emplace(std::move(*acquired));
+    }
+
+    const uintmax_t before_size = std::filesystem::file_size(*path);
+    Result<SegmentRecoveryReport> initial = storage::ScanSegment(*path);
+    if (!initial.ok()) return Fail("repair", initial.status(), err);
+    SegmentRecoveryReport validated;
+    if (!apply) {
+        const Status cross_checked =
+            ValidateAgainstSession(*path, *initial, &validated);
+        if (!cross_checked.ok()) return Fail("repair", cross_checked, err);
+    } else {
+        validated = *initial;
+    }
+    Result<SegmentRecoveryReport> report = validated;
+    if (apply) {
+        const Status same_inode = ValidateScannedIdentity(*path, *initial);
+        if (!same_inode.ok()) return Fail("repair", same_inode, err);
+        storage::SegmentRepairOptions repair_options;
+        repair_options.expected_device = initial->file_device;
+        repair_options.expected_inode = initial->file_inode;
+        repair_options.require_single_link = true;
+        report = storage::RepairSegment(*path, {}, repair_options);
+    }
     if (!report.ok()) return Fail("repair", report.status(), err);
     PrintSegmentReport(*path, *report, out);
-    if (dry_run && !report->clean()) return kStorageExitInvalidData;
+    const uintmax_t after_size = std::filesystem::file_size(*path);
+    out << "audit: command=storage-repair mode="
+        << (apply ? "apply-standalone" : "dry-run")
+        << " path=" << path->string()
+        << " before_bytes=" << before_size
+        << " after_bytes=" << after_size
+        << " modified=" << (before_size != after_size ? "true" : "false")
+        << " repairable=" << (report->repairable() ? "true" : "false")
+        << '\n';
+    if (!apply && !report->clean()) return kStorageExitInvalidData;
     return kStorageExitSuccess;
 }
 
@@ -748,14 +972,6 @@ std::vector<std::filesystem::path> TrackedSegments(
     return result;
 }
 
-class ValidationOnlyPublisher final : public storage::ReplayPublisherAdapter {
-public:
-    Status Publish(const storage::ReplayPublishRequest&) noexcept override {
-        return Status::Error(StatusCode::kInternal,
-                             "validate-only replay attempted to publish");
-    }
-};
-
 int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
               std::ostream& err,
               storage::ReplayPublisherAdapter* replay_adapter) {
@@ -766,6 +982,8 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
     storage::ReplayOptions options;
     bool validate_only = false;
     bool step = false;
+    bool explicit_segments = false;
+    bool unsafe_standalone_segment = false;
     std::vector<std::filesystem::path> segment_paths;
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
@@ -778,9 +996,12 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
             options.publish_target = storage::ReplayPublishTarget::kLive;
         } else if (flag == "--authorize-live") {
             options.live_injection_authorized = true;
+        } else if (flag == "--unsafe-standalone-segment") {
+            unsafe_standalone_segment = true;
         } else if (flag == "--segment") {
             Result<std::string_view> value = FlagValue(args, &index);
             if (!value.ok()) return Fail("replay", value.status(), err);
+            explicit_segments = true;
             segment_paths.emplace_back(*value);
         } else if (flag == "--topic") {
             Result<std::string_view> value = FlagValue(args, &index);
@@ -847,9 +1068,58 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
     }
     Result<LoadedSession> session = LoadSession(session_root, true);
     if (!session.ok()) return Fail("replay", session.status(), err);
-    if (segment_paths.empty()) segment_paths = TrackedSegments(*session);
+    if (unsafe_standalone_segment && !explicit_segments) {
+        return Fail("replay",
+                    Invalid("--unsafe-standalone-segment requires --segment"),
+                    err);
+    }
+    if (unsafe_standalone_segment &&
+        options.publish_target == storage::ReplayPublishTarget::kLive) {
+        return Fail(
+            "replay",
+            Status::Error(
+                StatusCode::kPermissionDenied,
+                "unsafe standalone segments may not be injected into live"),
+            err);
+    }
+    const std::vector<std::filesystem::path> tracked_segments =
+        TrackedSegments(*session);
+    if (segment_paths.empty()) segment_paths = tracked_segments;
     if (segment_paths.size() > kMaximumSegments) {
         return Fail("replay", Invalid("session has too many segments"), err);
+    }
+    for (const std::filesystem::path& path : segment_paths) {
+        const Status safe_path = ValidateNoSymlinkAncestors(path, true);
+        if (!safe_path.ok()) return Fail("replay", safe_path, err);
+        if (!unsafe_standalone_segment && explicit_segments) {
+            const std::filesystem::path selected =
+                std::filesystem::absolute(path).lexically_normal();
+            const bool tracked = std::any_of(
+                tracked_segments.begin(), tracked_segments.end(),
+                [&selected](const std::filesystem::path& candidate) {
+                    return std::filesystem::absolute(candidate).lexically_normal() ==
+                           selected;
+                });
+            if (!tracked) {
+                return Fail(
+                    "replay",
+                    Status::Error(
+                        StatusCode::kPermissionDenied,
+                        "--segment is not a tracked non-deleted manifest entry"),
+                    err);
+            }
+        }
+        // Default replay is not a weaker path: every tracked Segment (including
+        // snapshots) is rescanned with the session's schema refs and checked
+        // against its exact partition-manifest entry before ReplayEngine opens it.
+        if (!unsafe_standalone_segment) {
+            Result<SegmentRecoveryReport> scanned = storage::ScanSegment(path);
+            if (!scanned.ok()) return Fail("replay", scanned.status(), err);
+            SegmentRecoveryReport validated;
+            const Status cross_checked =
+                ValidateAgainstSession(path, *scanned, &validated);
+            if (!cross_checked.ok()) return Fail("replay", cross_checked, err);
+        }
     }
     if (replay_adapter == nullptr && !validate_only) {
         return Fail(
@@ -859,18 +1129,17 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
             err);
     }
 
-    ValidationOnlyPublisher validation_publisher;
-    storage::ReplayPublisherAdapter* publisher =
-        replay_adapter == nullptr ? &validation_publisher : replay_adapter;
     Result<std::unique_ptr<storage::ReplayEngine>> engine =
-        storage::ReplayEngine::Create(segment_paths, session->manifest, publisher,
-                                      options);
+        storage::ReplayEngine::Create(segment_paths, session->manifest, options);
     if (!engine.ok()) return Fail("replay", engine.status(), err);
     if (validate_only) {
         out << "replay validated: segments=" << segment_paths.size()
             << " topics=" << session->manifest.topics.size() << '\n';
         return kStorageExitSuccess;
     }
+    const Status installed =
+        (*engine)->InstallPublisherAdapter(replay_adapter);
+    if (!installed.ok()) return Fail("replay", installed, err);
 
     size_t published = 0;
     if (step) {
@@ -931,11 +1200,32 @@ Status CreateDirectoryTree(const std::filesystem::path& path) {
 }
 
 int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
-              std::ostream& err) {
-    if (args.size() < 2) {
-        return Fail("record", Invalid("record requires <session_root>"), err);
+              std::ostream& err,
+              RecorderServiceLauncher* service_launcher) {
+    if (args.size() < 3 || (args[1] != "create" && args[1] != "run")) {
+        return Fail("record",
+                    Invalid("usage: record <create|run> <session_root> ..."),
+                    err);
     }
-    const std::filesystem::path root(args[1]);
+    const std::filesystem::path root(args[2]);
+    if (args[1] == "run") {
+        if (args.size() != 3) {
+            return Fail("record", Invalid("record run accepts only <session_root>"),
+                        err);
+        }
+        if (service_launcher == nullptr) {
+            return Fail(
+                "record",
+                Status::Error(
+                    StatusCode::kUnsupported,
+                    "no RecorderService launcher is installed; D4 Bus assembly is required"),
+                err);
+        }
+        const Status started = service_launcher->Run(root);
+        if (!started.ok()) return Fail("record", started, err);
+        out << "recording service exited: " << root.string() << '\n';
+        return kStorageExitSuccess;
+    }
     std::optional<uint64_t> recording_id;
     std::optional<uint64_t> owner_id;
     std::optional<uint64_t> owner_epoch;
@@ -946,7 +1236,7 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
     bool validate_only = false;
     std::vector<RecordTopic> topics;
 
-    for (size_t index = 2; index < args.size(); ++index) {
+    for (size_t index = 3; index < args.size(); ++index) {
         const std::string& flag = args[index];
         if (flag == "--validate-only") {
             validate_only = true;
@@ -1099,7 +1389,8 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
     }
     out << "recording session created: " << root.string()
         << " recording_id=" << *recording_id << " topics=" << topics.size()
-        << " partitions=" << topics.size() * partition_count << '\n';
+        << " partitions=" << topics.size() * partition_count
+        << " service_state=not-started\n";
     return kStorageExitSuccess;
 }
 
@@ -1107,17 +1398,19 @@ void PrintStorageUsage(std::ostream& err) {
     err << "storage commands:\n"
            "  storage inspect <session_root>\n"
            "  storage verify <segment> [<segment> ...]\n"
-           "  storage repair <segment> [--dry-run]\n"
-           "  replay <session_root> [--validate-only] [--topic <name|id>] ...\n"
-           "  record <session_root> --recording-id N --owner-id N "
-           "--owner-epoch N --config-version N --topic <id>:<name> ...\n";
+           "  storage repair <segment> [--apply --standalone]\n"
+           "  replay <session_root> [--validate-only] [--topic <name|id>] "
+           "[--segment <tracked>] ...\n"
+           "  record create <session_root> --recording-id N --owner-id N "
+           "--owner-epoch N --config-version N --topic <id>:<name> ...\n"
+           "  record run <session_root>\n";
 }
 
 }  // namespace
 
 int RunStorageCommand(const std::vector<std::string>& args, std::ostream& out,
                       std::ostream& err,
-                      storage::ReplayPublisherAdapter* replay_adapter) {
+                      const StorageCommandServices& services) {
     try {
         if (args.empty()) {
             PrintStorageUsage(err);
@@ -1134,9 +1427,12 @@ int RunStorageCommand(const std::vector<std::string>& args, std::ostream& out,
         if (args[0] == "verify") return CmdVerify(args, out, err);
         if (args[0] == "repair") return CmdRepair(args, out, err);
         if (args[0] == "replay") {
-            return CmdReplay(args, out, err, replay_adapter);
+            return CmdReplay(args, out, err, services.replay_adapter);
         }
-        if (args[0] == "record") return CmdRecord(args, out, err);
+        if (args[0] == "record") {
+            return CmdRecord(args, out, err,
+                             services.recorder_service_launcher);
+        }
         PrintStorageUsage(err);
         return Fail(args[0], Invalid("unknown storage command"), err);
     } catch (const std::bad_alloc&) {
@@ -1151,6 +1447,14 @@ int RunStorageCommand(const std::vector<std::string>& args, std::ostream& out,
         return Fail(args.empty() ? "command" : args.front(),
                     Status::Error(StatusCode::kInternal, error.what()), err);
     }
+}
+
+int RunStorageCommand(const std::vector<std::string>& args, std::ostream& out,
+                      std::ostream& err,
+                      storage::ReplayPublisherAdapter* replay_adapter) {
+    return RunStorageCommand(
+        args, out, err,
+        StorageCommandServices{.replay_adapter = replay_adapter});
 }
 
 }  // namespace mino::tools

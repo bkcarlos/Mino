@@ -87,6 +87,8 @@ using TopicWriterAckCallback =
 using TopicWriterSchemaResolver =
     Result<SchemaRef> (*)(const RecorderSchemaMetadata& schema,
                          void* context) noexcept;
+using TopicWriterDirectorySyncHook =
+    int (*)(int directory_fd, void* context) noexcept;
 
 struct TopicWriterOptions {
     std::filesystem::path partition_root;
@@ -99,6 +101,10 @@ struct TopicWriterOptions {
     // partition). A non-zero value must be strictly after all tracked segments.
     uint64_t initial_ingestion_sequence = 0;
     SegmentWriterOptions segment_options{};
+    // Test/platform seam for the mandatory segments-directory fsync after a new
+    // Segment entry is created and before any durable checkpoint/ACK is exposed.
+    TopicWriterDirectorySyncHook directory_sync_hook = nullptr;
+    void* directory_sync_context = nullptr;
 
     // Stop normally owns queue shutdown and drains all committed records. Set
     // false only when a higher-level owner shares the pool lifetime.
@@ -197,6 +203,7 @@ private:
                               TopicWriterPumpResult* result,
                               std::vector<TopicWriterAck>* callbacks);
     Status EnsureSegmentLocked(uint64_t first_sequence, uint64_t now_ns);
+    Status SyncSegmentsDirectoryLocked();
     Status FlushCurrentLocked(uint64_t now_ns,
                               std::vector<TopicWriterAck>* callbacks);
     Status SealCurrentLocked(uint64_t now_ns,

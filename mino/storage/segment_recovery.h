@@ -91,6 +91,10 @@ enum class SegmentRecoveryReason : uint8_t {
 struct SegmentRecoveryReport {
     SegmentHeader segment_header{};
     uint64_t file_size = 0;
+    // Identity of the exact inode scanned. Destructive callers feed these back
+    // through SegmentRepairOptions to fail closed on path replacement/TOCTOU.
+    uint64_t file_device = 0;
+    uint64_t file_inode = 0;
 
     // scan_start_offset is the effective start after checkpoint validation.
     // records contains metadata from this offset onward. metadata_is_complete
@@ -145,6 +149,12 @@ enum class SegmentRecoverySyncMode : uint8_t {
 
 struct SegmentRepairOptions {
     SegmentRecoverySyncMode sync_mode = SegmentRecoverySyncMode::kDataOnly;
+    std::optional<uint64_t> expected_device;
+    std::optional<uint64_t> expected_inode;
+    // Destructive standalone repair must reject files reachable through any
+    // hard-link alias. This is checked on the opened target fd before and after
+    // mutation together with expected_device/expected_inode.
+    bool require_single_link = false;
     SegmentTruncateHook truncate_hook = nullptr;
     SegmentRecoverySyncHook sync_hook = nullptr;
     void* io_hook_context = nullptr;
