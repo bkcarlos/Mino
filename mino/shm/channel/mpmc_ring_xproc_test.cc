@@ -241,7 +241,7 @@ TEST_F(MpmcRingXprocTest, ConservationAcrossProcessesNoLossNoDuplication) {
                 << " lost or duplicated";
         }
     }
-    EXPECT_TRUE(ring_.IsEmpty());
+    EXPECT_TRUE(ring_.IsEmpty().value());
 }
 
 // With no consumer running, a producer process fills the ring and the next
@@ -273,7 +273,7 @@ TEST_F(MpmcRingXprocTest, FullRefusesEnqueueAcrossProcessesThenDrains) {
         }
         shared_->probe_code.store(static_cast<int>(blocked.status().code()),
                                   std::memory_order_release);
-        shared_->probe_snapshot.store(ring->IsFull() ? 1 : 0,
+        shared_->probe_snapshot.store(ring->IsFull().value() ? 1 : 0,
                                       std::memory_order_release);
         _exit(kChildOk);
     }
@@ -281,7 +281,7 @@ TEST_F(MpmcRingXprocTest, FullRefusesEnqueueAcrossProcessesThenDrains) {
     EXPECT_EQ(shared_->probe_code.load(std::memory_order_acquire),
               static_cast<int>(StatusCode::kResourceExhausted));
     EXPECT_EQ(shared_->probe_snapshot.load(std::memory_order_acquire), 1);
-    EXPECT_TRUE(ring_.IsFull());
+    EXPECT_TRUE(ring_.IsFull().value());
 
     // Phase 2: a consumer process drains exactly one slot. The first
     // committed message must come back first (FIFO over positions).
@@ -308,7 +308,7 @@ TEST_F(MpmcRingXprocTest, FullRefusesEnqueueAcrossProcessesThenDrains) {
     }
     WaitChild(pid);
     EXPECT_EQ(shared_->probe_value.load(std::memory_order_acquire), 1000u);
-    EXPECT_FALSE(ring_.IsFull());
+    EXPECT_FALSE(ring_.IsFull().value());
 
     // Phase 3: with a slot freed by another process, a new producer process
     // can enqueue again.
@@ -344,7 +344,7 @@ TEST_F(MpmcRingXprocTest, FullRefusesEnqueueAcrossProcessesThenDrains) {
     ASSERT_TRUE(got.ok());
     EXPECT_EQ(ring_.ReadSlot(*got).value(), 2000u);
     ASSERT_TRUE(ring_.CommitDequeue(*got).ok());
-    EXPECT_TRUE(ring_.IsEmpty());
+    EXPECT_TRUE(ring_.IsEmpty().value());
 }
 
 // A consumer process attaching to an empty ring observes IsEmpty() and
@@ -357,7 +357,7 @@ TEST_F(MpmcRingXprocTest, EmptyRefusesDequeueAcrossProcesses) {
         if (!ring.ok()) {
             _exit(kChildApiError);
         }
-        shared_->probe_snapshot.store(ring->IsEmpty() ? 1 : 0,
+        shared_->probe_snapshot.store(ring->IsEmpty().value() ? 1 : 0,
                                       std::memory_order_release);
         auto blocked = ring->TryDequeue();
         if (blocked.ok()) {
@@ -371,7 +371,7 @@ TEST_F(MpmcRingXprocTest, EmptyRefusesDequeueAcrossProcesses) {
     EXPECT_EQ(shared_->probe_code.load(std::memory_order_acquire),
               static_cast<int>(StatusCode::kWouldBlock));
     EXPECT_EQ(shared_->probe_snapshot.load(std::memory_order_acquire), 1);
-    EXPECT_TRUE(ring_.IsEmpty());
+    EXPECT_TRUE(ring_.IsEmpty().value());
 }
 
 }  // namespace

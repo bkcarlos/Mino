@@ -2,6 +2,21 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "channel_directory",
+    srcs = ["channel_directory.cc"],
+    hdrs = ["channel_directory.h"],
+    deps = [
+        ":recovery_directory",
+        ":superblock",
+        "//mino/common:checked_arithmetic",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/channel:mpmc_ring",
+        "//mino/shm/channel:ring_directory_abi",
+    ],
+)
+
+cc_library(
     name = "recovery_directory",
     srcs = ["recovery_directory.cc"],
     hdrs = ["recovery_directory.h"],
@@ -10,6 +25,18 @@ cc_library(
         "//mino/common:checked_arithmetic",
         "//mino/common:result",
         "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "channel_directory_test",
+    srcs = ["channel_directory_test.cc"],
+    deps = [
+        ":channel_directory",
+        "//mino/common:status",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpmc_ring",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -47,6 +74,7 @@ cc_library(
         "region.h",
     ],
     deps = [
+        ":channel_directory",
         ":recovery_directory",
         ":superblock",
         "//mino/common:checked_arithmetic",
@@ -56,6 +84,7 @@ cc_library(
         "//mino/platform:shared_memory",
         "//mino/shm/allocator:central_slab",
         "//mino/shm/allocator:large_object_pool",
+        "//mino/shm/channel:mpmc_ring",
         "//mino/shm/recovery:scanner",
     ],
 )
@@ -87,6 +116,9 @@ cc_test(
         ":superblock",
         "//mino/common:status",
         "//mino/platform:shared_memory",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:mpmc_ring",
         "@googletest//:gtest_main",
     ],
 )

@@ -20,9 +20,11 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -289,7 +291,7 @@ TEST_F(InspectorTest, AttachByNameDerivesRealAllocatorLayoutReadOnly) {
         auto ring = inspector->DumpRingBuffer(7);
         ASSERT_FALSE(ring.ok());
         EXPECT_EQ(ring.status().code(), StatusCode::kNotFound);
-        EXPECT_NE(ring.status().message().find("explicit RingRef"),
+        EXPECT_NE(ring.status().message().find("no active ring"),
                   std::string_view::npos);
     }
 
@@ -298,6 +300,228 @@ TEST_F(InspectorTest, AttachByNameDerivesRealAllocatorLayoutReadOnly) {
     EXPECT_EQ(LoadRegionState(*region->superblock()), state_before);
     EXPECT_EQ(LoadCleanShutdown(*region->superblock()), clean_before);
     EXPECT_EQ(LoadRegionEpoch(*region->superblock()), epoch_before);
+}
+
+TEST_F(InspectorTest, AttachByNameAutoDiscoversAndDumpsRealRegionRing) {
+    const std::string name = RegionName("_ring");
+    RegionCreateOptions create_options;
+    create_options.name = name;
+    create_options.size_bytes = 2 * 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(create_options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    const SuperBlock& sb = *region->superblock();
+    RegionAllocatorStorage storage{
+        .region_base = region->base(),
+        .region_size = region->size(),
+        .allocator_offset = sb.allocator_offset,
+        .allocator_size = sb.data_offset - sb.allocator_offset,
+        .data_offset = sb.data_offset,
+        .data_size = sb.data_size,
+        .region_id = sb.region_id,
+    };
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 4}};
+    auto allocator = CentralSlabAllocator::CreateInRegion(storage, config);
+    ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+
+    constexpr uint64_t capacity = 8;
+    const uint64_t ring_offset = sb.data_offset + 512 * 1024;
+    const uint64_t ring_size = TestMpmcRing::RequiredSize(
+        capacity, sizeof(TestRingElement), alignof(TestRingElement));
+    ASSERT_LT(ring_offset + ring_size, region->size());
+    auto ring = TestMpmcRing::Init(region->base() + ring_offset, capacity,
+                                   sizeof(TestRingElement),
+                                   alignof(TestRingElement), 3);
+    ASSERT_TRUE(ring.ok()) << ring.status().ToString();
+    for (uint64_t i = 0; i < capacity; ++i) {
+        auto* physical = reinterpret_cast<Inspector::RingSlotView*>(
+            region->base() + ring_offset + sizeof(Inspector::RingControlView) +
+            i * Inspector::kRingSlotStride);
+        new (physical->storage) Inspector::IndexSlotView();
+    }
+    auto* slot = reinterpret_cast<Inspector::RingSlotView*>(
+        region->base() + ring_offset + sizeof(Inspector::RingControlView) +
+        3 * Inspector::kRingSlotStride);
+    auto* index =
+        reinterpret_cast<Inspector::IndexSlotView*>(slot->storage);
+    index->sequence_num.store(77, std::memory_order_relaxed);
+    index->msg_type = 19;
+    index->payload.offset = 0x9000;
+    index->payload.generation = 6;
+    index->payload_len = 48;
+    SealIndexSlotImmutableCrc(*index);
+    index->state.store(static_cast<uint32_t>(SlotState::kReady),
+                       std::memory_order_release);
+
+    ChannelRingDescriptor descriptor{
+        .channel_id = 42,
+        .channel_type = static_cast<uint32_t>(ChannelRingType::kMpmcRing),
+        .state = static_cast<uint32_t>(ChannelRingState::kActive),
+        .control_offset = ring_offset,
+        .extent_size = ring_size,
+        .capacity = capacity,
+        .generation = 3,
+        .element_size = sizeof(TestRingElement),
+        .element_alignment = alignof(TestRingElement),
+        .ring_layout_version = kMpmcRingLayoutVersion,
+    };
+    ASSERT_TRUE(region->RegisterChannelRing(descriptor).ok());
+
+    auto inspector = Inspector::Attach(name);
+    ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+    ASSERT_EQ(inspector->layout().rings.size(), 1u);
+    const auto& discovered = inspector->layout().rings[0];
+    EXPECT_EQ(discovered.channel_id, 42u);
+    EXPECT_EQ(discovered.channel_type,
+              static_cast<uint32_t>(ChannelRingType::kMpmcRing));
+    EXPECT_EQ(discovered.control_offset, ring_offset);
+    EXPECT_EQ(discovered.capacity, capacity);
+    EXPECT_EQ(discovered.generation, 3u);
+    EXPECT_EQ(discovered.state,
+              static_cast<uint32_t>(ChannelRingState::kActive));
+
+    auto dump = inspector->DumpRingBuffer(42);
+    ASSERT_TRUE(dump.ok()) << dump.status().ToString();
+    EXPECT_EQ(dump->channel_type,
+              static_cast<uint32_t>(ChannelRingType::kMpmcRing));
+    EXPECT_EQ(dump->generation, 3u);
+    EXPECT_EQ(dump->capacity, capacity);
+    ASSERT_EQ(dump->slots.size(), capacity);
+    EXPECT_EQ(dump->slots[3].sequence, 77u);
+    EXPECT_EQ(dump->slots[3].msg_type, 19u);
+    EXPECT_EQ(dump->slots[3].payload_offset, 0x9000u);
+    EXPECT_EQ(dump->slots[3].payload_generation, 6u);
+    EXPECT_EQ(dump->slots[3].payload_len, 48u);
+
+    std::ostringstream report;
+    ASSERT_TRUE(inspector->PrintReport(report).ok());
+    EXPECT_NE(report.str().find("RingBuffer channel 42"), std::string::npos);
+
+    ASSERT_TRUE(region->UnregisterChannelRing(42, 3).ok());
+    EXPECT_EQ(inspector->DumpRingBuffer(42).status().code(),
+              StatusCode::kUnavailable);
+    auto replacement = TestMpmcRing::Init(
+        region->base() + ring_offset, capacity, sizeof(TestRingElement),
+        alignof(TestRingElement), 4);
+    ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
+    descriptor.generation = 4;
+    ASSERT_TRUE(region->RegisterChannelRing(descriptor).ok());
+    EXPECT_EQ(inspector->DumpRingBuffer(42).status().code(),
+              StatusCode::kUnavailable);
+
+    auto refreshed = Inspector::Attach(name);
+    ASSERT_TRUE(refreshed.ok()) << refreshed.status().ToString();
+    ASSERT_EQ(refreshed->layout().rings.size(), 1u);
+    EXPECT_EQ(refreshed->layout().rings[0].generation, 4u);
+}
+
+TEST_F(InspectorTest, AttachByNameRejectsCorruptChannelDirectory) {
+    const std::string name = RegionName("_ring_crc");
+    RegionCreateOptions options;
+    options.name = name;
+    options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    const SuperBlock& sb = *region->superblock();
+    auto* image = reinterpret_cast<ChannelDirectoryImage*>(
+        region->base() + sb.directory_offset +
+        kChannelDirectoryRelativeOffset);
+    const uint64_t published =
+        std::atomic_ref(image->control.published_word)
+            .load(std::memory_order_acquire);
+    image->snapshots[published & 1u].crc32 ^= 1u;
+
+    auto inspector = Inspector::Attach(name);
+    ASSERT_FALSE(inspector.ok());
+    EXPECT_EQ(inspector.status().code(), StatusCode::kCorruption);
+}
+
+TEST_F(InspectorTest, OfflineV4UpgradeInitializesDirectoryAndMpmcFence) {
+    const std::string name = RegionName("_upgrade_v4");
+    RegionCreateOptions options;
+    options.name = name;
+    options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+
+    SuperBlock* sb = region->superblock();
+    constexpr uint64_t capacity = 8;
+    const uint64_t ring_offset = sb->data_offset;
+    const uint64_t ring_size = TestMpmcRing::RequiredSize(
+        capacity, sizeof(TestRingElement), alignof(TestRingElement));
+    auto ring = TestMpmcRing::Init(region->base() + ring_offset, capacity,
+                                   sizeof(TestRingElement),
+                                   alignof(TestRingElement), 5);
+    ASSERT_TRUE(ring.ok()) << ring.status().ToString();
+    auto* control = reinterpret_cast<MpmcRingControlBlock*>(
+        region->base() + ring_offset);
+    // Model the persisted ABI that existed before generation fencing.
+    control->active_state.store(0, std::memory_order_relaxed);
+    control->generation.store(0, std::memory_order_relaxed);
+    control->layout_version.store(kOldestUpgradeableMpmcRingLayoutVersion,
+                                  std::memory_order_release);
+
+    ChannelRingDescriptor descriptor{
+        .channel_id = 71,
+        .channel_type = static_cast<uint32_t>(ChannelRingType::kMpmcRing),
+        .state = static_cast<uint32_t>(ChannelRingState::kActive),
+        .control_offset = ring_offset,
+        .extent_size = ring_size,
+        .capacity = capacity,
+        .generation = 5,
+        .element_size = sizeof(TestRingElement),
+        .element_alignment = alignof(TestRingElement),
+        .ring_layout_version = kMpmcRingLayoutVersion,
+    };
+    sb->layout_version = kRecoveryDirectoryRegionLayoutVersion;
+    sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
+    ASSERT_TRUE(region->Detach().ok());
+
+    RegionV4UpgradeOptions upgrade{
+        .name = name,
+        .rings = std::span<const ChannelRingDescriptor>(&descriptor, 1),
+    };
+    ASSERT_TRUE(UpgradeRegionV4ToV5Offline(upgrade).ok());
+
+    RegionAttachOptions attach_options;
+    attach_options.name = name;
+    attach_options.read_only = true;
+    auto upgraded = SharedMemoryRegion::Attach(attach_options);
+    ASSERT_TRUE(upgraded.ok()) << upgraded.status().ToString();
+    EXPECT_EQ(upgraded->superblock()->layout_version, kRegionLayoutVersion);
+    auto channels = upgraded->channel_directory();
+    ASSERT_TRUE(channels.ok()) << channels.status().ToString();
+    ASSERT_EQ(channels->entry_count, 1u);
+    EXPECT_EQ(channels->entries[0].channel_id, 71u);
+    auto attached_ring =
+        TestMpmcRing::Attach(upgraded->base() + ring_offset);
+    ASSERT_TRUE(attached_ring.ok()) << attached_ring.status().ToString();
+    EXPECT_EQ(attached_ring->expected_generation(), 5u);
+}
+
+TEST_F(InspectorTest, OfflineV4UpgradeRequiresExplicitEmptyInventory) {
+    const std::string name = RegionName("_upgrade_empty");
+    RegionCreateOptions options;
+    options.name = name;
+    options.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(options);
+    ASSERT_TRUE(region.ok()) << region.status().ToString();
+    SuperBlock* sb = region->superblock();
+    sb->layout_version = kRecoveryDirectoryRegionLayoutVersion;
+    sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
+    ASSERT_TRUE(region->Detach().ok());
+
+    RegionV4UpgradeOptions ambiguous{
+        .name = name,
+        .rings = {},
+        .confirm_no_channels = false,
+    };
+    EXPECT_EQ(UpgradeRegionV4ToV5Offline(ambiguous).code(),
+              StatusCode::kInvalidArgument);
+    ambiguous.confirm_no_channels = true;
+    EXPECT_TRUE(UpgradeRegionV4ToV5Offline(ambiguous).ok());
 }
 
 TEST_F(InspectorTest, AttachByNameDiagnosesQuarantinedRegionReadOnly) {
@@ -454,6 +678,7 @@ TEST_F(InspectorTest, DumpRingBufferReportsCursorsAndSlots) {
     slot->payload.offset = 0x2000;
     slot->payload.generation = 9;
     slot->payload_len = 256;
+    SealIndexSlotImmutableCrc(*slot);
     slot->state.store(3 /*READY*/, std::memory_order_release);
 
     auto inspector = Inspector::AttachMemory(
@@ -474,6 +699,8 @@ TEST_F(InspectorTest, DumpRingBufferReportsCursorsAndSlots) {
     EXPECT_EQ(dump->slots[3].payload_offset, 0x2000u);
     EXPECT_EQ(dump->slots[3].payload_generation, 9u);
     EXPECT_EQ(dump->slots[3].payload_len, 256u);
+    EXPECT_TRUE(dump->slots[3].crc_checked);
+    EXPECT_TRUE(dump->slots[3].crc_valid);
     // Untouched slots remain FREE.
     EXPECT_EQ(dump->slots[0].state, 0u);
 }
@@ -496,6 +723,7 @@ TEST_F(InspectorTest, DumpRingBufferInteroperatesWithRealMpmcBackingAndStride) {
     slot1->payload.offset = 0x4560;
     slot1->payload.generation = 17;
     slot1->payload_len = 64;
+    SealIndexSlotImmutableCrc(*slot1);
     slot1->state.store(static_cast<uint32_t>(SlotState::kReady),
                        std::memory_order_release);
 
@@ -521,6 +749,63 @@ TEST_F(InspectorTest, DumpRingBufferInteroperatesWithRealMpmcBackingAndStride) {
     EXPECT_EQ(dump->slots[1].payload_len, 64u);
     EXPECT_EQ(dump->slots[1].state,
               static_cast<uint32_t>(SlotState::kReady));
+    EXPECT_TRUE(dump->slots[1].crc_valid);
+}
+
+TEST_F(InspectorTest, DumpRingBufferReportsImmutableCrcCorruption) {
+    auto* slot = fixture_.RingSlot(2);
+    slot->sequence_num.store(12, std::memory_order_relaxed);
+    slot->msg_type = 4;
+    slot->payload.offset = 0x8000;
+    slot->payload.generation = 2;
+    slot->payload_len = 16;
+    SealIndexSlotImmutableCrc(*slot);
+    slot->msg_type ^= 1u;
+    slot->state.store(static_cast<uint32_t>(SlotState::kReady),
+                      std::memory_order_release);
+
+    auto inspector = Inspector::AttachMemory(
+        fixture_.base(), fixture_.size(), fixture_.MakeLayout(), "test");
+    ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+    auto dump = inspector->DumpRingBuffer(7);
+    ASSERT_TRUE(dump.ok()) << dump.status().ToString();
+    EXPECT_TRUE(dump->slots[2].crc_checked);
+    EXPECT_FALSE(dump->slots[2].crc_valid);
+    EXPECT_FALSE(dump->slots[2].unstable);
+}
+
+TEST_F(InspectorTest, DumpRingBufferMarksChangingOuterEraUnstable) {
+    auto inspector = Inspector::AttachMemory(
+        fixture_.base(), fixture_.size(), fixture_.MakeLayout(), "test");
+    ASSERT_TRUE(inspector.ok()) << inspector.status().ToString();
+
+    std::atomic<bool> stop{false};
+    // Use the known physical slot address directly; only its atomic outer era
+    // changes, so the payload snapshot itself has no data race.
+    auto* ring_slot = reinterpret_cast<Inspector::RingSlotView*>(
+        fixture_.base() + fixture_.MakeLayout().rings[0].control_offset +
+        sizeof(Inspector::RingControlView));
+    std::thread writer([&] {
+        uint64_t era = 1;
+        while (!stop.load(std::memory_order_acquire)) {
+            ring_slot->sequence.store(++era, std::memory_order_release);
+        }
+    });
+
+    bool observed_unstable = false;
+    Status dump_status = Status::Ok();
+    for (int attempt = 0; attempt < 10000 && !observed_unstable; ++attempt) {
+        auto dump = inspector->DumpRingBuffer(7);
+        if (!dump.ok()) {
+            dump_status = dump.status();
+            break;
+        }
+        observed_unstable = dump->slots[0].unstable;
+    }
+    stop.store(true, std::memory_order_release);
+    writer.join();
+    EXPECT_TRUE(dump_status.ok()) << dump_status.ToString();
+    EXPECT_TRUE(observed_unstable);
 }
 
 TEST_F(InspectorTest, AttachMemoryRejectsTruncatedRealMpmcBacking) {

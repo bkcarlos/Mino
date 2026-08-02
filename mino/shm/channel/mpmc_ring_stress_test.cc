@@ -240,7 +240,7 @@ TEST(MpmcRingStressTest, SequenceConservation) {
     EXPECT_EQ(consumed_count.load(), total);
 
     token_ledger.Verify(enqueued_per_producer);
-    EXPECT_TRUE(ring.IsEmpty());
+    EXPECT_TRUE(ring.IsEmpty().value());
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ TEST(MpmcRingStressTest, TimedHighContention) {
         }
         for (;;) {
             if (producers_done.load(std::memory_order_acquire) &&
-                ring.IsEmpty()) {
+                ring.IsEmpty().value()) {
                 return;
             }
             auto got = ring.TryDequeue();
@@ -351,7 +351,7 @@ TEST(MpmcRingStressTest, TimedHighContention) {
               << " empty_events=" << empty_events.load() << std::endl;
 
     token_ledger.Verify(totals);
-    EXPECT_TRUE(ring.IsEmpty());
+    EXPECT_TRUE(ring.IsEmpty().value());
 }
 
 }  // namespace

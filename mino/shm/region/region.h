@@ -26,10 +26,13 @@
 #include "mino/common/status.h"
 #include "mino/platform/process_identity.h"
 #include "mino/platform/shared_memory.h"
+#include "mino/shm/region/channel_directory.h"
 #include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/superblock.h"
 
 namespace mino {
+
+class SharedMemoryRegion;
 
 // Options for SharedMemoryRegion::Create (design doc section 6.2).
 struct RegionCreateOptions {
@@ -44,10 +47,9 @@ struct RegionCreateOptions {
     // pages otherwise).
     bool use_huge_pages = false;
 
-    // Reserved space between the SuperBlock and the data area for the Region
-    // Directory and Allocator metadata. Their concrete contents are defined by
-    // later milestones; here we only reserve and bound their offsets so Attach
-    // can validate them (design doc section 6.3 step 9).
+    // Reserved space between the SuperBlock and the data area for the fixed
+    // recovery and channel directories plus allocator metadata. Region layout
+    // v5 requires enough space for both directory images.
     uint64_t directory_size_bytes = 64 * 1024;
     uint64_t allocator_size_bytes = 64 * 1024;
 
@@ -59,13 +61,33 @@ struct RegionCreateOptions {
 
 // Options for SharedMemoryRegion::Attach (design doc section 6.2).
 //
-// v3 attachment contract:
+// v5 attachment contract:
 //   * read_only=true supports any number of concurrent processes and never
-//     participates in lifecycle recovery.
-//   * read_only=false requests the unique supervisor role. It fails with
-//     kWouldBlock while another supervisor process is live. The v3 SuperBlock
-//     has no capacity for a crash-safe multi-writer registration table, so
-//     writable non-supervisor Attach is intentionally unsupported.
+//     participates in lifecycle recovery. Region layouts v2-v4 remain readable;
+//     v4 has a Recovery Directory but no Channel Directory. This is offline
+//     read compatibility, not mixed-version rolling compatibility.
+//   * read_only=false requests the unique supervisor role and requires the
+//     current v5 layout. It fails with kWouldBlock while another supervisor
+//     process is live. Writable non-supervisor Attach remains unsupported.
+struct RegionV4UpgradeOptions {
+    std::string name;
+    std::span<const ChannelRingDescriptor> rings;
+    // An empty list is ambiguous for v4 because no channel inventory existed.
+    // Callers must explicitly attest that the Region contains no channels.
+    bool confirm_no_channels = false;
+};
+
+using RegionV4CopyCallback = Status (*)(const SharedMemoryRegion& source,
+                                        SharedMemoryRegion& destination,
+                                        void* context);
+
+struct RegionV4CopyUpgradeOptions {
+    std::string source_name;
+    RegionCreateOptions destination;
+    RegionV4CopyCallback migrate = nullptr;
+    void* context = nullptr;
+};
+
 struct RegionAttachOptions {
     std::string name;        // resolved to a region_id via the Registry
     uint32_t region_id = 0;  // or specified explicitly (mutually exclusive)
@@ -101,6 +123,19 @@ public:
     // of design doc section 6.3, then mapping the full Region. If the Region
     // is dirty (unclean shutdown), enters the recovery flow (section 6.5).
     static Result<SharedMemoryRegion> Attach(const RegionAttachOptions&);
+
+    // Offline-only in-place v4 -> v5 upgrade. Requires a clean CLOSED Region,
+    // exclusive supervisor lock, sufficient reserved directory bytes, and an
+    // explicit complete MPMC inventory. This is not a rolling upgrade.
+    static Status UpgradeV4ToV5Offline(const RegionV4UpgradeOptions&);
+
+    // Creates a fresh v5 Region and invokes a semantic migration callback while
+    // holding an offline lock on the clean CLOSED v4 source. Raw Region bytes
+    // are never copied because allocator handles embed Region identity. Use this
+    // path to recreate layouts such as Broadcast v4 that cannot be upgraded by
+    // the generic Region layer in place.
+    static Result<SharedMemoryRegion> CopyUpgradeV4ToV5Offline(
+        const RegionV4CopyUpgradeOptions&);
 
     std::byte* base() noexcept {
         return static_cast<std::byte*>(segment_->base());
@@ -154,6 +189,18 @@ public:
     // Returns the current CRC-validated recovery directory snapshot.
     Result<RecoveryDirectorySnapshot> recovery_directory() const;
 
+    // Publishes one initialized MPMC Ring using only Region-relative metadata.
+    // The descriptor must be ACTIVE and match the actual control block. A
+    // retired channel id may be reused only with a strictly newer generation.
+    Status RegisterChannelRing(const ChannelRingDescriptor& descriptor);
+
+    // Retires exactly the active generation. A stale generation cannot remove
+    // a replacement registration.
+    Status UnregisterChannelRing(uint32_t channel_id, uint64_t generation);
+
+    // Returns an immutable, CRC-validated point-in-time directory snapshot.
+    Result<ChannelDirectorySnapshot> channel_directory() const;
+
 private:
     SharedMemoryRegion() = default;
 
@@ -174,6 +221,7 @@ private:
     bool is_supervisor_ = false;
     bool detached_ = false;
     mutable std::mutex recovery_directory_mutex_;
+    mutable std::mutex channel_directory_mutex_;
 };
 
 }  // namespace mino

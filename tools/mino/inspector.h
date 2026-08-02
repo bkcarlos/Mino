@@ -32,6 +32,8 @@
 namespace mino {
 class CentralSlabAllocator;
 class SharedMemoryRegion;
+struct RegionV4CopyUpgradeOptions;
+struct RegionV4UpgradeOptions;
 }
 
 namespace mino::tools {
@@ -48,8 +50,8 @@ namespace mino::tools {
 // payload state. Attach(name) owns a read-only SharedMemoryRegion mapping and
 // derives slab offsets from the validated, persisted allocator metadata.
 // AttachMemory(...) remains available for offline images and explicit ring
-// layouts. Ring registration is not yet present in the Region Directory, so a
-// name-only attach intentionally leaves Layout::rings empty.
+// layouts. Region layout v5 persists a CRC-validated Channel Directory, so a
+// name-only attach discovers active rings without a sidecar.
 // ---------------------------------------------------------------------------
 class Inspector {
 public:
@@ -86,9 +88,14 @@ public:
         // Ring buffers: channel_id -> MpmcRing backing offset. The slot array
         // immediately follows the control block, as required by MpmcRing ABI.
         struct RingRef {
-            uint32_t channel_id;
-            uint32_t reserved;
-            uint64_t control_offset;
+            uint32_t channel_id = 0;
+            uint32_t channel_type = 0;
+            uint64_t control_offset = 0;
+            uint64_t extent_size = 0;
+            uint64_t capacity = 0;
+            uint64_t generation = 0;
+            uint32_t state = 0;
+            uint32_t reserved = 0;
         };
         std::vector<RingRef> rings;
     };
@@ -116,6 +123,11 @@ public:
 
     struct RingSlotSummary {
         uint64_t ring_sequence = 0;  // MpmcRing slot ownership sequence.
+        bool unstable = false;       // Outer sequence changed during snapshot.
+        bool crc_checked = false;    // READY immutable metadata was checked.
+        bool crc_valid = false;
+        uint8_t reserved0 = 0;
+        uint32_t reserved1 = 0;
         uint64_t sequence = 0;       // IndexSlot message sequence.
         uint32_t state = 0;
         uint32_t msg_type = 0;
@@ -127,6 +139,8 @@ public:
 
     struct RingBufferDump {
         uint32_t channel_id = 0;
+        uint32_t channel_type = 0;
+        uint64_t generation = 0;
         uint64_t capacity = 0;
         uint64_t enqueue_pos = 0;
         uint64_t dequeue_pos = 0;
@@ -138,9 +152,8 @@ public:
     };
 
     // Opens an existing Region by name in read-only mode, validates its
-    // SuperBlock and allocator metadata, and derives the slab layout. Ring
-    // buffers are not auto-discovered until the Region Directory persists ring
-    // registrations; use AttachMemory with explicit RingRef entries for those.
+    // SuperBlock, allocator metadata, and v5 Channel Directory, then derives
+    // the slab layout and active ring registrations automatically.
     static Result<Inspector> Attach(const std::string& region_name);
 
     // Attaches to a caller-provided region image. The Inspector never writes
@@ -191,6 +204,12 @@ private:
     // observation methods for live Region attachments.
     std::shared_ptr<const ::mino::CentralSlabAllocator> allocator_;
 };
+
+// Explicit offline migration tool APIs. They intentionally are not invoked by
+// Attach and are not rolling-compatible operations.
+Status UpgradeRegionV4ToV5Offline(const RegionV4UpgradeOptions& options);
+Status CopyUpgradeRegionV4ToV5Offline(
+    const RegionV4CopyUpgradeOptions& options);
 
 // Free helpers shared by PrintReport and the CLI.
 std::string SlotStateName(uint32_t state);

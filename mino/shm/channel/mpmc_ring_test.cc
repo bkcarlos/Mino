@@ -61,11 +61,15 @@ static_assert(offsetof(MpmcRingControlBlock, dequeue_pos) !=
               "cursors must live on separate cache lines");
 
 using TestSlot = MpmcRingSlot<16, 8>;
+using ByteSlot = MpmcRingSlot<1, 1>;
 static_assert(std::is_standard_layout_v<TestSlot>,
               "slot must be standard-layout");
 static_assert(offsetof(TestSlot, storage) % 8 == 0,
               "slot storage must honor the element alignment");
 static_assert(sizeof(TestSlot) == 24, "slot stride drifted");
+static_assert(sizeof(ByteSlot) == 16,
+              "small-alignment slot must remain aligned for its sequence");
+static_assert(MpmcRingSlotStride(1, 1) == sizeof(ByteSlot));
 
 // MpmcRing is a non-owning, trivially copyable view: it can be passed between
 // threads (and duplicated across processes' address spaces) freely.
@@ -120,9 +124,31 @@ TEST(MpmcRingInitTest, InitSucceeds) {
     auto ring = MpmcRing<uint64_t>::Init(f.storage, 8, sizeof(uint64_t),
                                          alignof(uint64_t));
     ASSERT_TRUE(ring.ok()) << ring.status().ToString();
-    EXPECT_EQ(ring->capacity(), 8u);
-    EXPECT_TRUE(ring->IsEmpty());
-    EXPECT_FALSE(ring->IsFull());
+    EXPECT_EQ(ring->capacity().value(), 8u);
+    EXPECT_TRUE(ring->IsEmpty().value());
+    EXPECT_FALSE(ring->IsFull().value());
+}
+
+TEST(MpmcRingInitTest, SmallAlignmentStrideAndRoundTripUseSequenceAlignment) {
+    struct ByteValue {
+        uint8_t value;
+    };
+    RingFixture<4, ByteValue> f;
+    EXPECT_EQ(MpmcRing<ByteValue>::RequiredSize(4, sizeof(ByteValue),
+                                                alignof(ByteValue)),
+              sizeof(MpmcRingControlBlock) + 4 * sizeof(ByteSlot));
+    auto ring = MpmcRing<ByteValue>::Init(
+        f.storage, 4, sizeof(ByteValue), alignof(ByteValue), 9);
+    ASSERT_TRUE(ring.ok()) << ring.status().ToString();
+    auto sequence = ring->TryEnqueue();
+    ASSERT_TRUE(sequence.ok());
+    ASSERT_TRUE(ring->CommitEnqueue(*sequence, ByteValue{.value = 0x5A}).ok());
+    auto consumed = ring->TryDequeue();
+    ASSERT_TRUE(consumed.ok());
+    auto value = ring->ReadSlot(*consumed);
+    ASSERT_TRUE(value.ok());
+    EXPECT_EQ(value->value, 0x5A);
+    EXPECT_TRUE(ring->CommitDequeue(*consumed).ok());
 }
 
 TEST(MpmcRingInitTest, InitRejectsNullBase) {
@@ -196,8 +222,8 @@ TEST(MpmcRingAttachTest, AttachSucceedsAfterInit) {
     // A second "process" view over the same mapping.
     auto attached = MpmcRing<uint64_t>::Attach(f.storage);
     ASSERT_TRUE(attached.ok()) << attached.status().ToString();
-    EXPECT_EQ(attached->capacity(), 8u);
-    EXPECT_TRUE(attached->IsEmpty());
+    EXPECT_EQ(attached->capacity().value(), 8u);
+    EXPECT_TRUE(attached->IsEmpty().value());
 }
 
 TEST(MpmcRingAttachTest, AttachRejectsNullAndMisalignedBase) {
@@ -301,6 +327,27 @@ TEST(MpmcRingAttachTest, AttachViewSeesCommittedData) {
     ASSERT_TRUE(guest->CommitDequeue(*got).ok());
 }
 
+TEST(MpmcRingGenerationTest, RetireAndReuseInvalidateOldFacade) {
+    U64Fixture<8> f;
+    auto old = MpmcRing<uint64_t>::Init(f.storage, 8, sizeof(uint64_t),
+                                        alignof(uint64_t), 11);
+    ASSERT_TRUE(old.ok());
+    auto* control = reinterpret_cast<MpmcRingControlBlock*>(f.storage);
+    ASSERT_TRUE(RetireMpmcRing(*control, 11).ok());
+
+    EXPECT_EQ(old->TryEnqueue().status().code(), StatusCode::kUnavailable);
+    EXPECT_EQ(old->TryDequeue().status().code(), StatusCode::kUnavailable);
+    EXPECT_EQ(old->IsFull().status().code(), StatusCode::kUnavailable);
+    EXPECT_EQ(old->IsEmpty().status().code(), StatusCode::kUnavailable);
+    EXPECT_EQ(old->capacity().status().code(), StatusCode::kUnavailable);
+
+    auto replacement = MpmcRing<uint64_t>::Init(
+        f.storage, 8, sizeof(uint64_t), alignof(uint64_t), 12);
+    ASSERT_TRUE(replacement.ok());
+    EXPECT_EQ(old->ValidateFence().code(), StatusCode::kUnavailable);
+    EXPECT_TRUE(replacement->TryEnqueue().ok());
+}
+
 // ---------------------------------------------------------------------------
 // Single-threaded behavior
 // ---------------------------------------------------------------------------
@@ -324,7 +371,7 @@ TEST(MpmcRingBasicTest, EnqueueDequeueRoundTrip) {
     EXPECT_EQ(*value, 42u);
     ASSERT_TRUE(ring->CommitDequeue(*got).ok());
 
-    EXPECT_TRUE(ring->IsEmpty());
+    EXPECT_TRUE(ring->IsEmpty().value());
 }
 
 TEST(MpmcRingBasicTest, SequencesAreMonotonic) {
@@ -408,8 +455,8 @@ TEST(MpmcRingFullEmptyTest, FullRefusesEnqueueAndReportsFull) {
         ASSERT_TRUE(seq.ok()) << "i=" << i;
         ASSERT_TRUE(ring->CommitEnqueue(*seq, i).ok());
     }
-    EXPECT_TRUE(ring->IsFull());
-    EXPECT_FALSE(ring->IsEmpty());
+    EXPECT_TRUE(ring->IsFull().value());
+    EXPECT_FALSE(ring->IsEmpty().value());
 
     auto blocked = ring->TryEnqueue();
     ASSERT_FALSE(blocked.ok());
@@ -422,8 +469,8 @@ TEST(MpmcRingFullEmptyTest, EmptyRefusesDequeueAndReportsEmpty) {
                                          alignof(uint64_t));
     ASSERT_TRUE(ring.ok());
 
-    EXPECT_TRUE(ring->IsEmpty());
-    EXPECT_FALSE(ring->IsFull());
+    EXPECT_TRUE(ring->IsEmpty().value());
+    EXPECT_FALSE(ring->IsFull().value());
 
     auto blocked = ring->TryDequeue();
     ASSERT_FALSE(blocked.ok());
@@ -470,7 +517,7 @@ TEST(MpmcRingFullEmptyTest, DequeueWithoutCommitStillBlocksProducers) {
     // reports room (enq - deq = 1 < 2), but the authoritative full signal is
     // the slot sequence: the producer is still rejected because the claimed
     // slot has not been released by CommitDequeue.
-    EXPECT_FALSE(ring->IsFull());
+    EXPECT_FALSE(ring->IsFull().value());
 
     auto blocked = ring->TryEnqueue();
     ASSERT_FALSE(blocked.ok());
@@ -478,7 +525,7 @@ TEST(MpmcRingFullEmptyTest, DequeueWithoutCommitStillBlocksProducers) {
 
     // Releasing the slot makes room again.
     ASSERT_TRUE(ring->CommitDequeue(*got).ok());
-    EXPECT_FALSE(ring->IsFull());
+    EXPECT_FALSE(ring->IsFull().value());
     auto seq = ring->TryEnqueue();
     ASSERT_TRUE(seq.ok());
     EXPECT_EQ(*seq, 2u);
@@ -532,7 +579,7 @@ TEST(MpmcRingWrapTest, SlotReuseAfterWrapDoesNotCorruptNeighbors) {
         ASSERT_TRUE(s2.ok());
         ASSERT_TRUE(ring->CommitEnqueue(*s1, cycle * 2).ok());
         ASSERT_TRUE(ring->CommitEnqueue(*s2, cycle * 2 + 1).ok());
-        EXPECT_TRUE(ring->IsFull());
+        EXPECT_TRUE(ring->IsFull().value());
 
         auto g1 = ring->TryDequeue();
         ASSERT_TRUE(g1.ok());
@@ -652,7 +699,7 @@ TEST(MpmcRingConcurrentTest, FourProducersFourConsumersNoLossNoDuplication) {
             EXPECT_EQ(got[i], i) << "producer " << p << " index " << i;
         }
     }
-    EXPECT_TRUE(ring.IsEmpty());
+    EXPECT_TRUE(ring.IsEmpty().value());
 }
 
 // Concurrent reservations must partition the logical positions: every

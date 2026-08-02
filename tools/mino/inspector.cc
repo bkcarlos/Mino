@@ -14,7 +14,9 @@
 
 #include "tools/mino/inspector.h"
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <ostream>
@@ -51,6 +53,52 @@ Result<InspectableRing> AttachInspectableRing(const void* control) {
     // later mutation, so its API accepts void*. Inspector never calls a
     // mutating operation on the returned view.
     return InspectableRing::Attach(const_cast<void*>(control));
+}
+
+// MpmcRing payload bytes are published and observed through lock-free atomic
+// byte accesses. Reading the complete IndexSlot representation this way avoids
+// racing a producer's CommitEnqueue. The outer slot sequence is sampled before
+// and after this function by the caller; only an unchanged era may be decoded.
+IndexSlotSnapshot AtomicSnapshotIndexSlot(const unsigned char* storage,
+                                          uint32_t* state) {
+    static_assert(ATOMIC_CHAR_LOCK_FREE == 2);
+    std::array<unsigned char, sizeof(Inspector::IndexSlotView)> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        auto& source = const_cast<unsigned char&>(storage[i]);
+        bytes[i] = std::atomic_ref<unsigned char>(source).load(
+            std::memory_order_relaxed);
+    }
+
+    auto copy = [&bytes](size_t offset, void* destination, size_t size) {
+        std::memcpy(destination, bytes.data() + offset, size);
+    };
+    IndexSlotSnapshot snapshot{};
+    copy(offsetof(IndexSlot, msg_type), &snapshot.msg_type,
+         sizeof(snapshot.msg_type));
+    copy(offsetof(IndexSlot, schema_version), &snapshot.schema_version,
+         sizeof(snapshot.schema_version));
+    copy(offsetof(IndexSlot, schema_short_id), &snapshot.schema_short_id,
+         sizeof(snapshot.schema_short_id));
+    copy(offsetof(IndexSlot, schema_layout_version),
+         &snapshot.schema_layout_version,
+         sizeof(snapshot.schema_layout_version));
+    copy(offsetof(IndexSlot, reserved0), &snapshot.reserved0,
+         sizeof(snapshot.reserved0));
+    copy(offsetof(IndexSlot, sequence_num), &snapshot.sequence_num,
+         sizeof(snapshot.sequence_num));
+    copy(offsetof(IndexSlot, timestamp_ns), &snapshot.timestamp_ns,
+         sizeof(snapshot.timestamp_ns));
+    copy(offsetof(IndexSlot, payload), &snapshot.payload,
+         sizeof(snapshot.payload));
+    copy(offsetof(IndexSlot, payload_len), &snapshot.payload_len,
+         sizeof(snapshot.payload_len));
+    copy(offsetof(IndexSlot, immutable_metadata_crc),
+         &snapshot.immutable_metadata_crc,
+         sizeof(snapshot.immutable_metadata_crc));
+    copy(offsetof(IndexSlot, flags), &snapshot.flags,
+         sizeof(snapshot.flags));
+    copy(offsetof(IndexSlot, state), state, sizeof(*state));
+    return snapshot;
 }
 
 constexpr std::string_view ObjectStateName(uint32_t value) {
@@ -90,6 +138,21 @@ constexpr bool IsProtocolReclaimableState(uint32_t value) {
 }
 
 }  // namespace
+
+Status UpgradeRegionV4ToV5Offline(
+    const RegionV4UpgradeOptions& options) {
+    return SharedMemoryRegion::UpgradeV4ToV5Offline(options);
+}
+
+Status CopyUpgradeRegionV4ToV5Offline(
+    const RegionV4CopyUpgradeOptions& options) {
+    auto destination =
+        SharedMemoryRegion::CopyUpgradeV4ToV5Offline(options);
+    if (!destination.ok()) {
+        return destination.status();
+    }
+    return destination->Detach();
+}
 
 std::string SlotStateName(uint32_t state) {
     // Ring index-slot states from the authoritative SlotState ABI.
@@ -179,9 +242,31 @@ Result<Inspector> Inspector::Attach(const std::string& region_name) {
             ++layout.classes[class_id].slot_count;
         }
     }
-    // The current Region Directory reserves bytes but does not persist channel
-    // ring registrations. Do not guess offsets by scanning for magic: callers
-    // that need ring dumps must continue to provide explicit RingRef metadata.
+    auto channels = region->channel_directory();
+    if (!channels.ok()) {
+        // v2-v4 Regions remain readable but predate persistent ring discovery.
+        if (channels.status().code() != StatusCode::kUnsupported) {
+            return channels.status();
+        }
+    } else {
+        for (uint32_t i = 0; i < channels->entry_count; ++i) {
+            const ChannelRingDescriptor& entry = channels->entries[i];
+            if (entry.state !=
+                static_cast<uint32_t>(ChannelRingState::kActive)) {
+                continue;
+            }
+            layout.rings.push_back(Layout::RingRef{
+                .channel_id = entry.channel_id,
+                .channel_type = entry.channel_type,
+                .control_offset = entry.control_offset,
+                .extent_size = entry.extent_size,
+                .capacity = entry.capacity,
+                .generation = entry.generation,
+                .state = entry.state,
+                .reserved = 0,
+            });
+        }
+    }
 
     Inspector inspector(region->base(), region->size(), std::move(layout),
                         region_name);
@@ -226,7 +311,15 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
             }
         }
     }
-    for (const auto& ring : inspector.layout_.rings) {
+    for (size_t ring_index = 0; ring_index < inspector.layout_.rings.size();
+         ++ring_index) {
+        const auto& ring = inspector.layout_.rings[ring_index];
+        for (size_t prior = 0; prior < ring_index; ++prior) {
+            if (inspector.layout_.rings[prior].channel_id == ring.channel_id) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "duplicate ring channel id in layout");
+            }
+        }
         const void* control_address =
             inspector.At(ring.control_offset, sizeof(RingControlView));
         if (control_address == nullptr) {
@@ -247,6 +340,25 @@ Result<Inspector> Inspector::AttachMemory(const std::byte* base, uint64_t size,
         }
 
         const auto* control = static_cast<const RingControlView*>(control_address);
+        const bool persisted_metadata = ring.channel_type != 0 ||
+                                        ring.extent_size != 0 ||
+                                        ring.capacity != 0 ||
+                                        ring.generation != 0 || ring.state != 0;
+        if (persisted_metadata &&
+            (ring.channel_type !=
+                 static_cast<uint32_t>(ChannelRingType::kMpmcRing) ||
+             ring.state != static_cast<uint32_t>(ChannelRingState::kActive) ||
+             ring.generation == 0 || ring.capacity != control->capacity ||
+             ring.generation !=
+                 control->generation.load(std::memory_order_acquire) ||
+             control->active_state.load(std::memory_order_acquire) !=
+                 static_cast<uint32_t>(MpmcRingState::kActive) ||
+             ring.extent_size != MpmcRingRequiredSize(
+                                     control->capacity, control->elem_size,
+                                     control->elem_align))) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "persisted ring descriptor does not match control ABI");
+        }
         const uint64_t slots_offset =
             ring.control_offset + sizeof(RingControlView);
         if (control->capacity >
@@ -393,10 +505,8 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
     if (ref == nullptr) {
         return Status::Error(
             StatusCode::kNotFound,
-            "no ring buffer registered for channel " +
-                std::to_string(channel_id) +
-                "; Region metadata does not currently persist ring locations, "
-                "so provide an explicit RingRef/layout sidecar");
+            "no active ring registered for channel " +
+                std::to_string(channel_id));
     }
 
     const void* control_address =
@@ -412,6 +522,29 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
 
     const auto* control = static_cast<const RingControlView*>(control_address);
     const uint64_t capacity = control->capacity;
+    if (ref->generation != 0 &&
+        control->generation.load(std::memory_order_acquire) !=
+            ref->generation) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "ring generation changed after Inspector attach");
+    }
+    const bool persisted_metadata = ref->channel_type != 0 ||
+                                    ref->extent_size != 0 ||
+                                    ref->capacity != 0 ||
+                                    ref->generation != 0 || ref->state != 0;
+    if (persisted_metadata &&
+        (ref->channel_type !=
+             static_cast<uint32_t>(ChannelRingType::kMpmcRing) ||
+         ref->state != static_cast<uint32_t>(ChannelRingState::kActive) ||
+         ref->generation == 0 || ref->capacity != capacity ||
+         control->active_state.load(std::memory_order_acquire) !=
+             static_cast<uint32_t>(MpmcRingState::kActive) ||
+         ref->extent_size != MpmcRingRequiredSize(
+                                 capacity, control->elem_size,
+                                 control->elem_align))) {
+        return Status::Error(StatusCode::kCorruption,
+                             "ring descriptor no longer matches control ABI");
+    }
     const uint64_t slots_offset =
         ref->control_offset + sizeof(RingControlView);
     if (capacity >
@@ -423,6 +556,8 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
 
     RingBufferDump dump;
     dump.channel_id = channel_id;
+    dump.channel_type = ref->channel_type;
+    dump.generation = ref->generation;
     dump.capacity = capacity;
     dump.enqueue_pos = control->enqueue_pos.load(std::memory_order_acquire);
     dump.dequeue_pos = control->dequeue_pos.load(std::memory_order_acquire);
@@ -438,19 +573,35 @@ Result<Inspector::RingBufferDump> Inspector::DumpRingBuffer(
     for (uint64_t i = 0; i < dump.capacity; ++i) {
         const auto* ring_slot = reinterpret_cast<const RingSlotView*>(
             slots_base + i * kRingSlotStride);
-        const auto* slot =
-            reinterpret_cast<const IndexSlotView*>(ring_slot->storage);
-        dump.slots.push_back(RingSlotSummary{
-            ring_slot->sequence.load(std::memory_order_acquire),
-            slot->sequence_num.load(std::memory_order_acquire),
-            slot->state.load(std::memory_order_acquire),
-            slot->msg_type,
-            slot->timestamp_ns,
-            slot->payload.offset,
-            slot->payload_len,
-            slot->payload.generation,
-        });
+        const uint64_t before =
+            ring_slot->sequence.load(std::memory_order_acquire);
+        uint32_t state = 0;
+        const IndexSlotSnapshot snapshot =
+            AtomicSnapshotIndexSlot(ring_slot->storage, &state);
+        const uint64_t after =
+            ring_slot->sequence.load(std::memory_order_acquire);
+
+        RingSlotSummary summary;
+        summary.ring_sequence = after;
+        if (before != after) {
+            summary.unstable = true;
+            dump.slots.push_back(summary);
+            continue;
+        }
+        summary.sequence = snapshot.sequence_num;
+        summary.state = state;
+        summary.msg_type = snapshot.msg_type;
+        summary.timestamp_ns = snapshot.timestamp_ns;
+        summary.payload_offset = snapshot.payload.offset;
+        summary.payload_len = snapshot.payload_len;
+        summary.payload_generation = snapshot.payload.generation;
+        summary.crc_checked =
+            state == static_cast<uint32_t>(SlotState::kReady);
+        summary.crc_valid =
+            summary.crc_checked && VerifySnapshotCrc(snapshot);
+        dump.slots.push_back(summary);
     }
+    MINO_RETURN_IF_ERROR(attached->ValidateFence());
     return dump;
 }
 
@@ -493,6 +644,8 @@ Status Inspector::PrintReport(std::ostream& out) const {
             out << "dump failed: " << dump.status().ToString() << "\n";
             continue;
         }
+        out << "type/generation:    " << dump->channel_type << " / "
+            << dump->generation << "\n";
         out << "capacity:           " << dump->capacity << "\n";
         out << "enqueue_pos:        " << dump->enqueue_pos << "\n";
         out << "dequeue_pos:        " << dump->dequeue_pos << "\n";
@@ -503,12 +656,20 @@ Status Inspector::PrintReport(std::ostream& out) const {
         out << "slots (physical order):\n";
         for (uint64_t i = 0; i < dump->slots.size(); ++i) {
             const auto& s = dump->slots[i];
-            out << "  [" << i << "] ring_seq=" << s.ring_sequence
-                << " seq=" << s.sequence
+            out << "  [" << i << "] ring_seq=" << s.ring_sequence;
+            if (s.unstable) {
+                out << " UNSTABLE\n";
+                continue;
+            }
+            out << " seq=" << s.sequence
                 << " state=" << SlotStateName(s.state)
                 << " msg_type=" << s.msg_type << " payload_off=0x" << std::hex
                 << s.payload_offset << std::dec << " len=" << s.payload_len
-                << " gen=" << s.payload_generation << "\n";
+                << " gen=" << s.payload_generation;
+            if (s.crc_checked) {
+                out << " crc=" << (s.crc_valid ? "OK" : "BAD");
+            }
+            out << "\n";
         }
     }
     return Status::Ok();

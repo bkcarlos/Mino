@@ -6,6 +6,11 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "ring_directory_abi",
+    hdrs = ["ring_directory_abi.h"],
+)
+
+cc_library(
     name = "mpmc_ring",
     hdrs = ["mpmc_ring.h"],
     deps = [
@@ -150,6 +155,7 @@ cc_library(
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/platform:process_identity",
     ],
 )
 

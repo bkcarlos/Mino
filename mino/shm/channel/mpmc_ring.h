@@ -72,6 +72,15 @@ namespace mino {
 // Cache line size used to separate the enqueue/dequeue cursors so producers
 // and consumers do not false-share a line (design doc 9.4 convention).
 inline constexpr uint64_t kMpmcRingCacheLineSize = 64;
+inline constexpr uint64_t kMpmcRingMagic = 0x4D494E4F524E4731ULL;  // "MINORNG1"
+inline constexpr uint32_t kMpmcRingLayoutVersion = 2;
+inline constexpr uint32_t kOldestUpgradeableMpmcRingLayoutVersion = 1;
+
+enum class MpmcRingState : uint32_t {
+    kInactive = 0,
+    kActive = 1,
+    kRetired = 2,
+};
 
 // ---------------------------------------------------------------------------
 // Control block
@@ -96,6 +105,11 @@ struct MpmcRingControlBlock {
     // processes built with different compilation configurations).
     uint32_t elem_size;
     uint32_t elem_align;
+    // Facades capture generation at Init/Attach and reject every operation once
+    // the control is retired or reused for another generation.
+    std::atomic<uint64_t> generation;
+    std::atomic<uint32_t> active_state;  // MpmcRingState.
+    uint32_t reserved1;
 
     // Producer cursor: next logical position to reserve. Claims a full cache
     // line; producers contend only among themselves.
@@ -117,12 +131,84 @@ static_assert(offsetof(MpmcRingControlBlock, magic) == 0,
               "magic must be the first field");
 static_assert(offsetof(MpmcRingControlBlock, capacity) == 16,
               "capacity offset drifted");
+static_assert(offsetof(MpmcRingControlBlock, generation) == 32,
+              "generation offset drifted");
+static_assert(offsetof(MpmcRingControlBlock, active_state) == 40,
+              "active_state offset drifted");
 static_assert(offsetof(MpmcRingControlBlock, enqueue_pos) ==
                   kMpmcRingCacheLineSize,
               "enqueue_pos must start its own cache line");
 static_assert(offsetof(MpmcRingControlBlock, dequeue_pos) ==
                   2 * kMpmcRingCacheLineSize,
               "dequeue_pos must start its own cache line");
+
+// Type-erased shared-memory ABI helpers used by Region metadata and read-only
+// tooling. They deliberately depend only on the persisted element size/alignment,
+// not on a process-local template instantiation.
+constexpr uint32_t MpmcRingSlotAlignment(uint32_t elem_align) {
+    return elem_align < alignof(uint64_t) ? alignof(uint64_t) : elem_align;
+}
+
+constexpr uint64_t MpmcRingSlotStride(uint32_t elem_size,
+                                      uint32_t elem_align) {
+    if (elem_align == 0) {
+        return 0;
+    }
+    const uint64_t slot_align = MpmcRingSlotAlignment(elem_align);
+    const uint64_t storage_offset =
+        (sizeof(uint64_t) + static_cast<uint64_t>(elem_align) - 1) /
+        elem_align * elem_align;
+    return (storage_offset + static_cast<uint64_t>(elem_size) + slot_align - 1) /
+           slot_align * slot_align;
+}
+
+constexpr uint64_t MpmcRingRequiredSize(uint64_t capacity, uint32_t elem_size,
+                                        uint32_t elem_align) {
+    return sizeof(MpmcRingControlBlock) +
+           capacity * MpmcRingSlotStride(elem_size, elem_align);
+}
+
+inline Status ValidateMpmcRingFence(const MpmcRingControlBlock& control,
+                                    uint64_t expected_generation) {
+    const uint64_t before = control.generation.load(std::memory_order_acquire);
+    const uint32_t state =
+        control.active_state.load(std::memory_order_acquire);
+    const uint64_t after = control.generation.load(std::memory_order_acquire);
+    if (expected_generation == 0 || before != expected_generation ||
+        after != expected_generation || before != after ||
+        state != static_cast<uint32_t>(MpmcRingState::kActive)) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "ring facade generation is stale or inactive");
+    }
+    return Status::Ok();
+}
+
+inline Status RetireMpmcRing(MpmcRingControlBlock& control,
+                             uint64_t expected_generation) {
+    MINO_RETURN_IF_ERROR(ValidateMpmcRingFence(control, expected_generation));
+    uint32_t active = static_cast<uint32_t>(MpmcRingState::kActive);
+    if (!control.active_state.compare_exchange_strong(
+            active, static_cast<uint32_t>(MpmcRingState::kRetired),
+            std::memory_order_acq_rel, std::memory_order_acquire) ||
+        control.generation.load(std::memory_order_acquire) !=
+            expected_generation) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "ring generation changed during retirement");
+    }
+    return Status::Ok();
+}
+
+inline bool ReactivateRetiredMpmcRing(MpmcRingControlBlock& control,
+                                      uint64_t expected_generation) {
+    if (control.generation.load(std::memory_order_acquire) !=
+        expected_generation) {
+        return false;
+    }
+    uint32_t retired = static_cast<uint32_t>(MpmcRingState::kRetired);
+    return control.active_state.compare_exchange_strong(
+        retired, static_cast<uint32_t>(MpmcRingState::kActive),
+        std::memory_order_release, std::memory_order_acquire);
+}
 
 // ---------------------------------------------------------------------------
 // Slot
@@ -163,6 +249,8 @@ public:
     // The ring requires lock-free 64-bit atomics to be implementable at all.
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "MpmcRing requires lock-free 64-bit atomics");
+    static_assert(ATOMIC_CHAR_LOCK_FREE == 2,
+                  "MpmcRing requires lock-free byte atomics for payload snapshots");
     // Reference semantics: elements are copied in/out bitwise and shared
     // across processes, so they must be trivially copyable and pointer-free.
     static_assert(std::is_trivially_copyable_v<T>,
@@ -190,7 +278,8 @@ public:
     // Callers must size the shared region with RequiredSize() and must not
     // touch the memory concurrently while Init runs.
     static Result<MpmcRing> Init(void* shm_base, uint64_t capacity,
-                                 uint32_t elem_size, uint32_t elem_align) {
+                                 uint32_t elem_size, uint32_t elem_align,
+                                 uint64_t generation = 1) {
         if (shm_base == nullptr) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "shm_base must not be null");
@@ -201,6 +290,10 @@ public:
             return Status::Error(StatusCode::kInvalidArgument,
                                  "shm_base must be aligned to the control "
                                  "block alignment (64 bytes)");
+        }
+        if (generation == 0) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "ring generation must be non-zero");
         }
         if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
             return Status::Error(StatusCode::kInvalidArgument,
@@ -214,30 +307,43 @@ public:
             return Status::Error(StatusCode::kInvalidArgument,
                                  "elem_size is smaller than sizeof(T)");
         }
-        if (elem_align < alignof(T) || elem_align == 0 ||
-            (elem_align & (elem_align - 1)) != 0) {
+        if (elem_align != alignof(T) || elem_align == 0 ||
+            (elem_align & (elem_align - 1)) != 0 ||
+            elem_align > alignof(MpmcRingControlBlock)) {
             return Status::Error(StatusCode::kInvalidArgument,
-                                 "elem_align must be a non-zero power of two "
-                                 "and >= alignof(T)");
+                                 "elem_align must exactly match alignof(T), be "
+                                 "a power of two, and not exceed 64");
         }
         if (elem_size % elem_align != 0) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "elem_size must be a multiple of elem_align");
         }
-        if (elem_size > (UINT64_MAX - sizeof(MpmcRingControlBlock)) / capacity) {
+        const uint64_t slot_stride =
+            MpmcRingSlotStride(elem_size, elem_align);
+        if (slot_stride >
+            (UINT64_MAX - sizeof(MpmcRingControlBlock)) / capacity) {
             return Status::Error(StatusCode::kInvalidArgument,
                                  "ring footprint overflows 64-bit size");
         }
 
         auto* control = static_cast<MpmcRingControlBlock*>(shm_base);
+        // Fence an older facade before reinitializing this backing. Init remains
+        // an offline operation: callers must ensure already-started operations
+        // have quiesced before reuse.
+        control->active_state.store(
+            static_cast<uint32_t>(MpmcRingState::kInactive),
+            std::memory_order_release);
+        control->magic.store(0, std::memory_order_release);
         // Initialize every non-atomic field before anything can observe the
-        // control block; the magic below is the single publication point.
-        control->layout_version.store(kLayoutVersion,
+        // control block; active_state below is the final publication point.
+        control->layout_version.store(kMpmcRingLayoutVersion,
                                       std::memory_order_relaxed);
         control->reserved0 = 0;
         control->capacity = capacity;
         control->elem_size = elem_size;
         control->elem_align = elem_align;
+        control->generation.store(generation, std::memory_order_relaxed);
+        control->reserved1 = 0;
         control->enqueue_pos.store(0, std::memory_order_relaxed);
         control->dequeue_pos.store(0, std::memory_order_relaxed);
 
@@ -251,8 +357,11 @@ public:
         // Publish: release so every plain/relaxed write above is visible to
         // any observer that acquires the magic. The structure must not be
         // used before the magic lands.
-        control->magic.store(kMagic, std::memory_order_release);
-        return MpmcRing(control, slots);
+        control->magic.store(kMpmcRingMagic, std::memory_order_release);
+        control->active_state.store(
+            static_cast<uint32_t>(MpmcRingState::kActive),
+            std::memory_order_release);
+        return MpmcRing(control, slots, generation);
     }
 
     // Attaches to an already-initialized ring at `shm_base`, validating the
@@ -274,16 +383,26 @@ public:
         auto* control = static_cast<MpmcRingControlBlock*>(shm_base);
         // Acquire pairs with the Init release store: once the magic reads as
         // valid, every field initialized before it is visible here.
-        if (control->magic.load(std::memory_order_acquire) != kMagic) {
+        if (control->magic.load(std::memory_order_acquire) != kMpmcRingMagic) {
             return Status::Error(StatusCode::kCorruption,
                                  "ring magic mismatch: region is not an "
                                  "initialized MpmcRing");
         }
         if (control->layout_version.load(std::memory_order_relaxed) !=
-            kLayoutVersion) {
+            kMpmcRingLayoutVersion) {
             return Status::Error(
                 StatusCode::kUnsupported,
                 "ring layout_version mismatch: unsupported ring layout");
+        }
+        const uint64_t generation =
+            control->generation.load(std::memory_order_acquire);
+        const uint32_t active_state =
+            control->active_state.load(std::memory_order_acquire);
+        if (generation == 0 ||
+            active_state != static_cast<uint32_t>(MpmcRingState::kActive) ||
+            control->generation.load(std::memory_order_acquire) != generation) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "ring generation is inactive or changing");
         }
         const uint64_t capacity = control->capacity;
         if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
@@ -296,19 +415,27 @@ public:
                                  "ring element ABI mismatch: elem_size or "
                                  "elem_align differs from this build");
         }
+        if (control->elem_align > alignof(MpmcRingControlBlock)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "ring element alignment exceeds control alignment");
+        }
         // Consistency guard shared with Init's overflow rule.
-        if (control->elem_size >
+        const uint64_t slot_stride =
+            MpmcRingSlotStride(control->elem_size, control->elem_align);
+        if (slot_stride >
             (UINT64_MAX - sizeof(MpmcRingControlBlock)) / capacity) {
             return Status::Error(StatusCode::kCorruption,
                                  "ring footprint overflows 64-bit size");
         }
-        if (control->elem_size % control->elem_align != 0) {
+        if (control->elem_align == 0 ||
+            (control->elem_align & (control->elem_align - 1)) != 0 ||
+            control->elem_size % control->elem_align != 0) {
             return Status::Error(StatusCode::kCorruption,
                                  "ring elem_size is not a multiple of elem_align");
         }
 
         Slot* slots = SlotsOf(shm_base);
-        return MpmcRing(control, slots);
+        return MpmcRing(control, slots, generation);
     }
 
     // Bytes of shared memory a ring of `capacity` slots with the given
@@ -320,8 +447,7 @@ public:
     static constexpr uint64_t RequiredSize(uint64_t capacity,
                                            uint32_t elem_size,
                                            uint32_t elem_align) {
-        return sizeof(MpmcRingControlBlock) +
-               capacity * SlotStride(elem_size, elem_align);
+        return MpmcRingRequiredSize(capacity, elem_size, elem_align);
     }
 
     // -----------------------------------------------------------------------
@@ -339,6 +465,7 @@ public:
     // the referenced shared memory is expected to change (also from other
     // processes). ReadSlot/IsFull/IsEmpty follow the same convention.
     Result<uint64_t> TryEnqueue() const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         uint64_t pos = control_->enqueue_pos.load(std::memory_order_relaxed);
         for (;;) {
             Slot* slot = SlotForPos(pos);
@@ -378,8 +505,13 @@ public:
     // release store, so a consumer that acquires the committed state is
     // guaranteed to see the data ("data becomes visible before its state").
     Status CommitEnqueue(uint64_t sequence, const T& value) const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         Slot* slot = SlotForPos(sequence);
-        std::memcpy(slot->storage, &value, sizeof(T));
+        const auto* source = reinterpret_cast<const unsigned char*>(&value);
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            std::atomic_ref<unsigned char>(slot->storage[i])
+                .store(source[i], std::memory_order_relaxed);
+        }
         slot->sequence.store(sequence + 1, std::memory_order_release);
         return Status::Ok();
     }
@@ -395,6 +527,7 @@ public:
     // CommitDequeue(sequence). Returns StatusCode::kWouldBlock without
     // effect when the ring is empty.
     Result<uint64_t> TryDequeue() const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         uint64_t pos = control_->dequeue_pos.load(std::memory_order_relaxed);
         for (;;) {
             Slot* slot = SlotForPos(pos);
@@ -429,9 +562,15 @@ public:
     // visibility of the data happened in TryDequeue; this read itself is a
     // plain copy out of shared memory.
     Result<T> ReadSlot(uint64_t sequence) const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         const Slot* slot = SlotForPos(sequence);
         T value;
-        std::memcpy(&value, slot->storage, sizeof(T));
+        auto* destination = reinterpret_cast<unsigned char*>(&value);
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            auto& byte = const_cast<unsigned char&>(slot->storage[i]);
+            destination[i] = std::atomic_ref<unsigned char>(byte).load(
+                std::memory_order_relaxed);
+        }
         return value;
     }
 
@@ -442,6 +581,7 @@ public:
     // load in TryEnqueue, so a producer reusing the slot in the next wrap
     // cycle observes a coherent state.
     Status CommitDequeue(uint64_t sequence) const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         Slot* slot = SlotForPos(sequence);
         slot->sequence.store(sequence + control_->capacity,
                              std::memory_order_release);
@@ -454,7 +594,8 @@ public:
 
     // Approximate fullness snapshot: enqueue_pos - dequeue_pos >= capacity.
     // Under concurrency the result may be stale the moment it returns.
-    bool IsFull() const {
+    Result<bool> IsFull() const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         const uint64_t enq =
             control_->enqueue_pos.load(std::memory_order_acquire);
         const uint64_t deq =
@@ -464,7 +605,8 @@ public:
 
     // Approximate emptiness snapshot: dequeue_pos >= enqueue_pos.
     // Under concurrency the result may be stale the moment it returns.
-    bool IsEmpty() const {
+    Result<bool> IsEmpty() const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
         const uint64_t enq =
             control_->enqueue_pos.load(std::memory_order_acquire);
         const uint64_t deq =
@@ -473,25 +615,40 @@ public:
     }
 
     // Number of slots (a power of two, fixed at Init).
-    uint64_t capacity() const { return control_->capacity; }
+    Result<uint64_t> capacity() const {
+        MINO_RETURN_IF_ERROR(ValidateFence());
+        return control_->capacity;
+    }
+
+    uint64_t expected_generation() const noexcept { return expected_generation_; }
+
+    // One fence validation may guard a caller-defined batch. Individual facade
+    // operations also validate so stale handles fail safely by default.
+    Status ValidateFence() const {
+        if (control_ == nullptr) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "ring facade is not attached");
+        }
+        return ValidateMpmcRingFence(*control_, expected_generation_);
+    }
 
 private:
-    static constexpr uint64_t kMagic = 0x4D494E4F524E4731ULL;  // "MINORNG1"
-    static constexpr uint32_t kLayoutVersion = 1;
-
     using Slot = MpmcRingSlot<sizeof(T), alignof(T)>;
 
-    explicit MpmcRing(MpmcRingControlBlock* control, Slot* slots) noexcept
-        : control_(control), slots_(slots) {}
+    explicit MpmcRing(MpmcRingControlBlock* control, Slot* slots,
+                      uint64_t expected_generation) noexcept
+        : control_(control),
+          slots_(slots),
+          expected_generation_(expected_generation) {}
 
     // Byte distance between consecutive slots: the sequence plus the storage
     // rounded up to the storage alignment. This equals
     // sizeof(MpmcRingSlot<elem_size, elem_align>) whenever elem_align is a
     // power of two (validated by Init), so the in-memory slot array is
     // exactly an array of slot objects.
-    static constexpr uint32_t SlotStride(uint32_t elem_size,
+    static constexpr uint64_t SlotStride(uint32_t elem_size,
                                          uint32_t elem_align) {
-        return (8 + elem_size + elem_align - 1) / elem_align * elem_align;
+        return MpmcRingSlotStride(elem_size, elem_align);
     }
 
     // The slot array immediately follows the control block. The control
@@ -516,6 +673,7 @@ private:
 
     MpmcRingControlBlock* control_ = nullptr;
     Slot* slots_ = nullptr;
+    uint64_t expected_generation_ = 0;
 };
 
 }  // namespace mino
