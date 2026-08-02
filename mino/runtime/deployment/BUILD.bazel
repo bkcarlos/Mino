@@ -1,0 +1,18 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "local_bus",
+    srcs = ["local_bus.cc"],
+    hdrs = ["local_bus.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/registry:registry",
+        "//mino/runtime:bus",
+        "//mino/schema:descriptor",
+        "//mino/shm/channel:broadcast",
+        "//mino/transport:transport_driver",
+        "//mino/transport:transport_switcher",
+    ],
+)

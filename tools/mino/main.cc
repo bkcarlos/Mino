@@ -29,24 +29,33 @@
 // Directory does not yet persist channel ring locations. `recover` continues
 // to use its explicit recovery sidecar/image path.
 
+#include <algorithm>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mino/common/status.h"
 #include "mino/shm/recovery/scanner.h"
 #include "tools/mino/inspector.h"
+#include "tools/mino/runtime_services.h"
 #include "tools/mino/storage_commands.h"
 
 namespace {
 
 using mino::Status;
 using mino::StatusCode;
+
+volatile std::sig_atomic_t g_runtime_stop_requested = 0;
+
+void RequestRuntimeStop(int) { g_runtime_stop_requested = 1; }
 
 void PrintUsage(std::ostream& out) {
     out <<
@@ -63,7 +72,7 @@ USAGE:
                 [--segment <tracked>] [--unsafe-standalone-segment] ...
     mino record create <session_root> --recording-id N --owner-id N --owner-epoch N
                        --config-version N --topic <id>:<name> ...
-    mino record run <session_root>
+    mino record run <session_root> --runtime-config <file>
 
 OPTIONS:
     --layout <file>   Layout sidecar describing class table and ring buffers.
@@ -71,6 +80,9 @@ OPTIONS:
     --image <file>    Raw offline region image. Must be paired with --layout.
     --output <file>   Write the report to <file> instead of stdout.
     --dry-run         (recover only) Scan without repairing.
+    --runtime-config <file>
+                      Strict TOML local Bus/Region/Topic/Schema configuration.
+                      MINO_RUNTIME_CONFIG provides the same path.
 )";
 }
 
@@ -441,12 +453,65 @@ int main(int argc, char** argv) {
 
     if (command == "storage" || command == "replay" || command == "record") {
         std::vector<std::string> storage_args;
+        std::string runtime_config_path;
         const int first_argument = command == "storage" ? 2 : 1;
         storage_args.reserve(static_cast<size_t>(argc - first_argument));
         for (int i = first_argument; i < argc; ++i) {
+            if (std::string_view(argv[i]) == "--runtime-config") {
+                if (++i >= argc || !runtime_config_path.empty()) {
+                    std::cerr << "mino: --runtime-config requires one value\n";
+                    return 2;
+                }
+                runtime_config_path = argv[i];
+                continue;
+            }
             storage_args.emplace_back(argv[i]);
         }
-        const mino::tools::StorageCommandServices services{};
+        if (runtime_config_path.empty()) {
+            const char* configured = std::getenv("MINO_RUNTIME_CONFIG");
+            if (configured != nullptr) runtime_config_path = configured;
+        }
+        const bool record_run = storage_args.size() >= 2 &&
+                                storage_args[0] == "record" &&
+                                storage_args[1] == "run";
+        const bool replay = !storage_args.empty() && storage_args[0] == "replay";
+        const bool validate_only =
+            std::find(storage_args.begin(), storage_args.end(), "--validate-only") !=
+            storage_args.end();
+        const bool requires_runtime = record_run || (replay && !validate_only);
+        if (requires_runtime && runtime_config_path.empty()) {
+            std::cerr << "mino: record run and publishing replay require "
+                         "--runtime-config or MINO_RUNTIME_CONFIG\n";
+            return 2;
+        }
+
+        std::unique_ptr<mino::tools::RuntimeCommandServices> runtime;
+        mino::tools::StorageCommandServices services{};
+        if (!runtime_config_path.empty()) {
+            if (runtime_config_path.size() > 4096 ||
+                runtime_config_path.find('\0') != std::string::npos) {
+                std::cerr << "mino: runtime config path is invalid\n";
+                return 2;
+            }
+            if (record_run) {
+                g_runtime_stop_requested = 0;
+                if (std::signal(SIGINT, RequestRuntimeStop) == SIG_ERR ||
+                    std::signal(SIGTERM, RequestRuntimeStop) == SIG_ERR) {
+                    std::cerr << "mino: cannot install recording stop handlers\n";
+                    return 1;
+                }
+            }
+            auto created = mino::tools::RuntimeCommandServices::Create(
+                runtime_config_path,
+                record_run ? &g_runtime_stop_requested : nullptr);
+            if (!created.ok()) {
+                std::cerr << "mino runtime: " << created.status().ToString()
+                          << '\n';
+                return 1;
+            }
+            runtime = std::move(*created);
+            services = runtime->services();
+        }
         return mino::tools::RunStorageCommand(storage_args, std::cout, std::cerr,
                                               services);
     }

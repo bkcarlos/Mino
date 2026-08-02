@@ -1,0 +1,48 @@
+# Pass this file with:
+#   mino record run <session_root> --runtime-config <this-file>
+#   mino replay <session_root> --runtime-config <this-file>
+# or set MINO_RUNTIME_CONFIG.
+
+[runtime]
+# Stable deployment-local identities. All values are positive and bounded.
+node_id = 4242
+lease_epoch = 1
+lease_duration_ms = 60000
+region_id = 17
+region_bytes = 67108864
+# Relative paths resolve against this TOML file. The state file is locked and
+# synchronously advanced before a generated Topic ID is returned.
+topic_id_state = "topic_ids.state"
+
+[record]
+# Zero means run until SIGINT/SIGTERM. Non-zero values are useful for bounded
+# batch jobs; max_runtime_ms expiration is reported as a failure.
+stop_after_records = 0
+max_runtime_ms = 0
+poll_interval_ms = 1
+buffer_bytes = 67108864
+queue_capacity = 4096
+max_segment_bytes = 67108864
+
+# Record uses the exact manifest topic name (for example "events"). Default
+# replay publishes into <namespace>/<recorded-name>, so its default destination
+# is "replay/events" and must be configured as a separate topic when needed.
+[[topics]]
+name = "events"
+schema_artifact = "event.schema"
+# Required when an artifact contains more than one local type.
+schema_type = "example.Event"
+channel_capacity = 256
+max_subscribers = 16
+max_payload_bytes = 1048576
+# Canonical Bus messages currently carry no partition key, so only 1 is allowed.
+record_partitions = 1
+
+[[topics]]
+name = "replay/events"
+schema_artifact = "event.schema"
+schema_type = "example.Event"
+channel_capacity = 256
+max_subscribers = 16
+max_payload_bytes = 1048576
+record_partitions = 1

@@ -1198,7 +1198,11 @@ Status RecordingManifest::UpdateTopic(TopicTableEntry topic) noexcept {
                 return Invalid("persisted topic schema refs are immutable");
             }
         }
-        if (topic.config_version == found->config_version && topic != *found) {
+        const bool initial_schema_binding =
+            topic.config_version == found->config_version &&
+            found->schema_snapshot.empty() && !topic.schema_snapshot.empty();
+        if (topic.config_version == found->config_version && topic != *found &&
+            !initial_schema_binding) {
             return Invalid("topic snapshot change requires a newer config version");
         }
         if (topic == *found) return Status::Ok();

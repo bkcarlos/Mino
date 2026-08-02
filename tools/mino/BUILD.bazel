@@ -1,6 +1,11 @@
 # mino: Mino CLI tool (D1-11 Inspector + recovery entry point).
 package(default_visibility = ["//visibility:private"])
 
+exports_files(
+    ["runtime.example.toml"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "inspector",
     srcs = ["inspector.cc"],
@@ -32,6 +37,34 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "runtime_services",
+    srcs = ["runtime_services.cc"],
+    hdrs = ["runtime_services.h"],
+    copts = ["-Wno-deprecated-literal-operator"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":storage_commands",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/registry:registry",
+        "//mino/runtime:bus",
+        "//mino/runtime/deployment:local_bus",
+        "//mino/schema:descriptor",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:recorder",
+        "//mino/storage:recorder_service",
+        "//mino/storage:recorder_subscriber",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:recording_policy",
+        "//mino/storage:replay_engine",
+        "//mino/storage:segment_format",
+        "//mino/storage:segment_writer",
+        "@tomlplusplus",
+    ],
+)
+
 cc_test(
     name = "storage_commands_test",
     srcs = ["storage_commands_test.cc"],
@@ -43,6 +76,26 @@ cc_test(
         "//mino/schema:compiler",
         "//mino/schema:layout",
         "//mino/schema/codegen:artifact_codec",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "runtime_services_test",
+    srcs = ["runtime_services_test.cc"],
+    deps = [
+        ":runtime_services",
+        ":storage_commands",
+        "//mino/common:status",
+        "//mino/registry:registry",
+        "//mino/runtime:bus",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:recorder",
+        "//mino/storage:recorder_subscriber",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:segment_recovery",
         "@googletest//:gtest_main",
     ],
 )
@@ -66,6 +119,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":inspector",
+        ":runtime_services",
         ":storage_commands",
         "//mino/common:status",
         "//mino/shm/recovery:scanner",
