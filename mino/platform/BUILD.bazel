@@ -10,8 +10,12 @@ cc_library(
 cc_library(
     name = "shared_memory",
     srcs = ["shared_memory.cc"],
-    hdrs = ["shared_memory.h"],
+    hdrs = [
+        "shared_memory.h",
+        "shared_memory_marker.h",
+    ],
     deps = [
+        ":process_identity",
         "//mino/common:result",
         "//mino/common:status",
     ],
@@ -23,6 +27,45 @@ cc_test(
     deps = [
         ":shared_memory",
         "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "shared_memory_fault_helper",
+    testonly = True,
+    srcs = ["shared_memory_fault_helper.cc"],
+    deps = [":shared_memory"],
+)
+
+cc_test(
+    name = "shared_memory_concurrency_test",
+    srcs = ["shared_memory_concurrency_test.cc"],
+    data = [":shared_memory_fault_helper"],
+    deps = [
+        ":shared_memory",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Requires Linux, a hugetlbfs mount, and at least two reserved huge pages. It is
+# intentionally excluded from wildcard CI; huge-page-validation.yml runs it on
+# a prepared self-hosted runner.
+cc_test(
+    name = "shared_memory_huge_page_test",
+    srcs = ["shared_memory_huge_page_test.cc"],
+    tags = [
+        "manual",
+        "requires-hugepages",
+    ],
+    deps = [
+        ":shared_memory",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/region:handle_resolver",
+        "//mino/shm/region:region",
         "@googletest//:gtest_main",
     ],
 )

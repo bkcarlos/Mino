@@ -187,23 +187,52 @@ TEST_F(SharedMemoryTest, MoveTransfersOwnership) {
     EXPECT_GE(b.size(), 4096u);
 }
 
-TEST_F(SharedMemoryTest, HugePagesDegradeGracefully) {
-    // Requesting huge pages must either succeed with huge_page_enabled() or
-    // degrade to normal pages; it must never fail to create the segment just
-    // because huge pages are unavailable on the host.
+TEST_F(SharedMemoryTest, HugePageFallbackReportsRequestedActualAndReason) {
+    // Force a deterministic fallback even on a host with reserved huge pages.
     const std::string name = MakeName("huge");
     SharedMemoryCreateOptions options;
     options.name = name;
-    options.size = 2 * 1024 * 1024;  // 2 MiB
+    options.size = 2 * 1024 * 1024;
     options.use_huge_pages = true;
+    options.hugetlbfs_path = "/mino/nonexistent/hugetlbfs";
 
     auto created = SharedMemorySegment::Create(options);
     ASSERT_TRUE(created.ok()) << created.status().ToString();
     EXPECT_NE(created->base(), nullptr);
     EXPECT_GE(created->size(), 2u * 1024 * 1024);
-    // huge_page_enabled() may be true or false depending on host config; the
-    // contract is only that creation succeeded and memory is usable.
+    EXPECT_TRUE(created->huge_pages_requested());
+    EXPECT_FALSE(created->huge_pages_actual());
+    EXPECT_FALSE(created->huge_page_enabled());
+#if defined(__linux__)
+    EXPECT_EQ(created->huge_page_fallback_reason(),
+              HugePageFallbackReason::kHugetlbfsUnavailable);
+    EXPECT_NE(created->huge_page_fallback_errno(), 0);
+#else
+    EXPECT_EQ(created->huge_page_fallback_reason(),
+              HugePageFallbackReason::kUnsupportedPlatform);
+#endif
+    EXPECT_LT(created->actual_page_size(), 2u * 1024 * 1024);
     std::memset(created->base(), 1, 4096);
+
+    auto opened = SharedMemorySegment::Open(name, /*read_only=*/true);
+    ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+    EXPECT_TRUE(opened->huge_pages_requested());
+    EXPECT_FALSE(opened->huge_pages_actual());
+    EXPECT_EQ(opened->huge_page_fallback_reason(),
+              created->huge_page_fallback_reason());
+    EXPECT_EQ(static_cast<const unsigned char*>(opened->base())[0], 1u);
+}
+
+TEST_F(SharedMemoryTest, OrdinaryMappingReportsNoHugePageRequest) {
+    const std::string name = MakeName("normal");
+    auto created = SharedMemorySegment::Create(name, 4096);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    EXPECT_FALSE(created->huge_pages_requested());
+    EXPECT_FALSE(created->huge_pages_actual());
+    EXPECT_EQ(created->huge_page_fallback_reason(),
+              HugePageFallbackReason::kNone);
+    EXPECT_EQ(created->huge_page_fallback_errno(), 0);
+    EXPECT_GT(created->actual_page_size(), 0u);
 }
 
 }  // namespace

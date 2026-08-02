@@ -1,0 +1,81 @@
+# Manual-only validation on a privileged/self-hosted Linux runner. This is
+# separate from public PR CI because reserving huge pages changes host state.
+name: Huge Page Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      configure_hugepages:
+        description: Reserve 2 MiB huge pages and mount hugetlbfs on the runner
+        required: true
+        default: true
+        type: boolean
+      hugepage_count:
+        description: Number of 2 MiB huge pages to reserve (minimum 2)
+        required: true
+        default: "8"
+        type: string
+      hugetlbfs_path:
+        description: hugetlbfs mount used by Mino
+        required: true
+        default: /mnt/mino-hugetlb
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huge-page-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-hugetlb:
+    name: MAP_HUGETLB / Region / Handle validation
+    runs-on: [self-hosted, linux, mino-hugepage]
+    timeout-minutes: 20
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      MINO_CONFIGURE_HUGEPAGES: ${{ inputs.configure_hugepages && '1' || '0' }}
+      MINO_HUGEPAGES_TO_RESERVE: ${{ inputs.hugepage_count }}
+      MINO_HUGETLBFS_PATH: ${{ inputs.hugetlbfs_path }}
+      MINO_HUGE_PAGE_RESULT_DIR: huge-page-results
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Validate real huge-page backing and cross-process paths
+        run: bash tools/ci/run_huge_page_validation.sh
+
+      - name: Publish host and test summary
+        if: always()
+        run: |
+          {
+            echo "## Huge Page Validation"
+            echo
+            echo "Runner: \`${RUNNER_NAME}\` (\`${RUNNER_OS}/${RUNNER_ARCH}\`)"
+            echo
+            if [[ -f huge-page-results/result.txt ]]; then
+              echo '```text'
+              cat huge-page-results/result.txt
+              echo '```'
+            fi
+            if [[ -f huge-page-results/error.txt ]]; then
+              echo '```text'
+              cat huge-page-results/error.txt
+              echo '```'
+            fi
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload host configuration and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: huge-page-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: huge-page-results/
+          if-no-files-found: warn
+          retention-days: 90
