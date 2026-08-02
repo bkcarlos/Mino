@@ -4,6 +4,9 @@ bazel-*
 # Caches and local state
 .cache/
 .bazelrc.local
+__pycache__/
+*.py[cod]
+d5-storage-fault-campaign/
 
 # Compiled artifacts
 *.o
