@@ -1,0 +1,22 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "storage_benchmark",
+    srcs = ["storage_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//mino/storage:recorder_buffer_pool",
+        "//mino/storage:segment_format",
+        "//mino/storage:segment_recovery",
+        "//mino/storage:segment_writer",
+    ],
+)

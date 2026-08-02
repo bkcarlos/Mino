@@ -315,17 +315,17 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D5-02 | Segment/Record 格式 ✅ | SegmentHeader/RecordHeader 显式小端编码、CRC、Commit Marker、Trailer（`//mino/storage:segment_format`，详设 17.10） | D3-07 | 5d |
 | D5-03 | Segment Writer ✅ | OPEN→SEALED/ERROR、Batch、四种 Sync 策略、轮转阈值、短写处理（`//mino/storage:segment_writer`，详设 17.7、17.11） | D5-02 | 5d |
 | D5-04 | Recorder Buffer Pool ✅ | 有界分级 Chunk Pool、MPSC Queue、按 Topic/全局预算、四种 BufferFullPolicy（`//mino/storage:recorder_buffer_pool`，详设 17.5） | D5-02 | 3d |
-| D5-05 | Recorder Subscriber | Borrow → Validate → Canonical Encode → Copy → ACK（详设 11.4） | D5-04 | 3d |
-| D5-06 | TopicWriter | Per-Topic Single Writer、Ingestion Sequence、Gap/Tombstone（详设 17.6~17.7） | D5-03, D5-05 | 5d |
-| D5-07 | 背压拓扑 | strong_consistent/isolated/best_effort 三种模式（详设 17.2） | D5-06 | 3d |
-| D5-08 | Storage 崩溃恢复 | 尾部扫描、CRC/Commit Marker 校验、截断、索引重建（详设 17.12） | D5-03 | 5d |
-| D5-09 | Manifest 管理 | 原子更新、Checkpoint、Seal 后补录/孤儿隔离（详设 17.12） | D5-03 | 3d |
-| D5-10 | Replay 引擎 | Segment Reader → Decode → Allocate → Publish（详设 17.13） | D5-08 | 5d |
-| D5-11 | Retention | 按时间/字节/Segment 数删除、Reader Pin/Lease（详设 17.14） | D5-09 | 3d |
-| D5-12 | `mino` 运维工具 | record/replay/storage inspect/verify/repair CLI（详设 17.16） | D5-10 | 5d |
-| D5-13 | 录制模式集成 | best_effort/memory_buffered/durable/snapshot 四种模式（详设 17.4） | D5-07 | 3d |
-| D5-14 | 正式 SLA 文档 | 硬件型号、负载模型、统计口径、目标数值 | 全部 | 3d |
-| D5-15 | Kill/ENOSPC/磁盘抖动测试 | 任意写入点 Kill 恢复、短写、ENOSPC、EIO、只读切换 | 全部 | 持续 |
+| D5-05 | Recorder Subscriber ✅ | Borrow → Validate → Canonical Encode → Recorder-owned Copy → ACK（`//mino/storage:recorder_subscriber`，详设 11.4） | D5-04 | 3d |
+| D5-06 | TopicWriter ✅ | Per-Topic Single Writer、来源去重、Ingestion Sequence、Gap/Tombstone、轮转（`//mino/storage:topic_writer`，详设 17.6~17.7） | D5-03, D5-05 | 5d |
+| D5-07 | 背压拓扑 ✅ | strong_consistent/isolated/best_effort 状态机、Gap debt 与指标（`//mino/storage:recording_topology`，详设 17.2） | D5-06 | 3d |
+| D5-08 | Storage 崩溃恢复 ✅ | 流式尾部扫描、CRC/Commit Marker、Checkpoint 回退、截断与索引元数据重建（`//mino/storage:segment_recovery`，详设 17.12） | D5-03 | 5d |
+| D5-09 | Manifest 管理 ✅ | Session/Topic/Partition Manifest、原子更新、Checkpoint、Seal orphan 补录/隔离（`//mino/storage:recording_manifest`，详设 17.12） | D5-03 | 3d |
+| D5-10 | Replay 引擎 ✅ | Segment Reader → CRC Decode → Schema Resolve → 正常 Publish Adapter、过滤与定时（`//mino/storage:replay_engine`，详设 17.13） | D5-08 | 5d |
+| D5-11 | Retention ✅ | 按时间/字节/Segment 数/归档删除、Reader Pin/Lease、崩溃幂等恢复（`//mino/storage:retention`，详设 17.14） | D5-09 | 3d |
+| D5-12 | `mino` 运维工具 ✅ | record/replay/storage inspect/verify/repair CLI（`//tools/mino:mino`，详设 17.16） | D5-10 | 5d |
+| D5-13 | 录制模式集成 ✅ | `//mino/storage:recording_policy` + `//mino/storage:recorder` + `//mino/storage:snapshot_store`：四种模式、确认/Sync/Buffer 策略、Snapshot 原子覆盖与完整 Session 编排（详设 17.4） | D5-07 | 3d |
+| D5-14 | 正式 SLA 文档 ✅ | `docs/benchmarks/D5_Storage_SLA.md`：硬件、负载、统计口径、实测目标与原始 JSON | 全部 | 3d |
+| D5-15 | Kill/ENOSPC/磁盘抖动测试 ✅（持续） | `//mino/storage:storage_fault_test` + `tools/ci/run_d5_storage_fault_campaign.py`：Kill 恢复、短写、EINTR、ENOSPC、EIO、EROFS、磁盘暂停 | 全部 | 持续 |
 
 ### 7.2 并行工作流
 
@@ -347,14 +347,14 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 7.4 退出条件（DoD）
 
-- [ ] 多 Publisher 单 Writer 来源内有序（INV-10、INV-11）
-- [ ] 任意写入点 Kill 后恢复到最后完整 Record，报告 Durable 边界
-- [ ] Schema 先于引用它的 Durable Record 持久化（INV-14、INV-24）
-- [ ] 磁盘短期暂停后 memory_buffered 数据可继续落盘
-- [ ] 缓冲满时按策略背压/丢弃/失败，无静默丢失（INV-12、INV-13）
-- [ ] Ingestion Sequence 无无法解释的永久空洞（INV-23）
-- [ ] Replay 可按 Topic/时间/Sequence 过滤回放
-- [ ] **正式 SLA 文档发布**
+- [x] 多 Publisher 单 Writer 来源内有序（INV-10、INV-11；`topic_writer_test`）
+- [x] 任意写入点 Kill 后恢复到最后完整 Record，报告 Durable 边界（`storage_fault_test`）
+- [x] Schema 先于引用它的 Durable Record 持久化（INV-14、INV-24；`recorder_test` + `schema_store_test`）
+- [x] 磁盘短期暂停后 memory_buffered 数据可继续落盘（`storage_fault_test`）
+- [x] 缓冲满时按策略背压/丢弃/失败，无静默丢失（INV-12、INV-13；Buffer/Topology/Recorder 测试）
+- [x] Ingestion Sequence 无无法解释的永久空洞（INV-23；Gap/Tombstone + `topic_writer_test`）
+- [x] Replay 可按 Topic/时间/Sequence 过滤回放（`replay_engine_test` + Storage CLI 测试）
+- [x] **正式 SLA 文档发布**（`docs/benchmarks/D5_Storage_SLA.md`）
 
 ---
 
@@ -531,7 +531,11 @@ D3: //mino/schema:descriptor, //mino/schema:runtime_compiler, //mino/schema:dyna
 D4: //mino/transport:switcher, //mino/bridge:tcp_bridge, //mino/registry
 D5: //mino/storage:schema_store, //mino/storage:segment_format,
     //mino/storage:segment_writer, //mino/storage:recorder_buffer_pool,
-    //mino/storage:recorder, //mino/storage:replay, //tools/mino
+    //mino/storage:recorder_subscriber, //mino/storage:topic_writer,
+    //mino/storage:segment_recovery, //mino/storage:recording_manifest,
+    //mino/storage:recording_topology, //mino/storage:snapshot_store,
+    //mino/storage:recorder, //mino/storage:replay_engine,
+    //mino/storage:retention, //tools/mino
 ```
 
 ## 附录 B：关键不变量与测试覆盖映射

@@ -1,0 +1,103 @@
+{
+  "schema": "mino.storage_benchmark.v1",
+  "benchmark": "D5-14",
+  "clock": "std::chrono::steady_clock",
+  "configuration": {
+    "records": 20000,
+    "payload_bytes": 1024,
+    "sync_policy": "per-batch",
+    "directory_base": "/code/Mino/.cache",
+    "writer_batch_records": 128,
+    "mpsc_producers": 4
+  },
+  "methodology": {
+    "payload_seed": 5569068516574048564,
+    "percentile_method": "nearest-rank",
+    "latency_unit": "ns",
+    "throughput_byte_unit": "MiB/s",
+    "warmup": {
+      "encode_records": 2000,
+      "writer_records": 2000,
+      "recovery_scans": 1,
+      "buffer_records": 2000
+    }
+  },
+  "results": {
+    "encode_record": {
+      "operations_attempted": 20000,
+      "errors": 0,
+      "error_rate": 0,
+      "latency_ns":       {
+        "samples": 20000,
+        "p50": 3707,
+        "p95": 3834,
+        "p99": 3859,
+        "p99_9": 6632,
+        "max": 25858
+      }
+    },
+    "segment_writer": {
+      "records": 20000,
+      "encoded_bytes": 23360000,
+      "append_elapsed_ns": 75539826,
+      "end_to_end_elapsed_ns": 1080202472,
+      "append_records_per_second": 264761.00169995095,
+      "write_mebibytes_per_second": 20.623755831628944,
+      "operations_attempted": 20158,
+      "errors": 0,
+      "error_rate": 0,
+      "flush_latency_ns":       {
+        "samples": 157,
+        "p50": 6409898,
+        "p95": 6511984,
+        "p99": 6603894,
+        "p99_9": 6608637,
+        "max": 6608637
+      },
+      "fdatasync": {
+        "operations_attempted": 158,
+        "errors": 0,
+        "error_rate": 0,
+        "latency_ns":         {
+          "samples": 158,
+          "p50": 6318504,
+          "p95": 6401332,
+          "p99": 6436214,
+          "p99_9": 6454785,
+          "max": 6454785
+        }
+      }
+    },
+    "recovery_scan": {
+      "operations_attempted": 5,
+      "errors": 0,
+      "error_rate": 0,
+      "records_per_scan": 20000,
+      "bytes_per_scan": 23360052,
+      "total_elapsed_ns": 581308314,
+      "records_per_second": 172025.75224134847,
+      "mebibytes_per_second": 191.61846722111781,
+      "scan_time_ns":       {
+        "samples": 5,
+        "p50": 116236792,
+        "p95": 116485238,
+        "p99": 116485238,
+        "p99_9": 116485238,
+        "max": 116485238
+      }
+    },
+    "buffer_mpsc": {
+      "producers": 4,
+      "queue_capacity": 4096,
+      "records": 20000,
+      "elapsed_ns": 31296694,
+      "records_per_second": 639045.13364894071,
+      "payload_mebibytes_per_second": 624.06751332904366,
+      "operations_attempted": 20000,
+      "errors": 0,
+      "internal_errors": 0,
+      "error_rate": 0,
+      "error_detail": ""
+    }
+  }
+}
