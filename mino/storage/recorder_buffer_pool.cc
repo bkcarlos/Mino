@@ -112,6 +112,7 @@ struct QueueEntry {
     size_t payload_size = 0;
     size_t charged_bytes = 0;
     uint64_t user_tag = 0;
+    std::optional<RecorderRecordMetadata> metadata;
 };
 
 struct TopicUsage {
@@ -295,7 +296,8 @@ struct RecorderBufferPoolState final
 
     std::optional<DiscardedBuffer> CancelReservation(
         RecorderBufferBlock* block, TopicId topic_id, size_t payload_size,
-        size_t charged_bytes, uint64_t user_tag) noexcept {
+        size_t charged_bytes, uint64_t user_tag,
+        std::optional<RecorderRecordMetadata> metadata) noexcept {
         if (block == nullptr) return std::nullopt;
         {
             std::lock_guard lock(mutex);
@@ -304,13 +306,15 @@ struct RecorderBufferPoolState final
             ReleaseBlockLocked(block, topic_id, charged_bytes);
         }
         capacity_changed.notify_all();
-        return DiscardedBuffer{BufferDiscardReason::kReservationCancelled,
-                               topic_id, user_tag, payload_size, charged_bytes};
+        return DiscardedBuffer{
+            BufferDiscardReason::kReservationCancelled, topic_id, user_tag,
+            payload_size, charged_bytes, std::move(metadata)};
     }
 
-    Status CommitReservation(RecorderBufferBlock* block, TopicId topic_id,
-                             size_t payload_size, size_t charged_bytes,
-                             uint64_t user_tag) {
+    Status CommitReservation(
+        RecorderBufferBlock* block, TopicId topic_id, size_t payload_size,
+        size_t charged_bytes, uint64_t user_tag,
+        const std::optional<RecorderRecordMetadata>& metadata) {
         {
             std::lock_guard lock(mutex);
             if (closed || recording_failed) {
@@ -328,7 +332,7 @@ struct RecorderBufferPoolState final
 
             QueueEntry& entry = queue[queue_tail];
             entry = QueueEntry{block, topic_id, payload_size, charged_bytes,
-                               user_tag};
+                               user_tag, metadata};
             queue_tail = (queue_tail + 1) % options.queue_capacity;
             ++queued_records;
             if (reserved_records != 0) --reserved_records;
@@ -389,13 +393,15 @@ struct RecorderBufferPoolState final
 RecorderBufferHandle::RecorderBufferHandle(
     std::shared_ptr<detail::RecorderBufferPoolState> state,
     detail::RecorderBufferBlock* block, TopicId topic_id, size_t payload_size,
-    size_t charged_bytes, uint64_t user_tag) noexcept
+    size_t charged_bytes, uint64_t user_tag,
+    std::optional<RecorderRecordMetadata> metadata) noexcept
     : state_(std::move(state)),
       block_(block),
       topic_id_(topic_id),
       payload_size_(payload_size),
       charged_bytes_(charged_bytes),
-      user_tag_(user_tag) {}
+      user_tag_(user_tag),
+      metadata_(std::move(metadata)) {}
 
 RecorderBufferHandle::~RecorderBufferHandle() { Reset(); }
 
@@ -406,7 +412,8 @@ RecorderBufferHandle::RecorderBufferHandle(
       topic_id_(other.topic_id_),
       payload_size_(std::exchange(other.payload_size_, 0)),
       charged_bytes_(std::exchange(other.charged_bytes_, 0)),
-      user_tag_(std::exchange(other.user_tag_, 0)) {}
+      user_tag_(std::exchange(other.user_tag_, 0)),
+      metadata_(std::exchange(other.metadata_, std::nullopt)) {}
 
 RecorderBufferHandle& RecorderBufferHandle::operator=(
     RecorderBufferHandle&& other) noexcept {
@@ -418,6 +425,7 @@ RecorderBufferHandle& RecorderBufferHandle::operator=(
     payload_size_ = std::exchange(other.payload_size_, 0);
     charged_bytes_ = std::exchange(other.charged_bytes_, 0);
     user_tag_ = std::exchange(other.user_tag_, 0);
+    metadata_ = std::exchange(other.metadata_, std::nullopt);
     return *this;
 }
 
@@ -444,6 +452,7 @@ void RecorderBufferHandle::Reset() noexcept {
     const size_t charged_bytes = std::exchange(charged_bytes_, 0);
     payload_size_ = 0;
     user_tag_ = 0;
+    metadata_.reset();
     state_->ReleaseHandle(block, topic_id, charged_bytes);
     state_.reset();
 }
@@ -451,13 +460,15 @@ void RecorderBufferHandle::Reset() noexcept {
 RecorderBufferReservation::RecorderBufferReservation(
     std::shared_ptr<detail::RecorderBufferPoolState> state,
     detail::RecorderBufferBlock* block, TopicId topic_id, size_t payload_size,
-    size_t charged_bytes, uint64_t user_tag) noexcept
+    size_t charged_bytes, uint64_t user_tag,
+    std::optional<RecorderRecordMetadata> metadata) noexcept
     : state_(std::move(state)),
       block_(block),
       topic_id_(topic_id),
       payload_size_(payload_size),
       charged_bytes_(charged_bytes),
-      user_tag_(user_tag) {}
+      user_tag_(user_tag),
+      metadata_(std::move(metadata)) {}
 
 RecorderBufferReservation::~RecorderBufferReservation() {
     static_cast<void>(Cancel());
@@ -470,7 +481,8 @@ RecorderBufferReservation::RecorderBufferReservation(
       topic_id_(other.topic_id_),
       payload_size_(std::exchange(other.payload_size_, 0)),
       charged_bytes_(std::exchange(other.charged_bytes_, 0)),
-      user_tag_(std::exchange(other.user_tag_, 0)) {}
+      user_tag_(std::exchange(other.user_tag_, 0)),
+      metadata_(std::exchange(other.metadata_, std::nullopt)) {}
 
 RecorderBufferReservation& RecorderBufferReservation::operator=(
     RecorderBufferReservation&& other) noexcept {
@@ -482,6 +494,7 @@ RecorderBufferReservation& RecorderBufferReservation::operator=(
     payload_size_ = std::exchange(other.payload_size_, 0);
     charged_bytes_ = std::exchange(other.charged_bytes_, 0);
     user_tag_ = std::exchange(other.user_tag_, 0);
+    metadata_ = std::exchange(other.metadata_, std::nullopt);
     return *this;
 }
 
@@ -510,14 +523,16 @@ Status RecorderBufferReservation::Commit() && noexcept {
     const size_t payload_size = std::exchange(payload_size_, 0);
     const size_t charged_bytes = std::exchange(charged_bytes_, 0);
     const uint64_t user_tag = std::exchange(user_tag_, 0);
+    std::optional<RecorderRecordMetadata> metadata =
+        std::exchange(metadata_, std::nullopt);
     try {
         Status status = state_->CommitReservation(
-            block, topic_id, payload_size, charged_bytes, user_tag);
+            block, topic_id, payload_size, charged_bytes, user_tag, metadata);
         state_.reset();
         return status;
     } catch (...) {
         state_->CancelReservation(block, topic_id, payload_size, charged_bytes,
-                                  user_tag);
+                                  user_tag, std::move(metadata));
         state_.reset();
         return Status::Error(StatusCode::kInternal);
     }
@@ -530,8 +545,11 @@ std::optional<DiscardedBuffer> RecorderBufferReservation::Cancel() noexcept {
     const size_t payload_size = std::exchange(payload_size_, 0);
     const size_t charged_bytes = std::exchange(charged_bytes_, 0);
     const uint64_t user_tag = std::exchange(user_tag_, 0);
+    std::optional<RecorderRecordMetadata> metadata =
+        std::exchange(metadata_, std::nullopt);
     std::optional<DiscardedBuffer> discarded = state_->CancelReservation(
-        block, topic_id, payload_size, charged_bytes, user_tag);
+        block, topic_id, payload_size, charged_bytes, user_tag,
+        std::move(metadata));
     state_.reset();
     return discarded;
 }
@@ -564,6 +582,11 @@ Result<BufferReserveResult> RecorderBufferPool::Reserve(
     if (request.timeout < std::chrono::nanoseconds::zero()) {
         return Invalid("recorder reserve timeout must not be negative");
     }
+    if (request.metadata.has_value() &&
+        (request.metadata->topic_id != request.topic_id ||
+         request.metadata->payload_size != request.payload_size)) {
+        return Invalid("recorder buffer metadata does not match request");
+    }
 
     auto charged_result = state_->ChargedBytes(request.payload_size);
     if (!charged_result.ok()) return charged_result.status();
@@ -582,7 +605,8 @@ Result<BufferReserveResult> RecorderBufferPool::Reserve(
 
     auto make_incoming_discard = [&](BufferDiscardReason reason) {
         return DiscardedBuffer{reason, request.topic_id, request.user_tag,
-                               request.payload_size, charged_bytes};
+                               request.payload_size, charged_bytes,
+                               request.metadata};
     };
 
     std::vector<DiscardedBuffer> policy_discards;
@@ -692,7 +716,7 @@ Result<BufferReserveResult> RecorderBufferPool::Reserve(
                     policy_discards.push_back(DiscardedBuffer{
                         BufferDiscardReason::kDropOldest, entry.topic_id,
                         entry.user_tag, entry.payload_size,
-                        entry.charged_bytes});
+                        entry.charged_bytes, entry.metadata});
                 }
                 for (size_t count = 0; count < prefix; ++count) {
                     state_->DropFrontLocked();
@@ -771,7 +795,7 @@ Result<BufferReserveResult> RecorderBufferPool::Reserve(
     result.discarded = std::move(policy_discards);
     result.reservation = RecorderBufferReservation(
         state_, block, request.topic_id, request.payload_size, charged_bytes,
-        request.user_tag);
+        request.user_tag, request.metadata);
     lock.unlock();
     if (!result.discarded.empty()) state_->capacity_changed.notify_all();
     return Result<BufferReserveResult>(std::move(result));
@@ -808,7 +832,7 @@ Result<RecorderBufferHandle> RecorderBufferPool::Dequeue(
     detail::QueueEntry& entry = state_->queue[state_->queue_head];
     RecorderBufferHandle handle(state_, entry.block, entry.topic_id,
                                 entry.payload_size, entry.charged_bytes,
-                                entry.user_tag);
+                                entry.user_tag, std::move(entry.metadata));
     entry = detail::QueueEntry{};
     state_->queue_head =
         (state_->queue_head + 1) % state_->options.queue_capacity;
@@ -833,7 +857,7 @@ Result<RecorderBufferHandle> RecorderBufferPool::TryDequeue() {
     detail::QueueEntry& entry = state_->queue[state_->queue_head];
     RecorderBufferHandle handle(state_, entry.block, entry.topic_id,
                                 entry.payload_size, entry.charged_bytes,
-                                entry.user_tag);
+                                entry.user_tag, std::move(entry.metadata));
     entry = detail::QueueEntry{};
     state_->queue_head =
         (state_->queue_head + 1) % state_->options.queue_capacity;

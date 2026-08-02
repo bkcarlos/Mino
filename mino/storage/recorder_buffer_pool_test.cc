@@ -6,10 +6,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -19,12 +21,41 @@ namespace {
 
 using namespace std::chrono_literals;
 
+RecorderRecordMetadata RecordMetadata(TopicId topic_id,
+                                      uint64_t source_sequence,
+                                      size_t payload_size) {
+    std::array<std::byte, 32> digest{};
+    for (size_t index = 0; index < digest.size(); ++index) {
+        digest[index] = static_cast<std::byte>(index + 1);
+    }
+    return RecorderRecordMetadata{
+        .schema = RecorderSchemaMetadata{
+            .short_id = 0x0807060504030201ULL,
+            .canonical_digest = digest,
+            .schema_version = 7,
+            .layout_version = 3,
+        },
+        .topic_id = topic_id,
+        .source = MessageSource{
+            .node_id = 10,
+            .publisher_id = 20,
+            .publisher_epoch = 30,
+            .source_sequence = source_sequence,
+            .observed_timestamp_ns = 40 + source_sequence,
+        },
+        .ingestion_timestamp_ns = 50 + source_sequence,
+        .payload_size = static_cast<uint32_t>(payload_size),
+        .payload_crc = static_cast<uint32_t>(60 + source_sequence),
+    };
+}
+
 BufferReservationRequest Request(
     TopicId topic_id, size_t payload_size, uint64_t user_tag,
     BufferFullPolicy policy = BufferFullPolicy::kBlock,
-    std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max()) {
+    std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max(),
+    std::optional<RecorderRecordMetadata> metadata = std::nullopt) {
     return BufferReservationRequest{topic_id, payload_size, user_tag, policy,
-                                    timeout};
+                                    timeout, std::move(metadata)};
 }
 
 std::unique_ptr<RecorderBufferPool> NewPool(
@@ -98,6 +129,83 @@ TEST(RecorderBufferPoolTest, ValidatesOptionsAndUsesBoundedSizeClasses) {
     EXPECT_EQ(too_large.status().code(), StatusCode::kResourceExhausted);
 }
 
+TEST(RecorderBufferPoolTest,
+     MetadataRoundTripsAcrossReservationQueueAndHandleMoves) {
+    RecorderBufferPoolOptions options;
+    options.global_byte_limit = 8u * 1024u;
+    options.default_topic_byte_limit = options.global_byte_limit;
+    options.queue_capacity = 2;
+    auto pool = NewPool(options);
+    ASSERT_NE(pool, nullptr);
+
+    const RecorderRecordMetadata metadata =
+        RecordMetadata(TopicId{7}, 101, 3);
+    auto reserved = pool->Reserve(Request(
+        TopicId{7}, 3, 101, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(), metadata));
+    ASSERT_TRUE(reserved.ok()) << reserved.status().ToString();
+    ASSERT_TRUE(reserved->accepted());
+    ASSERT_TRUE(reserved->reservation.metadata().has_value());
+    EXPECT_EQ(*reserved->reservation.metadata(), metadata);
+
+    RecorderBufferReservation moved = std::move(reserved->reservation);
+    EXPECT_FALSE(reserved->reservation.metadata().has_value());
+    ASSERT_TRUE(moved.metadata().has_value());
+    EXPECT_EQ(*moved.metadata(), metadata);
+    moved.bytes()[0] = std::byte{1};
+    moved.bytes()[1] = std::byte{2};
+    moved.bytes()[2] = std::byte{3};
+    ASSERT_TRUE(std::move(moved).Commit().ok());
+
+    auto dequeued = pool->TryDequeue();
+    ASSERT_TRUE(dequeued.ok()) << dequeued.status().ToString();
+    RecorderBufferHandle handle = std::move(*dequeued);
+    EXPECT_FALSE(dequeued->metadata().has_value());
+    ASSERT_TRUE(handle.metadata().has_value());
+    EXPECT_EQ(*handle.metadata(), metadata);
+    EXPECT_EQ(handle.metadata()->source.node_id, 10u);
+    EXPECT_EQ(handle.metadata()->source.publisher_id, 20u);
+    EXPECT_EQ(handle.metadata()->source.publisher_epoch, 30u);
+    EXPECT_EQ(handle.metadata()->source.source_sequence, 101u);
+    EXPECT_EQ(std::vector<std::byte>(handle.bytes().begin(),
+                                     handle.bytes().end()),
+              (std::vector<std::byte>{std::byte{1}, std::byte{2},
+                                      std::byte{3}}));
+
+    auto cancelled = pool->Reserve(Request(
+        TopicId{7}, 3, 102, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{7}, 102, 3)));
+    ASSERT_TRUE(cancelled.ok());
+    auto discard = cancelled->reservation.Cancel();
+    ASSERT_TRUE(discard.has_value());
+    ASSERT_TRUE(discard->metadata.has_value());
+    EXPECT_EQ(discard->metadata->source.source_sequence, 102u);
+}
+
+TEST(RecorderBufferPoolTest, RejectsMetadataThatDoesNotMatchRequest) {
+    RecorderBufferPoolOptions options;
+    options.global_byte_limit = 4u * 1024u;
+    options.default_topic_byte_limit = options.global_byte_limit;
+    options.queue_capacity = 1;
+    auto pool = NewPool(options);
+    ASSERT_NE(pool, nullptr);
+
+    auto wrong_topic = pool->Reserve(Request(
+        TopicId{1}, 1, 1, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{2}, 1, 1)));
+    ASSERT_FALSE(wrong_topic.ok());
+    EXPECT_EQ(wrong_topic.status().code(), StatusCode::kInvalidArgument);
+
+    auto wrong_size = pool->Reserve(Request(
+        TopicId{1}, 1, 1, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{1}, 1, 2)));
+    ASSERT_FALSE(wrong_size.ok());
+    EXPECT_EQ(wrong_size.status().code(), StatusCode::kInvalidArgument);
+}
+
 TEST(RecorderBufferPoolTest, EnforcesTopicGlobalAndQueueCapacity) {
     RecorderBufferPoolOptions options;
     options.global_byte_limit = 8u * 1024u;
@@ -112,13 +220,20 @@ TEST(RecorderBufferPoolTest, EnforcesTopicGlobalAndQueueCapacity) {
     CommitAccepted(&*topic_one);
 
     auto topic_drop = pool->Reserve(Request(
-        TopicId{1}, 1, 11, BufferFullPolicy::kDropNewest));
+        TopicId{1}, 1, 11, BufferFullPolicy::kDropNewest,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{1}, 11, 1)));
     ASSERT_TRUE(topic_drop.ok());
     EXPECT_EQ(topic_drop->admission, BufferAdmission::kDroppedNewest);
     ASSERT_EQ(topic_drop->discarded.size(), 1u);
     EXPECT_EQ(topic_drop->discarded[0].reason,
               BufferDiscardReason::kDropNewest);
     EXPECT_EQ(topic_drop->discarded[0].user_tag, 11u);
+    ASSERT_TRUE(topic_drop->discarded[0].metadata.has_value());
+    EXPECT_EQ(topic_drop->discarded[0].metadata->source.node_id, 10u);
+    EXPECT_EQ(topic_drop->discarded[0].metadata->source.publisher_id, 20u);
+    EXPECT_EQ(topic_drop->discarded[0].metadata->source.publisher_epoch, 30u);
+    EXPECT_EQ(topic_drop->discarded[0].metadata->source.source_sequence, 11u);
 
     auto topic_two = pool->Reserve(Request(TopicId{2}, 1, 20));
     ASSERT_TRUE(topic_two.ok());
@@ -135,6 +250,7 @@ TEST(RecorderBufferPoolTest, EnforcesTopicGlobalAndQueueCapacity) {
     auto first = pool->TryDequeue();
     ASSERT_TRUE(first.ok());
     EXPECT_EQ(first->user_tag(), 10u);
+    EXPECT_FALSE(first->metadata().has_value());
     // Dequeue frees the queue slot, but the consumer's RAII handle continues
     // to own and charge the bytes until it is released.
     EXPECT_EQ(pool->TopicBytesInUse(TopicId{1}), 4u * 1024u);
@@ -166,17 +282,25 @@ TEST(RecorderBufferPoolTest, DropOldestReturnsEveryDiscardedRecord) {
     auto pool = NewPool(options);
     ASSERT_NE(pool, nullptr);
 
-    auto other_topic = pool->Reserve(Request(TopicId{2}, 1, 100));
+    auto other_topic = pool->Reserve(Request(
+        TopicId{2}, 1, 100, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{2}, 100, 1)));
     ASSERT_TRUE(other_topic.ok());
     CommitAccepted(&*other_topic);
-    auto same_topic = pool->Reserve(Request(TopicId{1}, 1, 101));
+    auto same_topic = pool->Reserve(Request(
+        TopicId{1}, 1, 101, BufferFullPolicy::kBlock,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{1}, 101, 1)));
     ASSERT_TRUE(same_topic.ok());
     CommitAccepted(&*same_topic);
 
     // Satisfying Topic 1's limit requires dropping through the global oldest
     // prefix: Topic 2's record and then Topic 1's old record.
     auto replacement = pool->Reserve(Request(
-        TopicId{1}, 1, 102, BufferFullPolicy::kDropOldest));
+        TopicId{1}, 1, 102, BufferFullPolicy::kDropOldest,
+        std::chrono::nanoseconds::max(),
+        RecordMetadata(TopicId{1}, 102, 1)));
     ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
     ASSERT_TRUE(replacement->accepted());
     ASSERT_EQ(replacement->discarded.size(), 2u);
@@ -184,11 +308,22 @@ TEST(RecorderBufferPoolTest, DropOldestReturnsEveryDiscardedRecord) {
               BufferDiscardReason::kDropOldest);
     EXPECT_EQ(replacement->discarded[0].user_tag, 100u);
     EXPECT_EQ(replacement->discarded[1].user_tag, 101u);
+    ASSERT_TRUE(replacement->discarded[0].metadata.has_value());
+    ASSERT_TRUE(replacement->discarded[1].metadata.has_value());
+    EXPECT_EQ(replacement->discarded[0].metadata->source.node_id, 10u);
+    EXPECT_EQ(replacement->discarded[0].metadata->source.publisher_id, 20u);
+    EXPECT_EQ(replacement->discarded[0].metadata->source.publisher_epoch, 30u);
+    EXPECT_EQ(replacement->discarded[0].metadata->source.source_sequence,
+              100u);
+    EXPECT_EQ(replacement->discarded[1].metadata->source.source_sequence,
+              101u);
     CommitAccepted(&*replacement);
 
     auto remaining = pool->TryDequeue();
     ASSERT_TRUE(remaining.ok());
     EXPECT_EQ(remaining->user_tag(), 102u);
+    ASSERT_TRUE(remaining->metadata().has_value());
+    EXPECT_EQ(remaining->metadata()->source.source_sequence, 102u);
     EXPECT_EQ(pool->stats().dropped_oldest_records, 2u);
     EXPECT_EQ(pool->TryDequeue().status().code(), StatusCode::kWouldBlock);
 }
@@ -431,7 +566,8 @@ TEST(RecorderBufferPoolTest, ConcurrentProducersPreserveEveryCommittedBuffer) {
                 const uint64_t tag = producer * kRecordsPerProducer + index;
                 auto result = pool->Reserve(Request(
                     TopicId{1}, sizeof(uint64_t), tag,
-                    BufferFullPolicy::kBlock, 5s));
+                    BufferFullPolicy::kBlock, 5s,
+                    RecordMetadata(TopicId{1}, tag, sizeof(uint64_t))));
                 if (!result.ok() || !result->accepted()) {
                     failed.store(true, std::memory_order_release);
                     break;
@@ -464,7 +600,9 @@ TEST(RecorderBufferPoolTest, ConcurrentProducersPreserveEveryCommittedBuffer) {
             continue;
         }
         const uint64_t tag = record->user_tag();
-        if (tag >= kTotalRecords || observed[tag]) {
+        if (tag >= kTotalRecords || observed[tag] ||
+            !record->metadata().has_value() ||
+            record->metadata()->source.source_sequence != tag) {
             failed.store(true, std::memory_order_release);
         } else {
             observed[tag] = true;

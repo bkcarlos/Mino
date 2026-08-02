@@ -17,6 +17,7 @@
 #include "mino/common/ids.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/storage/recording_types.h"
 
 namespace mino::storage {
 
@@ -62,6 +63,9 @@ struct DiscardedBuffer {
     uint64_t user_tag = 0;
     size_t payload_size = 0;
     size_t charged_bytes = 0;
+    // Present when the producer supplied recorder identity. Drop reports retain
+    // it so TopicWriter can derive source-sequence Gaps without side channels.
+    std::optional<RecorderRecordMetadata> metadata;
 };
 
 struct RecorderBufferPoolOptions {
@@ -109,6 +113,9 @@ struct BufferReservationRequest {
     uint64_t user_tag = 0;
     BufferFullPolicy full_policy = BufferFullPolicy::kBlock;
     std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max();
+    // Optional preserves the generic D5-04 byte-buffer API. RecorderSubscriber
+    // always supplies this value.
+    std::optional<RecorderRecordMetadata> metadata;
 };
 
 namespace detail {
@@ -140,6 +147,9 @@ public:
     size_t capacity() const noexcept { return charged_bytes_; }
     TopicId topic_id() const noexcept { return topic_id_; }
     uint64_t user_tag() const noexcept { return user_tag_; }
+    const std::optional<RecorderRecordMetadata>& metadata() const noexcept {
+        return metadata_;
+    }
 
     void Reset() noexcept;
 
@@ -150,7 +160,8 @@ private:
     RecorderBufferHandle(
         std::shared_ptr<detail::RecorderBufferPoolState> state,
         detail::RecorderBufferBlock* block, TopicId topic_id,
-        size_t payload_size, size_t charged_bytes, uint64_t user_tag) noexcept;
+        size_t payload_size, size_t charged_bytes, uint64_t user_tag,
+        std::optional<RecorderRecordMetadata> metadata) noexcept;
 
     std::shared_ptr<detail::RecorderBufferPoolState> state_;
     detail::RecorderBufferBlock* block_ = nullptr;
@@ -158,6 +169,7 @@ private:
     size_t payload_size_ = 0;
     size_t charged_bytes_ = 0;
     uint64_t user_tag_ = 0;
+    std::optional<RecorderRecordMetadata> metadata_;
 };
 
 // Producer-side two-phase queue reservation. Destruction safely cancels an
@@ -186,6 +198,9 @@ public:
     size_t capacity() const noexcept { return charged_bytes_; }
     TopicId topic_id() const noexcept { return topic_id_; }
     uint64_t user_tag() const noexcept { return user_tag_; }
+    const std::optional<RecorderRecordMetadata>& metadata() const noexcept {
+        return metadata_;
+    }
 
     // Commits in producer completion order. On close/failure the reservation is
     // released and a non-OK Status explicitly reports that it was not queued.
@@ -203,7 +218,8 @@ private:
     RecorderBufferReservation(
         std::shared_ptr<detail::RecorderBufferPoolState> state,
         detail::RecorderBufferBlock* block, TopicId topic_id,
-        size_t payload_size, size_t charged_bytes, uint64_t user_tag) noexcept;
+        size_t payload_size, size_t charged_bytes, uint64_t user_tag,
+        std::optional<RecorderRecordMetadata> metadata) noexcept;
 
     std::shared_ptr<detail::RecorderBufferPoolState> state_;
     detail::RecorderBufferBlock* block_ = nullptr;
@@ -211,6 +227,7 @@ private:
     size_t payload_size_ = 0;
     size_t charged_bytes_ = 0;
     uint64_t user_tag_ = 0;
+    std::optional<RecorderRecordMetadata> metadata_;
 };
 
 struct BufferReserveResult {
