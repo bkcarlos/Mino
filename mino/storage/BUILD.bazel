@@ -75,7 +75,10 @@ cc_test(
 cc_library(
     name = "recorder_buffer_pool",
     srcs = ["recorder_buffer_pool.cc"],
-    hdrs = ["recorder_buffer_pool.h"],
+    hdrs = [
+        "recorder_buffer_pool.h",
+        "recording_types.h",
+    ],
     deps = [
         "//mino/common:ids",
         "//mino/common:result",
@@ -89,6 +92,270 @@ cc_test(
     deps = [
         ":recorder_buffer_pool",
         "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recorder_subscriber",
+    srcs = ["recorder_subscriber.cc"],
+    hdrs = ["recorder_subscriber.h"],
+    deps = [
+        ":recorder_buffer_pool",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/runtime:runtime_types",
+        "//mino/runtime:subscriber",
+        "//mino/schema:descriptor",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:wire",
+    ],
+)
+
+cc_test(
+    name = "recorder_subscriber_test",
+    srcs = ["recorder_subscriber_test.cc"],
+    deps = [
+        ":recorder_buffer_pool",
+        ":recorder_subscriber",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "segment_recovery",
+    srcs = ["segment_recovery.cc"],
+    hdrs = ["segment_recovery.h"],
+    deps = [
+        ":segment_format",
+        "//mino/bridge:crc32c",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "segment_recovery_test",
+    srcs = ["segment_recovery_test.cc"],
+    deps = [
+        ":segment_format",
+        ":segment_recovery",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recording_manifest",
+    srcs = ["recording_manifest.cc"],
+    hdrs = ["recording_manifest.h"],
+    deps = [
+        "//mino/bridge:crc32c",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "recording_manifest_test",
+    srcs = ["recording_manifest_test.cc"],
+    deps = [
+        ":recording_manifest",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recording_policy",
+    srcs = ["recording_policy.cc"],
+    hdrs = ["recording_policy.h"],
+    deps = [
+        ":recorder_buffer_pool",
+        ":segment_writer",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "recording_policy_test",
+    srcs = ["recording_policy_test.cc"],
+    deps = [
+        ":recording_policy",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "topic_writer",
+    srcs = ["topic_writer.cc"],
+    hdrs = ["topic_writer.h"],
+    deps = [
+        ":recorder_buffer_pool",
+        ":recording_manifest",
+        ":recording_policy",
+        ":schema_store",
+        ":segment_writer",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "topic_writer_test",
+    srcs = ["topic_writer_test.cc"],
+    deps = [
+        ":segment_format",
+        ":topic_writer",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recording_topology",
+    srcs = ["recording_topology.cc"],
+    hdrs = ["recording_topology.h"],
+    deps = [
+        ":recording_policy",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "recording_topology_test",
+    srcs = ["recording_topology_test.cc"],
+    deps = [
+        ":recording_topology",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "replay_engine",
+    srcs = ["replay_engine.cc"],
+    hdrs = ["replay_engine.h"],
+    deps = [
+        ":recording_manifest",
+        ":segment_format",
+        ":segment_recovery",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "replay_engine_test",
+    srcs = ["replay_engine_test.cc"],
+    deps = [
+        ":recording_manifest",
+        ":replay_engine",
+        ":segment_format",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "retention",
+    srcs = ["retention.cc"],
+    hdrs = ["retention.h"],
+    deps = [
+        ":recording_manifest",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "retention_test",
+    srcs = ["retention_test.cc"],
+    deps = [
+        ":recording_manifest",
+        ":retention",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "snapshot_store",
+    srcs = ["snapshot_store.cc"],
+    hdrs = ["snapshot_store.h"],
+    deps = [
+        ":segment_format",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "snapshot_store_test",
+    srcs = ["snapshot_store_test.cc"],
+    deps = [
+        ":replay_engine",
+        ":snapshot_store",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recorder",
+    srcs = ["recorder.cc"],
+    hdrs = ["recorder.h"],
+    deps = [
+        ":recorder_buffer_pool",
+        ":recording_manifest",
+        ":recording_policy",
+        ":recording_topology",
+        ":schema_store",
+        ":segment_recovery",
+        ":snapshot_store",
+        ":topic_writer",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:descriptor",
+        "//mino/schema:registry",
+    ],
+)
+
+cc_test(
+    name = "recorder_test",
+    srcs = ["recorder_test.cc"],
+    deps = [
+        ":recorder",
+        "//mino/common:status",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "storage_fault_test",
+    srcs = ["storage_fault_test.cc"],
+    deps = [
+        ":recorder_buffer_pool",
+        ":recording_manifest",
+        ":schema_store",
+        ":segment_format",
+        ":segment_recovery",
+        ":segment_writer",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema:registry",
+        "//mino/schema/codegen:artifact_codec",
         "@googletest//:gtest_main",
     ],
 )

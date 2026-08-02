@@ -17,6 +17,32 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "storage_commands",
+    srcs = ["storage_commands.cc"],
+    hdrs = ["storage_commands.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:replay_engine",
+        "//mino/storage:segment_recovery",
+    ],
+)
+
+cc_test(
+    name = "storage_commands_test",
+    srcs = ["storage_commands_test.cc"],
+    deps = [
+        ":storage_commands",
+        "//mino/common:status",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:segment_format",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "inspector_test",
     srcs = ["inspector_test.cc"],
@@ -36,6 +62,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":inspector",
+        ":storage_commands",
         "//mino/common:status",
         "//mino/shm/recovery:scanner",
     ],
