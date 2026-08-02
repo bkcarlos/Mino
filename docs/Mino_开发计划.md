@@ -311,10 +311,10 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 | # | 任务 | 产出 | 依赖 | 预估 |
 |---|---|---|---|---|
-| D5-01 | Schema Store | Descriptor 持久化、fdatasync + Atomic Rename、Ref Table（详设 17.3） | D3-11 | 5d |
-| D5-02 | Segment/Record 格式 | SegmentHeader/RecordHeader 编码、Commit Marker、Trailer（详设 17.10） | D3-07 | 5d |
-| D5-03 | Segment Writer | OPEN→SEALED 生命周期、Batch、Sync 策略、轮转（详设 17.7、17.11） | D5-02 | 5d |
-| D5-04 | Recorder Buffer Pool | 有界 Chunk Pool、MPSC Queue、BufferFullPolicy（详设 17.5） | D5-02 | 3d |
+| D5-01 | Schema Store ✅ | Descriptor 持久化、fdatasync + Atomic Rename、Ref Table（`//mino/storage:schema_store`，详设 17.3） | D3-11 | 5d |
+| D5-02 | Segment/Record 格式 ✅ | SegmentHeader/RecordHeader 显式小端编码、CRC、Commit Marker、Trailer（`//mino/storage:segment_format`，详设 17.10） | D3-07 | 5d |
+| D5-03 | Segment Writer ✅ | OPEN→SEALED/ERROR、Batch、四种 Sync 策略、轮转阈值、短写处理（`//mino/storage:segment_writer`，详设 17.7、17.11） | D5-02 | 5d |
+| D5-04 | Recorder Buffer Pool ✅ | 有界分级 Chunk Pool、MPSC Queue、按 Topic/全局预算、四种 BufferFullPolicy（`//mino/storage:recorder_buffer_pool`，详设 17.5） | D5-02 | 3d |
 | D5-05 | Recorder Subscriber | Borrow → Validate → Canonical Encode → Copy → ACK（详设 11.4） | D5-04 | 3d |
 | D5-06 | TopicWriter | Per-Topic Single Writer、Ingestion Sequence、Gap/Tombstone（详设 17.6~17.7） | D5-03, D5-05 | 5d |
 | D5-07 | 背压拓扑 | strong_consistent/isolated/best_effort 三种模式（详设 17.2） | D5-06 | 3d |
@@ -529,7 +529,9 @@ D2: //mino/shm/channel:spsc, //mino/shm/channel:mpsc, //mino/shm/channel:broadca
 D3: //mino/schema:descriptor, //mino/schema:runtime_compiler, //mino/schema:dynamic,
     //tools/minoc
 D4: //mino/transport:switcher, //mino/bridge:tcp_bridge, //mino/registry
-D5: //mino/storage:recorder, //mino/storage:replay, //tools/mino
+D5: //mino/storage:schema_store, //mino/storage:segment_format,
+    //mino/storage:segment_writer, //mino/storage:recorder_buffer_pool,
+    //mino/storage:recorder, //mino/storage:replay, //tools/mino
 ```
 
 ## 附录 B：关键不变量与测试覆盖映射

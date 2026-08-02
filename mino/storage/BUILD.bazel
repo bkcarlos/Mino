@@ -1,2 +1,94 @@
 # Recorder, storage, replay.
-package(default_visibility = ["//visibility:private"])
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "schema_store",
+    srcs = ["schema_store.cc"],
+    hdrs = ["schema_store.h"],
+    deps = [
+        "//mino/bridge:crc32c",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:registry",
+    ],
+)
+
+cc_test(
+    name = "schema_store_test",
+    srcs = ["schema_store_test.cc"],
+    deps = [
+        ":schema_store",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema:registry",
+        "//mino/schema/codegen:artifact_codec",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "segment_format",
+    srcs = ["segment_format.cc"],
+    hdrs = ["segment_format.h"],
+    deps = [
+        "//mino/bridge:crc32c",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "segment_format_test",
+    srcs = ["segment_format_test.cc"],
+    deps = [
+        ":segment_format",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "segment_writer",
+    srcs = ["segment_writer.cc"],
+    hdrs = ["segment_writer.h"],
+    deps = [
+        ":segment_format",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "segment_writer_test",
+    srcs = ["segment_writer_test.cc"],
+    deps = [
+        ":segment_format",
+        ":segment_writer",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "recorder_buffer_pool",
+    srcs = ["recorder_buffer_pool.cc"],
+    hdrs = ["recorder_buffer_pool.h"],
+    deps = [
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "recorder_buffer_pool_test",
+    srcs = ["recorder_buffer_pool_test.cc"],
+    deps = [
+        ":recorder_buffer_pool",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
