@@ -348,6 +348,35 @@ public:
         };
     }
 
+    Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
+        Wake();
+        std::lock_guard lock(mutex_);
+        const auto found = sockets_.find(request.connection_id);
+        if (found == sockets_.end()) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "UDP connection does not exist");
+        }
+        if (found->second.info.is_listener) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "UDP listener has no configured send peer");
+        }
+        ssize_t sent = -1;
+        do {
+            sent = ::send(found->second.fd, request.payload.data(),
+                          request.payload.size(), 0);
+        } while (sent < 0 && errno == EINTR);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return WouldBlock("UDP socket send buffer is full");
+            }
+            return Unavailable("UDP datagram send failed");
+        }
+        if (static_cast<size_t>(sent) != request.payload.size()) {
+            return Internal("UDP socket reported a partial datagram send");
+        }
+        return request.payload.size();
+    }
+
     Result<ReceiveResult> PollMessages(const ReceiveRequest& request) {
         std::unique_lock lock(mutex_);
         const auto deadline =
@@ -364,6 +393,10 @@ public:
                 pollfd{.fd = wake_read_fd_, .events = POLLIN, .revents = 0});
             ids.push_back(kInvalidConnectionId);
             for (const auto& [id, socket] : sockets_) {
+                if (request.connection_id != kInvalidConnectionId &&
+                    id != request.connection_id) {
+                    continue;
+                }
                 descriptors.push_back(
                     pollfd{.fd = socket.fd, .events = POLLIN, .revents = 0});
                 ids.push_back(id);
@@ -475,29 +508,53 @@ public:
     Result<CompletionPollResult> PollCompletions(
         const CompletionPollRequest& request) {
         std::unique_lock lock(mutex_);
-        if (completion_count_ == 0) {
+        const auto has_matching_completion = [this, &request] {
+            for (size_t offset = 0; offset < completion_count_; ++offset) {
+                const size_t index =
+                    (completion_head_ + offset) % completions_.size();
+                if (request.connection_id == kInvalidConnectionId ||
+                    completions_[index].operation.connection_id ==
+                        request.connection_id) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!has_matching_completion()) {
             if (request.timeout_ms == 0) {
                 return WouldBlock("UDP completion queue is empty");
             }
             const bool ready = completion_cv_.wait_for(
-                lock, std::chrono::milliseconds(request.timeout_ms), [this] {
-                    return completion_count_ != 0 ||
+                lock, std::chrono::milliseconds(request.timeout_ms),
+                [this, &has_matching_completion] {
+                    return has_matching_completion() ||
                            stop_requested_.load(std::memory_order_acquire);
                 });
             if (!ready) return Timeout("UDP completion poll timed out");
-            if (completion_count_ == 0) {
+            if (!has_matching_completion()) {
                 return Unavailable("UDP driver is stopping");
             }
         }
         CompletionPollResult result;
         result.completions.reserve(
             std::min<size_t>(request.max_completions, completion_count_));
-        while (completion_count_ != 0 &&
-               result.completions.size() < request.max_completions) {
-            result.completions.push_back(
-                std::move(completions_[completion_head_]));
+        const size_t initial_count = completion_count_;
+        for (size_t scanned = 0; scanned < initial_count; ++scanned) {
+            DeliveryCompletion completion =
+                std::move(completions_[completion_head_]);
             completion_head_ = (completion_head_ + 1) % completions_.size();
             --completion_count_;
+            const bool matches =
+                request.connection_id == kInvalidConnectionId ||
+                completion.operation.connection_id == request.connection_id;
+            if (matches &&
+                result.completions.size() < request.max_completions) {
+                result.completions.push_back(std::move(completion));
+                continue;
+            }
+            completions_[completion_tail_] = std::move(completion);
+            completion_tail_ = (completion_tail_ + 1) % completions_.size();
+            ++completion_count_;
         }
         return result;
     }
@@ -630,6 +687,11 @@ Result<SendResult> UdpDriver::DoSend(const SendRequest& request,
                                      SendOperation operation) {
     return impl_->Send(request, operation);
 }
+Result<size_t> UdpDriver::DoSendUntracked(
+    const UntrackedSendRequest& request) {
+    return impl_->SendUntracked(request);
+}
+
 Result<ReceiveResult> UdpDriver::DoPoll(const ReceiveRequest& request) {
     return impl_->PollMessages(request);
 }

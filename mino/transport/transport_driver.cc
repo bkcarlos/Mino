@@ -148,6 +148,12 @@ Status ValidateTransportCapabilities(
         capabilities.kind == TransportKind::kNetwork) {
         return Invalid("network transport cannot advertise a shared window");
     }
+    if (capabilities.features.Has(
+            Capability::kRemoteAcceptedConfirmation) &&
+        capabilities.reliability != TransportReliability::kReliable) {
+        return Invalid(
+            "remote acceptance confirmation requires reliable transport");
+    }
     return Status::Ok();
 }
 
@@ -527,6 +533,29 @@ Status ValidateSendRequest(const SendRequest& request,
     return Status::Ok();
 }
 
+Status ValidateUntrackedSendRequest(
+    const UntrackedSendRequest& request,
+    const TransportCapabilities& capabilities) {
+    MINO_RETURN_IF_ERROR(ValidateTransportCapabilities(capabilities));
+    if (request.connection_id == kInvalidConnectionId) {
+        return Invalid("untracked send connection id must be non-zero");
+    }
+    if (request.payload.empty()) {
+        return Invalid("untracked send payload must be non-empty");
+    }
+    if (request.payload.size() > kMaxPayloadBytes ||
+        (capabilities.max_frame_size != 0 &&
+         request.payload.size() > capabilities.max_frame_size)) {
+        return Exhausted("untracked send payload exceeds driver limits");
+    }
+    switch (request.traffic_class) {
+        case UntrackedTrafficClass::kProtocolControl:
+        case UntrackedTrafficClass::kData:
+            return Status::Ok();
+    }
+    return Invalid("untracked send has an unknown traffic class");
+}
+
 Status ValidateReceiveRequest(const ReceiveRequest& request) {
     if (request.max_messages == 0 || request.max_bytes == 0) {
         return Invalid("receive limits must be non-zero");
@@ -581,6 +610,10 @@ Status ValidateReceiveResult(const ReceiveRequest& request,
             message.payload.empty()) {
             return Invalid("received message has invalid id or empty payload");
         }
+        if (request.connection_id != kInvalidConnectionId &&
+            message.connection_id != request.connection_id) {
+            return Invalid("received message does not match connection filter");
+        }
         MINO_RETURN_IF_ERROR(ValidateEndpointDescriptor(message.from));
         if (message.payload.size() > request.max_bytes - total_bytes) {
             return Exhausted("receive result exceeds requested byte count");
@@ -605,6 +638,10 @@ Status ValidateCompletionPollResult(const CompletionPollRequest& request,
             !IsTransportDeliveryStage(completion.reached_stage)) {
             return Invalid("completion has invalid identity or delivery stage");
         }
+        if (request.connection_id != kInvalidConnectionId &&
+            completion.operation.connection_id != request.connection_id) {
+            return Invalid("completion does not match connection filter");
+        }
         for (size_t j = 0; j < i; ++j) {
             if (result.completions[j].operation.id == completion.operation.id) {
                 return Invalid("completion result contains a duplicate operation");
@@ -618,6 +655,15 @@ void TransportDriver::DoRequestStop() noexcept {}
 
 Result<ConnectionInfo> TransportDriver::DoAccept(const AcceptRequest&) {
     return Unsupported("driver does not support Accept");
+}
+
+Result<size_t> TransportDriver::DoSendUntracked(
+    const UntrackedSendRequest&) {
+    return Unsupported("driver does not support untracked sends");
+}
+
+Status TransportDriver::DoConfirmRemoteAccepted(SendOperation) {
+    return Unsupported("driver does not support protocol ACK confirmation");
 }
 
 TransportDriver::ActiveOperation::~ActiveOperation() {
@@ -887,6 +933,63 @@ Result<SendResult> TransportDriver::Send(const SendRequest& request) {
             CancelSendOperation(operation.id);
             throw;
         }
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<size_t> TransportDriver::SendUntracked(
+    const UntrackedSendRequest& request) {
+    try {
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        const TransportCapabilities driver_capabilities = capabilities();
+        MINO_RETURN_IF_ERROR(
+            ValidateDriverCapabilitiesForCall(driver_capabilities));
+        MINO_RETURN_IF_ERROR(
+            ValidateUntrackedSendRequest(request, driver_capabilities));
+        auto result = DoSendUntracked(request);
+        if (!result.ok()) return result.status();
+        if (*result != request.payload.size()) {
+            return InvalidDriverResult(
+                "driver returned invalid untracked Send admission");
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Status TransportDriver::ConfirmRemoteAccepted(SendOperation operation) {
+    try {
+        if (operation.id == kInvalidOperationId ||
+            operation.connection_id == kInvalidConnectionId) {
+            return Invalid("remote confirmation operation is incomplete");
+        }
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        const TransportCapabilities driver_capabilities = capabilities();
+        MINO_RETURN_IF_ERROR(
+            ValidateDriverCapabilitiesForCall(driver_capabilities));
+        if (!driver_capabilities.features.Has(
+                Capability::kRemoteAcceptedConfirmation)) {
+            return Unsupported(
+                "driver does not support remote acceptance confirmation");
+        }
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            const auto found = outstanding_sends_.find(operation.id);
+            if (found == outstanding_sends_.end() ||
+                found->second.connection_id != operation.connection_id) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "send operation is not outstanding");
+            }
+            if (found->second.target_stage !=
+                DeliveryStage::kRemoteAccepted) {
+                return Invalid("send operation does not target remote acceptance");
+            }
+        }
+        return DoConfirmRemoteAccepted(operation);
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }

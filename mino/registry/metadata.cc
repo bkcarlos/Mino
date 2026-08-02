@@ -253,6 +253,24 @@ Status ValidateTopicMetadata(const TopicMetadata& metadata,
         !HasNonzeroDigest(metadata.schema.canonical_digest())) {
         return Invalid("schema identity is incomplete");
     }
+    if (metadata.accepted_schemas.size() > kMaxAcceptedSchemasPerTopic) {
+        return Status::Error(StatusCode::kResourceExhausted,
+                             "accepted schema set exceeds topic bound");
+    }
+    for (size_t i = 0; i < metadata.accepted_schemas.size(); ++i) {
+        const schema::SchemaIdentity& accepted = metadata.accepted_schemas[i];
+        if (accepted.short_id() == 0 || accepted.schema_version() == 0 ||
+            accepted.layout_version() == 0 ||
+            !HasNonzeroDigest(accepted.canonical_digest()) ||
+            SchemaIdentityEqual(metadata.schema, accepted)) {
+            return Invalid("accepted schema identity is incomplete or redundant");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (SchemaIdentityEqual(accepted, metadata.accepted_schemas[j])) {
+                return Invalid("accepted schema identities must be unique");
+            }
+        }
+    }
     if (metadata.route_policy == RoutePolicy::kDiscovery) {
         if (!metadata.static_routes.empty()) {
             return Invalid("discovery routing must not contain static routes");

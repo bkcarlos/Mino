@@ -170,6 +170,7 @@ TopicMetadata DiscoveryTopic(std::string name = "test/topic") {
                      .allow_drop = false},
         .queue_full_policy = QueueFullPolicy::kBlock,
         .schema = Schema(),
+        .accepted_schemas = {},
         .route_policy = RoutePolicy::kDiscovery,
         .static_routes = {},
         .route_set_version = 0,
@@ -274,6 +275,14 @@ TEST(MetadataValidationTest, RejectsMalformedCapacitySchemaRoutesAndChannels) {
               StatusCode::kInvalidArgument);
     topic = DiscoveryTopic();
     topic.channel_kind = ChannelKind::kSpsc;
+    EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
+              StatusCode::kInvalidArgument);
+    topic = DiscoveryTopic();
+    topic.accepted_schemas = {topic.schema};
+    EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
+              StatusCode::kInvalidArgument);
+    topic = DiscoveryTopic();
+    topic.accepted_schemas = {Schema(8), Schema(8)};
     EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
               StatusCode::kInvalidArgument);
 }

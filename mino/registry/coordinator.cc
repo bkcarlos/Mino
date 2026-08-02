@@ -358,6 +358,25 @@ Result<std::shared_ptr<const TopicSnapshot>> Coordinator::GetTopic(
     }
 }
 
+Result<std::shared_ptr<const TopicSnapshot>> Coordinator::FindTopic(
+    std::string_view name) const {
+    try {
+        std::lock_guard lock(mutex_);
+        const auto id = topic_names_.find(std::string(name));
+        if (id == topic_names_.end()) {
+            return Status::Error(StatusCode::kNotFound, "topic not found");
+        }
+        const auto topic = topics_.find(id->second);
+        if (topic == topics_.end()) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "topic name index is inconsistent");
+        }
+        return topic->second.snapshot;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
 Result<std::vector<std::shared_ptr<const TopicSnapshot>>>
 Coordinator::ListTopics() const {
     try {

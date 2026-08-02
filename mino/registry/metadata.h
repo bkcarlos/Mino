@@ -29,6 +29,7 @@ inline constexpr size_t kMaxTrustDomainBytes = 255;
 inline constexpr size_t kMaxTopicCount = 65'536;
 inline constexpr size_t kMaxTopicNameBytes = 255;
 inline constexpr size_t kMaxStaticRoutes = 4096;
+inline constexpr size_t kMaxAcceptedSchemasPerTopic = 16;
 inline constexpr uint32_t kMaxTopicCapacity = 1u << 30;
 inline constexpr uint32_t kMaxTopicPublishers = 65'536;
 inline constexpr uint32_t kMaxTopicSubscribers = 65'536;
@@ -153,6 +154,9 @@ struct TopicMetadata {
     DeliveryPolicy delivery;
     QueueFullPolicy queue_full_policy = QueueFullPolicy::kBlock;
     schema::SchemaIdentity schema{0, {}, 0, 0};
+    // Explicitly accepted reader/wire versions in addition to the primary
+    // publish schema. Empty means only schema is accepted.
+    std::vector<schema::SchemaIdentity> accepted_schemas;
     RoutePolicy route_policy = RoutePolicy::kDiscovery;
     std::vector<StaticRouteEntry> static_routes;
     uint64_t route_set_version = 0;

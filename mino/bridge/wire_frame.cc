@@ -101,6 +101,7 @@ bool IsValidFrameType(FrameType type) noexcept {
         case FrameType::kSchemaRequest:
         case FrameType::kAck:
         case FrameType::kHeartbeat:
+        case FrameType::kSessionHello:
             return true;
     }
     return false;

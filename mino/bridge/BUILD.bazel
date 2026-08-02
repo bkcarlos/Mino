@@ -19,6 +19,153 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "reliability",
+    srcs = [
+        "control_payload.cc",
+        "dedup_window.cc",
+        "retransmit_window.cc",
+    ],
+    hdrs = [
+        "control_payload.h",
+        "dedup_window.h",
+        "retransmit_window.h",
+        "source_identity.h",
+    ],
+    deps = [
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "schema_negotiator",
+    srcs = ["schema_negotiator.cc"],
+    hdrs = ["schema_negotiator.h"],
+    deps = [
+        ":wire_frame",
+        "//mino/common:result",
+        "//mino/schema:canonical",
+        "//mino/schema:descriptor",
+        "//mino/schema:registry",
+    ],
+)
+
+cc_library(
+    name = "bridge_pipeline",
+    srcs = ["bridge_pipeline.cc"],
+    hdrs = ["bridge_pipeline.h"],
+    deps = [
+        ":reliability",
+        ":schema_negotiator",
+        ":wire_frame",
+        "//mino/common:result",
+        "//mino/registry:registry",
+        "//mino/transport:transport_driver",
+    ],
+)
+
+cc_library(
+    name = "remote_object_reconstructor",
+    srcs = ["remote_object_reconstructor.cc"],
+    hdrs = ["remote_object_reconstructor.h"],
+    deps = [
+        ":bridge_pipeline",
+        ":schema_negotiator",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/platform:process_identity",
+        "//mino/registry:registry",
+        "//mino/runtime:allocation_journal",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:layout",
+        "//mino/schema:registry",
+        "//mino/schema:wire",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_test(
+    name = "remote_object_reconstructor_test",
+    srcs = ["remote_object_reconstructor_test.cc"],
+    deps = [
+        ":remote_object_reconstructor",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:dynamic_value",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "bridge_pipeline_test",
+    srcs = ["bridge_pipeline_test.cc"],
+    deps = [
+        ":bridge_pipeline",
+        "//mino/schema:compiler",
+        "//mino/transport:tcp_driver",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "bridge_two_node_test",
+    srcs = ["bridge_two_node_test.cc"],
+    deps = [
+        ":bridge_pipeline",
+        "//mino/transport:tcp_driver",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "control_payload_test",
+    srcs = ["control_payload_test.cc"],
+    deps = [
+        ":reliability",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "dedup_window_test",
+    srcs = ["dedup_window_test.cc"],
+    deps = [
+        ":reliability",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "retransmit_window_test",
+    srcs = ["retransmit_window_test.cc"],
+    deps = [
+        ":reliability",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "schema_negotiator_test",
+    srcs = ["schema_negotiator_test.cc"],
+    deps = [
+        ":schema_negotiator",
+        "//mino/common:status",
+        "//mino/schema:canonical",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "wire_frame_test",
     size = "small",

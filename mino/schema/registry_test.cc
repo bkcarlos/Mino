@@ -148,6 +148,29 @@ message Root { Child child = 1; }
     }
 }
 
+TEST(SchemaRegistryTest, ValidatedArtifactIsInvisibleUntilPublished) {
+    auto compiled = SchemaCompiler::Compile(
+        "option schema_version = \"1.0\"; package p; message Staged {}");
+    ASSERT_TRUE(compiled.ok()) << compiled.status().ToString();
+    auto artifact = EncodeArtifact(*compiled);
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+
+    SchemaRegistry registry;
+    auto staged = registry.ValidateDescriptorArtifact(ArtifactBytes(*artifact));
+    ASSERT_TRUE(staged.ok()) << staged.status().ToString();
+    ASSERT_EQ(staged->descriptors().size(), 1u);
+    EXPECT_EQ(registry.size(), 0u);
+    auto hidden = registry.Find(compiled->types()[0]->identity());
+    ASSERT_FALSE(hidden.ok());
+    EXPECT_EQ(hidden.status().code(), StatusCode::kNotFound);
+
+    auto published =
+        registry.PublishDescriptorArtifact(std::move(*staged));
+    ASSERT_TRUE(published.ok()) << published.status().ToString();
+    EXPECT_EQ(registry.size(), 1u);
+    EXPECT_TRUE(registry.Find(compiled->types()[0]->identity()).ok());
+}
+
 TEST(SchemaRegistryTest, RejectsMalformedDescriptorArtifact) {
     SchemaRegistry registry;
     const std::array<std::byte, 4> bytes = {

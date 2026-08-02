@@ -529,12 +529,20 @@ Result<std::vector<SchemaHandle>> SchemaRegistry::RegisterIdl(
 Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
     SchemaHandle descriptor) noexcept {
     const std::array<SchemaHandle, 1> descriptors = {std::move(descriptor)};
-    auto registered = RegisterDescriptors(descriptors);
+    auto registered = ValidateAndRegisterDescriptors(descriptors, true);
     if (!registered.ok()) return registered.status();
     return (*registered)[0];
 }
 
 Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
+    std::span<const std::byte> descriptor_bytes) noexcept {
+    auto validated = ValidateDescriptorArtifact(descriptor_bytes);
+    if (!validated.ok()) return validated.status();
+    return PublishDescriptorArtifact(std::move(*validated));
+}
+
+Result<ValidatedDescriptorArtifact>
+SchemaRegistry::ValidateDescriptorArtifact(
     std::span<const std::byte> descriptor_bytes) noexcept {
     try {
         const std::string_view bytes = descriptor_bytes.empty()
@@ -552,8 +560,7 @@ Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
                 external_descriptors.push_back(descriptor);
             }
         }
-        auto decoded =
-            codegen::DecodeAndValidate(bytes, external_descriptors);
+        auto decoded = codegen::DecodeAndValidate(bytes, external_descriptors);
         if (!decoded.ok()) return decoded.status();
         if (decoded->types.empty()) {
             return Invalid("descriptor artifact contains no types");
@@ -564,9 +571,10 @@ Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
         for (auto& type : decoded->types) {
             descriptors.push_back(std::move(type.descriptor));
         }
-        auto registered = RegisterDescriptors(descriptors);
-        if (!registered.ok()) return registered.status();
-        return (*registered)[0];
+        auto validated =
+            ValidateAndRegisterDescriptors(descriptors, false);
+        if (!validated.ok()) return validated.status();
+        return ValidatedDescriptorArtifact(std::move(*validated));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {
@@ -574,13 +582,25 @@ Result<SchemaHandle> SchemaRegistry::RegisterDescriptor(
     }
 }
 
-Result<std::vector<SchemaHandle>> SchemaRegistry::RegisterCompiled(
-    const CompiledSchema& schema) noexcept {
-    return RegisterDescriptors(schema.types());
+Result<SchemaHandle> SchemaRegistry::PublishDescriptorArtifact(
+    ValidatedDescriptorArtifact artifact) noexcept {
+    if (artifact.descriptors_.empty()) {
+        return Invalid("validated descriptor artifact contains no types");
+    }
+    auto registered =
+        ValidateAndRegisterDescriptors(artifact.descriptors_, true);
+    if (!registered.ok()) return registered.status();
+    return (*registered)[0];
 }
 
-Result<std::vector<SchemaHandle>> SchemaRegistry::RegisterDescriptors(
-    std::span<const SchemaHandle> descriptors) noexcept {
+Result<std::vector<SchemaHandle>> SchemaRegistry::RegisterCompiled(
+    const CompiledSchema& schema) noexcept {
+    return ValidateAndRegisterDescriptors(schema.types(), true);
+}
+
+Result<std::vector<SchemaHandle>>
+SchemaRegistry::ValidateAndRegisterDescriptors(
+    std::span<const SchemaHandle> descriptors, bool publish) noexcept {
     try {
         std::vector<SchemaHandle> trusted;
         trusted.reserve(descriptors.size());
@@ -714,6 +734,8 @@ Result<std::vector<SchemaHandle>> SchemaRegistry::RegisterDescriptors(
                     "major version");
             }
         }
+
+        if (!publish) return trusted;
 
         auto next_by_digest = by_digest_;
         auto next_by_type_version = by_type_version_;

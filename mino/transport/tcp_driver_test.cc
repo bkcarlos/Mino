@@ -3,6 +3,7 @@
 #include "mino/transport/tcp_driver.h"
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -171,6 +172,72 @@ ScopedFd ConnectRaw(const EndpointDescriptor& endpoint) {
     return fd;
 }
 
+struct RawListener {
+    ScopedFd fd;
+    EndpointDescriptor endpoint;
+};
+
+RawListener ListenRaw(int receive_buffer_bytes = 4096) {
+    ScopedFd fd(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+    EXPECT_GE(fd.get(), 0);
+    const int reuse = 1;
+    EXPECT_EQ(::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &reuse,
+                           sizeof(reuse)),
+              0);
+    EXPECT_EQ(::setsockopt(fd.get(), SOL_SOCKET, SO_RCVBUF,
+                           &receive_buffer_bytes,
+                           sizeof(receive_buffer_bytes)),
+              0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    EXPECT_EQ(::bind(fd.get(), reinterpret_cast<sockaddr*>(&address),
+                     sizeof(address)),
+              0);
+    EXPECT_EQ(::listen(fd.get(), 1), 0);
+    socklen_t size = sizeof(address);
+    EXPECT_EQ(::getsockname(fd.get(), reinterpret_cast<sockaddr*>(&address),
+                            &size),
+              0);
+    return RawListener{.fd = std::move(fd),
+                       .endpoint = Loopback(ntohs(address.sin_port))};
+}
+
+ScopedFd AcceptRaw(const RawListener& listener) {
+    pollfd descriptor{.fd = listener.fd.get(),
+                      .events = POLLIN,
+                      .revents = 0};
+    EXPECT_EQ(::poll(&descriptor, 1, 1000), 1);
+    ScopedFd accepted(::accept(listener.fd.get(), nullptr, nullptr));
+    EXPECT_GE(accepted.get(), 0);
+    return accepted;
+}
+
+bool ReceiveUntil(int fd, std::vector<std::byte>* bytes, size_t target_size,
+                  std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::array<std::byte, 64 * 1024> buffer{};
+    while (bytes->size() < target_size) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) return false;
+        pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+        const int ready = ::poll(
+            &descriptor, 1,
+            static_cast<int>(std::min<int64_t>(remaining.count(), 100)));
+        if (ready < 0) return false;
+        if (ready == 0) continue;
+        const size_t amount =
+            std::min(buffer.size(), target_size - bytes->size());
+        const ssize_t received = ::recv(fd, buffer.data(), amount, 0);
+        if (received <= 0) return false;
+        bytes->insert(bytes->end(), buffer.begin(),
+                      buffer.begin() + received);
+    }
+    return true;
+}
+
 bool WaitForConnectionCount(const TcpDriver& driver, size_t expected,
                             std::chrono::milliseconds timeout = 1000ms) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -179,6 +246,16 @@ bool WaitForConnectionCount(const TcpDriver& driver, size_t expected,
         std::this_thread::sleep_for(2ms);
     }
     return driver.stats().active_connections == expected;
+}
+
+bool WaitForReadyMessageCount(const TcpDriver& driver, size_t expected,
+                              std::chrono::milliseconds timeout = 1000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (driver.stats().ready_receive_messages == expected) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return driver.stats().ready_receive_messages == expected;
 }
 
 TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
@@ -192,15 +269,25 @@ TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
     options.max_ready_receive_bytes = options.max_frame_body_bytes - 1;
     EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
               StatusCode::kInvalidArgument);
+    options = TestOptions();
+    options.max_control_send_buffer_bytes = options.max_frame_body_bytes;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = TestOptions();
+    options.max_control_send_messages = 0;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
 }
 
-TEST(TcpDriverTest, LoopbackRoundTripStripsPrefixAndWriteIsNotRemoteAccepted) {
+TEST(TcpDriverTest, RemoteAcceptedCompletesOnlyAfterExplicitConfirmation) {
     DriverPair pair = ConnectPair();
     ASSERT_NE(pair.server, nullptr);
     ASSERT_NE(pair.client, nullptr);
     ASSERT_NE(pair.client_connection.id, kInvalidConnectionId);
     ASSERT_NE(pair.server_connection.id, kInvalidConnectionId);
     EXPECT_NE(pair.listener.id, pair.server_connection.id);
+    EXPECT_TRUE(pair.client->capabilities().features.Has(
+        Capability::kRemoteAcceptedConfirmation));
 
     const std::vector<std::byte> body = FrameBody(256);
     auto sent = pair.client->Send({
@@ -219,10 +306,155 @@ TEST(TcpDriverTest, LoopbackRoundTripStripsPrefixAndWriteIsNotRemoteAccepted) {
               pair.server_connection.id);
     EXPECT_EQ(received->messages[0].payload, body);
 
-    auto no_ack = pair.client->PollCompletions(
+    auto before_ack = pair.client->PollCompletions(
         {.max_completions = 1, .timeout_ms = 50});
-    ASSERT_FALSE(no_ack.ok());
-    EXPECT_EQ(no_ack.status().code(), StatusCode::kTimeout);
+    ASSERT_FALSE(before_ack.ok());
+    EXPECT_EQ(before_ack.status().code(), StatusCode::kTimeout);
+
+    EXPECT_TRUE(pair.client->ConfirmRemoteAccepted(sent->operation).ok());
+    EXPECT_EQ(pair.client->ConfirmRemoteAccepted(sent->operation).code(),
+              StatusCode::kNotFound);
+    SendOperation unknown = sent->operation;
+    ++unknown.id;
+    EXPECT_EQ(pair.client->ConfirmRemoteAccepted(unknown).code(),
+              StatusCode::kNotFound);
+
+    auto completed = pair.client->PollCompletions(
+        {.max_completions = 1, .timeout_ms = 1000});
+    ASSERT_TRUE(completed.ok()) << completed.status().ToString();
+    ASSERT_EQ(completed->completions.size(), 1u);
+    EXPECT_EQ(completed->completions[0].operation, sent->operation);
+    EXPECT_EQ(completed->completions[0].reached_stage,
+              DeliveryStage::kRemoteAccepted);
+    EXPECT_TRUE(completed->completions[0].status.ok());
+    EXPECT_EQ(pair.client->ConfirmRemoteAccepted(sent->operation).code(),
+              StatusCode::kNotFound);
+}
+
+TEST(TcpDriverTest, ConnectionFiltersPreserveOtherMessagesAndCompletions) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    auto second_client = pair.client->Connect({
+        .remote_endpoint = *pair.listener.local_endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_client.ok()) << second_client.status().ToString();
+    auto second_server = pair.server->Accept({
+        .listener_id = pair.listener.id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_server.ok()) << second_server.status().ToString();
+
+    const std::vector<std::byte> first = FrameBody(40, 101);
+    const std::vector<std::byte> second = FrameBody(48, 102);
+    auto first_send = pair.client->Send({
+        .connection_id = pair.client_connection.id,
+        .payload = first,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    auto second_send = pair.client->Send({
+        .connection_id = second_client->id,
+        .payload = second,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(first_send.ok()) << first_send.status().ToString();
+    ASSERT_TRUE(second_send.ok()) << second_send.status().ToString();
+
+    auto second_received = pair.server->Poll({
+        .max_messages = 2,
+        .max_bytes = 4096,
+        .timeout_ms = 1000,
+        .connection_id = second_server->id,
+    });
+    ASSERT_TRUE(second_received.ok()) << second_received.status().ToString();
+    ASSERT_EQ(second_received->messages.size(), 1u);
+    EXPECT_EQ(second_received->messages[0].connection_id, second_server->id);
+    EXPECT_EQ(second_received->messages[0].payload, second);
+    EXPECT_EQ(pair.server->Poll({
+                  .max_messages = 1,
+                  .max_bytes = 4096,
+                  .timeout_ms = 0,
+                  .connection_id = second_server->id,
+              }).status().code(),
+              StatusCode::kWouldBlock);
+
+    auto first_received = pair.server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = pair.server_connection.id,
+    });
+    ASSERT_TRUE(first_received.ok()) << first_received.status().ToString();
+    ASSERT_EQ(first_received->messages.size(), 1u);
+    EXPECT_EQ(first_received->messages[0].connection_id,
+              pair.server_connection.id);
+    EXPECT_EQ(first_received->messages[0].payload, first);
+
+    ASSERT_TRUE(pair.client->ConfirmRemoteAccepted(first_send->operation).ok());
+    ASSERT_TRUE(pair.client->ConfirmRemoteAccepted(second_send->operation).ok());
+    auto second_completion = pair.client->PollCompletions({
+        .max_completions = 2,
+        .timeout_ms = 0,
+        .connection_id = second_client->id,
+    });
+    ASSERT_TRUE(second_completion.ok())
+        << second_completion.status().ToString();
+    ASSERT_EQ(second_completion->completions.size(), 1u);
+    EXPECT_EQ(second_completion->completions[0].operation,
+              second_send->operation);
+    EXPECT_EQ(pair.client->PollCompletions({
+                  .max_completions = 1,
+                  .timeout_ms = 0,
+                  .connection_id = second_client->id,
+              }).status().code(),
+              StatusCode::kWouldBlock);
+
+    auto first_completion = pair.client->PollCompletions({
+        .max_completions = 1,
+        .timeout_ms = 0,
+        .connection_id = pair.client_connection.id,
+    });
+    ASSERT_TRUE(first_completion.ok())
+        << first_completion.status().ToString();
+    ASSERT_EQ(first_completion->completions.size(), 1u);
+    EXPECT_EQ(first_completion->completions[0].operation,
+              first_send->operation);
+}
+
+TEST(TcpDriverTest, CloseDiscardsReadyMessagesForConnection) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    const std::vector<std::byte> body = FrameBody(64, 103);
+    ASSERT_TRUE(pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = body,
+    }).ok());
+    ASSERT_TRUE(WaitForReadyMessageCount(*pair.server, 1));
+    ASSERT_TRUE(pair.server->Close(pair.server_connection.id).ok());
+    EXPECT_EQ(pair.server->stats().ready_receive_messages, 0u);
+    EXPECT_EQ(pair.server->stats().ready_receive_bytes, 0u);
+}
+
+TEST(TcpDriverTest, CloseBeforeAckFailsTrackedOperation) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    const std::vector<std::byte> body = FrameBody(128);
+    auto sent = pair.client->Send({
+        .connection_id = pair.client_connection.id,
+        .payload = body,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    auto received = pair.server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
 
     ASSERT_TRUE(pair.client->Close(pair.client_connection.id).ok());
     auto failed = pair.client->PollCompletions(
@@ -233,6 +465,108 @@ TEST(TcpDriverTest, LoopbackRoundTripStripsPrefixAndWriteIsNotRemoteAccepted) {
     EXPECT_EQ(failed->completions[0].reached_stage,
               DeliveryStage::kLocalPublished);
     EXPECT_FALSE(failed->completions[0].status.ok());
+}
+
+TEST(TcpDriverTest, UntrackedSendProducesNoCompletion) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    const std::vector<std::byte> body = FrameBody(64);
+    auto sent = pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData,
+    });
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    EXPECT_EQ(*sent, body.size());
+
+    auto received = pair.server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, body);
+
+    auto completion = pair.client->PollCompletions(
+        {.max_completions = 1, .timeout_ms = 50});
+    ASSERT_FALSE(completion.ok());
+    EXPECT_EQ(completion.status().code(), StatusCode::kTimeout);
+}
+
+TEST(TcpDriverTest, ControlReserveWorksAtFullDataQuotaWithoutInterleaving) {
+    const std::vector<std::byte> data = FrameBody(8u * 1024u * 1024u, 20);
+    const std::vector<std::byte> control = FrameBody(32, 21);
+    TcpDriverOptions options = TestOptions();
+    options.max_frame_body_bytes = static_cast<uint32_t>(data.size());
+    options.max_total_send_buffer_bytes = data.size() + 4;
+    options.max_connection_send_buffer_bytes = data.size() + 4;
+    options.max_control_send_buffer_bytes = data.size() + 4;
+    options.max_control_send_messages = 1;
+    options.max_ready_receive_bytes = data.size();
+    options.heartbeat_interval_ms = 1000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+
+    RawListener listener = ListenRaw();
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+    ASSERT_GE(peer.get(), 0);
+
+    auto tracked = driver->Send({
+        .connection_id = connected->id,
+        .payload = data,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(tracked.ok()) << tracked.status().ToString();
+
+    std::vector<std::byte> received_wire;
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received_wire, 1));
+    ASSERT_NE(driver->stats().queued_send_bytes, 0u);
+    auto data_blocked = driver->Send({
+        .connection_id = connected->id,
+        .payload = data,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_FALSE(data_blocked.ok());
+    EXPECT_EQ(data_blocked.status().code(), StatusCode::kWouldBlock);
+
+    auto best_effort_blocked = driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = control,
+        .traffic_class = UntrackedTrafficClass::kData,
+    });
+    ASSERT_FALSE(best_effort_blocked.ok());
+    EXPECT_EQ(best_effort_blocked.status().code(), StatusCode::kWouldBlock);
+
+    auto control_sent = driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = control,
+    });
+    ASSERT_TRUE(control_sent.ok()) << control_sent.status().ToString();
+    EXPECT_EQ(*control_sent, control.size());
+    auto control_blocked = driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = control,
+    });
+    ASSERT_FALSE(control_blocked.ok());
+    EXPECT_EQ(control_blocked.status().code(), StatusCode::kWouldBlock);
+
+    std::vector<std::byte> expected_wire = Prefix(data);
+    const std::vector<std::byte> control_wire = Prefix(control);
+    expected_wire.insert(expected_wire.end(), control_wire.begin(),
+                         control_wire.end());
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received_wire,
+                             expected_wire.size(), 5000ms));
+    EXPECT_EQ(received_wire, expected_wire);
 }
 
 TEST(TcpDriverTest, IncrementalReaderAcceptsOneBytePrefixAndBodyFragments) {

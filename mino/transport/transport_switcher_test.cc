@@ -258,6 +258,7 @@ protected:
             .delivery = {.reliability = reliability, .allow_drop = false},
             .queue_full_policy = QueueFullPolicy::kBlock,
             .schema = Schema(),
+            .accepted_schemas = {},
             .route_policy = policy,
             .static_routes = std::move(routes),
             .route_set_version = 0,

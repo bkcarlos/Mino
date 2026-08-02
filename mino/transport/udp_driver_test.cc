@@ -103,6 +103,8 @@ TEST(UdpDriverTest, PreservesDatagramBoundariesAndReportsDegradedLocalCompletion
     std::unique_ptr<UdpDriver> client = std::move(*client_result);
     ASSERT_TRUE(server->Start(Config()).ok());
     ASSERT_TRUE(client->Start(Config()).ok());
+    EXPECT_FALSE(client->capabilities().features.Has(
+        Capability::kRemoteAcceptedConfirmation));
 
     const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
     auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
@@ -125,6 +127,8 @@ TEST(UdpDriverTest, PreservesDatagramBoundariesAndReportsDegradedLocalCompletion
     });
     ASSERT_TRUE(first_send.ok()) << first_send.status().ToString();
     ASSERT_TRUE(second_send.ok()) << second_send.status().ToString();
+    EXPECT_EQ(client->ConfirmRemoteAccepted(first_send->operation).code(),
+              StatusCode::kUnsupported);
 
     auto received = server->Poll(
         {.max_messages = 2, .max_bytes = 1200, .timeout_ms = 1000});
@@ -143,6 +147,155 @@ TEST(UdpDriverTest, PreservesDatagramBoundariesAndReportsDegradedLocalCompletion
         EXPECT_EQ(completion.reached_stage, DeliveryStage::kLocalPublished);
         EXPECT_EQ(completion.status.code(), StatusCode::kDegraded);
     }
+}
+
+TEST(UdpDriverTest, ConnectionFiltersPreserveOtherDatagramsAndCompletions) {
+    auto server_result = UdpDriver::Create();
+    auto client_result = UdpDriver::Create();
+    ASSERT_TRUE(server_result.ok());
+    ASSERT_TRUE(client_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    std::unique_ptr<UdpDriver> client = std::move(*client_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    ASSERT_TRUE(client->Start(Config()).ok());
+
+    const EndpointDescriptor first_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    auto first_listener = server->Listen(
+        {.local_endpoint = first_endpoint, .backlog = 1});
+    ASSERT_TRUE(first_listener.ok()) << first_listener.status().ToString();
+    const EndpointDescriptor second_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    auto second_listener = server->Listen(
+        {.local_endpoint = second_endpoint, .backlog = 1});
+    ASSERT_TRUE(second_listener.ok()) << second_listener.status().ToString();
+
+    auto first_connection = client->Connect({
+        .remote_endpoint = first_endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 0,
+    });
+    auto second_connection = client->Connect({
+        .remote_endpoint = second_endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 0,
+    });
+    ASSERT_TRUE(first_connection.ok()) << first_connection.status().ToString();
+    ASSERT_TRUE(second_connection.ok()) << second_connection.status().ToString();
+
+    const std::vector<std::byte> first(19, std::byte{0x31});
+    const std::vector<std::byte> second(29, std::byte{0x32});
+    auto first_send = client->Send({
+        .connection_id = first_connection->id,
+        .payload = first,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    auto second_send = client->Send({
+        .connection_id = second_connection->id,
+        .payload = second,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(first_send.ok()) << first_send.status().ToString();
+    ASSERT_TRUE(second_send.ok()) << second_send.status().ToString();
+
+    auto second_received = server->Poll({
+        .max_messages = 2,
+        .max_bytes = 1200,
+        .timeout_ms = 1000,
+        .connection_id = second_listener->id,
+    });
+    ASSERT_TRUE(second_received.ok()) << second_received.status().ToString();
+    ASSERT_EQ(second_received->messages.size(), 1u);
+    EXPECT_EQ(second_received->messages[0].connection_id,
+              second_listener->id);
+    EXPECT_EQ(second_received->messages[0].payload, second);
+    EXPECT_EQ(server->Poll({
+                  .max_messages = 1,
+                  .max_bytes = 1200,
+                  .timeout_ms = 0,
+                  .connection_id = second_listener->id,
+              }).status().code(),
+              StatusCode::kWouldBlock);
+
+    auto first_received = server->Poll({
+        .max_messages = 1,
+        .max_bytes = 1200,
+        .timeout_ms = 0,
+        .connection_id = first_listener->id,
+    });
+    ASSERT_TRUE(first_received.ok()) << first_received.status().ToString();
+    ASSERT_EQ(first_received->messages.size(), 1u);
+    EXPECT_EQ(first_received->messages[0].connection_id, first_listener->id);
+    EXPECT_EQ(first_received->messages[0].payload, first);
+
+    auto second_completion = client->PollCompletions({
+        .max_completions = 2,
+        .timeout_ms = 0,
+        .connection_id = second_connection->id,
+    });
+    ASSERT_TRUE(second_completion.ok())
+        << second_completion.status().ToString();
+    ASSERT_EQ(second_completion->completions.size(), 1u);
+    EXPECT_EQ(second_completion->completions[0].operation,
+              second_send->operation);
+    EXPECT_EQ(client->PollCompletions({
+                  .max_completions = 1,
+                  .timeout_ms = 0,
+                  .connection_id = second_connection->id,
+              }).status().code(),
+              StatusCode::kWouldBlock);
+
+    auto first_completion = client->PollCompletions({
+        .max_completions = 1,
+        .timeout_ms = 0,
+        .connection_id = first_connection->id,
+    });
+    ASSERT_TRUE(first_completion.ok())
+        << first_completion.status().ToString();
+    ASSERT_EQ(first_completion->completions.size(), 1u);
+    EXPECT_EQ(first_completion->completions[0].operation,
+              first_send->operation);
+}
+
+TEST(UdpDriverTest, UntrackedDatagramProducesNoCompletion) {
+    auto server_result = UdpDriver::Create();
+    auto client_result = UdpDriver::Create();
+    ASSERT_TRUE(server_result.ok());
+    ASSERT_TRUE(client_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    std::unique_ptr<UdpDriver> client = std::move(*client_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    ASSERT_TRUE(client->Start(Config()).ok());
+
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    auto connected = client->Connect({
+        .remote_endpoint = endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 0,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+
+    const std::vector<std::byte> payload(23, std::byte{0x3c});
+    auto sent = client->SendUntracked({
+        .connection_id = connected->id,
+        .payload = payload,
+        .traffic_class = UntrackedTrafficClass::kData,
+    });
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    EXPECT_EQ(*sent, payload.size());
+
+    auto received = server->Poll(
+        {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, payload);
+
+    auto completion = client->PollCompletions(
+        {.max_completions = 1, .timeout_ms = 50});
+    ASSERT_FALSE(completion.ok());
+    EXPECT_EQ(completion.status().code(), StatusCode::kTimeout);
 }
 
 TEST(UdpDriverTest, RejectsOversizedDatagramAndListenerSend) {

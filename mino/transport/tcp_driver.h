@@ -26,6 +26,10 @@ struct TcpDriverOptions {
     uint32_t idle_timeout_ms = 5000;
     uint32_t partial_frame_timeout_ms = 5000;
     uint32_t io_poll_max_ms = 50;
+    // Untracked protocol-control frames have an independent bounded reserve so
+    // ACK traffic can still make progress when the tracked data quota is full.
+    size_t max_control_send_buffer_bytes = 16u * 1024u * 1024u + 4u;
+    uint32_t max_control_send_messages = 1024;
 };
 
 Status ValidateTcpDriverOptions(const TcpDriverOptions& options);
@@ -65,6 +69,9 @@ protected:
     Result<ConnectionInfo> DoAccept(const AcceptRequest& request) override;
     Result<SendResult> DoSend(const SendRequest& request,
                               SendOperation operation) override;
+    Result<size_t> DoSendUntracked(
+        const UntrackedSendRequest& request) override;
+    Status DoConfirmRemoteAccepted(SendOperation operation) override;
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override;
     Result<CompletionPollResult> DoPollCompletions(
         const CompletionPollRequest& request) override;

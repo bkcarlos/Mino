@@ -45,6 +45,28 @@ cc_library(
 )
 
 cc_library(
+    name = "bus",
+    srcs = ["bus.cc"],
+    hdrs = ["bus.h"],
+    deps = [
+        "//mino/bridge:reliability",
+        "//mino/common:result",
+        "//mino/registry:registry",
+        "//mino/schema:descriptor",
+        "//mino/transport:transport_switcher",
+    ],
+)
+
+cc_test(
+    name = "bus_test",
+    srcs = ["bus_test.cc"],
+    deps = [
+        ":bus",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "publisher",
     hdrs = ["publisher.h"],
     deps = [

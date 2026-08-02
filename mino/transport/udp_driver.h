@@ -57,6 +57,8 @@ protected:
     Result<ConnectionInfo> DoListen(const ListenRequest& request) override;
     Result<SendResult> DoSend(const SendRequest& request,
                               SendOperation operation) override;
+    Result<size_t> DoSendUntracked(
+        const UntrackedSendRequest& request) override;
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override;
     Result<CompletionPollResult> DoPollCompletions(
         const CompletionPollRequest& request) override;

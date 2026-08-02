@@ -253,11 +253,16 @@ Status ValidateTcpDriverOptions(const TcpDriverOptions& options) {
         options.max_connection_send_buffer_bytes < minimum_wire ||
         options.max_connection_send_buffer_bytes >
             options.max_total_send_buffer_bytes ||
+        options.max_control_send_buffer_bytes < minimum_wire ||
+        options.max_control_send_buffer_bytes >
+            kMaxPayloadBytes + kTcpPrefixBytes ||
         options.max_ready_receive_bytes < options.max_frame_body_bytes ||
         options.max_ready_receive_bytes > kMaxReceiveBatchBytes) {
         return Invalid("TCP send or receive byte bounds are inconsistent");
     }
-    if (options.max_ready_receive_messages == 0 ||
+    if (options.max_control_send_messages == 0 ||
+        options.max_control_send_messages > kMaxQueuedSends ||
+        options.max_ready_receive_messages == 0 ||
         options.max_ready_receive_messages > kMaxQueuedSends ||
         options.max_pending_accepts == 0 ||
         options.max_pending_accepts > kMaxConnections) {
@@ -347,7 +352,9 @@ public:
         ready_messages_.clear();
         completions_.clear();
         recently_closed_.clear();
-        total_send_bytes_ = 0;
+        total_data_send_bytes_ = 0;
+        total_control_send_bytes_ = 0;
+        total_control_send_messages_ = 0;
         ready_receive_bytes_ = 0;
         reserved_receive_bytes_ = 0;
         reserved_receive_messages_ = 0;
@@ -563,18 +570,18 @@ public:
             return Unavailable("TCP connection is closing");
         }
         if (wire_size > options_.max_total_send_buffer_bytes -
-                            total_send_bytes_ ||
+                            total_data_send_bytes_ ||
             wire_size > options_.max_connection_send_buffer_bytes -
-                            connection.queued_send_bytes) {
-            return WouldBlock("TCP send byte queue is full");
+                            connection.queued_data_send_bytes) {
+            return WouldBlock("TCP data send byte queue is full");
         }
-        connection.writes.push_back(PendingWrite{
+        connection.data_writes.push_back(PendingWrite{
             .bytes = std::move(wire),
             .offset = 0,
             .operation = operation,
         });
-        connection.queued_send_bytes += wire_size;
-        total_send_bytes_ += wire_size;
+        connection.queued_data_send_bytes += wire_size;
+        total_data_send_bytes_ += wire_size;
         Wake();
         return SendResult{
             .operation = operation,
@@ -582,24 +589,104 @@ public:
         };
     }
 
+    Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
+        std::vector<std::byte> wire = PrefixFrame(request.payload);
+        const size_t wire_size = wire.size();
+        std::lock_guard lock(mutex_);
+        const auto found = connections_.find(request.connection_id);
+        if (found == connections_.end()) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "TCP connection does not exist");
+        }
+        Connection& connection = found->second;
+        if (connection.closing) {
+            return Unavailable("TCP connection is closing");
+        }
+        if (request.traffic_class ==
+            UntrackedTrafficClass::kProtocolControl) {
+            if (wire_size > options_.max_control_send_buffer_bytes -
+                                total_control_send_bytes_ ||
+                total_control_send_messages_ >=
+                    options_.max_control_send_messages) {
+                return WouldBlock("TCP control send queue is full");
+            }
+            connection.control_writes.push_back(PendingWrite{
+                .bytes = std::move(wire),
+                .offset = 0,
+                .operation = {},
+            });
+            connection.queued_control_send_bytes += wire_size;
+            total_control_send_bytes_ += wire_size;
+            ++total_control_send_messages_;
+        } else {
+            if (wire_size > options_.max_total_send_buffer_bytes -
+                                total_data_send_bytes_ ||
+                wire_size > options_.max_connection_send_buffer_bytes -
+                                connection.queued_data_send_bytes) {
+                return WouldBlock("TCP data send byte queue is full");
+            }
+            connection.data_writes.push_back(PendingWrite{
+                .bytes = std::move(wire),
+                .offset = 0,
+                .operation = {},
+            });
+            connection.queued_data_send_bytes += wire_size;
+            total_data_send_bytes_ += wire_size;
+        }
+        Wake();
+        return request.payload.size();
+    }
+
+    Status ConfirmRemoteAccepted(SendOperation operation) {
+        std::lock_guard lock(mutex_);
+        const auto found = connections_.find(operation.connection_id);
+        if (found == connections_.end()) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "TCP connection does not exist");
+        }
+        auto pending = std::find(found->second.awaiting_ack.begin(),
+                                 found->second.awaiting_ack.end(), operation);
+        if (pending == found->second.awaiting_ack.end()) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "TCP operation is not awaiting ACK");
+        }
+        completions_.push_back(DeliveryCompletion{
+            .operation = operation,
+            .reached_stage = DeliveryStage::kRemoteAccepted,
+            .status = Status::Ok(),
+        });
+        found->second.awaiting_ack.erase(pending);
+        completion_cv_.notify_all();
+        return Status::Ok();
+    }
+
     Result<ReceiveResult> PollMessages(const ReceiveRequest& request) {
         std::unique_lock lock(mutex_);
-        if (ready_messages_.empty()) {
+        const auto matches_filter = [&request](const ReceivedMessage& message) {
+            return request.connection_id == kInvalidConnectionId ||
+                   message.connection_id == request.connection_id;
+        };
+        const auto find_ready = [this, &matches_filter] {
+            return std::find_if(ready_messages_.begin(), ready_messages_.end(),
+                                matches_filter);
+        };
+        if (find_ready() == ready_messages_.end()) {
             if (request.timeout_ms == 0) {
                 return WouldBlock("TCP receive queue is empty");
             }
             const bool ready = receive_cv_.wait_for(
-                lock, std::chrono::milliseconds(request.timeout_ms), [this] {
-                    return !ready_messages_.empty() ||
+                lock, std::chrono::milliseconds(request.timeout_ms),
+                [this, &find_ready] {
+                    return find_ready() != ready_messages_.end() ||
                            stop_requested_.load(std::memory_order_acquire) ||
                            worker_failed_;
                 });
             if (!ready) return Timeout("TCP receive timed out");
-            if (ready_messages_.empty()) {
+            if (find_ready() == ready_messages_.end()) {
                 return Unavailable("TCP receive worker stopped");
             }
         }
-        if (ready_messages_.front().payload.size() > request.max_bytes) {
+        if (find_ready()->payload.size() > request.max_bytes) {
             return Exhausted("next TCP frame exceeds receive byte budget");
         }
 
@@ -607,14 +694,15 @@ public:
         result.messages.reserve(
             std::min<size_t>(request.max_messages, ready_messages_.size()));
         size_t bytes = 0;
-        while (!ready_messages_.empty() &&
-               result.messages.size() < request.max_messages) {
-            const size_t frame_size = ready_messages_.front().payload.size();
+        while (result.messages.size() < request.max_messages) {
+            const auto message = find_ready();
+            if (message == ready_messages_.end()) break;
+            const size_t frame_size = message->payload.size();
             if (frame_size > request.max_bytes - bytes) break;
             bytes += frame_size;
             ready_receive_bytes_ -= frame_size;
-            result.messages.push_back(std::move(ready_messages_.front()));
-            ready_messages_.pop_front();
+            result.messages.push_back(std::move(*message));
+            ready_messages_.erase(message);
         }
         Wake();
         return result;
@@ -623,28 +711,40 @@ public:
     Result<CompletionPollResult> PollCompletions(
         const CompletionPollRequest& request) {
         std::unique_lock lock(mutex_);
-        if (completions_.empty()) {
+        const auto matches_filter =
+            [&request](const DeliveryCompletion& completion) {
+                return request.connection_id == kInvalidConnectionId ||
+                       completion.operation.connection_id ==
+                           request.connection_id;
+            };
+        const auto find_ready = [this, &matches_filter] {
+            return std::find_if(completions_.begin(), completions_.end(),
+                                matches_filter);
+        };
+        if (find_ready() == completions_.end()) {
             if (request.timeout_ms == 0) {
                 return WouldBlock("TCP completion queue is empty");
             }
             const bool ready = completion_cv_.wait_for(
-                lock, std::chrono::milliseconds(request.timeout_ms), [this] {
-                    return !completions_.empty() ||
+                lock, std::chrono::milliseconds(request.timeout_ms),
+                [this, &find_ready] {
+                    return find_ready() != completions_.end() ||
                            stop_requested_.load(std::memory_order_acquire) ||
                            worker_failed_;
                 });
             if (!ready) return Timeout("TCP completion poll timed out");
-            if (completions_.empty()) {
+            if (find_ready() == completions_.end()) {
                 return Unavailable("TCP completion worker stopped");
             }
         }
         CompletionPollResult result;
         result.completions.reserve(
             std::min<size_t>(request.max_completions, completions_.size()));
-        while (!completions_.empty() &&
-               result.completions.size() < request.max_completions) {
-            result.completions.push_back(std::move(completions_.front()));
-            completions_.pop_front();
+        while (result.completions.size() < request.max_completions) {
+            const auto completion = find_ready();
+            if (completion == completions_.end()) break;
+            result.completions.push_back(std::move(*completion));
+            completions_.erase(completion);
         }
         return result;
     }
@@ -660,6 +760,7 @@ public:
         const auto connection = connections_.find(id);
         if (connection != connections_.end()) {
             connection->second.closing = true;
+            RemoveReadyMessagesLocked(id);
             Wake();
             return Status::Ok();
         }
@@ -673,7 +774,8 @@ public:
         return TcpDriverStats{
             .active_connections = connections_.size(),
             .listeners = listeners_.size(),
-            .queued_send_bytes = total_send_bytes_,
+            .queued_send_bytes =
+                total_data_send_bytes_ + total_control_send_bytes_,
             .ready_receive_bytes = ready_receive_bytes_,
             .ready_receive_messages = ready_messages_.size(),
             .pending_accepts = accepted_.size(),
@@ -698,9 +800,11 @@ private:
         size_t body_size = 0;
         size_t reserved_body_bytes = 0;
         std::optional<TimePoint> partial_frame_started;
-        std::deque<PendingWrite> writes;
+        std::deque<PendingWrite> control_writes;
+        std::deque<PendingWrite> data_writes;
         std::vector<SendOperation> awaiting_ack;
-        size_t queued_send_bytes = 0;
+        size_t queued_control_send_bytes = 0;
+        size_t queued_data_send_bytes = 0;
         bool heartbeat_pending = false;
         size_t heartbeat_offset = 0;
         TimePoint last_valid_receive{};
@@ -804,7 +908,8 @@ private:
                         PrepareHeartbeatLocked(connection, Clock::now());
                         short events = 0;
                         if (CanReadLocked(connection)) events |= POLLIN;
-                        if (!connection.writes.empty() ||
+                        if (!connection.control_writes.empty() ||
+                            !connection.data_writes.empty() ||
                             connection.heartbeat_pending) {
                             events |= POLLOUT;
                         }
@@ -904,16 +1009,30 @@ private:
         accept_cv_.notify_all();
     }
 
+    void RemoveReadyMessagesLocked(ConnectionId id) {
+        for (auto message = ready_messages_.begin();
+             message != ready_messages_.end();) {
+            if (message->connection_id != id) {
+                ++message;
+                continue;
+            }
+            ready_receive_bytes_ -= message->payload.size();
+            message = ready_messages_.erase(message);
+        }
+    }
+
     void CloseConnectionLocked(ConnectionId id, const Status& failure) {
         const auto found = connections_.find(id);
         if (found == connections_.end()) return;
         Connection& connection = found->second;
         if (connection.fd >= 0) (void)::close(connection.fd);
+        RemoveReadyMessagesLocked(id);
         if (connection.reserved_body_bytes != 0) {
             reserved_receive_bytes_ -= connection.reserved_body_bytes;
             --reserved_receive_messages_;
         }
-        for (const PendingWrite& write : connection.writes) {
+        for (const PendingWrite& write : connection.data_writes) {
+            if (write.operation.id == kInvalidOperationId) continue;
             completions_.push_back(DeliveryCompletion{
                 .operation = write.operation,
                 .reached_stage = DeliveryStage::kLocalPublished,
@@ -927,7 +1046,9 @@ private:
                 .status = failure,
             });
         }
-        total_send_bytes_ -= connection.queued_send_bytes;
+        total_data_send_bytes_ -= connection.queued_data_send_bytes;
+        total_control_send_bytes_ -= connection.queued_control_send_bytes;
+        total_control_send_messages_ -= connection.control_writes.size();
 
         accepted_.erase(
             std::remove_if(accepted_.begin(), accepted_.end(),
@@ -952,7 +1073,9 @@ private:
     }
 
     void PrepareHeartbeatLocked(Connection& connection, TimePoint now) noexcept {
-        if (!connection.heartbeat_pending && connection.writes.empty() &&
+        if (!connection.heartbeat_pending &&
+            connection.control_writes.empty() &&
+            connection.data_writes.empty() &&
             now - connection.last_transmit >=
                 std::chrono::milliseconds(options_.heartbeat_interval_ms)) {
             connection.heartbeat_pending = true;
@@ -1057,7 +1180,10 @@ private:
 
     void ProcessConnectionEventLocked(const PollToken& token, short events) {
         auto found = connections_.find(token.id);
-        if (found == connections_.end() || found->second.fd != token.fd) return;
+        if (found == connections_.end() || found->second.fd != token.fd ||
+            found->second.closing) {
+            return;
+        }
         if ((events & (POLLERR | POLLNVAL)) != 0) {
             CloseConnectionLocked(token.id,
                                   Unavailable("TCP socket poll failed"));
@@ -1196,57 +1322,113 @@ private:
 
     Status WriteConnectionLocked(Connection& connection) {
         size_t budget = kIoBudgetBytes;
-        while (budget != 0 && !connection.writes.empty()) {
-            PendingWrite& write = connection.writes.front();
-            const size_t remaining = write.bytes.size() - write.offset;
-            const size_t amount = std::min(remaining, budget);
-            const ssize_t sent = SendNoSignal(
-                connection.fd, write.bytes.data() + write.offset, amount);
+        while (budget != 0) {
+            // A heartbeat is also a stream frame. Once any part of it has been
+            // written, finish it before switching to either user queue.
+            if (connection.heartbeat_pending &&
+                connection.heartbeat_offset != 0) {
+                const size_t remaining =
+                    heartbeat_wire_.size() - connection.heartbeat_offset;
+                const size_t amount = std::min(remaining, budget);
+                const ssize_t sent = SendNoSignal(
+                    connection.fd,
+                    heartbeat_wire_.data() + connection.heartbeat_offset,
+                    amount);
+                if (sent < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return Status::Ok();
+                    }
+                    return Unavailable("TCP heartbeat send failed");
+                }
+                if (sent == 0) {
+                    return Unavailable("TCP heartbeat made no progress");
+                }
+                connection.heartbeat_offset += static_cast<size_t>(sent);
+                budget -= static_cast<size_t>(sent);
+                connection.last_transmit = Clock::now();
+                if (connection.heartbeat_offset == heartbeat_wire_.size()) {
+                    connection.heartbeat_pending = false;
+                    connection.heartbeat_offset = 0;
+                }
+                continue;
+            }
+
+            std::deque<PendingWrite>* writes = nullptr;
+            bool is_control = false;
+            if (!connection.data_writes.empty() &&
+                connection.data_writes.front().offset != 0) {
+                writes = &connection.data_writes;
+            } else if (!connection.control_writes.empty() &&
+                       connection.control_writes.front().offset != 0) {
+                writes = &connection.control_writes;
+                is_control = true;
+            } else if (!connection.control_writes.empty()) {
+                writes = &connection.control_writes;
+                is_control = true;
+            } else if (!connection.data_writes.empty()) {
+                writes = &connection.data_writes;
+            }
+
+            if (writes != nullptr) {
+                PendingWrite& write = writes->front();
+                const size_t remaining = write.bytes.size() - write.offset;
+                const size_t amount = std::min(remaining, budget);
+                const ssize_t sent = SendNoSignal(
+                    connection.fd, write.bytes.data() + write.offset, amount);
+                if (sent < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return Status::Ok();
+                    }
+                    return Unavailable("TCP send failed");
+                }
+                if (sent == 0) return Unavailable("TCP send made no progress");
+                write.offset += static_cast<size_t>(sent);
+                budget -= static_cast<size_t>(sent);
+                connection.last_transmit = Clock::now();
+                if (write.offset != write.bytes.size()) continue;
+
+                const size_t wire_size = write.bytes.size();
+                if (is_control) {
+                    connection.queued_control_send_bytes -= wire_size;
+                    total_control_send_bytes_ -= wire_size;
+                    --total_control_send_messages_;
+                } else {
+                    if (write.operation.id != kInvalidOperationId) {
+                        connection.awaiting_ack.push_back(write.operation);
+                    }
+                    connection.queued_data_send_bytes -= wire_size;
+                    total_data_send_bytes_ -= wire_size;
+                }
+                writes->pop_front();
+                // Deliberately no successful DeliveryCompletion here: TCP
+                // write is not remote acceptance. The protocol ACK calls
+                // ConfirmRemoteAccepted() for tracked data operations.
+                continue;
+            }
+
+            if (!connection.heartbeat_pending) break;
+            const size_t amount = std::min(heartbeat_wire_.size(), budget);
+            const ssize_t sent = SendNoSignal(connection.fd,
+                                               heartbeat_wire_.data(), amount);
             if (sent < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     return Status::Ok();
                 }
-                return Unavailable("TCP send failed");
+                return Unavailable("TCP heartbeat send failed");
             }
-            if (sent == 0) return Unavailable("TCP send made no progress");
-            write.offset += static_cast<size_t>(sent);
+            if (sent == 0) {
+                return Unavailable("TCP heartbeat made no progress");
+            }
+            connection.heartbeat_offset = static_cast<size_t>(sent);
             budget -= static_cast<size_t>(sent);
             connection.last_transmit = Clock::now();
-            if (write.offset != write.bytes.size()) continue;
-
-            const size_t wire_size = write.bytes.size();
-            connection.awaiting_ack.push_back(write.operation);
-            connection.writes.pop_front();
-            connection.queued_send_bytes -= wire_size;
-            total_send_bytes_ -= wire_size;
-            // Deliberately no successful DeliveryCompletion here: TCP write is
-            // not remote acceptance. D4-09 moves awaiting_ack via peer ACKs.
-        }
-        if (!connection.writes.empty() || !connection.heartbeat_pending ||
-            budget == 0) {
-            return Status::Ok();
-        }
-
-        const size_t remaining =
-            heartbeat_wire_.size() - connection.heartbeat_offset;
-        const size_t amount = std::min(remaining, budget);
-        ssize_t sent = -1;
-        do {
-            sent = SendNoSignal(
-                connection.fd,
-                heartbeat_wire_.data() + connection.heartbeat_offset, amount);
-        } while (sent < 0 && errno == EINTR);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return Status::Ok();
-            return Unavailable("TCP heartbeat send failed");
-        }
-        if (sent == 0) return Unavailable("TCP heartbeat made no progress");
-        connection.heartbeat_offset += static_cast<size_t>(sent);
-        connection.last_transmit = Clock::now();
-        if (connection.heartbeat_offset == heartbeat_wire_.size()) {
-            connection.heartbeat_pending = false;
-            connection.heartbeat_offset = 0;
+            if (connection.heartbeat_offset == heartbeat_wire_.size()) {
+                connection.heartbeat_pending = false;
+                connection.heartbeat_offset = 0;
+            }
         }
         return Status::Ok();
     }
@@ -1272,7 +1454,9 @@ private:
     std::deque<ReceivedMessage> ready_messages_;
     std::deque<DeliveryCompletion> completions_;
     std::unordered_set<ConnectionId> recently_closed_;
-    size_t total_send_bytes_ = 0;
+    size_t total_data_send_bytes_ = 0;
+    size_t total_control_send_bytes_ = 0;
+    size_t total_control_send_messages_ = 0;
     size_t ready_receive_bytes_ = 0;
     size_t reserved_receive_bytes_ = 0;
     size_t reserved_receive_messages_ = 0;
@@ -1303,7 +1487,8 @@ TransportCapabilities TcpDriver::capabilities() const noexcept {
         .reliability = TransportReliability::kReliable,
         .max_frame_size = options_.max_frame_body_bytes,
         .max_reassembly_bytes = options_.max_frame_body_bytes,
-        .features = Capability::kConnect | Capability::kListen,
+        .features = Capability::kConnect | Capability::kListen |
+                    Capability::kRemoteAcceptedConfirmation,
     };
 }
 
@@ -1334,6 +1519,15 @@ Result<ConnectionInfo> TcpDriver::DoAccept(const AcceptRequest& request) {
 Result<SendResult> TcpDriver::DoSend(const SendRequest& request,
                                      SendOperation operation) {
     return impl_->Send(request, operation);
+}
+
+Result<size_t> TcpDriver::DoSendUntracked(
+    const UntrackedSendRequest& request) {
+    return impl_->SendUntracked(request);
+}
+
+Status TcpDriver::DoConfirmRemoteAccepted(SendOperation operation) {
+    return impl_->ConfirmRemoteAccepted(operation);
 }
 
 Result<ReceiveResult> TcpDriver::DoPoll(const ReceiveRequest& request) {

@@ -25,6 +25,25 @@ namespace mino::schema {
 
 using SchemaHandle = std::shared_ptr<const SchemaDescriptor>;
 
+// A fully decoded and registry-validated descriptor artifact that has not been
+// published. Handles are immutable; only SchemaRegistry can construct a
+// publishable staged value.
+class ValidatedDescriptorArtifact {
+public:
+    ValidatedDescriptorArtifact() = default;
+
+    std::span<const SchemaHandle> descriptors() const noexcept {
+        return descriptors_;
+    }
+
+private:
+    explicit ValidatedDescriptorArtifact(std::vector<SchemaHandle> descriptors)
+        : descriptors_(std::move(descriptors)) {}
+
+    friend class SchemaRegistry;
+    std::vector<SchemaHandle> descriptors_;
+};
+
 class SchemaRegistry {
 public:
     using ShortIdIndexProviderForTesting =
@@ -52,6 +71,15 @@ public:
     // artifacts are rejected.
     Result<SchemaHandle> RegisterDescriptor(
         std::span<const std::byte> descriptor_bytes) noexcept;
+
+    // Performs artifact decoding and all current-registry validation without
+    // publishing any descriptor. PublishDescriptorArtifact revalidates under
+    // the write lock so concurrent registry changes cannot bypass checks.
+    Result<ValidatedDescriptorArtifact> ValidateDescriptorArtifact(
+        std::span<const std::byte> descriptor_bytes) noexcept;
+    Result<SchemaHandle> PublishDescriptorArtifact(
+        ValidatedDescriptorArtifact artifact) noexcept;
+
     Result<std::vector<SchemaHandle>> RegisterCompiled(
         const CompiledSchema& schema) noexcept;
 
@@ -81,8 +109,8 @@ private:
         }
     };
 
-    Result<std::vector<SchemaHandle>> RegisterDescriptors(
-        std::span<const SchemaHandle> descriptors) noexcept;
+    Result<std::vector<SchemaHandle>> ValidateAndRegisterDescriptors(
+        std::span<const SchemaHandle> descriptors, bool publish) noexcept;
     uint64_t ShortIdIndex(const CanonicalDigest& digest) const noexcept;
 
     mutable std::shared_mutex mutex_;

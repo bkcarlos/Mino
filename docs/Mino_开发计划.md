@@ -268,12 +268,12 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-04 | Transport Driver 接口 ✅ | Driver 生命周期/并发 fencing、Capabilities、EndpointDescriptor 显式持久化 codec、异步 Delivery completion（`//mino/transport:transport_driver`，详设 15.3） | D0-14 | 2d |
 | D4-05 | Wire Frame 编解码 ✅ | 80B v1 Header 显式大端 Encoder/Decoder、CRC32C、控制 payload opcode、有界增量 stream decoder（`//mino/bridge:wire_frame`，详设 16.2） | D3-07 | 3d |
 | D4-06 | TCP Driver ✅ | 非阻塞长连接、独立 Accept、4B 大端 Length Prefix、有界 Partial Read/Write、Canonical Heartbeat/Idle Timeout、Shutdown 唤醒与失败 completion（`//mino/transport:tcp_driver`，详设 16.4） | D4-04, D4-05 | 5d |
-| D4-07 | Bridge 管线 | Local Subscriber → Encode → Send → Receive → Decode → Remote Publish（详设 16.1） | D4-06 | 5d |
-| D4-08 | Schema 分发与协商 | connection_schema_ref 映射、Descriptor 按需请求、限频（详设 13.9） | D4-07 | 3d |
-| D4-09 | 可靠传输与去重 | Sequence/ACK/Session Epoch/重传窗口/逐来源映射表（详设 16.5） | D4-07 | 5d |
-| D4-10 | 远端对象重建 | 校验 → Slab 分配 → Decode → Validate → 本地发布（详设 16.3） | D4-07 | 3d |
-| D4-11 | Publisher/Subscriber 门面 API | Bus 入口、CreatePublisher/CreateSubscriber、Transport Switcher 集成 | D4-03 | 3d |
-| D4-12 | 双节点集成测试 | 同机/跨机端到端、断链重连、错误帧处理、N/N-1 Schema 互通 | 全部 | 持续 |
+| D4-07 | Bridge 管线 ✅ | 单 Owner 有界 Pump：Encode/Send/Receive/Decode/Remote Publish，控制帧独立 reserve（`//mino/bridge:bridge_pipeline`） | D4-06 | 5d |
+| D4-08 | Schema 分发与协商 ✅ | connection_schema_ref 单调映射、Descriptor 按需请求、4 MiB/1024 帧缓冲、16/s 限频与认证持久化门禁（`//mino/bridge:schema_negotiator`） | D4-07 | 3d |
+| D4-09 | 可靠传输与去重 ✅ | Sequence/ACK/Session Epoch、逐来源 HWM、重传/重连、重复抑制、Receiver restart `kDegraded`（`//mino/bridge:reliability`） | D4-07 | 5d |
+| D4-10 | 远端对象重建 ✅ | Schema/Topic 校验 → Canonical Decode → Slab/Journal → SPSC 原子发布，支持显式 N/N-1 binding（`//mino/bridge:remote_object_reconstructor`） | D4-07 | 3d |
+| D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`） | D4-03 | 3d |
+| D4-12 | 双节点集成测试 ✅ | 真实 TCP 双节点、`fork()` 双进程 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`） | 全部 | 持续 |
 
 ### 6.2 并行工作流
 
@@ -292,12 +292,12 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 6.4 退出条件（DoD）
 
-- [ ] 同机端到端 Pub/Sub 通过
-- [ ] 跨机双节点端到端通过
-- [ ] 断链重连后按策略恢复，去重窗口正常工作（V-19）
-- [ ] 错误帧被校验拒绝且不导致越界（INV-31）
-- [ ] N/N-1 Schema 互通通过
-- [ ] Bridge 去重窗口、Receiver 重启 kDegraded 路径测试通过
+- [x] 同机端到端 Pub/Sub 通过
+- [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback；同一协议路径可部署到跨机 Endpoint）
+- [x] 断链重连后按策略恢复，去重窗口正常工作（V-19）
+- [x] 错误帧被校验拒绝且不导致越界（INV-31）
+- [x] N/N-1 Schema 互通通过
+- [x] Bridge 去重窗口、Receiver 重启 kDegraded 路径测试通过
 
 ---
 

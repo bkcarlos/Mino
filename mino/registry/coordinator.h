@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +68,8 @@ public:
     Result<std::shared_ptr<const TopicSnapshot>> CreateTopic(
         TopicMetadata candidate);
     Result<std::shared_ptr<const TopicSnapshot>> GetTopic(TopicId topic_id) const;
+    Result<std::shared_ptr<const TopicSnapshot>> FindTopic(
+        std::string_view name) const;
     Result<std::vector<std::shared_ptr<const TopicSnapshot>>> ListTopics() const;
 
     // Two-phase update: validate and build an immutable candidate first, then

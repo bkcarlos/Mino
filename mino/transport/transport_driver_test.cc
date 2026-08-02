@@ -83,6 +83,66 @@ TEST(CapabilitiesTest, RejectsInvalidSemanticCombinationsAndLimits) {
     capabilities.max_reassembly_bytes = kMaxPayloadBytes + 1;
     EXPECT_EQ(ValidateTransportCapabilities(capabilities).code(),
               StatusCode::kResourceExhausted);
+
+    capabilities.max_reassembly_bytes = 4096;
+    capabilities.reliability = TransportReliability::kUnreliable;
+    capabilities.features = Capability::kRemoteAcceptedConfirmation;
+    EXPECT_EQ(ValidateTransportCapabilities(capabilities).code(),
+              StatusCode::kInvalidArgument);
+}
+
+TEST(TransportValidationTest, RejectsResultsOutsideConnectionFilter) {
+    const ReceiveRequest receive_request{
+        .max_messages = 1,
+        .max_bytes = 16,
+        .timeout_ms = 0,
+        .connection_id = 7,
+    };
+    ReceiveResult receive_result;
+    receive_result.messages.push_back(ReceivedMessage{
+        .connection_id = 8,
+        .from = MakeIpv4(2, 3001),
+        .payload = {std::byte{1}},
+    });
+    EXPECT_EQ(ValidateReceiveResult(receive_request, receive_result).code(),
+              StatusCode::kInvalidArgument);
+    receive_result.messages[0].connection_id = 7;
+    EXPECT_TRUE(ValidateReceiveResult(receive_request, receive_result).ok());
+
+    const CompletionPollRequest completion_request{
+        .max_completions = 1,
+        .timeout_ms = 0,
+        .connection_id = 7,
+    };
+    CompletionPollResult completion_result;
+    completion_result.completions.push_back(DeliveryCompletion{
+        .operation = {.id = 1, .connection_id = 8},
+        .reached_stage = DeliveryStage::kRemoteAccepted,
+    });
+    EXPECT_EQ(ValidateCompletionPollResult(completion_request,
+                                           completion_result).code(),
+              StatusCode::kInvalidArgument);
+    completion_result.completions[0].operation.connection_id = 7;
+    EXPECT_TRUE(ValidateCompletionPollResult(completion_request,
+                                              completion_result).ok());
+}
+
+TEST(TransportValidationTest, RejectsUnknownUntrackedTrafficClass) {
+    const std::array<std::byte, 1> payload = {std::byte{1}};
+    const TransportCapabilities capabilities{
+        .kind = TransportKind::kNetwork,
+        .reliability = TransportReliability::kReliable,
+        .max_frame_size = 1024,
+        .max_reassembly_bytes = 4096,
+        .features = Capability::kConnect,
+    };
+    const UntrackedSendRequest request{
+        .connection_id = 1,
+        .payload = payload,
+        .traffic_class = static_cast<UntrackedTrafficClass>(255),
+    };
+    EXPECT_EQ(ValidateUntrackedSendRequest(request, capabilities).code(),
+              StatusCode::kInvalidArgument);
 }
 
 TEST(EndpointDescriptorTest, Ipv4Ipv6AndFabricMatchFixedGolden) {
@@ -358,6 +418,21 @@ protected:
                           .admitted_bytes = request.payload.size()};
     }
 
+    Result<size_t> DoSendUntracked(
+        const UntrackedSendRequest& request) override {
+        std::lock_guard lock(data_mutex_);
+        if (request.connection_id != 1 || connection_closed_) {
+            return Status::Error(StatusCode::kNotFound);
+        }
+        queued_.push_back(ReceivedMessage{
+            .connection_id = request.connection_id,
+            .from = peer_,
+            .payload = std::vector<std::byte>(request.payload.begin(),
+                                              request.payload.end()),
+        });
+        return request.payload.size();
+    }
+
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override {
         std::lock_guard lock(data_mutex_);
         if (queued_.empty()) {
@@ -486,6 +561,20 @@ TEST(TransportDriverTest, SendAdmissionDoesNotCompleteRemoteReceipt) {
     received = driver.Poll(ReceiveRequest{});
     ASSERT_FALSE(received.ok());
     EXPECT_EQ(received.status().code(), StatusCode::kWouldBlock);
+
+    auto untracked = driver.SendUntracked(
+        UntrackedSendRequest{.connection_id = connection->id,
+                             .payload = payload});
+    ASSERT_TRUE(untracked.ok()) << untracked.status().ToString();
+    EXPECT_EQ(*untracked, payload.size());
+    completed = driver.PollCompletions(CompletionPollRequest{});
+    ASSERT_FALSE(completed.ok());
+    EXPECT_EQ(completed.status().code(), StatusCode::kWouldBlock);
+    received = driver.Poll(
+        ReceiveRequest{.max_messages = 1, .max_bytes = payload.size()});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->messages[0].payload,
+              std::vector<std::byte>(payload.begin(), payload.end()));
 
     ASSERT_TRUE(driver.Close(connection->id).ok());
     ASSERT_TRUE(driver.Close(connection->id).ok());

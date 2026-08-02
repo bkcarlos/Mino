@@ -42,6 +42,7 @@ enum class FrameType : uint32_t {
     kSchemaRequest = 2,
     kAck = 3,
     kHeartbeat = 4,
+    kSessionHello = 5,
 };
 
 enum class FrameFlag : uint16_t {

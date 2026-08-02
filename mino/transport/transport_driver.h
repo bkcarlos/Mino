@@ -58,6 +58,9 @@ enum class Capability : uint32_t {
     kZeroCopyWindow = 1u << 2,
     kMulticast = 1u << 3,
     kRemoteWrite = 1u << 4,
+    // The driver can turn a protocol-validated peer ACK into a successful
+    // kRemoteAccepted completion through ConfirmRemoteAccepted().
+    kRemoteAcceptedConfirmation = 1u << 5,
 };
 
 class Capabilities;
@@ -114,7 +117,8 @@ public:
         static_cast<uint32_t>(Capability::kListen) |
         static_cast<uint32_t>(Capability::kZeroCopyWindow) |
         static_cast<uint32_t>(Capability::kMulticast) |
-        static_cast<uint32_t>(Capability::kRemoteWrite);
+        static_cast<uint32_t>(Capability::kRemoteWrite) |
+        static_cast<uint32_t>(Capability::kRemoteAcceptedConfirmation);
 
 private:
     static constexpr Capabilities FromKnownBits(uint32_t bits) noexcept {
@@ -265,6 +269,24 @@ struct SendRequest {
     DeliveryStage target_stage = DeliveryStage::kRemoteAccepted;
 };
 
+enum class UntrackedTrafficClass : uint8_t {
+    // ACK/Schema/Session traffic that must retain an independent progress
+    // reserve. This remains the default for source compatibility.
+    kProtocolControl = 0,
+    // Best-effort application data: charged to normal data quota without
+    // creating a SendOperation or DeliveryCompletion.
+    kData = 1,
+};
+
+struct UntrackedSendRequest {
+    ConnectionId connection_id = kInvalidConnectionId;
+    // Success is local bounded admission only; the payload never creates an
+    // operation or completion.
+    std::span<const std::byte> payload;
+    UntrackedTrafficClass traffic_class =
+        UntrackedTrafficClass::kProtocolControl;
+};
+
 using OperationId = uint64_t;
 inline constexpr OperationId kInvalidOperationId = 0;
 
@@ -295,6 +317,9 @@ struct CompletionPollRequest {
     uint32_t max_completions = 1;
     // Zero is non-blocking. A positive timeout returns kTimeout when it expires.
     uint32_t timeout_ms = 0;
+    // Invalid means any connection. A specific ID must not consume completion
+    // events belonging to other connections.
+    ConnectionId connection_id = kInvalidConnectionId;
 };
 
 struct CompletionPollResult {
@@ -314,6 +339,9 @@ struct ReceiveRequest {
     // Zero is non-blocking. Poll returns kWouldBlock when no message is ready;
     // a positive timeout returns kTimeout when it expires.
     uint32_t timeout_ms = 0;
+    // Invalid means any connection. A specific ID must not consume messages
+    // belonging to other connections.
+    ConnectionId connection_id = kInvalidConnectionId;
 };
 
 struct ReceiveResult {
@@ -331,6 +359,9 @@ Status ValidateListenRequest(const ListenRequest& request,
 Status ValidateAcceptRequest(const AcceptRequest& request);
 Status ValidateSendRequest(const SendRequest& request,
                            const TransportCapabilities& capabilities);
+Status ValidateUntrackedSendRequest(
+    const UntrackedSendRequest& request,
+    const TransportCapabilities& capabilities);
 Status ValidateReceiveRequest(const ReceiveRequest& request);
 Status ValidateCompletionPollRequest(const CompletionPollRequest& request);
 Status ValidateSendResult(const SendRequest& request,
@@ -371,6 +402,11 @@ public:
     Result<ConnectionInfo> Listen(const ListenRequest& request);
     Result<ConnectionInfo> Accept(const AcceptRequest& request);
     Result<SendResult> Send(const SendRequest& request);
+    Result<size_t> SendUntracked(const UntrackedSendRequest& request);
+    // Called only after Bridge protocol validation proves peer acceptance.
+    // The resulting successful completion remains observable through
+    // PollCompletions().
+    Status ConfirmRemoteAccepted(SendOperation operation);
     Result<ReceiveResult> Poll(const ReceiveRequest& request);
     Result<CompletionPollResult> PollCompletions(
         const CompletionPollRequest& request);
@@ -395,6 +431,9 @@ protected:
     // retained by the driver until its ACK completion is polled.
     virtual Result<SendResult> DoSend(const SendRequest& request,
                                       SendOperation operation) = 0;
+    virtual Result<size_t> DoSendUntracked(
+        const UntrackedSendRequest& request);
+    virtual Status DoConfirmRemoteAccepted(SendOperation operation);
     virtual Result<ReceiveResult> DoPoll(const ReceiveRequest& request) = 0;
     virtual Result<CompletionPollResult> DoPollCompletions(
         const CompletionPollRequest& request) = 0;
