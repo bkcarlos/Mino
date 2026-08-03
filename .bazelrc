@@ -38,6 +38,10 @@ build:gcc12 --host_cxxopt=-Wno-maybe-uninitialized
 # toolchain is not globally registered; existing host compiler configs remain
 # unchanged unless --config=hermetic is present.
 build:hermetic --extra_toolchains=@mino_llvm//:all
+# The downloaded toolchain defaults to C++17; Mino requires C++20 APIs such as
+# std::atomic_ref, so override both target and exec compilation explicitly.
+build:hermetic --cxxopt=-std=c++20
+build:hermetic --host_cxxopt=-std=c++20
 
 # Better diagnostics.
 build --copt=-fno-omit-frame-pointer
