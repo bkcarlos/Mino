@@ -108,7 +108,7 @@ public:
             pinned.Release().ok();
             return ack;
         }
-        return std::move(pinned);
+        return pinned;
     }
 
     Status Ack() && noexcept {

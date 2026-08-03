@@ -51,7 +51,7 @@ cc_library(
     deps = [
         "//mino/bridge:reliability",
         "//mino/common:result",
-        "//mino/registry:registry",
+        "//mino/registry",
         "//mino/schema:descriptor",
         "//mino/transport:transport_switcher",
     ],

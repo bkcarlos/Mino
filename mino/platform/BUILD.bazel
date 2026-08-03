@@ -64,8 +64,8 @@ cc_test(
         "//mino/common:ids",
         "//mino/common:status",
         "//mino/shm/allocator:central_slab",
+        "//mino/shm/region",
         "//mino/shm/region:handle_resolver",
-        "//mino/shm/region:region",
         "@googletest//:gtest_main",
     ],
 )

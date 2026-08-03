@@ -42,7 +42,7 @@ cc_library(
     deps = [
         ":transport_driver",
         "//mino/common:result",
-        "//mino/registry:registry",
+        "//mino/registry",
         "//mino/schema:descriptor",
     ],
 )
@@ -71,7 +71,7 @@ cc_test(
     srcs = ["transport_switcher_test.cc"],
     deps = [
         ":transport_switcher",
-        "//mino/registry:registry",
+        "//mino/registry",
         "@googletest//:gtest_main",
     ],
 )

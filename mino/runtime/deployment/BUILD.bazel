@@ -8,7 +8,7 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/platform:process_identity",
-        "//mino/registry:registry",
+        "//mino/registry",
         "//mino/runtime:bus",
         "//mino/schema:descriptor",
         "//mino/shm/channel:broadcast",

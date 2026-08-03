@@ -30,10 +30,10 @@ cc_library(
     deps = [
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/schema/codegen:artifact_codec",
         "//mino/storage:recording_manifest",
         "//mino/storage:replay_engine",
         "//mino/storage:segment_recovery",
-        "//mino/schema/codegen:artifact_codec",
     ],
 )
 
@@ -48,7 +48,7 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/platform:process_identity",
-        "//mino/registry:registry",
+        "//mino/registry",
         "//mino/runtime:bus",
         "//mino/runtime/deployment:local_bus",
         "//mino/schema:descriptor",
@@ -71,11 +71,11 @@ cc_test(
     deps = [
         ":storage_commands",
         "//mino/common:status",
-        "//mino/storage:recording_manifest",
-        "//mino/storage:segment_format",
         "//mino/schema:compiler",
         "//mino/schema:layout",
         "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:segment_format",
         "@googletest//:gtest_main",
     ],
 )
@@ -87,7 +87,7 @@ cc_test(
         ":runtime_services",
         ":storage_commands",
         "//mino/common:status",
-        "//mino/registry:registry",
+        "//mino/registry",
         "//mino/runtime:bus",
         "//mino/schema:compiler",
         "//mino/schema:layout",
