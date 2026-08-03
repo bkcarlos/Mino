@@ -1503,30 +1503,33 @@ public:
             if (era.retired_era.load(std::memory_order_acquire) >= token) {
                 continue;
             }
-            if (payload_retire_observer_ == nullptr) {
-                continue;
-            }
 
-            const ShmHandle payload{
-                .offset = offset,
-                .generation = static_cast<uint32_t>(identity >> 32),
-                .region_id = static_cast<uint32_t>(identity)};
-            if (!payload.IsNull()) {
-                const Status retired =
-                    payload_retire_observer_(payload, payload_retire_context_);
-                if (!retired.ok()) {
-                    continue;
-                }
-            }
-            if (retire_persistence_hook_ != nullptr) {
-                retire_persistence_hook_(seq, retire_persistence_context_);
-            }
+            // Claim the logical era before invoking the potentially blocking
+            // observer. This makes slot retirement visible immediately and
+            // keeps publisher reuse independent from callback completion. A
+            // crash after the claim is safe: the observer is at-most-once and
+            // recovery can use the persisted retired era as its fence.
             uint64_t retired =
                 era.retired_era.load(std::memory_order_acquire);
             while (retired < token &&
                    !era.retired_era.compare_exchange_weak(
                        retired, token, std::memory_order_acq_rel,
                        std::memory_order_acquire)) {
+            }
+            if (retired >= token) {
+                continue;
+            }
+            if (retire_persistence_hook_ != nullptr) {
+                retire_persistence_hook_(seq, retire_persistence_context_);
+            }
+
+            const ShmHandle payload{
+                .offset = offset,
+                .generation = static_cast<uint32_t>(identity >> 32),
+                .region_id = static_cast<uint32_t>(identity)};
+            if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
+                static_cast<void>(payload_retire_observer_(
+                    payload, payload_retire_context_));
             }
         }
     }
