@@ -208,8 +208,16 @@ public:
         WriteU32(&bytes, 12, next ^ kFence);
         const ssize_t written = ::pwrite(fd_, bytes.data(), bytes.size(), 0);
         if (written != static_cast<ssize_t>(bytes.size()) ||
-            ::ftruncate(fd_, static_cast<off_t>(bytes.size())) != 0 ||
-            ::fdatasync(fd_) != 0) {
+            ::ftruncate(fd_, static_cast<off_t>(bytes.size())) != 0) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "cannot durably advance topic ID state");
+        }
+#if defined(__APPLE__)
+        const int sync_result = ::fsync(fd_);
+#else
+        const int sync_result = ::fdatasync(fd_);
+#endif
+        if (sync_result != 0) {
             return Status::Error(StatusCode::kUnavailable,
                                  "cannot durably advance topic ID state");
         }

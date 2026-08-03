@@ -330,11 +330,16 @@ Status WriteAll(int fd, const std::filesystem::path& path,
 }
 
 Status DataSync(int fd, const std::filesystem::path& path) {
-    while (::fdatasync(fd) != 0) {
+    while (true) {
+#if defined(__APPLE__)
+        const int result = ::fsync(fd);
+#else
+        const int result = ::fdatasync(fd);
+#endif
+        if (result == 0) return Status::Ok();
         if (errno == EINTR) continue;
-        return IoError("cannot fdatasync snapshot temp file", path);
+        return IoError("cannot sync snapshot temp file", path);
     }
-    return Status::Ok();
 }
 
 Status SyncDirectory(const std::filesystem::path& path) {

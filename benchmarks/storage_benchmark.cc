@@ -547,7 +547,13 @@ struct SyncSamples {
 int TimedDataSync(int fd, void* context) noexcept {
     auto* samples = static_cast<SyncSamples*>(context);
     const Clock::time_point begin = Clock::now();
+#if defined(__APPLE__)
+    // macOS does not expose fdatasync; use fsync for the durable benchmark
+    // path so the timing still measures the configured sync boundary.
+    const int result = ::fsync(fd);
+#else
     const int result = ::fdatasync(fd);
+#endif
     const int saved_errno = errno;
     const Clock::time_point end = Clock::now();
     ++samples->attempts;

@@ -386,7 +386,11 @@ int ScriptedSync(int fd, void* context) noexcept {
         errno = state->sync_error;
         return -1;
     }
+#if defined(__APPLE__)
+    return ::fsync(fd);
+#else
     return ::fdatasync(fd);
+#endif
 }
 
 struct ErrnoExpectation {
@@ -650,7 +654,13 @@ public:
         condition_.notify_all();
         condition_.wait(lock, [this] { return released_; });
         lock.unlock();
-        while (::fdatasync(fd) != 0) {
+        while (true) {
+#if defined(__APPLE__)
+            const int result = ::fsync(fd);
+#else
+            const int result = ::fdatasync(fd);
+#endif
+            if (result == 0) break;
             if (errno != EINTR) return -1;
         }
         return 0;

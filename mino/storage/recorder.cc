@@ -118,11 +118,16 @@ Status WriteAllRecovery(int fd, const std::filesystem::path& path,
 }
 
 Status SyncRecoveryFile(int fd, const std::filesystem::path& path) {
-    while (::fdatasync(fd) != 0) {
+    while (true) {
+#if defined(__APPLE__)
+        const int result = ::fsync(fd);
+#else
+        const int result = ::fdatasync(fd);
+#endif
+        if (result == 0) return Status::Ok();
         if (errno == EINTR) continue;
-        return RecoveryIoError("cannot fdatasync recovered segment", path);
+        return RecoveryIoError("cannot sync recovered segment", path);
     }
-    return Status::Ok();
 }
 
 Status SyncRecoveryDirectory(const std::filesystem::path& path) {

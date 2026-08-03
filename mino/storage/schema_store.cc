@@ -238,7 +238,11 @@ Status WriteAll(int fd, const std::filesystem::path& path,
 }
 
 Status DataSync(int fd, const std::filesystem::path& path) {
+#if defined(__APPLE__)
+    if (::fsync(fd) != 0) return IoError("cannot fsync", path);
+#else
     if (::fdatasync(fd) != 0) return IoError("cannot fdatasync", path);
+#endif
     return Status::Ok();
 }
 

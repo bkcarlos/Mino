@@ -262,8 +262,8 @@ void ArmChildWatchdog(StressDeadline deadline) {
     const unsigned int seconds = static_cast<unsigned int>(
         std::min<uint64_t>(static_cast<uint64_t>(rounded), maximum));
     sigset_t alarm_signal;
-    ::sigemptyset(&alarm_signal);
-    ::sigaddset(&alarm_signal, SIGALRM);
+    sigemptyset(&alarm_signal);
+    sigaddset(&alarm_signal, SIGALRM);
     (void)::sigprocmask(SIG_UNBLOCK, &alarm_signal, nullptr);
     ::signal(SIGALRM, SIG_DFL);
     ::alarm(std::max(1u, seconds));

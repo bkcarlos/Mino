@@ -349,10 +349,16 @@ Status SegmentWriter::WriteAll(std::span<const std::byte> bytes) {
 
 Status SegmentWriter::DataSync(uint64_t now_ns) {
     while (true) {
-        const int result = options_.data_sync_hook == nullptr
-                               ? ::fdatasync(fd_)
-                               : options_.data_sync_hook(
-                                     fd_, options_.io_hook_context);
+        int result = 0;
+        if (options_.data_sync_hook != nullptr) {
+            result = options_.data_sync_hook(fd_, options_.io_hook_context);
+        } else {
+#if defined(__APPLE__)
+            result = ::fsync(fd_);
+#else
+            result = ::fdatasync(fd_);
+#endif
+        }
         if (result == 0) break;
         if (errno == EINTR) continue;
         return Poison(IoError("cannot fdatasync segment", path_));

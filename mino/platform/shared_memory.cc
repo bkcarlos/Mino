@@ -129,6 +129,7 @@ uint64_t DefaultHugePageSize() {
     return kFallbackHugePageSize;
 }
 
+#if MINO_HAS_HUGETLB
 std::string ConfiguredHugePageDirectory(const std::string& explicit_path) {
     if (!explicit_path.empty()) return explicit_path;
 #if MINO_HAS_HUGETLB
@@ -175,6 +176,7 @@ HugePageFallbackReason ClassifyHugePageFailure(int error_number) {
             return HugePageFallbackReason::kSystemError;
     }
 }
+#endif  // MINO_HAS_HUGETLB
 
 bool CopyMarkerString(std::string_view value, char* destination,
                       size_t capacity) {
@@ -387,12 +389,14 @@ std::string UniquePosixDataName() {
     return name;
 }
 
+#if MINO_HAS_HUGETLB
 std::string UniqueHugeBasename() {
     char name[32];
     std::snprintf(name, sizeof(name), ".mino-h-%016llx",
                   static_cast<unsigned long long>(RandomToken()));
     return name;
 }
+#endif  // MINO_HAS_HUGETLB
 
 Status VerifyDataIdentity(int fd, const SharedMemoryMarkerPayload& payload,
                           std::string_view kind, bool require_size = true) {

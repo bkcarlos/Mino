@@ -16,6 +16,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>

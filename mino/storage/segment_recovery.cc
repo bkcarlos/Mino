@@ -785,7 +785,13 @@ Status TruncateAndSync(int fd, const std::filesystem::path& path, uint64_t size,
         } else if (options.sync_mode == SegmentRecoverySyncMode::kFull) {
             result = ::fsync(fd);
         } else {
+#if defined(__APPLE__)
+            // macOS does not expose fdatasync; fsync is the closest durable
+            // equivalent for the recovery path.
+            result = ::fsync(fd);
+#else
             result = ::fdatasync(fd);
+#endif
         }
         if (result == 0) break;
         if (errno == EINTR) continue;
