@@ -46,6 +46,10 @@ build:hermetic --host_cxxopt=-std=c++20
 # explicit because -stdlib=libstdc++ alone does not add it to every link action.
 build:hermetic --linkopt=-lstdc++
 build:hermetic --host_linkopt=-lstdc++
+# GCC 12's libstdc++ marks legacy helpers used by the pinned GoogleTest as
+# deprecated; Clang promotes that third-party warning under the global -Werror.
+build:hermetic --cxxopt=-Wno-deprecated-declarations
+build:hermetic --host_cxxopt=-Wno-deprecated-declarations
 
 # Better diagnostics.
 build --copt=-fno-omit-frame-pointer
