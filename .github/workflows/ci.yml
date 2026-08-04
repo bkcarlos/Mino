@@ -131,16 +131,20 @@ jobs:
           cat hermetic-toolchain-evidence/hermetic-clang-version.txt
 
       - name: Build with hermetic LLVM
-        run: bazel build --lockfile_mode=error --config=hermetic --config=debug \
-          --cxxopt=-stdlib=libstdc++ --host_cxxopt=-stdlib=libstdc++ //...
+        run: |
+          bazel build --lockfile_mode=error --config=hermetic --config=debug \
+            --cxxopt=-stdlib=libstdc++ \
+            --host_cxxopt=-stdlib=libstdc++ //...
 
       - name: Verify build did not mutate locked inputs
         run: git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
 
       - name: Test with hermetic LLVM
-        run: bazel test --lockfile_mode=error --config=hermetic --config=debug \
-          --cxxopt=-stdlib=libstdc++ --host_cxxopt=-stdlib=libstdc++ //... \
-          --test_output=errors
+        run: |
+          bazel test --lockfile_mode=error --config=hermetic --config=debug \
+            --cxxopt=-stdlib=libstdc++ \
+            --host_cxxopt=-stdlib=libstdc++ //... \
+            --test_output=errors
 
       - name: Upload compiler version evidence
         if: always()
