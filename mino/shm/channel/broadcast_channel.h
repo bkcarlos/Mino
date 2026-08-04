@@ -1327,13 +1327,14 @@ public:
                 if (slot->sequence_num.load(std::memory_order_relaxed) == cons &&
                     era_metas_[cons & mask_].payload_era.load(
                         std::memory_order_acquire) == cons + 1) {
-                    IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
-                    if (VerifySnapshotCrc(snapshot)) {
-                        if (TryClaimBorrow(sub, cons, borrower)) {
-                            return Borrow(this, sub, snapshot);
-                        }
+                    if (!TryClaimBorrow(sub, cons, borrower)) {
                         continue;
                     }
+                    IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
+                    if (VerifySnapshotCrc(snapshot)) {
+                        return Borrow(this, sub, snapshot);
+                    }
+                    ReleaseBorrowClaim(sub, cons);
                 }
                 // Genuinely stale or corrupt: skip like corruption below.
                 AdvanceCursorPast(sub.id.value, cons);
@@ -1360,18 +1361,19 @@ public:
                     StatusCode::kCorruption,
                     "broadcast slot sequence mismatch (skipped)");
             }
-            // Copy the header out, then verify the CRC on our own copy. The
-            // snapshot decouples all further use from any later overwrite
-            // (kDropOldest may recycle the slot while we hold the Borrow).
+            // Claim the borrow before copying the header. DropOldest uses this
+            // claim as its exclusion fence; copying first would let it recycle
+            // the slot while SnapshotIndexSlot reads the old era.
+            if (!TryClaimBorrow(sub, cons, borrower)) {
+                continue;
+            }
             IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
             if (!VerifySnapshotCrc(snapshot)) {
+                ReleaseBorrowClaim(sub, cons);
                 AdvanceCursorPast(sub.id.value, cons);
                 return Status::Error(
                     StatusCode::kCorruption,
                     "broadcast slot immutable CRC mismatch (skipped)");
-            }
-            if (!TryClaimBorrow(sub, cons, borrower)) {
-                continue;
             }
             return Borrow(this, sub, snapshot);
         }
