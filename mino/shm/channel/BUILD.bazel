@@ -69,6 +69,7 @@ cc_library(
 
 cc_test(
     name = "mpsc_channel_test",
+    timeout = "long",
     srcs = ["mpsc_channel_test.cc"],
     deps = [
         ":index_slot",

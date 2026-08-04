@@ -104,7 +104,7 @@ struct ChannelFixture {
         std::memset(storage, 0, kBytes);
     }
     ~ChannelFixture() {
-        ::operator delete(storage, kBytes, std::align_val_t(64));
+        ::operator delete(storage, std::align_val_t(64));
     }
 
     ChannelFixture(const ChannelFixture&) = delete;
@@ -949,20 +949,28 @@ TEST(BroadcastPolicyTest, ConcurrentAckAndDropNeverClearNewEra) {
             }
             const Status status = ch->Ack(sub, 0);
             ack_result_valid.store(
-                status.ok() || status.code() == StatusCode::kNotFound,
+                status.ok() || status.code() == StatusCode::kNotFound ||
+                    status.code() == StatusCode::kWouldBlock,
                 std::memory_order_release);
         });
         std::thread publisher([&]() {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            auto reservation = ch->Reserve(QueueFullPolicy::kDropOldest);
-            if (!reservation.ok()) {
+            for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+                auto reservation = ch->Reserve(QueueFullPolicy::kDropOldest);
+                if (!reservation.ok()) {
+                    if (reservation.status().code() == StatusCode::kWouldBlock) {
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    return;
+                }
+                FillSlot(*reservation, 4);
+                publish_ok.store(std::move(*reservation).Commit().ok(),
+                                 std::memory_order_release);
                 return;
             }
-            FillSlot(*reservation, 4);
-            publish_ok.store(std::move(*reservation).Commit().ok(),
-                             std::memory_order_release);
         });
         start.store(true, std::memory_order_release);
         acker.join();

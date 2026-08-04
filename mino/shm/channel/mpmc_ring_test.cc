@@ -103,7 +103,7 @@ struct RingFixture {
         std::memset(storage, 0, kBytes);
     }
     ~RingFixture() {
-        ::operator delete(storage, kBytes, std::align_val_t(64));
+        ::operator delete(storage, std::align_val_t(64));
     }
 
     RingFixture(const RingFixture&) = delete;

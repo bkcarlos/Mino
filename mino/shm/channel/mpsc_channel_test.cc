@@ -58,7 +58,9 @@ struct ChannelFixture {
               ::operator new(kBytes, std::align_val_t(64)))) {
         std::memset(storage, 0, kBytes);
     }
-    ~ChannelFixture() { ::operator delete(storage, kBytes, std::align_val_t(64)); }
+    ~ChannelFixture() {
+        ::operator delete(storage, std::align_val_t(64));
+    }
 
     ChannelFixture(const ChannelFixture&) = delete;
     ChannelFixture& operator=(const ChannelFixture&) = delete;

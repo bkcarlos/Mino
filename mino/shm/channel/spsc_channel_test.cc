@@ -62,7 +62,7 @@ struct ChannelFixture {
         std::memset(storage, 0, kBytes);
     }
     ~ChannelFixture() {
-        ::operator delete(storage, kBytes, std::align_val_t(64));
+        ::operator delete(storage, std::align_val_t(64));
     }
 
     ChannelFixture(const ChannelFixture&) = delete;
