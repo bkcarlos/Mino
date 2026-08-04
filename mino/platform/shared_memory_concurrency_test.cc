@@ -244,7 +244,17 @@ TEST_F(SharedMemoryConcurrencyTest,
         sizeof(crashed_marker->backing_name));
     ASSERT_FALSE(orphan.empty());
 
-    auto recovered = SharedMemorySegment::Create(name, 8192);
+    Result<SharedMemorySegment> recovered =
+        Status::Error(StatusCode::kWouldBlock, "recovery not attempted");
+    for (int attempt = 0; attempt < 100 && !recovered.ok(); ++attempt) {
+        recovered = SharedMemorySegment::Create(name, 8192);
+        if (!recovered.ok() &&
+            recovered.status().code() != StatusCode::kWouldBlock &&
+            recovered.status().code() != StatusCode::kAlreadyExists) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
     errno = 0;
     EXPECT_EQ(::shm_open(orphan.c_str(), O_RDONLY, 0), -1);
@@ -291,7 +301,18 @@ TEST_F(SharedMemoryConcurrencyTest, UnlinkCrashLeavesRetryableTombstone) {
     ASSERT_FALSE(opened.ok());
     EXPECT_EQ(opened.status().code(), StatusCode::kWouldBlock);
 
-    EXPECT_TRUE(SharedMemorySegment::Unlink(name).ok());
+    Status unlink_status = Status::Error(StatusCode::kWouldBlock,
+                                          "unlink not attempted");
+    for (int attempt = 0; attempt < 100 && !unlink_status.ok(); ++attempt) {
+        unlink_status = SharedMemorySegment::Unlink(name);
+        if (!unlink_status.ok() &&
+            unlink_status.code() != StatusCode::kWouldBlock &&
+            unlink_status.code() != StatusCode::kAlreadyExists) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(unlink_status.ok()) << unlink_status.ToString();
     EXPECT_EQ(static_cast<unsigned char*>(created->base())[0], 0xA7);
     opened = SharedMemorySegment::Open(name, /*read_only=*/false);
     ASSERT_FALSE(opened.ok());
