@@ -7,7 +7,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -189,6 +188,7 @@ public:
         completion_head_ = 0;
         completion_tail_ = 0;
         completion_count_ = 0;
+        next_poll_connection_id_ = kInvalidConnectionId;
         stop_requested_.store(false, std::memory_order_release);
         wake_read_fd_ = read_end.release();
         wake_write_fd_ = write_end.release();
@@ -320,8 +320,11 @@ public:
             return Status::Error(StatusCode::kUnsupported,
                                  "UDP listener has no configured send peer");
         }
-        const ssize_t sent = ::send(found->second.fd, request.payload.data(),
-                                    request.payload.size(), 0);
+        ssize_t sent = -1;
+        do {
+            sent = ::send(found->second.fd, request.payload.data(),
+                          request.payload.size(), 0);
+        } while (sent < 0 && errno == EINTR);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return WouldBlock("UDP socket send buffer is full");
@@ -437,52 +440,111 @@ public:
 
             ReceiveResult result;
             result.messages.reserve(request.max_messages);
+            std::vector<std::byte> inspection_buffer(
+                static_cast<size_t>(options_.max_datagram_bytes) + 1);
             size_t total_bytes = 0;
-            for (size_t index = 1; index < descriptors.size(); ++index) {
-                if ((descriptors[index].revents & POLLIN) == 0) continue;
-                while (result.messages.size() < request.max_messages) {
-                    int datagram_size = 0;
-                    if (::ioctl(descriptors[index].fd, FIONREAD,
-                                &datagram_size) != 0) {
-                        return Unavailable("failed to inspect UDP datagram size");
-                    }
-                    if (datagram_size < 0) {
-                        return Internal("UDP datagram size is negative");
-                    }
-                    if (datagram_size == 0) {
-                        std::array<std::byte, 1> discard{};
-                        const ssize_t discarded =
-                            ::recv(descriptors[index].fd, discard.data(),
-                                   discard.size(), 0);
-                        if (discarded < 0 && errno != EAGAIN &&
-                            errno != EWOULDBLOCK) {
-                            return Unavailable("failed to discard empty UDP datagram");
-                        }
+            size_t inspected_datagrams = 0;
+            const size_t inspected_datagram_budget = request.max_messages;
+            const size_t socket_descriptor_count = descriptors.size() - 1;
+            size_t next_descriptor_offset = 0;
+            if (next_poll_connection_id_ != kInvalidConnectionId) {
+                for (size_t offset = 0; offset < socket_descriptor_count;
+                     ++offset) {
+                    if (ids[offset + 1] == next_poll_connection_id_) {
+                        next_descriptor_offset = offset;
                         break;
                     }
-                    if (static_cast<uint32_t>(datagram_size) >
-                        options_.max_datagram_bytes) {
-                        std::array<std::byte, 1> discard{};
-                        (void)::recv(descriptors[index].fd, discard.data(),
-                                     discard.size(), 0);
+                }
+            }
+            while (result.messages.size() < request.max_messages &&
+                   inspected_datagrams < inspected_datagram_budget) {
+                bool inspected_in_sweep = false;
+                const size_t sweep_start = next_descriptor_offset;
+                for (size_t offset = 0;
+                     offset < socket_descriptor_count &&
+                     result.messages.size() < request.max_messages &&
+                     inspected_datagrams < inspected_datagram_budget;
+                     ++offset) {
+                    const size_t descriptor_offset =
+                        (sweep_start + offset) % socket_descriptor_count;
+                    const size_t index = descriptor_offset + 1;
+                    if ((descriptors[index].revents & POLLIN) == 0) continue;
+                    if (stop_requested_.load(std::memory_order_acquire)) {
+                        if (!result.messages.empty()) return result;
+                        return Unavailable("UDP driver is stopping");
+                    }
+                    if (request.timeout_ms != 0 && Clock::now() >= deadline) {
+                        if (!result.messages.empty()) return result;
+                        return Timeout("UDP receive timed out");
+                    }
+                    ssize_t inspected = -1;
+                    do {
+                        inspected = ::recv(descriptors[index].fd,
+                                           inspection_buffer.data(),
+                                           inspection_buffer.size(), MSG_PEEK);
+                    } while (inspected < 0 && errno == EINTR);
+                    if (inspected < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                        return Unavailable("failed to inspect UDP datagram size");
+                    }
+                    inspected_in_sweep = true;
+                    ++inspected_datagrams;
+                    next_descriptor_offset =
+                        (descriptor_offset + 1) % socket_descriptor_count;
+                    next_poll_connection_id_ =
+                        ids[next_descriptor_offset + 1];
+                    const size_t size = static_cast<size_t>(inspected);
+                    if (size > options_.max_datagram_bytes) {
+                        if (!result.messages.empty()) return result;
+                        ssize_t discarded = -1;
+                        do {
+                            discarded = ::recv(descriptors[index].fd,
+                                               inspection_buffer.data(),
+                                               inspection_buffer.size(), 0);
+                        } while (discarded < 0 && errno == EINTR);
+                        if (discarded < 0 && errno != EAGAIN &&
+                            errno != EWOULDBLOCK) {
+                            return Unavailable(
+                                "failed to discard oversized UDP datagram");
+                        }
                         return Exhausted("UDP datagram exceeds configured bound");
                     }
-                    const size_t size = static_cast<size_t>(datagram_size);
+                    if (size == 0) {
+                        std::array<std::byte, 1> discard{};
+                        ssize_t discarded = -1;
+                        do {
+                            discarded = ::recv(descriptors[index].fd,
+                                               discard.data(), discard.size(), 0);
+                        } while (discarded < 0 && errno == EINTR);
+                        if (discarded < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                            return Unavailable(
+                                "failed to discard empty UDP datagram");
+                        }
+                        if (discarded != 0) {
+                            return Internal(
+                                "UDP datagram size changed while receiving");
+                        }
+                        continue;
+                    }
                     if (size > request.max_bytes - total_bytes) {
                         if (result.messages.empty()) {
                             return Exhausted(
                                 "next UDP datagram exceeds receive byte budget");
                         }
-                        break;
+                        return result;
                     }
                     sockaddr_storage peer{};
                     socklen_t peer_size = sizeof(peer);
                     std::vector<std::byte> payload(size);
-                    const ssize_t received = ::recvfrom(
-                        descriptors[index].fd, payload.data(), payload.size(), 0,
-                        reinterpret_cast<sockaddr*>(&peer), &peer_size);
+                    ssize_t received = -1;
+                    do {
+                        received = ::recvfrom(
+                            descriptors[index].fd, payload.data(), payload.size(),
+                            0, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+                    } while (received < 0 && errno == EINTR);
                     if (received < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
                         return Unavailable("UDP datagram receive failed");
                     }
                     if (static_cast<size_t>(received) != size) {
@@ -497,10 +559,16 @@ public:
                     });
                     total_bytes += size;
                 }
+                if (!inspected_in_sweep) break;
             }
             if (!result.messages.empty()) return result;
             if (request.timeout_ms == 0) {
                 return WouldBlock("UDP receive queue is empty");
+            }
+            if (inspected_datagrams != 0) {
+                lock.unlock();
+                std::this_thread::yield();
+                lock.lock();
             }
         }
     }
@@ -637,6 +705,7 @@ private:
     int wake_read_fd_ = -1;
     int wake_write_fd_ = -1;
     ConnectionId next_id_ = 1;
+    ConnectionId next_poll_connection_id_ = kInvalidConnectionId;
     std::unordered_map<ConnectionId, SocketState> sockets_;
     std::unordered_set<ConnectionId> closed_;
     std::vector<DeliveryCompletion> completions_;

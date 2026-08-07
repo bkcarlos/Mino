@@ -64,7 +64,7 @@ bazel run --config=release //benchmarks:storage_benchmark -- \
   --payload-bytes=1024 \
   --sync-policy=per-batch \
   --directory=/code/Mino/.cache \
-  --output-json=docs/benchmarks/d5_storage_sla_baseline.json
+  --output-json=docs/benchmarks/d5_storage_sla_timed.json
 ```
 
 ## 5. 性能 SLA
@@ -99,6 +99,8 @@ bazel run --config=release //benchmarks:storage_benchmark -- \
 - `docs/benchmarks/d5_storage_64k.json`
 - `docs/benchmarks/d5_storage_1m.json`
 
+上述首版 JSON 保存负载配置和测量结果，运行日期、硬件、OS 与编译器 provenance 由本报告第 3 节记录；它们尚未内嵌 commit SHA，因此不能单独作为当前发布候选的资格证明。后续重新资格认证必须将 commit SHA、完整命令、Bazel 配置、编译器、OS、硬件/存储和运行时间写入同一 artifact manifest，并记录 JSON 与日志的 SHA-256。
+
 ## 6. Buffer Capacity SLA
 
 默认 Buffer 配置必须同时满足：
@@ -120,7 +122,7 @@ per_topic_capacity >= topic_peak_bytes_per_second × tolerated_disk_pause_second
 扩展 campaign：
 
 ```bash
-tools/ci/run_d5_storage_fault_campaign.py --rounds=20 --seed=42 \
+tools/ci/run_d5_storage_fault_campaign.py --rounds=100 --seed=42 \
   --out=d5-storage-fault-campaign
 ```
 

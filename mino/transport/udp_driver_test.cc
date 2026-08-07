@@ -3,6 +3,8 @@
 #include "mino/transport/udp_driver.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -59,6 +61,65 @@ EndpointDescriptor UdpLoopback(uint16_t port) {
     EXPECT_TRUE(endpoint.ok()) << endpoint.status().ToString();
     return endpoint.ok() ? *endpoint : EndpointDescriptor{};
 }
+
+sockaddr_in UdpLoopbackAddress(uint16_t port) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    return address;
+}
+
+class EmptyDatagramFlood final {
+public:
+    EmptyDatagramFlood(int fd, sockaddr_in address)
+        : thread_([this, fd, address] {
+              while (running_.load(std::memory_order_acquire)) {
+                  const ssize_t sent = ::sendto(
+                      fd, nullptr, 0, 0,
+                      reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address));
+                  if (sent == 0) {
+                      successful_sends_.fetch_add(1, std::memory_order_release);
+                      std::this_thread::yield();
+                      continue;
+                  }
+                  if (errno == EINTR) continue;
+                  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                      std::this_thread::yield();
+                      continue;
+                  }
+                  failed_.store(true, std::memory_order_release);
+                  break;
+              }
+          }) {}
+
+    EmptyDatagramFlood(const EmptyDatagramFlood&) = delete;
+    EmptyDatagramFlood& operator=(const EmptyDatagramFlood&) = delete;
+
+    ~EmptyDatagramFlood() { Stop(); }
+
+    bool WaitUntilStarted() const {
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (successful_sends_.load(std::memory_order_acquire) == 0 &&
+               !failed_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        return successful_sends_.load(std::memory_order_acquire) != 0;
+    }
+
+    void Stop() {
+        running_.store(false, std::memory_order_release);
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    std::atomic<bool> running_{true};
+    std::atomic<bool> failed_{false};
+    std::atomic<size_t> successful_sends_{0};
+    std::thread thread_;
+};
 
 DriverConfig Config() {
     return DriverConfig{
@@ -351,17 +412,270 @@ TEST(UdpDriverTest, EmptyDatagramDoesNotSpinOrEscapeAsMessage) {
 
     ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     ASSERT_GE(peer.get(), 0);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(endpoint.port());
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
     ASSERT_EQ(::sendto(peer.get(), nullptr, 0, 0,
-                       reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+                       reinterpret_cast<const sockaddr*>(&address),
+                       sizeof(address)),
               0);
     auto polled = server->Poll(
         {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 30});
     ASSERT_FALSE(polled.ok());
     EXPECT_EQ(polled.status().code(), StatusCode::kTimeout);
+}
+
+TEST(UdpDriverTest, ContinuousEmptyDatagramsRespectReceiveDeadline) {
+    auto server_result = UdpDriver::Create();
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const int flags = ::fcntl(peer.get(), F_GETFL, 0);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(::fcntl(peer.get(), F_SETFL, flags | O_NONBLOCK), 0);
+    EmptyDatagramFlood flood(peer.get(),
+                             UdpLoopbackAddress(endpoint.port()));
+    ASSERT_TRUE(flood.WaitUntilStarted());
+
+    const auto started = std::chrono::steady_clock::now();
+    auto polled = server->Poll(
+        {.max_messages = 4, .max_bytes = 1200, .timeout_ms = 50});
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    flood.Stop();
+
+    ASSERT_FALSE(polled.ok());
+    EXPECT_EQ(polled.status().code(), StatusCode::kTimeout);
+    EXPECT_LT(elapsed, 1s);
+}
+
+TEST(UdpDriverTest, EmptyDatagramFloodDoesNotStarveOtherReadySocket) {
+    for (const bool flood_second_listener : {false, true}) {
+        SCOPED_TRACE(flood_second_listener);
+        auto server_result = UdpDriver::Create();
+        ASSERT_TRUE(server_result.ok());
+        std::unique_ptr<UdpDriver> server = std::move(*server_result);
+        ASSERT_TRUE(server->Start(Config()).ok());
+
+        const EndpointDescriptor first_endpoint =
+            UdpLoopback(FindUnusedUdpPort());
+        auto first_listener = server->Listen(
+            {.local_endpoint = first_endpoint, .backlog = 1});
+        ASSERT_TRUE(first_listener.ok());
+        const EndpointDescriptor second_endpoint =
+            UdpLoopback(FindUnusedUdpPort());
+        auto second_listener = server->Listen(
+            {.local_endpoint = second_endpoint, .backlog = 1});
+        ASSERT_TRUE(second_listener.ok());
+
+        const EndpointDescriptor& flood_endpoint =
+            flood_second_listener ? second_endpoint : first_endpoint;
+        const ConnectionInfo& normal_listener =
+            flood_second_listener ? *first_listener : *second_listener;
+        const EndpointDescriptor& normal_endpoint =
+            flood_second_listener ? first_endpoint : second_endpoint;
+
+        ScopedFd flood_peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+        ASSERT_GE(flood_peer.get(), 0);
+        const sockaddr_in flood_address =
+            UdpLoopbackAddress(flood_endpoint.port());
+        for (size_t index = 0; index < 256; ++index) {
+            ASSERT_EQ(::sendto(
+                          flood_peer.get(), nullptr, 0, 0,
+                          reinterpret_cast<const sockaddr*>(&flood_address),
+                          sizeof(flood_address)),
+                      0);
+        }
+        const int flags = ::fcntl(flood_peer.get(), F_GETFL, 0);
+        ASSERT_GE(flags, 0);
+        ASSERT_EQ(::fcntl(flood_peer.get(), F_SETFL, flags | O_NONBLOCK), 0);
+        EmptyDatagramFlood flood(flood_peer.get(), flood_address);
+        ASSERT_TRUE(flood.WaitUntilStarted());
+
+        ScopedFd normal_peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+        ASSERT_GE(normal_peer.get(), 0);
+        const sockaddr_in normal_address =
+            UdpLoopbackAddress(normal_endpoint.port());
+        const std::vector<std::byte> payload(37, std::byte{0x5a});
+        ASSERT_EQ(::sendto(
+                      normal_peer.get(), payload.data(), payload.size(), 0,
+                      reinterpret_cast<const sockaddr*>(&normal_address),
+                      sizeof(normal_address)),
+                  static_cast<ssize_t>(payload.size()));
+
+        auto received = server->Poll(
+            {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 500});
+        flood.Stop();
+
+        ASSERT_TRUE(received.ok()) << received.status().ToString();
+        ASSERT_EQ(received->messages.size(), 1u);
+        EXPECT_EQ(received->messages[0].connection_id, normal_listener.id);
+        EXPECT_EQ(received->messages[0].payload, payload);
+    }
+}
+
+TEST(UdpDriverTest, NonBlockingPollPersistsRoundRobinAcrossCalls) {
+    for (const bool ordinary_flood : {false, true}) {
+        for (const bool flood_second_listener : {false, true}) {
+            SCOPED_TRACE(ordinary_flood);
+            SCOPED_TRACE(flood_second_listener);
+            auto server_result = UdpDriver::Create();
+            ASSERT_TRUE(server_result.ok());
+            std::unique_ptr<UdpDriver> server = std::move(*server_result);
+            ASSERT_TRUE(server->Start(Config()).ok());
+
+            const EndpointDescriptor first_endpoint =
+                UdpLoopback(FindUnusedUdpPort());
+            auto first_listener = server->Listen(
+                {.local_endpoint = first_endpoint, .backlog = 1});
+            ASSERT_TRUE(first_listener.ok());
+            const EndpointDescriptor second_endpoint =
+                UdpLoopback(FindUnusedUdpPort());
+            auto second_listener = server->Listen(
+                {.local_endpoint = second_endpoint, .backlog = 1});
+            ASSERT_TRUE(second_listener.ok());
+
+            const EndpointDescriptor& flood_endpoint =
+                flood_second_listener ? second_endpoint : first_endpoint;
+            const ConnectionInfo& flood_listener =
+                flood_second_listener ? *second_listener : *first_listener;
+            const EndpointDescriptor& target_endpoint =
+                flood_second_listener ? first_endpoint : second_endpoint;
+            const ConnectionInfo& target_listener =
+                flood_second_listener ? *first_listener : *second_listener;
+
+            ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+            ASSERT_GE(peer.get(), 0);
+            const sockaddr_in flood_address =
+                UdpLoopbackAddress(flood_endpoint.port());
+            const std::vector<std::byte> flood_payload(13, std::byte{0x61});
+            const void* flood_data =
+                ordinary_flood ? flood_payload.data() : nullptr;
+            const size_t flood_size =
+                ordinary_flood ? flood_payload.size() : 0;
+            for (size_t index = 0; index < 32; ++index) {
+                ASSERT_EQ(::sendto(
+                              peer.get(), flood_data, flood_size, 0,
+                              reinterpret_cast<const sockaddr*>(&flood_address),
+                              sizeof(flood_address)),
+                          static_cast<ssize_t>(flood_size));
+            }
+
+            const sockaddr_in target_address =
+                UdpLoopbackAddress(target_endpoint.port());
+            const std::vector<std::byte> target_payload(29, std::byte{0x62});
+            ASSERT_EQ(::sendto(
+                          peer.get(), target_payload.data(), target_payload.size(),
+                          0,
+                          reinterpret_cast<const sockaddr*>(&target_address),
+                          sizeof(target_address)),
+                      static_cast<ssize_t>(target_payload.size()));
+
+            bool consumed_target = false;
+            for (size_t attempt = 0; attempt < 2; ++attempt) {
+                auto received = server->Poll(
+                    {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 0});
+                if (!received.ok()) {
+                    EXPECT_FALSE(ordinary_flood);
+                    EXPECT_EQ(received.status().code(), StatusCode::kWouldBlock);
+                    continue;
+                }
+                ASSERT_EQ(received->messages.size(), 1u);
+                const ReceivedMessage& message = received->messages[0];
+                if (message.connection_id == target_listener.id) {
+                    EXPECT_EQ(message.payload, target_payload);
+                    consumed_target = true;
+                    break;
+                }
+                EXPECT_EQ(message.connection_id, flood_listener.id);
+                ASSERT_TRUE(ordinary_flood);
+                EXPECT_EQ(message.payload, flood_payload);
+            }
+            EXPECT_TRUE(consumed_target);
+        }
+    }
+}
+
+TEST(UdpDriverTest, ShutdownWakesReceiveDuringEmptyDatagramFlood) {
+    auto server_result = UdpDriver::Create();
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const int flags = ::fcntl(peer.get(), F_GETFL, 0);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(::fcntl(peer.get(), F_SETFL, flags | O_NONBLOCK), 0);
+    EmptyDatagramFlood flood(peer.get(),
+                             UdpLoopbackAddress(endpoint.port()));
+    ASSERT_TRUE(flood.WaitUntilStarted());
+
+    std::atomic<StatusCode> result{StatusCode::kOk};
+    std::thread receiver([&] {
+        auto polled = server->Poll(
+            {.max_messages = 4, .max_bytes = 1200, .timeout_ms = 60'000});
+        result.store(polled.ok() ? StatusCode::kOk : polled.status().code(),
+                     std::memory_order_release);
+    });
+    std::this_thread::sleep_for(10ms);
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_TRUE(server->Shutdown().ok());
+    receiver.join();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    flood.Stop();
+
+    EXPECT_LT(elapsed, 1s);
+    EXPECT_EQ(result.load(std::memory_order_acquire), StatusCode::kUnavailable);
+}
+
+TEST(UdpDriverTest, ReturnsMessagesBeforeFollowingOversizedDatagramError) {
+    UdpDriverOptions options;
+    options.max_datagram_bytes = 256;
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
+    const std::vector<std::byte> normal(31, std::byte{0x41});
+    const std::vector<std::byte> oversized(257, std::byte{0x42});
+    ASSERT_EQ(::sendto(peer.get(), normal.data(), normal.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&address),
+                       sizeof(address)),
+              static_cast<ssize_t>(normal.size()));
+    ASSERT_EQ(::sendto(peer.get(), oversized.data(), oversized.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&address),
+                       sizeof(address)),
+              static_cast<ssize_t>(oversized.size()));
+
+    auto received = server->Poll(
+        {.max_messages = 2, .max_bytes = 1200, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, normal);
+
+    auto rejected = server->Poll(
+        {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 0});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(server->Poll({.max_messages = 1,
+                            .max_bytes = 1200,
+                            .timeout_ms = 0})
+                  .status()
+                  .code(),
+              StatusCode::kWouldBlock);
 }
 
 TEST(UdpDriverTest, ShutdownWakesBlockingReceive) {

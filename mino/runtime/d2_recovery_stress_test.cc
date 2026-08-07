@@ -125,6 +125,7 @@ constexpr auto kDeterministicWatchdog = std::chrono::seconds(30);
 constexpr auto kMinimumCleanupReserve = std::chrono::milliseconds(250);
 constexpr auto kMaximumCleanupReserve = std::chrono::milliseconds(2000);
 constexpr auto kEstimatedMinimumRoundBudget = std::chrono::milliseconds(75);
+constexpr auto kForcedReapBudget = std::chrono::seconds(2);
 constexpr auto kElapsedUpperSlack = std::chrono::seconds(1);
 
 constexpr std::chrono::milliseconds CleanupReserveFor(
@@ -328,7 +329,7 @@ StressRound MakeRandomRound(std::mt19937_64* random) {
 struct HookContext {
     SharedBlock* shared = nullptr;
     CrashScenario target = CrashScenario::kJournalAllocationPublished;
-    bool stop_instead_of_pause = false;
+    bool await_continue_command = false;
     bool triggered = false;
 };
 
@@ -343,8 +344,11 @@ struct HookContext {
 void ReachHook(HookContext* context) {
     context->shared->reached.store(static_cast<uint32_t>(context->target),
                                    std::memory_order_release);
-    if (context->stop_instead_of_pause) {
-        ::raise(SIGSTOP);
+    if (context->await_continue_command) {
+        while (context->shared->child_command.load(
+                   std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
         return;
     }
     PauseForKill(context);
@@ -398,7 +402,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
 
 [[noreturn]] void PublisherChild(
     SharedBlock* shared, CrashScenario scenario, StressDeadline deadline,
-    bool stop_instead_of_pause = false) {
+    bool await_continue_command = false) {
     ArmChildWatchdog(deadline);
     auto allocator = CentralSlabAllocator::Attach(shared->allocator_storage);
     auto journal = AllocationJournal::Attach(
@@ -410,7 +414,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
 
     HookContext hooks{.shared = shared,
                       .target = scenario,
-                      .stop_instead_of_pause = stop_instead_of_pause};
+                      .await_continue_command = await_continue_command};
     journal->SetPersistenceHook(&JournalHook, &hooks);
     channel->SetPersistenceHook(&MpscHook, &hooks);
 
@@ -487,14 +491,23 @@ protected:
 
         baseline_available_slots_ = ProbeAvailableSlots();
         ASSERT_EQ(baseline_available_slots_, allocator_.total_slot_count());
-        watchdog_deadline_ = StressClock::now() + kDeterministicWatchdog;
     }
 
     void TearDown() override {
         if (child_pid_ > 0) {
-            (void)::kill(child_pid_, SIGKILL);
+            const int kill_result = ::kill(child_pid_, SIGKILL);
+            const int kill_error = errno;
+            if (kill_result != 0 && kill_error != ESRCH) {
+                ADD_FAILURE() << "failed to SIGKILL child during cleanup: "
+                              << std::strerror(kill_error);
+            }
             int status = 0;
-            (void)WaitForExit(watchdog_deadline_, &status);
+            const StressDeadline reap_deadline =
+                StressClock::now() + kForcedReapBudget;
+            if (!WaitForExit(reap_deadline, &status)) {
+                ADD_FAILURE() << "failed to reap child within the bounded "
+                                 "cleanup budget";
+            }
         }
         if (shared_ != nullptr) {
             ::munmap(shared_, sizeof(SharedBlock));
@@ -538,10 +551,6 @@ protected:
         EXPECT_EQ(LiveSlabs(), 0u)
             << "capacity probe must restore every slab state to FREE";
         return available;
-    }
-
-    void UseWatchdogDeadline(StressDeadline deadline) {
-        watchdog_deadline_ = deadline;
     }
 
     bool WaitForExit(StressDeadline deadline, int* status) {
@@ -618,12 +627,14 @@ protected:
         }
     }
 
-    void KillAndReap(StressDeadline deadline) {
+    void KillAndReap() {
         ASSERT_GT(child_pid_, 0);
         ASSERT_EQ(::kill(child_pid_, SIGKILL), 0);
         int status = 0;
-        ASSERT_TRUE(WaitForExit(deadline, &status))
-            << "child did not exit before the absolute watchdog deadline";
+        const StressDeadline reap_deadline =
+            StressClock::now() + kForcedReapBudget;
+        ASSERT_TRUE(WaitForExit(reap_deadline, &status))
+            << "child did not exit within the bounded cleanup budget";
         ASSERT_TRUE(WIFSIGNALED(status));
     }
 
@@ -658,6 +669,7 @@ protected:
         shared_->root = {};
         shared_->child = {};
         shared_->reached.store(0, std::memory_order_relaxed);
+        shared_->child_command.store(0, std::memory_order_relaxed);
 
         child_pid_ = ::fork();
         ASSERT_NE(child_pid_, -1) << std::strerror(errno);
@@ -670,13 +682,15 @@ protected:
 
         bool child_completed = false;
         if (interruption == Interruption::kSigkill) {
-            KillAndReap(deadline);
+            KillAndReap();
         } else {
+            ASSERT_EQ(::kill(child_pid_, SIGSTOP), 0);
             ASSERT_TRUE(WaitStopped(deadline))
                 << "child did not stop before the absolute deadline";
             if (interruption == Interruption::kSigstopThenKill) {
-                KillAndReap(deadline);
+                KillAndReap();
             } else {
+                shared_->child_command.store(1, std::memory_order_release);
                 ASSERT_EQ(::kill(child_pid_, SIGCONT), 0);
                 int status = 0;
                 ASSERT_TRUE(WaitForExit(deadline, &status))
@@ -753,7 +767,7 @@ protected:
         EXPECT_TRUE(allocator_.Inspect(*root).ok());
         EXPECT_TRUE(allocator_.Inspect(*child).ok());
 
-        KillAndReap(deadline);
+        KillAndReap();
         RecoverProducts();
         EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
         EXPECT_TRUE(mpsc_->IsEmpty());
@@ -815,7 +829,6 @@ protected:
     std::optional<SubscriberLeaseTable> leases_;
     pid_t child_pid_ = -1;
     uint32_t baseline_available_slots_ = 0;
-    StressDeadline watchdog_deadline_{};
 };
 
 TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
@@ -833,7 +846,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
 
     const auto started = StressClock::now();
     const auto maximum_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-        StressClock::time_point::max() - started).count();
+        StressClock::time_point::max() - started - kElapsedUpperSlack).count();
     ASSERT_LE(stress_seconds, static_cast<uint64_t>(maximum_seconds))
         << "MINO_D2_RECOVERY_STRESS_SECONDS is too large";
     const auto configured_duration =
@@ -843,7 +856,10 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
     const StressDeadline hard_deadline = started + configured_duration;
     const StressDeadline scheduling_deadline =
         hard_deadline - cleanup_reserve;
-    UseWatchdogDeadline(hard_deadline);
+    // Correctness waits use hard_deadline. Only post-SIGKILL recovery and
+    // verification may consume the test's existing elapsed-time slack.
+    const StressDeadline cleanup_deadline =
+        hard_deadline + kElapsedUpperSlack;
 
     RecordProperty("stress_seed", std::to_string(seed));
     RecordProperty("stress_seconds", std::to_string(stress_seconds));
@@ -885,7 +901,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
                             round.interruption));
         }
         ASSERT_NO_FATAL_FAILURE(
-            VerifyQueueProgressAndCapacity(iteration, hard_deadline));
+            VerifyQueueProgressAndCapacity(iteration, cleanup_deadline));
         ++iteration;
     }
 
@@ -921,7 +937,6 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
 TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
-    UseWatchdogDeadline(deadline);
     uint64_t iteration = 0;
     for (CrashScenario scenario : kScenarios) {
         SCOPED_TRACE(ScenarioName(scenario));
@@ -934,22 +949,24 @@ TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
 TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
-    UseWatchdogDeadline(deadline);
     shared_->reached.store(0, std::memory_order_relaxed);
+    shared_->child_command.store(0, std::memory_order_relaxed);
     child_pid_ = ::fork();
     ASSERT_NE(child_pid_, -1);
     if (child_pid_ == 0) {
         PublisherChild(shared_, CrashScenario::kMpscWritingPublished, deadline,
-                       /*stop_instead_of_pause=*/true);
+                       /*await_continue_command=*/true);
     }
     ASSERT_TRUE(WaitReached(
         static_cast<uint32_t>(CrashScenario::kMpscWritingPublished), deadline));
+    ASSERT_EQ(::kill(child_pid_, SIGSTOP), 0);
     ASSERT_TRUE(WaitStopped(deadline));
 
     EXPECT_EQ(mpsc_->AbortOrphanedReservations(NowNs() + 1000, 1), 0u);
     EXPECT_EQ(recovery_->RecoverOrphans(), 0u);
     EXPECT_GT(LiveSlabs(), 0u);
 
+    shared_->child_command.store(1, std::memory_order_release);
     ASSERT_EQ(::kill(child_pid_, SIGCONT), 0);
     int status = 0;
     ASSERT_TRUE(WaitForExit(deadline, &status));
@@ -967,7 +984,6 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
 TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
-    UseWatchdogDeadline(deadline);
     ASSERT_NO_FATAL_FAILURE(
         RunPidIncarnationScenario(/*mutate_epoch=*/true, deadline));
     ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
@@ -976,7 +992,6 @@ TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
 TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
-    UseWatchdogDeadline(deadline);
     child_pid_ = ::fork();
     ASSERT_NE(child_pid_, -1);
     if (child_pid_ == 0) {
@@ -1009,7 +1024,7 @@ TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
     }
     ASSERT_TRUE(broadcast_->IsFull());
 
-    KillAndReap(deadline);
+    KillAndReap();
     EXPECT_EQ(coordinator.EvictExpired(kT0 + 100, 1), 1u);
     EXPECT_FALSE(broadcast_->IsFull());
     EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kEvicted);

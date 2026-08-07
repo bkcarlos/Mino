@@ -1,6 +1,11 @@
 # Platform abstraction (shared memory, process identity).
 package(default_visibility = ["//visibility:public"])
 
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 cc_library(
     name = "process_identity",
     srcs = ["process_identity.cc"],
@@ -24,6 +29,7 @@ cc_library(
 cc_test(
     name = "shared_memory_test",
     srcs = ["shared_memory_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":shared_memory",
         "//mino/common:status",
@@ -42,6 +48,7 @@ cc_test(
     name = "shared_memory_concurrency_test",
     srcs = ["shared_memory_concurrency_test.cc"],
     data = [":shared_memory_fault_helper"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":shared_memory",
         "//mino/common:status",
@@ -59,6 +66,7 @@ cc_test(
         "manual",
         "requires-hugepages",
     ],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":shared_memory",
         "//mino/common:ids",

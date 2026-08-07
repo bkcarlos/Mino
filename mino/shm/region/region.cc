@@ -115,7 +115,12 @@ uint32_t HostPageSize() {
 }
 
 Result<int> TryAcquireSupervisorLock(const std::string& name) {
-#if defined(__unix__) || defined(__APPLE__)
+#if defined(__APPLE__)
+    (void)name;
+    return Status::Error(
+        StatusCode::kUnsupported,
+        "writable Region supervisor locking is supported only on Linux");
+#elif defined(__unix__)
     const int fd = ::shm_open(name.c_str(), O_RDWR, 0);
     if (fd < 0) {
         return Status::Error(StatusCode::kInternal,

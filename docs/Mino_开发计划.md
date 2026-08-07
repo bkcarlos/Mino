@@ -11,12 +11,12 @@
 | 维度 | 现状 |
 |---|---|
 | 设计文档 | 架构设计 v1、详细设计 v0.5，已完成评审修订 |
-| ADR 状态 | 13 篇中 3 篇 ACCEPTED（0001 平台基线、0008 Recorder 背压、0010 SHM Trust Domain），10 篇 PROPOSED |
-| 代码 | 仓库尚无代码，需从工程骨架起步 |
+| ADR 状态 | 0001~0014 共 14 篇，全部 ACCEPTED |
+| 代码 | D0~D5 核心实现、单元/集成测试与 CI 编排已落地；D6 性能优化与产品化继续推进 |
 | 验证登记 | 27 项（V-01~V-27），P0 优先级 14 项、P1 优先级 11 项、P2 优先级 2 项 |
 | 关键不变量 | 32 项（INV-01~INV-32），贯穿测试与验收 |
 
-**结论**：项目处于 P0（协议语义定稿）阶段，当前最高优先级是完成 ADR 评审并搭建工程骨架，为 P1 编码扫清障碍。
+**结论**：D0~D5 的代码交付基本完成。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置归档、D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证和 D5 当前提交 100 轮故障 campaign 仍是待关闭门禁。
 
 ### 1.2 阶段映射
 
@@ -46,12 +46,12 @@ D0 (ADR ACCEPTED + Bazel 骨架)
                           └─▶ D6 (性能 + 产品化)
 ```
 
-关键路径上的阻塞点：
+当前发布候选的剩余门禁：
 
-1. **ADR-0002/0003/0004/0005/0006/0011 未 ACCEPTED** → D1 无法开始（Handle/Slot/Channel 语义未定）
-2. **MPMC 骨架 + Slab Allocator** → 所有 Channel 和 Publisher/Subscriber 依赖
-3. **Canonical Wire Format** → Bridge 和 Storage 共同依赖
-4. **IDL Compiler Core** → `minoc`、Dynamic View、Bridge Schema 协商依赖
+1. **D0 CI 证据归档**：当前提交必须在 GitHub Actions 的 debug/release/asan/ubsan/tsan 五配置全绿并保留 run provenance。
+2. **D2 长时间恢复验证**：对当前提交执行固定 seed 与随机 seed 的 Publisher/Subscriber Kill、暂停和 PID incarnation campaign，并保存 manifest。
+3. **D4 物理双机验证**：现有 `.github/workflows/physical-two-host.yml` 只覆盖基础 TCP 与双向可靠帧/ACK；需先扩展 probe 注入强制断链和非空 Schema Identity，再在两台不同物理主机完成验证。fork + loopback 不替代该门禁。
+4. **D5 故障恢复验证**：对当前提交执行 100 轮 SIGKILL campaign；短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停仍由常规 fault suite 覆盖。
 
 ---
 
@@ -88,8 +88,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 2.3 退出条件（DoD）
 
-- [x] 全部 13 篇 ADR 达到 ACCEPTED 状态
-- [x] `bazel build //...` 成功（空骨架）
+- [x] 0001~0014 共 14 篇 ADR 达到 ACCEPTED 状态
+- [x] `bazel build //...` 成功
 - [x] `bazel test //...` 通过（含 Status/Result 单测）
 - [x] Linux 本地五配置（debug/release/asan/ubsan/tsan）全绿（2026-08-01，修复后各 59/59，无缓存全量回归）
 - [ ] GitHub Actions 五配置首跑全绿并归档结果
@@ -167,7 +167,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D2-10 | 静态 Subscriber API ✅ | `Subscriber<T>` + `BorrowedMessage<T>`：Poll/ACK/Cursor 推进与析构 ACK（`//mino/runtime:subscriber`，详设 11.1~11.3） | D2-02 | 3d |
 | D2-11 | ShmSharedPtr（引用 Pin） ✅ | `//mino/runtime:shm_shared_ptr`：Transfer/Pin 计数、per-object/per-process 配额、Lease Owner 崩溃清除（详设 11.2.1、ADR-0013） | D2-10 | 3d |
 | D2-12 | Delivery Receipt 框架 ✅ | `//mino/runtime:delivery_receipt`：有界 Outstanding Table、Target Snapshot、kAll/kAny/kQuorum 与逐目标状态（详设 10.5） | D2-09 | 3d |
-| D2-13 | Kill/暂停/PID 复用压力测试 | Publisher 各点 Kill、Subscriber Kill、慢 Subscriber、Lease 误判边界 | 全部 | 持续 |
+| D2-13 | Kill/暂停/PID 复用压力测试 ✅（持续） | Publisher 各点 Kill、Subscriber Kill、慢 Subscriber、Lease 误判边界；runner/workflow 已落地，发布候选仍需重新执行并归档 manifest | 全部 | 持续 |
 | D2-14 | TLA+ 模型验证 ✅ | `docs/formal/`：MPSC Reservation、Broadcast Membership、Lease Eviction；TLC 穷举通过并映射 INV-17/INV-18/INV-32 | D2-04, D2-06 | 5d |
 
 ### 4.2 并行工作流
@@ -254,7 +254,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ## 6. D4：Bridge（P3）
 
-**目标**：同机和跨机端到端 Pub/Sub 可用，TCP Bridge 支持断链重连和 Schema 协商。
+**目标**：同机与跨地址空间 Pub/Sub 可用，TCP Bridge 支持断链重连和 Schema 协商；真实跨物理主机作为独立发布资格门禁。
 
 **入口条件**：D3 全部退出条件满足。
 
@@ -265,7 +265,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-01 | Node Registry / Coordinator ✅ | 有界单 Authoritative Registry：节点注册/发现、三态健康与 Lease、不可变 Snapshot、Topic 元数据、Durable HWM 接口（`//mino/registry:registry`，详设 14.1~14.2） | D2-08 | 5d |
 | D4-02 | Topic 生命周期管理 ✅ | `CREATING→ACTIVE→DRAINING→RETIRED→DELETED`，版本绑定 readiness/drain proof、owner-bound Pin 与删除门禁（`//mino/registry:registry`，详设 14.4） | D4-01 | 3d |
 | D4-03 | Transport Switcher ✅ | 不可变 Route Handle、显式刷新缓存、kDiscovery/kStatic 双策略、ACL/Schema fail-closed 校验与 Driver 生命周期固定（`//mino/transport:transport_switcher`，详设 15.1~15.2） | D4-01 | 5d |
-| D4-04 | Transport Driver 接口 ✅ | Driver 生命周期/并发 fencing、Capabilities、EndpointDescriptor 显式持久化 codec、异步 Delivery completion（`//mino/transport:transport_driver`，详设 15.3） | D0-14 | 2d |
+| D4-04 | Transport Driver 接口 ✅ | Driver 生命周期/并发 fencing、Capabilities、EndpointDescriptor 显式持久化 codec、异步 Delivery completion（`//mino/transport:transport_driver`，详设 15.3） | D0-13 | 2d |
 | D4-05 | Wire Frame 编解码 ✅ | 80B v1 Header 显式大端 Encoder/Decoder、CRC32C、控制 payload opcode、有界增量 stream decoder（`//mino/bridge:wire_frame`，详设 16.2） | D3-07 | 3d |
 | D4-06 | TCP Driver ✅ | 非阻塞长连接、独立 Accept、4B 大端 Length Prefix、有界 Partial Read/Write、Canonical Heartbeat/Idle Timeout、Shutdown 唤醒与失败 completion（`//mino/transport:tcp_driver`，详设 16.4） | D4-04, D4-05 | 5d |
 | D4-07 | Bridge 管线 ✅ | 单 Owner 有界 Pump：Encode/Send/Receive/Decode/Remote Publish，控制帧独立 reserve（`//mino/bridge:bridge_pipeline`） | D4-06 | 5d |
@@ -273,7 +273,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-09 | 可靠传输与去重 ✅ | Sequence/ACK/Session Epoch、逐来源 HWM、重传/重连、重复抑制、Receiver restart `kDegraded`（`//mino/bridge:reliability`） | D4-07 | 5d |
 | D4-10 | 远端对象重建 ✅ | Schema/Topic 校验 → Canonical Decode → Slab/Journal → SPSC 原子发布，支持显式 N/N-1 binding（`//mino/bridge:remote_object_reconstructor`） | D4-07 | 3d |
 | D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`） | D4-03 | 3d |
-| D4-12 | 双节点集成测试 ✅ | 真实 TCP 双节点、`fork()` 双进程 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`） | 全部 | 持续 |
+| D4-12 | 双节点集成测试 ✅（物理双机资格验证待执行） | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；`.github/workflows/physical-two-host.yml` 当前仅覆盖物理双机基础 TCP 与双向 ACK，强制重连和 Schema 协商仍需扩展 | 全部 | 持续 |
 
 ### 6.2 并行工作流
 
@@ -293,7 +293,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 ### 6.4 退出条件（DoD）
 
 - [x] 同机端到端 Pub/Sub 通过
-- [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback；同一协议路径可部署到跨机 Endpoint）
+- [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback）
+- [ ] 扩展物理双机 probe 注入强制断链与非空 Schema Identity；当前发布候选随后在两台不同物理主机完成 TCP、重连、Schema 协商与双向 ACK 验证，并归档 manifest
 - [x] 断链重连后按策略恢复，去重窗口正常工作（V-19）
 - [x] 错误帧被校验拒绝且不导致越界（INV-31）
 - [x] N/N-1 Schema 互通通过
@@ -355,6 +356,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] Ingestion Sequence 无无法解释的永久空洞（INV-23；Gap/Tombstone + `topic_writer_test`）
 - [x] Replay 可按 Topic/时间/Sequence 过滤回放（`replay_engine_test` + Storage CLI 测试）
 - [x] **正式 SLA 文档发布**（`docs/benchmarks/D5_Storage_SLA.md`）
+- [ ] 当前发布候选完成 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、命令、日志摘要和 GitHub run provenance 的 manifest
 
 ---
 

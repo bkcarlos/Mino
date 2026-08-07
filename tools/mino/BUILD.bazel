@@ -1,6 +1,11 @@
 # mino: Mino CLI tool (D1-11 Inspector + recovery entry point).
 package(default_visibility = ["//visibility:private"])
 
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 exports_files(
     ["runtime.example.toml"],
     visibility = ["//visibility:public"],
@@ -103,6 +108,7 @@ cc_test(
 cc_test(
     name = "inspector_test",
     srcs = ["inspector_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":inspector",
         "//mino/common:status",

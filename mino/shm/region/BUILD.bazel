@@ -1,6 +1,11 @@
 # Shared memory Region lifecycle: SuperBlock, Region, Recovery, HandleResolver.
 package(default_visibility = ["//visibility:public"])
 
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 cc_library(
     name = "channel_directory",
     srcs = ["channel_directory.cc"],
@@ -111,6 +116,7 @@ cc_library(
 cc_test(
     name = "region_test",
     srcs = ["region_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
         ":superblock",
@@ -126,6 +132,7 @@ cc_test(
 cc_test(
     name = "recovery_test",
     srcs = ["recovery_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
         ":superblock",
@@ -146,6 +153,7 @@ cc_test(
 cc_test(
     name = "d1_region_recovery_kill_stress_test",
     srcs = ["d1_region_recovery_kill_stress_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
         ":superblock",
@@ -177,6 +185,7 @@ cc_test(
         "large",
         "manual",
     ],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
         ":superblock",
@@ -193,6 +202,7 @@ cc_test(
 cc_test(
     name = "service_liveness_test",
     srcs = ["service_liveness_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
         ":superblock",
@@ -206,6 +216,7 @@ cc_test(
 cc_test(
     name = "handle_resolver_test",
     srcs = ["handle_resolver_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":handle_resolver",
         ":region",
@@ -224,6 +235,7 @@ cc_test(
 cc_test(
     name = "cross_process_handle_test",
     srcs = ["cross_process_handle_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":handle_resolver",
         ":region",

@@ -46,6 +46,7 @@ Mino 是一个面向高性能系统的统一通信框架，通过统一的类型
 - 语言：C++20
 - 构建：Bazel + Bzlmod
 - 首版平台：Linux x86-64（AArch64 在完成 ABI/原子/性能验证后启用）
+- macOS/Darwin：仅用于编译和非持久 SHM 测试；POSIX SHM marker/supervisor 锁语义不满足首版协议，相关 Bazel 测试明确标记为 Linux-only
 - 工具链：Runtime、Schema Compiler、`minoc`（代码生成）与 `mino`（运维工具）
 
 ## API 预览

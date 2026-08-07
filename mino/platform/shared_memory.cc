@@ -264,6 +264,13 @@ Result<MarkerMapping> MapMarkerFd(int fd) {
 }
 
 Status LockMarkerExclusive(int fd, bool already_exists) {
+#if defined(__APPLE__)
+    (void)fd;
+    (void)already_exists;
+    return Status::Error(
+        StatusCode::kUnsupported,
+        "persistent shared-memory marker locking is supported only on Linux");
+#else
     if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return Status::Ok();
     if (errno == EWOULDBLOCK || errno == EAGAIN) {
         return Status::Error(already_exists ? StatusCode::kAlreadyExists
@@ -271,6 +278,7 @@ Status LockMarkerExclusive(int fd, bool already_exists) {
                              "shared-memory marker is busy");
     }
     return ErrnoStatus("flock(marker) failed");
+#endif
 }
 
 Status WriteInitialMarker(int fd,
