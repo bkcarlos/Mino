@@ -16,7 +16,7 @@
 | 验证登记 | 27 项（V-01~V-27），P0 优先级 14 项、P1 优先级 11 项、P2 优先级 2 项 |
 | 关键不变量 | 32 项（INV-01~INV-32），贯穿测试与验收 |
 
-**结论**：D0~D5 的代码交付基本完成。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置归档、D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证和 D5 当前提交 100 轮故障 campaign 仍是待关闭门禁。
+**结论**：D0~D5 的代码交付基本完成。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已归档，D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证和 D5 当前提交 100 轮故障 campaign 仍是待关闭门禁。
 
 ### 1.2 阶段映射
 
@@ -48,10 +48,9 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 当前发布候选的剩余门禁：
 
-1. **D0 CI 证据归档**：当前提交必须在 GitHub Actions 的 debug/release/asan/ubsan/tsan 五配置全绿并保留 run provenance。
-2. **D2 长时间恢复验证**：对当前提交执行固定 seed 与随机 seed 的 Publisher/Subscriber Kill、暂停和 PID incarnation campaign，并保存 manifest。
-3. **D4 物理双机验证**：现有 `.github/workflows/physical-two-host.yml` 只覆盖基础 TCP 与双向可靠帧/ACK；需先扩展 probe 注入强制断链和非空 Schema Identity，再在两台不同物理主机完成验证。fork + loopback 不替代该门禁。
-4. **D5 故障恢复验证**：对当前提交执行 100 轮 SIGKILL campaign；短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停仍由常规 fault suite 覆盖。
+1. **D2 长时间恢复验证**：对当前提交执行固定 seed 与随机 seed 的 Publisher/Subscriber Kill、暂停和 PID incarnation campaign，并保存 manifest。
+2. **D4 物理双机验证**：现有 `.github/workflows/physical-two-host.yml` 只覆盖基础 TCP 与双向可靠帧/ACK；需先扩展 probe 注入强制断链和非空 Schema Identity，再在两台不同物理主机完成验证。fork + loopback 不替代该门禁。
+3. **D5 故障恢复验证**：对当前提交执行 100 轮 SIGKILL campaign；短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停仍由常规 fault suite 覆盖。
 
 ---
 
@@ -92,7 +91,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] `bazel build //...` 成功
 - [x] `bazel test //...` 通过（含 Status/Result 单测）
 - [x] Linux 本地五配置（debug/release/asan/ubsan/tsan）全绿（2026-08-01，修复后各 59/59，无缓存全量回归）
-- [ ] GitHub Actions 五配置首跑全绿并归档结果
+- [x] GitHub Actions 五配置首跑全绿并归档结果（2026-08-07 UTC，commit `5271596`，[CI run 31197160078](https://github.com/bkcarlos/Mino/actions/runs/31197160078)：debug/release/asan/ubsan/tsan、Hermetic LLVM、buildifier 与 tooling smoke 全部成功）
 - [x] V-12 原子 ABI Litmus 报告产出（Linux x86-64 必需的 ≤64-bit Lock-free 与跨进程语义 4/4 通过；128-bit 为可选能力且未进入 v1 ABI）
 
 ---
