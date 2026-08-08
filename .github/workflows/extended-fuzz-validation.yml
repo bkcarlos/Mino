@@ -69,7 +69,6 @@ jobs:
             //mino/bridge/fuzz:corpus_smoke_test \
             //mino/storage/fuzz:corpus_smoke_test \
             //mino/shm/region/fuzz:corpus_smoke_test \
-            --test_env=MINO_REGION_ID_HWM_PATH=${RUNNER_TEMP}/mino-region-fuzz-hwm \
             --test_output=errors \
             --nocache_test_results
 

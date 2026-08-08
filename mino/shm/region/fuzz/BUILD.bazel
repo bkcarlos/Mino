@@ -17,8 +17,8 @@ cc_library(
         "//mino/platform:process_identity",
         "//mino/platform:shared_memory",
         "//mino/shm/allocator:slab_header",
+        "//mino/shm/region",
         "//mino/shm/region:handle_resolver",
-        "//mino/shm/region:region",
         "//mino/shm/region:superblock",
     ],
 )

@@ -408,9 +408,9 @@ cc_test(
 
 cc_test(
     name = "storage_fault_test",
+    timeout = "long",
     srcs = ["storage_fault_test.cc"],
     tags = ["storage-fault"],
-    timeout = "long",
     target_compatible_with = POSIX_ONLY,
     deps = [
         ":recorder_buffer_pool",

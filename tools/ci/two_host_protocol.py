@@ -1014,7 +1014,8 @@ def finalize_evidence(
 
 def self_test() -> None:
     token = b"self-test-token-that-is-at-least-thirty-two-bytes"
-    commit = "a" * 40
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    commit = github_sha.lower() if COMMIT_RE.fullmatch(github_sha) else "a" * 40
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         fake = root / "fake-mino-probe.py"

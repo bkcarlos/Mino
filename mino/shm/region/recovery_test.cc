@@ -436,6 +436,7 @@ TEST_F(RecoveryOwnerTest, ActiveInUseRegionIsFencedWithoutRepair) {
   config.classes = {{.slot_size = 256, .slot_count = 8}};
   auto allocator = CentralSlabAllocator::CreateInRegion(storage, config);
   ASSERT_TRUE(allocator.ok());
+  allocator->ConfigureLocalCache({.enabled = false});
   AllocationRequest request{.object_size = 64,
                             .type_id = TypeId{19},
                             .schema = SchemaIdentity{.short_id = 0x99,

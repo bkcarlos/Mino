@@ -69,6 +69,7 @@ protected:
             memory_.get(), kAllocatorBytes, TestConfig());
         ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
         allocator_ = *allocator;
+        allocator_.ConfigureLocalCache({.enabled = false});
     }
 
     AllocationRequest Request() const {

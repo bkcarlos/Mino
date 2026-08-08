@@ -171,7 +171,7 @@ cc_library(
     deps = [
         ":validation_runtime",
         ":validation_stats",
-        "//mino/registry:registry",
+        "//mino/registry",
     ],
 )
 
@@ -184,27 +184,27 @@ cc_binary(
         "//conditions:default": [],
     }),
     deps = [
+        ":validation_broadcast_ack",
+        ":validation_buffer_capacity",
         ":validation_cli",
+        ":validation_dynamic_view",
         ":validation_json",
+        ":validation_pin_lease",
         ":validation_report",
         ":validation_runtime",
-        ":validation_temporary_directory",
-        ":validation_broadcast_ack",
-        ":validation_dynamic_view",
-        ":validation_topic_writer_scaling",
         ":validation_sync_policy",
-        ":validation_buffer_capacity",
-        ":validation_pin_lease",
+        ":validation_temporary_directory",
+        ":validation_topic_writer_scaling",
     ],
 )
 
 py_test(
     name = "validation_contract_smoke_test",
+    size = "small",
     srcs = ["validation/tests/contract_smoke_test.py"],
     data = [":validation_benchmark"],
     main = "validation/tests/contract_smoke_test.py",
     python_version = "PY3",
-    size = "small",
 )
 
 cc_binary(

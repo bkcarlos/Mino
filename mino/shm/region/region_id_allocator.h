@@ -13,8 +13,8 @@ namespace mino::region_internal {
 
 // Options for the deployment-local durable Region ID high-water mark.
 struct RegionIdAllocatorOptions {
-    // Empty selects MINO_REGION_ID_HWM_PATH, then
-    // $XDG_STATE_HOME/mino/region_id_hwm, then
+    // Empty selects MINO_REGION_ID_HWM_PATH, then the Bazel TEST_TMPDIR,
+    // then $XDG_STATE_HOME/mino/region_id_hwm, then
     // $HOME/.local/state/mino/region_id_hwm, then a UID-isolated
     // /var/tmp/mino-<uid>/region_id_hwm fallback. Tests may inject an explicit path.
     std::string hwm_path;

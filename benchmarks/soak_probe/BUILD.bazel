@@ -14,7 +14,7 @@ cc_binary(
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
-        "//mino/observability:observability",
+        "//mino/observability",
         "//mino/shm/allocator:central_slab",
         "//mino/shm/channel:broadcast",
         "//mino/storage:recorder_buffer_pool",

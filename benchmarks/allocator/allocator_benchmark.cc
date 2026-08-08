@@ -9,7 +9,6 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -94,11 +93,7 @@ Config ParseArguments(int argc, char** argv) {
 ResultRow Run(const Config& config, bool cache_enabled) {
     constexpr uint64_t kMetadataAllowance = 1u << 20;
     constexpr uint64_t kBytesPerSlotAllowance = 256;
-    if (config.slots >
-        (std::numeric_limits<uint64_t>::max() - kMetadataAllowance) /
-            kBytesPerSlotAllowance) {
-        throw std::overflow_error("allocator benchmark region size overflow");
-    }
+
     const uint64_t region_size =
         kMetadataAllowance + kBytesPerSlotAllowance * config.slots;
     auto region = std::unique_ptr<std::byte[], AlignedDeleter>(

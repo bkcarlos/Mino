@@ -181,6 +181,10 @@ Result<std::filesystem::path> ResolveHwmPath(
         injected != nullptr && *injected != '\0') {
         return std::filesystem::path(injected);
     }
+    if (const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+        test_tmpdir != nullptr && *test_tmpdir != '\0') {
+        return std::filesystem::path(test_tmpdir) / "mino" / "region_id_hwm";
+    }
     if (const char* state_home = std::getenv("XDG_STATE_HOME");
         state_home != nullptr && *state_home != '\0') {
         return std::filesystem::path(state_home) / "mino" / "region_id_hwm";

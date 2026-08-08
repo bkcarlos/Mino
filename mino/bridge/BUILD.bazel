@@ -74,7 +74,7 @@ cc_library(
     deps = [
         ":bridge_pipeline",
         "//mino/common:result",
-        "//mino/observability:observability",
+        "//mino/observability",
         "//mino/runtime:bus",
         "//mino/schema:canonical",
         "//mino/transport:transport_driver",
@@ -131,7 +131,7 @@ cc_test(
     srcs = ["connection_manager_test.cc"],
     deps = [
         ":bridge_connection_manager",
-        "//mino/observability:observability",
+        "//mino/observability",
         "//mino/registry",
         "//mino/runtime:bus",
         "//mino/schema:canonical",
