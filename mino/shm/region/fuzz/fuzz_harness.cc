@@ -226,7 +226,8 @@ Status FuzzHandleResolver(std::span<const std::byte> input) noexcept {
         }
         ResolverFixture& fixture = Fixture();
         if (!fixture.setup_status().ok()) {
-            return Internal("handle fuzz Region fixture could not be created");
+            return Internal("handle fuzz Region fixture could not be created: " +
+                            fixture.setup_status().ToString());
         }
         ResetValidFixture(&fixture);
 

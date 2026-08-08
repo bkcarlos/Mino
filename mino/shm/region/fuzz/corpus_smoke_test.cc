@@ -27,7 +27,9 @@ int main() {
         if ((path == kCorpus.front() && !first.ok()) ||
             first.code() != second.code() ||
             first.code() == mino::StatusCode::kInternal) {
-            std::cerr << "non-deterministic or internal handle corpus result\n";
+            std::cerr << "invalid handle corpus result: path=" << path
+                      << " first=" << first.ToString()
+                      << " second=" << second.ToString() << '\n';
             return 1;
         }
     }
