@@ -104,24 +104,28 @@ size_t Coordinator::TopicPinKeyHash::operator()(
 
 Result<std::unique_ptr<Coordinator>> Coordinator::Create(
     CoordinatorLimits limits, std::shared_ptr<IdAllocator> id_allocator,
-    std::shared_ptr<const LivenessProbe> liveness_probe) {
+    std::shared_ptr<const LivenessProbe> liveness_probe,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) {
     return CreateImpl(limits, std::move(id_allocator),
-                      std::move(liveness_probe), {}, true);
+                      std::move(liveness_probe), {},
+                      std::move(capacity_controller), true);
 }
 
 Result<std::unique_ptr<Coordinator>> Coordinator::CreateForTesting(
     CoordinatorLimits limits, std::shared_ptr<IdAllocator> id_allocator,
     std::shared_ptr<const LivenessProbe> liveness_probe,
-    std::shared_ptr<RegistryFaultInjector> fault_injector) {
+    std::shared_ptr<RegistryFaultInjector> fault_injector,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) {
     return CreateImpl(limits, std::move(id_allocator),
                       std::move(liveness_probe), std::move(fault_injector),
-                      false);
+                      std::move(capacity_controller), false);
 }
 
 Result<std::unique_ptr<Coordinator>> Coordinator::CreateImpl(
     CoordinatorLimits limits, std::shared_ptr<IdAllocator> id_allocator,
     std::shared_ptr<const LivenessProbe> liveness_probe,
     std::shared_ptr<RegistryFaultInjector> fault_injector,
+    std::shared_ptr<capacity::CapacityController> capacity_controller,
     bool require_durable) {
     try {
         MINO_RETURN_IF_ERROR(ValidateCoordinatorLimits(limits));
@@ -146,7 +150,7 @@ Result<std::unique_ptr<Coordinator>> Coordinator::CreateImpl(
             NodeRegistry::Create(limits, std::move(liveness_probe)));
         return std::unique_ptr<Coordinator>(new Coordinator(
             limits, std::move(id_allocator), std::move(nodes),
-            std::move(fault_injector)));
+            std::move(fault_injector), std::move(capacity_controller)));
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }
@@ -155,11 +159,13 @@ Result<std::unique_ptr<Coordinator>> Coordinator::CreateImpl(
 Coordinator::Coordinator(
     CoordinatorLimits limits, std::shared_ptr<IdAllocator> allocator,
     std::unique_ptr<NodeRegistry> nodes,
-    std::shared_ptr<RegistryFaultInjector> fault_injector)
+    std::shared_ptr<RegistryFaultInjector> fault_injector,
+    std::shared_ptr<capacity::CapacityController> capacity_controller)
     : limits_(limits),
       id_allocator_(std::move(allocator)),
       nodes_(std::move(nodes)),
-      fault_injector_(std::move(fault_injector)) {
+      fault_injector_(std::move(fault_injector)),
+      capacity_controller_(std::move(capacity_controller)) {
     topics_.reserve(limits_.max_topics);
     topic_names_.reserve(limits_.max_topics);
     publishers_.reserve(limits_.max_publisher_registrations);
@@ -168,6 +174,18 @@ Coordinator::Coordinator(
     pending_cleanup_owners_.reserve(
         limits_.max_publisher_registrations +
         limits_.max_subscriber_registrations + limits_.max_topic_pins);
+}
+
+Result<capacity::CapacityReservation> Coordinator::ReserveCapacity(
+    capacity::ResourceVector resources, capacity::ResourceScope scope,
+    std::string_view name) {
+    if (!capacity_controller_) return capacity::CapacityReservation{};
+    return capacity_controller_->Reserve(capacity::ResourceRequest{
+        .resources = resources,
+        .scope = scope,
+        .admission_class = capacity::AdmissionClass::kDataPlane,
+        .name = name,
+    });
 }
 
 Result<NodeRegistrationOutcome> Coordinator::RegisterNode(
@@ -269,10 +287,15 @@ Status Coordinator::ValidateStaticRouteNodesLocked(
 }
 
 Result<std::shared_ptr<const TopicSnapshot>> Coordinator::CreateTopic(
-    TopicMetadata candidate) {
+    TopicMetadata candidate, capacity::ResourceVector additional_resources) {
     try {
         MINO_RETURN_IF_ERROR(
             ValidateTopicMetadata(candidate, limits_, true));
+        capacity::ResourceVector topic_unit;
+        topic_unit.topics = 1;
+        MINO_ASSIGN_OR_RETURN(auto topic_resources,
+                              capacity::CheckedAdd(additional_resources,
+                                                   topic_unit));
         {
             std::lock_guard lock(mutex_);
             if (topics_.size() >= limits_.max_topics) {
@@ -285,6 +308,10 @@ Result<std::shared_ptr<const TopicSnapshot>> Coordinator::CreateTopic(
             }
             MINO_RETURN_IF_ERROR(ValidateStaticRouteNodesLocked(candidate));
         }
+        MINO_ASSIGN_OR_RETURN(
+            auto capacity_reservation,
+            ReserveCapacity(topic_resources, capacity::ResourceScope::kTopic,
+                            candidate.name));
 
         // AllocateTopicId is a persistence boundary and a user-supplied virtual
         // call. It is never made under a registry lock. Durable allocators must
@@ -308,6 +335,7 @@ Result<std::shared_ptr<const TopicSnapshot>> Coordinator::CreateTopic(
                     .nodes = {},
                 });
         TopicEntry entry{
+            .capacity_lease = {},
             .snapshot = snapshot,
             .subscriber_nodes = std::move(subscriber_nodes),
             .subscriber_counts_by_node = {},
@@ -331,13 +359,25 @@ Result<std::shared_ptr<const TopicSnapshot>> Coordinator::CreateTopic(
         }
 
         const TopicId topic_id = candidate.topic_id;
-        topics_.emplace(topic_id, std::move(entry));
+        auto [inserted_topic, inserted] =
+            topics_.emplace(topic_id, std::move(entry));
+        if (!inserted) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "TopicId insertion unexpectedly failed");
+        }
         try {
             topic_names_.emplace(candidate.name, topic_id);
         } catch (...) {
-            topics_.erase(topic_id);
+            topics_.erase(inserted_topic);
             throw;
         }
+        auto committed = capacity_reservation.Commit();
+        if (!committed.ok()) {
+            topic_names_.erase(candidate.name);
+            topics_.erase(inserted_topic);
+            return committed.status();
+        }
+        inserted_topic->second.capacity_lease = std::move(*committed);
         return snapshot;
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -587,8 +627,10 @@ Status Coordinator::DeleteTopic(TopicId topic_id) {
                 StatusCode::kWouldBlock,
                 "topic still has registrations or exact pin tokens");
         }
-        return AdvanceTopicStateLocked(found->second, TopicState::kRetired,
-                                       TopicState::kDeleted);
+        MINO_RETURN_IF_ERROR(AdvanceTopicStateLocked(
+            found->second, TopicState::kRetired, TopicState::kDeleted));
+        found->second.capacity_lease.Reset();
+        return Status::Ok();
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }
@@ -618,16 +660,38 @@ Status Coordinator::RegisterPublisher(
             return Status::Error(StatusCode::kInvalidArgument,
                                  "publisher registration is incomplete");
         }
+        const PublisherKey key{registration.topic_id,
+                               registration.publisher_id};
+        {
+            std::lock_guard lock(mutex_);
+            if (topics_.find(registration.topic_id) == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound, "topic not found");
+            }
+            const auto existing = publishers_.find(key);
+            if (existing != publishers_.end()) {
+                return SamePublisherRegistration(existing->second.registration,
+                                                 registration)
+                           ? Status::Ok()
+                           : Status::Error(
+                                 StatusCode::kAlreadyExists,
+                                 "publisher ID is already registered");
+            }
+        }
+        capacity::ResourceVector resources;
+        resources.publishers = 1;
+        MINO_ASSIGN_OR_RETURN(
+            auto capacity_reservation,
+            ReserveCapacity(resources, capacity::ResourceScope::kPublisher,
+                            "publisher registration"));
         std::lock_guard lock(mutex_);
         auto topic = topics_.find(registration.topic_id);
         if (topic == topics_.end()) {
             return Status::Error(StatusCode::kNotFound, "topic not found");
         }
-        const PublisherKey key{registration.topic_id,
-                               registration.publisher_id};
         const auto existing = publishers_.find(key);
         if (existing != publishers_.end()) {
-            return SamePublisherRegistration(existing->second, registration)
+            return SamePublisherRegistration(existing->second.registration,
+                                             registration)
                        ? Status::Ok()
                        : Status::Error(StatusCode::kAlreadyExists,
                                        "publisher ID is already registered");
@@ -649,7 +713,19 @@ Status Coordinator::RegisterPublisher(
             .metadata = topic->second.snapshot->metadata,
             .usage = usage,
         });
-        publishers_.emplace(key, registration);
+        auto [inserted_entry, inserted] = publishers_.emplace(
+            key, PublisherEntry{.registration = registration,
+                                .capacity_lease = {}});
+        if (!inserted) {
+            return Status::Error(StatusCode::kAlreadyExists,
+                                 "publisher ID raced with registration");
+        }
+        auto committed = capacity_reservation.Commit();
+        if (!committed.ok()) {
+            publishers_.erase(inserted_entry);
+            return committed.status();
+        }
+        inserted_entry->second.capacity_lease = std::move(*committed);
         topic->second.snapshot = std::move(next);
         return Status::Ok();
     } catch (const std::bad_alloc&) {
@@ -665,7 +741,8 @@ Status Coordinator::UnregisterPublisher(
                                registration.publisher_id};
         auto found = publishers_.find(key);
         if (found == publishers_.end() ||
-            !SamePublisherRegistration(found->second, registration)) {
+            !SamePublisherRegistration(found->second.registration,
+                                       registration)) {
             return Status::Error(StatusCode::kNotFound,
                                  "publisher registration does not match");
         }
@@ -728,16 +805,38 @@ Status Coordinator::RegisterSubscriber(
             return Status::Error(StatusCode::kInvalidArgument,
                                  "subscriber registration is incomplete");
         }
+        const SubscriberKey key{registration.topic_id,
+                                registration.subscriber_id};
+        {
+            std::lock_guard lock(mutex_);
+            if (topics_.find(registration.topic_id) == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound, "topic not found");
+            }
+            const auto existing = subscribers_.find(key);
+            if (existing != subscribers_.end()) {
+                return SameSubscriberRegistration(
+                           existing->second.registration, registration)
+                           ? Status::Ok()
+                           : Status::Error(
+                                 StatusCode::kAlreadyExists,
+                                 "subscriber ID is already registered");
+            }
+        }
+        capacity::ResourceVector resources;
+        resources.subscribers = 1;
+        MINO_ASSIGN_OR_RETURN(
+            auto capacity_reservation,
+            ReserveCapacity(resources, capacity::ResourceScope::kSubscriber,
+                            "subscriber registration"));
         std::lock_guard lock(mutex_);
         auto topic = topics_.find(registration.topic_id);
         if (topic == topics_.end()) {
             return Status::Error(StatusCode::kNotFound, "topic not found");
         }
-        const SubscriberKey key{registration.topic_id,
-                                registration.subscriber_id};
         const auto existing = subscribers_.find(key);
         if (existing != subscribers_.end()) {
-            return SameSubscriberRegistration(existing->second, registration)
+            return SameSubscriberRegistration(existing->second.registration,
+                                              registration)
                        ? Status::Ok()
                        : Status::Error(StatusCode::kAlreadyExists,
                                        "subscriber ID is already registered");
@@ -771,13 +870,28 @@ Status Coordinator::RegisterSubscriber(
                 .metadata = topic->second.snapshot->metadata,
                 .usage = usage,
             });
-        subscribers_.emplace(key, registration);
+        auto [inserted_entry, inserted] = subscribers_.emplace(
+            key, SubscriberEntry{.registration = registration,
+                                 .capacity_lease = {}});
+        if (!inserted) {
+            return Status::Error(StatusCode::kAlreadyExists,
+                                 "subscriber ID raced with registration");
+        }
         try {
-            auto [count, inserted] =
+            auto [count, inserted_count] =
                 topic->second.subscriber_counts_by_node.try_emplace(
                     registration.owner.node_id, 0);
-            (void)inserted;
+            (void)inserted_count;
             ++count->second;
+            auto committed = capacity_reservation.Commit();
+            if (!committed.ok()) {
+                if (--count->second == 0) {
+                    topic->second.subscriber_counts_by_node.erase(count);
+                }
+                subscribers_.erase(inserted_entry);
+                return committed.status();
+            }
+            inserted_entry->second.capacity_lease = std::move(*committed);
         } catch (...) {
             subscribers_.erase(key);
             throw;
@@ -798,7 +912,8 @@ Status Coordinator::UnregisterSubscriber(
                                 registration.subscriber_id};
         auto found = subscribers_.find(key);
         if (found == subscribers_.end() ||
-            !SameSubscriberRegistration(found->second, registration)) {
+            !SameSubscriberRegistration(found->second.registration,
+                                        registration)) {
             return Status::Error(StatusCode::kNotFound,
                                  "subscriber registration does not match");
         }
@@ -1037,11 +1152,11 @@ bool Coordinator::OwnerHasResourcesLocked(
     const NodeLeaseOwner& owner) const noexcept {
     return std::any_of(publishers_.begin(), publishers_.end(),
                        [&owner](const auto& item) {
-                           return item.second.owner == owner;
+                           return item.second.registration.owner == owner;
                        }) ||
            std::any_of(subscribers_.begin(), subscribers_.end(),
                        [&owner](const auto& item) {
-                           return item.second.owner == owner;
+                           return item.second.registration.owner == owner;
                        }) ||
            std::any_of(pins_.begin(), pins_.end(), [&owner](const auto& item) {
                return item.second.owner == owner;
@@ -1051,11 +1166,11 @@ bool Coordinator::OwnerHasResourcesLocked(
 bool Coordinator::TopicHasParticipantsLocked(TopicId topic_id) const noexcept {
     return std::any_of(publishers_.begin(), publishers_.end(),
                        [topic_id](const auto& item) {
-                           return item.second.topic_id == topic_id;
+                           return item.second.registration.topic_id == topic_id;
                        }) ||
            std::any_of(subscribers_.begin(), subscribers_.end(),
                        [topic_id](const auto& item) {
-                           return item.second.topic_id == topic_id;
+                           return item.second.registration.topic_id == topic_id;
                        });
 }
 
@@ -1106,11 +1221,11 @@ Status Coordinator::CleanupOwnerLocked(const NodeLeaseOwner& owner,
     // and scalar updates are non-throwing. A retry therefore sees either the
     // intact record or an already committed removal.
     for (auto iterator = publishers_.begin(); iterator != publishers_.end();) {
-        if (iterator->second.owner != owner) {
+        if (iterator->second.registration.owner != owner) {
             ++iterator;
             continue;
         }
-        auto topic = topics_.find(iterator->second.topic_id);
+        auto topic = topics_.find(iterator->second.registration.topic_id);
         if (topic != topics_.end() &&
             topic->second.snapshot->usage.publishers != 0) {
             TopicUsageCounts usage = topic->second.snapshot->usage;
@@ -1125,14 +1240,15 @@ Status Coordinator::CleanupOwnerLocked(const NodeLeaseOwner& owner,
     }
 
     for (auto iterator = subscribers_.begin(); iterator != subscribers_.end();) {
-        if (iterator->second.owner != owner) {
+        if (iterator->second.registration.owner != owner) {
             ++iterator;
             continue;
         }
-        auto topic = topics_.find(iterator->second.topic_id);
+        auto topic = topics_.find(iterator->second.registration.topic_id);
         if (topic != topics_.end() &&
             topic->second.snapshot->usage.subscribers != 0) {
-            const NodeId node_id = iterator->second.owner.node_id;
+            const NodeId node_id =
+                iterator->second.registration.owner.node_id;
             auto count = topic->second.subscriber_counts_by_node.find(node_id);
             const bool remove_node =
                 count != topic->second.subscriber_counts_by_node.end() &&

@@ -600,6 +600,54 @@ public:
         }
     }
 
+    // Returns a later committed-prefix message without advancing the consumer
+    // cursor. The caller must retain the head Borrow returned by Poll() and ACK
+    // every returned Borrow in sequence order. No shared-memory fields are
+    // added or changed by this process-local batch helper.
+    Result<Borrow> PollAtOffset(uint64_t head_sequence,
+                                uint64_t offset) noexcept {
+        if (offset == 0) {
+            return Poll();
+        }
+        const uint64_t cons = control_->consumer_cursor.load(
+            std::memory_order_acquire);
+        if (cons != head_sequence) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "MPSC batch head was overtaken");
+        }
+        const uint64_t reserved = control_->reservation_cursor.load(
+            std::memory_order_acquire);
+        if (offset >= reserved - head_sequence) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "MPSC batch reached queue tail");
+        }
+        const uint64_t sequence = head_sequence + offset;
+        IndexSlot* slot = &slots_[sequence & mask_];
+        const uint64_t turn = slot->turn.load(std::memory_order_acquire);
+        const uint32_t state = slot->state.load(std::memory_order_acquire);
+        if (turn != sequence + 1 ||
+            state != static_cast<uint32_t>(SlotState::kReady)) {
+            return Status::Error(
+                StatusCode::kWouldBlock,
+                "MPSC batch reached an uncommitted prefix slot");
+        }
+        if (slot->sequence_num.load(std::memory_order_acquire) != sequence) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "MPSC batch slot sequence mismatch");
+        }
+        IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
+        if (!VerifySnapshotCrc(snapshot)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "MPSC batch slot immutable CRC mismatch");
+        }
+        if (control_->consumer_cursor.load(std::memory_order_acquire) !=
+            head_sequence) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "MPSC batch head changed during snapshot");
+        }
+        return Borrow(this, snapshot);
+    }
+
     // -----------------------------------------------------------------------
     // Crash recovery (design doc 9.5 / 12.3)
     // -----------------------------------------------------------------------

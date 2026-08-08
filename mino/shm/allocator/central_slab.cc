@@ -14,9 +14,14 @@
 
 #include "mino/shm/allocator/central_slab.h"
 
+#include <array>
 #include <atomic>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
 #include <new>
+#include <thread>
 
 #include "mino/common/checked_arithmetic.h"
 
@@ -62,12 +67,71 @@ static_assert(sizeof(AllocatorSuperblock) == 64);
 
 constexpr uint64_t AlignUp(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
+std::atomic<uint64_t> g_next_local_cache_id{1};
+
+struct ThreadCursorMagazine {
+    uint64_t cache_id = 0;
+    uint64_t epoch = 0;
+    std::array<uint32_t, kMaxClassCount> next_bits{};
+    std::array<bool, kMaxClassCount> valid{};
+};
+
+thread_local ThreadCursorMagazine g_thread_cursor_magazine;
+
+uint32_t GetThreadCursor(uint64_t cache_id, uint64_t epoch,
+                         uint16_t class_id, uint32_t begin,
+                         uint32_t slot_count) {
+    ThreadCursorMagazine& magazine = g_thread_cursor_magazine;
+    if (magazine.cache_id != cache_id || magazine.epoch != epoch) {
+        magazine.cache_id = cache_id;
+        magazine.epoch = epoch;
+        magazine.valid.fill(false);
+    }
+    if (!magazine.valid[class_id]) {
+        const uint64_t thread_hash = static_cast<uint64_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        const uint64_t seed = thread_hash ^ (cache_id * 0x9E3779B97F4A7C15ull) ^
+                              static_cast<uint64_t>(class_id);
+        magazine.next_bits[class_id] =
+            begin + static_cast<uint32_t>(seed % slot_count);
+        magazine.valid[class_id] = true;
+    }
+    return magazine.next_bits[class_id];
+}
+
+void SetThreadCursor(uint64_t cache_id, uint64_t epoch, uint16_t class_id,
+                     uint32_t next_bit) {
+    ThreadCursorMagazine& magazine = g_thread_cursor_magazine;
+    if (magazine.cache_id != cache_id || magazine.epoch != epoch) {
+        magazine.cache_id = cache_id;
+        magazine.epoch = epoch;
+        magazine.valid.fill(false);
+    }
+    magazine.next_bits[class_id] = next_bit;
+    magazine.valid[class_id] = true;
+}
+
 }  // namespace
 
 struct CentralSlabAllocator::Layout {
     uint64_t metadata_size = 0;
     uint64_t slot_stride = 0;
     uint32_t bitmap_words = 0;
+};
+
+struct CentralSlabAllocator::LocalCacheState {
+    LocalCacheState()
+        : cache_id(g_next_local_cache_id.fetch_add(1,
+                                                   std::memory_order_relaxed)) {}
+
+    const uint64_t cache_id;
+    std::atomic<uint64_t> epoch{1};
+    std::atomic<bool> enabled{true};
+    std::atomic<uint64_t> hint_hits{0};
+    std::atomic<uint64_t> fallback_scans{0};
+    std::atomic<uint64_t> cache_bypasses{0};
+    std::atomic<uint64_t> exhaustions{0};
+    std::atomic<uint64_t> drain_count{0};
 };
 
 Result<CentralSlabAllocator::Layout> CentralSlabAllocator::ComputeLayout(
@@ -215,6 +279,7 @@ Result<CentralSlabAllocator> CentralSlabAllocator::CreateWithStorage(
     alloc.slot_stride_ = layout.slot_stride;
     alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
+    alloc.local_cache_state_ = std::make_shared<LocalCacheState>();
     return alloc;
 }
 
@@ -378,7 +443,43 @@ Result<CentralSlabAllocator> CentralSlabAllocator::AttachWithBias(
     alloc.slot_stride_ = layout.slot_stride;
     alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
+    alloc.local_cache_state_ = std::make_shared<LocalCacheState>();
     return alloc;
+}
+
+void CentralSlabAllocator::ConfigureLocalCache(
+    AllocatorLocalCacheConfig config) noexcept {
+    if (local_cache_state_ == nullptr) return;
+    local_cache_state_->enabled.store(config.enabled, std::memory_order_release);
+    DrainLocalCache();
+}
+
+AllocatorLocalCacheConfig CentralSlabAllocator::local_cache_config() const noexcept {
+    return AllocatorLocalCacheConfig{
+        .enabled = local_cache_state_ != nullptr &&
+                   local_cache_state_->enabled.load(std::memory_order_acquire),
+    };
+}
+
+AllocatorLocalCacheStats CentralSlabAllocator::local_cache_stats() const noexcept {
+    if (local_cache_state_ == nullptr) return {};
+    return AllocatorLocalCacheStats{
+        .hint_hits = local_cache_state_->hint_hits.load(std::memory_order_relaxed),
+        .fallback_scans =
+            local_cache_state_->fallback_scans.load(std::memory_order_relaxed),
+        .cache_bypasses =
+            local_cache_state_->cache_bypasses.load(std::memory_order_relaxed),
+        .exhaustions =
+            local_cache_state_->exhaustions.load(std::memory_order_relaxed),
+        .drain_count =
+            local_cache_state_->drain_count.load(std::memory_order_relaxed),
+    };
+}
+
+void CentralSlabAllocator::DrainLocalCache() noexcept {
+    if (local_cache_state_ == nullptr) return;
+    local_cache_state_->epoch.fetch_add(1, std::memory_order_acq_rel);
+    local_cache_state_->drain_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& request) {
@@ -415,13 +516,50 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
         return Status::Error(StatusCode::kUnavailable, "size class is draining");
     }
 
-    // Steps 3-5: shard selection, free-bit search, CAS claim. The shard hint
-    // is the class's base shard so allocations of one class cluster together.
-    MINO_ASSIGN_OR_RETURN(
-        const uint32_t bit_index,
-        bitmap_.FindAndSetFreeBitInRange(
-            cls.bitmap_shard_offset,
-            cls.bitmap_shard_offset + cls.slot_count));
+    // Steps 3-5: use a bounded process-local cursor magazine to select a shard,
+    // then claim directly in the shared bitmap. No free slot is ever held in the
+    // magazine, so process death cannot hide capacity from Attach/recovery.
+    const uint32_t range_begin = cls.bitmap_shard_offset;
+    const uint32_t range_end = range_begin + cls.slot_count;
+    uint32_t bit_index = 0;
+    LocalCacheState* const cache = local_cache_state_.get();
+    if (cache != nullptr && cache->enabled.load(std::memory_order_acquire)) {
+        const uint64_t epoch = cache->epoch.load(std::memory_order_acquire);
+        const uint32_t hint = GetThreadCursor(
+            cache->cache_id, epoch, class_id, range_begin, cls.slot_count);
+        Result<BitmapClaim> claim = bitmap_.FindAndSetFreeBitInRangeHinted(
+            range_begin, range_end, hint);
+        if (!claim.ok()) {
+            cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
+            if (claim.status().code() == StatusCode::kResourceExhausted) {
+                cache->exhaustions.fetch_add(1, std::memory_order_relaxed);
+            }
+            return claim.status();
+        }
+        bit_index = claim->bit_index;
+        if (claim->shards_probed == 1) {
+            cache->hint_hits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint32_t next_bit =
+            bit_index + 1 == range_end ? range_begin : bit_index + 1;
+        SetThreadCursor(cache->cache_id, epoch, class_id, next_bit);
+    } else {
+        if (cache != nullptr) {
+            cache->cache_bypasses.fetch_add(1, std::memory_order_relaxed);
+        }
+        Result<uint32_t> claim =
+            bitmap_.FindAndSetFreeBitInRange(range_begin, range_end);
+        if (!claim.ok()) {
+            if (cache != nullptr &&
+                claim.status().code() == StatusCode::kResourceExhausted) {
+                cache->exhaustions.fetch_add(1, std::memory_order_relaxed);
+            }
+            return claim.status();
+        }
+        bit_index = *claim;
+    }
 
     const uint32_t slot_index = bit_index;
     SlabHeader& header = HeaderAt(slot_index);
@@ -557,6 +695,23 @@ bool CentralSlabAllocator::CanReclaim(ShmHandle handle) const noexcept {
            reclaim_guard_(handle, reclaim_guard_context_);
 }
 
+void CentralSlabAllocator::RememberLocalCursor(uint16_t class_id,
+                                               uint32_t slot_index) noexcept {
+    LocalCacheState* const cache = local_cache_state_.get();
+    if (cache == nullptr ||
+        !cache->enabled.load(std::memory_order_acquire) ||
+        class_id >= class_table_.class_count()) {
+        return;
+    }
+    const ClassDescriptor& cls = class_table_.GetClass(class_id);
+    if (slot_index < cls.bitmap_shard_offset ||
+        slot_index - cls.bitmap_shard_offset >= cls.slot_count) {
+        return;
+    }
+    const uint64_t epoch = cache->epoch.load(std::memory_order_acquire);
+    SetThreadCursor(cache->cache_id, epoch, class_id, slot_index);
+}
+
 Status CentralSlabAllocator::ReclaimSlotExact(uint32_t slot_index,
                                               ShmHandle handle,
                                               bool allow_published) {
@@ -618,7 +773,9 @@ Status CentralSlabAllocator::ReclaimSlotExact(uint32_t slot_index,
         // final state store.
         header.object_state.store(static_cast<uint32_t>(ObjectState::kFree),
                                   std::memory_order_release);
-        return bitmap_.ClearBit(slot_index);
+        const Status cleared = bitmap_.ClearBit(slot_index);
+        if (cleared.ok()) RememberLocalCursor(header.class_id, slot_index);
+        return cleared;
     }
 }
 

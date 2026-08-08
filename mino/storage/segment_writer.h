@@ -36,6 +36,16 @@ enum class SegmentSyncPolicy : uint8_t {
 using SegmentWriteHook = std::ptrdiff_t (*)(int fd, const std::byte* data,
                                             size_t size,
                                             void* context) noexcept;
+struct SegmentWriteBuffer {
+    const std::byte* data = nullptr;
+    size_t size = 0;
+};
+// Returns aggregate bytes written across buffers, matching POSIX writev. This
+// complements the legacy single-buffer hook so cross-iovec partial writes can
+// be injected without changing existing fault-hook call boundaries.
+using SegmentWritevHook = std::ptrdiff_t (*)(
+    int fd, std::span<const SegmentWriteBuffer> buffers,
+    void* context) noexcept;
 using SegmentDataSyncHook = int (*)(int fd, void* context) noexcept;
 
 struct SegmentWriterOptions {
@@ -58,7 +68,11 @@ struct SegmentWriterOptions {
     uint64_t max_segment_duration_ns = 0;
 
     SegmentFormatLimits format_limits{};
+    // Aggregate writes are additionally capped by IOV_MAX, SSIZE_MAX, and 64
+    // buffers. This bound must be non-zero.
+    size_t max_writev_bytes = 1u << 20;
     SegmentWriteHook write_hook = nullptr;
+    SegmentWritevHook writev_hook = nullptr;
     SegmentDataSyncHook data_sync_hook = nullptr;
     void* io_hook_context = nullptr;
 };
@@ -68,6 +82,13 @@ struct SegmentAppendResult {
     // this index with a newly created SegmentWriter.
     size_t records_accepted = 0;
     bool rotate_needed = false;
+};
+
+struct SegmentWriterStats {
+    uint64_t write_syscalls = 0;
+    uint64_t writev_syscalls = 0;
+    uint64_t writev_buffers = 0;
+    uint64_t io_bytes_written = 0;
 };
 
 // Creates and exclusively owns one new append-only segment file. This class is
@@ -106,8 +127,11 @@ public:
     const std::filesystem::path& path() const noexcept { return path_; }
     uint64_t size_bytes() const noexcept { return logical_bytes_; }
     uint64_t record_count() const noexcept { return logical_records_; }
+    uint64_t written_bytes() const noexcept { return written_bytes_; }
+    uint64_t written_records() const noexcept { return written_records_; }
     uint64_t durable_bytes() const noexcept { return durable_bytes_; }
     uint64_t durable_records() const noexcept { return durable_records_; }
+    SegmentWriterStats stats() const noexcept { return stats_; }
     bool rotation_needed(uint64_t now_ns) const noexcept;
 
 private:
@@ -118,6 +142,7 @@ private:
 
     Status ValidateOpenAndTime(uint64_t now_ns);
     Status FlushPending(uint64_t now_ns);
+    Status WritePendingGathered();
     Status WriteAll(std::span<const std::byte> bytes);
     Status DataSync(uint64_t now_ns);
     Status Poison(Status status);
@@ -151,6 +176,7 @@ private:
     uint64_t last_sequence_ = 0;
     uint64_t pending_bytes_ = 0;
     std::vector<std::vector<std::byte>> pending_records_;
+    SegmentWriterStats stats_{};
 };
 
 }  // namespace mino::storage

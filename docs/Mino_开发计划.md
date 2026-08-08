@@ -371,16 +371,16 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 | # | 任务 | 产出 | 依赖 | 预估 |
 |---|---|---|---|---|
-| D6-01 | 位图分片 + 每核缓存 | Slab Allocator 高竞争优化 | D5 | 5d |
+| D6-01 | 位图分片 + 每核缓存 ✅ | ShardedBitmap word/mask hinted scan + 进程本地每线程 cursor magazine；不预占空闲 Slot、不修改 SHM ABI，支持配置/Drain/命中回退统计与高竞争 benchmark（`//mino/shm/allocator:central_slab`、`//benchmarks/allocator:allocator_benchmark`） | D5 | 5d |
 | D6-02 | NUMA 感知分配 | NUMA Node 绑定、本地 Class 优先 | D5 | 5d |
-| D6-03 | 批量发布/消费 | 批量 Reserve/Commit、批量 ACK | D5 | 3d |
-| D6-04 | 网络批量收发 | sendmsg/writev、存储批量写 | D5 | 3d |
-| D6-05 | UDP Driver（基础数据报已实现） | 非阻塞小数据报收发已落地（`//mino/transport:udp_driver`）；Fragment ID、分片、重组配额与超时仍待完成（详设 16.6） | D4-04 | 5d |
+| D6-03 | 批量发布/消费 ✅ | `Publisher<T>::PublishBatch` 与 `Subscriber<T>::TryPollBatch/PollBatch`，支持 SPSC/MPSC/Broadcast、部分失败计数、连续前缀 ACK、析构安全 ACK 与 Broadcast 独立 Pin；单消息 API/SHM ABI 不变 | D5 | 3d |
+| D6-04 | 网络批量收发 ✅ | TCP queued frame 使用 `sendmsg(iovec[])` 聚集写并精确处理 partial write/completion；SegmentWriter 对非 per-record 策略使用有界 `writev`，保持 Hook、Sync、rotation 与 durable counter 语义 | D5 | 3d |
+| D6-05 | UDP Driver ✅ | 小数据报保持原始单包；大消息使用 36B 大端 v1 Fragment Header，支持 Message/Fragment ID、CRC、乱序/重复重组、每连接/全局 bytes/messages 配额、fragment 上限、超时与 Close/Shutdown 清理（`//mino/transport:udp_driver`，详设 16.6） | D4-04 | 5d |
 | D6-06 | RDMA Driver | Buffer 注册/Pin/回收独立协议 | D4-04 | 8d |
 | D6-07 | Fabric Driver（IPCF/NTB/CXL） | FabricWindowDriver 实现（详设 15.3、16.7） | D4-04 | 8d |
 | D6-08 | 大对象专用池优化 | Huge Page、DMA/RDMA Buffer 隔离 | D1-10 | 3d |
 | D6-09 | Topic Partition | 单 Writer 瓶颈后的分区扩展（详设 17.8） | D5-06 | 5d |
-| D6-10 | 长稳测试 | ≥72 小时，RSS/Slab 增长 < 5%/24h | 全部 | 持续 |
+| D6-10 | 长稳测试 ✅（框架完成，资格待执行） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/d6-10-long-soak.yml`；统一 allocator/channel/bridge/storage/observability workload，采样 RSS/Slab/Queue/FD，按 24h 归一化并对 <5% 门禁 fail-closed | 全部 | 持续 |
 
 ### 8.2 产品化（P6）
 
@@ -390,10 +390,12 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D6-12 | TLS/认证 | Bridge 双向认证、Topic ACL（详设 22.2） | D4-06 | 5d |
 | D6-13 | 部署工具 | 节点启动脚本、配置生成、容器镜像 | D5 | 3d |
 | D6-14 | 监控与告警 | Prometheus Endpoint、OTLP Exporter、告警规则（详设 21.5.8） | D5 | 5d |
-| D6-15 | 容量规划 | Admission Control、节点资源预算（详设 20.4） | D5 | 3d |
+| D6-15 | 容量规划 ✅ | `//mino/capacity:capacity` 提供节点多维资源预算、数据面 emergency reserve、原子 Reserve/Commit/Rollback、RAII Lease、headroom/rejection/JSON；已接入 Registry Topic/参与者、RemoteBridge、Recorder 与 RecorderService（详设 20.4） | D5 | 3d |
 | D6-16 | 滚动升级 | New Region + Drain/Cutover 流程与工具（详设 18.4） | D5 | 5d |
 | D6-17 | 运维手册 + 故障演练 | 手册文档、至少一轮实操演练 | 全部 | 5d |
 | D6-18 | AArch64 验证（V-13） | 与 x86-64 相同 ABI/Litmus/性能矩阵 | D6-01 | 5d |
+
+**当前进度**：D6 首批实现已完成 D6-01、D6-03、D6-04、D6-05、D6-10 验证框架和 D6-15，共 6/18 项；D6-10 的 72 小时资格结果、正式 SLA、安全评审、滚动升级及演练仍按 DoD 独立关闭。
 
 ### 8.3 退出条件（DoD）
 

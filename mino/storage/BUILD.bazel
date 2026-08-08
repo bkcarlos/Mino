@@ -325,6 +325,7 @@ cc_library(
         ":segment_recovery",
         ":snapshot_store",
         ":topic_writer",
+        "//mino/capacity",
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
@@ -338,6 +339,7 @@ cc_test(
     srcs = ["recorder_test.cc"],
     deps = [
         ":recorder",
+        "//mino/capacity",
         "//mino/common:status",
         "//mino/schema:compiler",
         "//mino/schema:layout",
@@ -365,6 +367,7 @@ cc_test(
     deps = [
         ":recorder_service",
         ":segment_recovery",
+        "//mino/capacity",
         "//mino/common:status",
         "//mino/schema:compiler",
         "//mino/schema:layout",

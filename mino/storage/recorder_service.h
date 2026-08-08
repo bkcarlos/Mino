@@ -137,7 +137,8 @@ public:
     static Result<std::unique_ptr<RecorderService>> Create(
         std::unique_ptr<Recorder> recorder,
         RecorderServiceOptions options = {},
-        RecorderClock* clock = nullptr) noexcept;
+        RecorderClock* clock = nullptr,
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept;
     // Product open path: recover manifests/segments/schema refs under owner locks,
     // release recovery ownership, then open Recorder for topic/source assembly.
     static Result<std::unique_ptr<RecorderService>> OpenRecovered(
@@ -145,7 +146,8 @@ public:
         const RecorderSessionOptions& recorder_options = {},
         const SessionRecoveryOptions& recovery_options = {},
         RecorderServiceOptions service_options = {},
-        RecorderClock* clock = nullptr) noexcept;
+        RecorderClock* clock = nullptr,
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept;
 
     ~RecorderService();
     RecorderService(const RecorderService&) = delete;
@@ -166,7 +168,8 @@ public:
     const Recorder& recorder() const noexcept { return *recorder_; }
 
 private:
-    RecorderService(std::unique_ptr<Recorder> recorder,
+    RecorderService(capacity::CapacityLease capacity_lease,
+                    std::unique_ptr<Recorder> recorder,
                     RecorderServiceOptions options,
                     RecorderClock* clock,
                     std::optional<SessionRecoveryReport> recovery_report =
@@ -181,6 +184,8 @@ private:
     void RecordError(Status status) noexcept;
     uint64_t NowNs() noexcept;
 
+    // Held until all Recorder/service resources are destroyed.
+    capacity::CapacityLease capacity_lease_;
     std::unique_ptr<Recorder> recorder_;
     RecorderServiceOptions options_;
     SystemRecorderClock system_clock_;

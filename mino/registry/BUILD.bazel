@@ -17,6 +17,7 @@ cc_library(
         "registry.h",
     ],
     deps = [
+        "//mino/capacity",
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",

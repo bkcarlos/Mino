@@ -1,0 +1,19 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "allocator_benchmark",
+    srcs = ["allocator_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//mino/shm/allocator:central_slab",
+    ],
+)

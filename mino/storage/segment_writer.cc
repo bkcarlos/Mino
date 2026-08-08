@@ -5,8 +5,11 @@
 #include "mino/storage/segment_writer.h"
 
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -44,6 +47,14 @@ Status IoError(std::string_view operation,
 }
 
 Status ValidateOptions(const SegmentWriterOptions& options) {
+    if (options.max_writev_bytes == 0 ||
+        options.max_writev_bytes >
+            static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        return Invalid("segment writev byte quota is invalid");
+    }
+    if (options.write_hook != nullptr && options.writev_hook != nullptr) {
+        return Invalid("segment write and writev hooks are mutually exclusive");
+    }
     if (options.sync_policy == SegmentSyncPolicy::kInterval &&
         options.sync_interval_ns == 0 && options.sync_interval_bytes == 0) {
         return Invalid("interval sync policy requires a time or byte threshold");
@@ -88,6 +99,21 @@ bool ReachedElapsed(uint64_t now_ns, uint64_t start_ns,
                     uint64_t interval_ns) noexcept {
     return interval_ns != 0 && now_ns >= start_ns &&
            now_ns - start_ns >= interval_ns;
+}
+
+constexpr size_t kMaximumWritevBuffers = 64;
+
+size_t EffectiveWritevBufferLimit() noexcept {
+    const long system_limit = ::sysconf(_SC_IOV_MAX);
+    if (system_limit > 0) {
+        return std::min(kMaximumWritevBuffers,
+                        static_cast<size_t>(system_limit));
+    }
+#ifdef IOV_MAX
+    return std::min(kMaximumWritevBuffers, static_cast<size_t>(IOV_MAX));
+#else
+    return 16;
+#endif
 }
 
 }  // namespace
@@ -288,17 +314,25 @@ Status SegmentWriter::ValidateOpenAndTime(uint64_t now_ns) {
 
 Status SegmentWriter::FlushPending(uint64_t now_ns) {
     const bool had_records = !pending_records_.empty();
-    for (const std::vector<std::byte>& encoded : pending_records_) {
-        const Status write_status = WriteAll(encoded);
-        if (!write_status.ok()) return write_status;
-        written_bytes_ += static_cast<uint64_t>(encoded.size());
-        ++written_records_;
-        unsynced_bytes_ += static_cast<uint64_t>(encoded.size());
+    if (options_.sync_policy == SegmentSyncPolicy::kPerRecord ||
+        options_.write_hook != nullptr) {
+        // The legacy hook and kPerRecord retain their historical one-record call
+        // boundaries. In particular, no write may cross a per-record sync.
+        for (const std::vector<std::byte>& encoded : pending_records_) {
+            const Status write_status = WriteAll(encoded);
+            if (!write_status.ok()) return write_status;
+            written_bytes_ += static_cast<uint64_t>(encoded.size());
+            ++written_records_;
+            unsynced_bytes_ += static_cast<uint64_t>(encoded.size());
 
-        if (options_.sync_policy == SegmentSyncPolicy::kPerRecord) {
-            const Status sync_status = DataSync(now_ns);
-            if (!sync_status.ok()) return sync_status;
+            if (options_.sync_policy == SegmentSyncPolicy::kPerRecord) {
+                const Status sync_status = DataSync(now_ns);
+                if (!sync_status.ok()) return sync_status;
+            }
         }
+    } else {
+        const Status write_status = WritePendingGathered();
+        if (!write_status.ok()) return write_status;
     }
     pending_records_.clear();
     pending_bytes_ = 0;
@@ -314,20 +348,118 @@ Status SegmentWriter::FlushPending(uint64_t now_ns) {
     return Status::Ok();
 }
 
+Status SegmentWriter::WritePendingGathered() {
+    size_t record_index = 0;
+    size_t record_offset = 0;
+    const size_t buffer_limit = EffectiveWritevBufferLimit();
+    while (record_index < pending_records_.size()) {
+        std::array<SegmentWriteBuffer, kMaximumWritevBuffers> buffers{};
+        size_t buffer_count = 0;
+        size_t request_bytes = 0;
+        for (size_t index = record_index;
+             index < pending_records_.size() && buffer_count < buffer_limit &&
+             request_bytes < options_.max_writev_bytes;
+             ++index) {
+            const std::vector<std::byte>& encoded = pending_records_[index];
+            const size_t offset = index == record_index ? record_offset : 0;
+            const size_t remaining = encoded.size() - offset;
+            const size_t amount = std::min(
+                remaining, options_.max_writev_bytes - request_bytes);
+            buffers[buffer_count++] = SegmentWriteBuffer{
+                .data = encoded.data() + offset,
+                .size = amount,
+            };
+            request_bytes += amount;
+        }
+        if (buffer_count == 0 || request_bytes == 0) {
+            return Poison(Status::Error(StatusCode::kInternal,
+                                        "segment writev made no request"));
+        }
+
+        std::ptrdiff_t written = -1;
+        ++stats_.write_syscalls;
+        ++stats_.writev_syscalls;
+        stats_.writev_buffers += buffer_count;
+        if (options_.writev_hook != nullptr) {
+            written = options_.writev_hook(
+                fd_, std::span<const SegmentWriteBuffer>(buffers)
+                         .first(buffer_count),
+                options_.io_hook_context);
+        } else {
+            std::array<iovec, kMaximumWritevBuffers> vectors{};
+            for (size_t index = 0; index < buffer_count; ++index) {
+                vectors[index] = iovec{
+                    .iov_base = const_cast<std::byte*>(buffers[index].data),
+                    .iov_len = buffers[index].size,
+                };
+            }
+            written = static_cast<std::ptrdiff_t>(
+                ::writev(fd_, vectors.data(), static_cast<int>(buffer_count)));
+        }
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return Poison(IoError("cannot append segment", path_));
+        }
+        if (written == 0) {
+            return Poison(Status::Error(StatusCode::kUnavailable,
+                                        "zero-byte segment writev"));
+        }
+        const size_t count = static_cast<size_t>(written);
+        if (count > request_bytes) {
+            return Poison(Status::Error(
+                StatusCode::kInternal,
+                "segment writev hook over-reported bytes"));
+        }
+        stats_.io_bytes_written += count;
+
+        size_t consumed = count;
+        while (consumed != 0) {
+            const std::vector<std::byte>& encoded =
+                pending_records_[record_index];
+            const size_t remaining = encoded.size() - record_offset;
+            const size_t amount = std::min(remaining, consumed);
+            record_offset += amount;
+            consumed -= amount;
+            if (record_offset != encoded.size()) break;
+
+            written_bytes_ += static_cast<uint64_t>(encoded.size());
+            ++written_records_;
+            unsynced_bytes_ += static_cast<uint64_t>(encoded.size());
+            ++record_index;
+            record_offset = 0;
+        }
+    }
+    return Status::Ok();
+}
+
 Status SegmentWriter::WriteAll(std::span<const std::byte> bytes) {
     size_t offset = 0;
     while (offset < bytes.size()) {
         const size_t remaining = bytes.size() - offset;
         const size_t max_request =
             static_cast<size_t>(std::numeric_limits<ssize_t>::max());
-        const size_t request = remaining < max_request ? remaining : max_request;
+        size_t request = std::min(remaining, max_request);
+        if (options_.writev_hook != nullptr) {
+            request = std::min(request, options_.max_writev_bytes);
+        }
         std::ptrdiff_t written = 0;
-        if (options_.write_hook == nullptr) {
-            const ssize_t result = ::write(fd_, bytes.data() + offset, request);
-            written = static_cast<std::ptrdiff_t>(result);
-        } else {
+        ++stats_.write_syscalls;
+        if (options_.write_hook != nullptr) {
             written = options_.write_hook(fd_, bytes.data() + offset, request,
                                           options_.io_hook_context);
+        } else if (options_.writev_hook != nullptr) {
+            const SegmentWriteBuffer buffer{
+                .data = bytes.data() + offset,
+                .size = request,
+            };
+            ++stats_.writev_syscalls;
+            ++stats_.writev_buffers;
+            written = options_.writev_hook(
+                fd_, std::span<const SegmentWriteBuffer>(&buffer, 1),
+                options_.io_hook_context);
+        } else {
+            const ssize_t result = ::write(fd_, bytes.data() + offset, request);
+            written = static_cast<std::ptrdiff_t>(result);
         }
         if (written < 0) {
             if (errno == EINTR) continue;
@@ -343,6 +475,7 @@ Status SegmentWriter::WriteAll(std::span<const std::byte> bytes) {
                                         "segment write hook over-reported bytes"));
         }
         offset += count;
+        stats_.io_bytes_written += count;
     }
     return Status::Ok();
 }

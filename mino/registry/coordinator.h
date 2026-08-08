@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "mino/capacity/capacity.h"
 #include "mino/common/result.h"
 #include "mino/registry/id_allocator.h"
 #include "mino/registry/metadata.h"
@@ -43,14 +44,16 @@ public:
     static Result<std::unique_ptr<Coordinator>> Create(
         CoordinatorLimits limits = {},
         std::shared_ptr<IdAllocator> id_allocator = {},
-        std::shared_ptr<const LivenessProbe> liveness_probe = {});
+        std::shared_ptr<const LivenessProbe> liveness_probe = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {});
 
     // Explicitly non-durable construction for unit tests and local development.
     static Result<std::unique_ptr<Coordinator>> CreateForTesting(
         CoordinatorLimits limits = {},
         std::shared_ptr<IdAllocator> id_allocator = {},
         std::shared_ptr<const LivenessProbe> liveness_probe = {},
-        std::shared_ptr<RegistryFaultInjector> fault_injector = {});
+        std::shared_ptr<RegistryFaultInjector> fault_injector = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {});
 
     Coordinator(const Coordinator&) = delete;
     Coordinator& operator=(const Coordinator&) = delete;
@@ -65,8 +68,11 @@ public:
     Result<std::shared_ptr<const NodeMetadata>> GetNode(NodeId node_id) const;
     Result<std::shared_ptr<const NodeRegistrySnapshot>> NodeSnapshot() const;
 
+    // additional_resources models the Topic's concrete SHM/ring/slab/schema
+    // resources. The registry always adds one Topic unit atomically.
     Result<std::shared_ptr<const TopicSnapshot>> CreateTopic(
-        TopicMetadata candidate);
+        TopicMetadata candidate,
+        capacity::ResourceVector additional_resources = {});
     Result<std::shared_ptr<const TopicSnapshot>> GetTopic(TopicId topic_id) const;
     Result<std::shared_ptr<const TopicSnapshot>> FindTopic(
         std::string_view name) const;
@@ -129,7 +135,17 @@ private:
     struct TopicPinKeyHash {
         size_t operator()(const TopicPinKey& key) const noexcept;
     };
+    struct PublisherEntry {
+        PublisherRegistration registration;
+        capacity::CapacityLease capacity_lease;
+    };
+    struct SubscriberEntry {
+        SubscriberRegistration registration;
+        capacity::CapacityLease capacity_lease;
+    };
     struct TopicEntry {
+        // Declared first so the charge outlives all registry-side Topic state.
+        capacity::CapacityLease capacity_lease;
         std::shared_ptr<const TopicSnapshot> snapshot;
         std::shared_ptr<const SubscriberNodeSetSnapshot> subscriber_nodes;
         std::unordered_map<NodeId, uint32_t> subscriber_counts_by_node;
@@ -137,12 +153,17 @@ private:
 
     Coordinator(CoordinatorLimits limits, std::shared_ptr<IdAllocator> allocator,
                 std::unique_ptr<NodeRegistry> nodes,
-                std::shared_ptr<RegistryFaultInjector> fault_injector);
+                std::shared_ptr<RegistryFaultInjector> fault_injector,
+                std::shared_ptr<capacity::CapacityController> capacity_controller);
     static Result<std::unique_ptr<Coordinator>> CreateImpl(
         CoordinatorLimits limits, std::shared_ptr<IdAllocator> id_allocator,
         std::shared_ptr<const LivenessProbe> liveness_probe,
         std::shared_ptr<RegistryFaultInjector> fault_injector,
+        std::shared_ptr<capacity::CapacityController> capacity_controller,
         bool require_durable);
+    Result<capacity::CapacityReservation> ReserveCapacity(
+        capacity::ResourceVector resources, capacity::ResourceScope scope,
+        std::string_view name);
 
     Status ValidateStaticRouteNodesLocked(const TopicMetadata& metadata) const;
     Status ValidateOwnerLocked(const NodeLeaseOwner& owner,
@@ -173,13 +194,13 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<TopicId, TopicEntry> topics_;
     std::unordered_map<std::string, TopicId> topic_names_;
-    std::unordered_map<PublisherKey, PublisherRegistration, PublisherKeyHash>
-        publishers_;
-    std::unordered_map<SubscriberKey, SubscriberRegistration, SubscriberKeyHash>
+    std::unordered_map<PublisherKey, PublisherEntry, PublisherKeyHash> publishers_;
+    std::unordered_map<SubscriberKey, SubscriberEntry, SubscriberKeyHash>
         subscribers_;
     std::unordered_map<TopicPinKey, TopicPinRegistration, TopicPinKeyHash> pins_;
     std::vector<NodeLeaseOwner> pending_cleanup_owners_;
     std::shared_ptr<RegistryFaultInjector> fault_injector_;
+    std::shared_ptr<capacity::CapacityController> capacity_controller_;
     size_t total_topic_pins_ = 0;
 };
 

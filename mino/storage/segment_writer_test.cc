@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -122,6 +123,67 @@ std::ptrdiff_t ControlledWrite(int fd, const std::byte* data, size_t size,
     return static_cast<std::ptrdiff_t>(::write(fd, data, count));
 }
 
+struct VectorIoState {
+    bool armed = false;
+    size_t calls = 0;
+    size_t interrupts = 0;
+    size_t max_write_size = std::numeric_limits<size_t>::max();
+    size_t bytes_before_error = std::numeric_limits<size_t>::max();
+    int write_error = 0;
+    bool crossed_buffer_boundary = false;
+};
+
+std::ptrdiff_t ControlledWritev(
+    int fd, std::span<const SegmentWriteBuffer> buffers,
+    void* context) noexcept {
+    auto* state = static_cast<VectorIoState*>(context);
+    ++state->calls;
+    if (state->armed && state->interrupts != 0) {
+        --state->interrupts;
+        errno = EINTR;
+        return -1;
+    }
+    if (state->armed && state->bytes_before_error == 0 &&
+        state->write_error != 0) {
+        errno = state->write_error;
+        return -1;
+    }
+
+    size_t limit = state->armed ? state->max_write_size
+                                : std::numeric_limits<size_t>::max();
+    if (state->armed &&
+        state->bytes_before_error != std::numeric_limits<size_t>::max()) {
+        limit = std::min(limit, state->bytes_before_error);
+    }
+    std::array<iovec, 64> vectors{};
+    size_t vector_count = 0;
+    size_t request_bytes = 0;
+    for (const SegmentWriteBuffer& buffer : buffers) {
+        if (vector_count == vectors.size() || request_bytes == limit) break;
+        const size_t amount = std::min(buffer.size, limit - request_bytes);
+        vectors[vector_count++] = iovec{
+            .iov_base = const_cast<std::byte*>(buffer.data),
+            .iov_len = amount,
+        };
+        request_bytes += amount;
+    }
+    if (request_bytes == 0) {
+        errno = EIO;
+        return -1;
+    }
+    const ssize_t written =
+        ::writev(fd, vectors.data(), static_cast<int>(vector_count));
+    if (written > 0 && buffers.size() > 1 &&
+        static_cast<size_t>(written) > buffers[0].size) {
+        state->crossed_buffer_boundary = true;
+    }
+    if (written > 0 && state->armed &&
+        state->bytes_before_error != std::numeric_limits<size_t>::max()) {
+        state->bytes_before_error -= static_cast<size_t>(written);
+    }
+    return static_cast<std::ptrdiff_t>(written);
+}
+
 int ControlledSync(int fd, void* context) noexcept {
     auto* state = static_cast<IoState*>(context);
     ++state->sync_calls;
@@ -213,6 +275,37 @@ TEST(SegmentWriterTest, NoneAndPerBatchPoliciesInvokeExpectedSyncs) {
     }
 }
 
+TEST(SegmentWriterTest, PerBatchAndIntervalPoliciesGatherBeforeSync) {
+    for (const SegmentSyncPolicy policy : {SegmentSyncPolicy::kPerBatch,
+                                           SegmentSyncPolicy::kInterval}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        IoState io;
+        SegmentWriterOptions options = BufferedOptions();
+        options.sync_policy = policy;
+        if (policy == SegmentSyncPolicy::kInterval) {
+            options.sync_interval_ns = 0;
+            options.sync_interval_bytes = 1;
+        }
+        options.data_sync_hook = ControlledSync;
+        options.io_hook_context = &io;
+        auto writer = SegmentWriter::Create(
+            TestPath("gather_before_sync_" +
+                     std::to_string(static_cast<int>(policy))),
+            SampleHeader(), 100, options);
+        ASSERT_TRUE(writer.ok()) << writer.status().ToString();
+        const std::vector<Record> records = {
+            SampleRecord(1, 13), SampleRecord(2, 17), SampleRecord(3, 19)};
+        ASSERT_TRUE((*writer)->AppendBatch(records, 101).ok());
+        EXPECT_EQ((*writer)->durable_records(), 0u);
+        ASSERT_TRUE((*writer)->Flush(102).ok());
+        EXPECT_EQ((*writer)->stats().writev_syscalls, 1u);
+        EXPECT_EQ((*writer)->stats().writev_buffers, records.size());
+        EXPECT_EQ(io.sync_calls, 1u);
+        EXPECT_EQ((*writer)->durable_records(), records.size());
+        EXPECT_EQ((*writer)->durable_bytes(), (*writer)->size_bytes());
+    }
+}
+
 TEST(SegmentWriterTest, IntervalPolicySupportsDeterministicTimeAndBytes) {
     {
         IoState io;
@@ -266,10 +359,107 @@ TEST(SegmentWriterTest, PerRecordSyncsEachRecordEvenWithinOneBatch) {
     const std::vector<Record> records = {SampleRecord(1), SampleRecord(2)};
     ASSERT_TRUE((*writer)->AppendBatch(records, 101).ok());
     ASSERT_TRUE((*writer)->Flush(102).ok());
+    EXPECT_EQ(io.write_calls, 3u);  // Header plus one call per record.
+    EXPECT_EQ((*writer)->stats().writev_syscalls, 0u);
     EXPECT_EQ(io.sync_calls, 2u);
     EXPECT_EQ((*writer)->durable_records(), 2u);
     ASSERT_TRUE((*writer)->Seal(103).ok());
     EXPECT_EQ(io.sync_calls, 3u);
+}
+
+TEST(SegmentWriterTest, BatchesRecordsWithFewerBoundedWritevSyscalls) {
+    const std::filesystem::path path = TestPath("writev_batch");
+    SegmentWriterOptions options = BufferedOptions();
+    std::vector<Record> records;
+    constexpr size_t kRecordCount = 70;
+    records.reserve(kRecordCount);
+    for (size_t index = 0; index < kRecordCount; ++index) {
+        records.push_back(SampleRecord(index + 1, 32));
+    }
+
+    auto writer = SegmentWriter::Create(path, SampleHeader(), 100, options);
+    ASSERT_TRUE(writer.ok()) << writer.status().ToString();
+    ASSERT_TRUE((*writer)->AppendBatch(records, 101).ok());
+    ASSERT_TRUE((*writer)->Flush(102).ok());
+
+    const SegmentWriterStats stats = (*writer)->stats();
+    EXPECT_GT(stats.writev_syscalls, 0u);
+    EXPECT_LT(stats.writev_syscalls, records.size());
+    EXPECT_GE(stats.writev_buffers, records.size());
+    EXPECT_EQ(stats.write_syscalls, stats.writev_syscalls + 1);  // Header.
+    EXPECT_EQ(stats.io_bytes_written, (*writer)->size_bytes());
+    EXPECT_EQ((*writer)->written_bytes(), (*writer)->size_bytes());
+    EXPECT_EQ((*writer)->written_records(), records.size());
+    EXPECT_EQ((*writer)->durable_records(), 0u);
+}
+
+TEST(SegmentWriterTest, WritevRetriesEintrAndShortWriteAcrossRecordBoundary) {
+    const std::filesystem::path path = TestPath("writev_partial");
+    VectorIoState io;
+    SegmentWriterOptions options = BufferedOptions();
+    options.writev_hook = ControlledWritev;
+    options.io_hook_context = &io;
+    auto writer = SegmentWriter::Create(path, SampleHeader(), 100, options);
+    ASSERT_TRUE(writer.ok()) << writer.status().ToString();
+
+    const std::vector<Record> records = {
+        SampleRecord(1, 17), SampleRecord(2, 31), SampleRecord(3, 47)};
+    auto first = EncodeRecord(records[0]);
+    ASSERT_TRUE(first.ok());
+    io.armed = true;
+    io.interrupts = 1;
+    io.max_write_size = first->size() + 7;
+    ASSERT_TRUE((*writer)->AppendBatch(records, 101).ok());
+    ASSERT_TRUE((*writer)->Flush(102).ok());
+    EXPECT_TRUE(io.crossed_buffer_boundary);
+    EXPECT_GT((*writer)->stats().writev_syscalls, 2u);
+    EXPECT_EQ((*writer)->written_records(), records.size());
+    EXPECT_EQ((*writer)->written_bytes(), (*writer)->size_bytes());
+
+    auto expected_header = EncodeSegmentHeader(SampleHeader());
+    ASSERT_TRUE(expected_header.ok());
+    std::vector<std::byte> expected = *expected_header;
+    for (const Record& record : records) {
+        auto encoded = EncodeRecord(record);
+        ASSERT_TRUE(encoded.ok());
+        AppendBytes(&expected, *encoded);
+    }
+    EXPECT_EQ(ReadFile(path), expected);
+    EXPECT_EQ((*writer)->stats().io_bytes_written, expected.size());
+}
+
+TEST(SegmentWriterTest, WritevPartialErrorKeepsCompletedRecordCountersSticky) {
+    const std::filesystem::path path = TestPath("writev_partial_error");
+    VectorIoState io;
+    SegmentWriterOptions options = BufferedOptions();
+    options.writev_hook = ControlledWritev;
+    options.io_hook_context = &io;
+    auto writer = SegmentWriter::Create(path, SampleHeader(), 100, options);
+    ASSERT_TRUE(writer.ok()) << writer.status().ToString();
+
+    const std::vector<Record> records = {
+        SampleRecord(1, 19), SampleRecord(2, 23), SampleRecord(3, 29)};
+    auto first = EncodeRecord(records[0]);
+    ASSERT_TRUE(first.ok());
+    io.armed = true;
+    io.bytes_before_error = first->size() + 7;
+    io.write_error = EIO;
+    ASSERT_TRUE((*writer)->AppendBatch(records, 101).ok());
+    const Status failed = (*writer)->Flush(102);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.code(), StatusCode::kUnavailable);
+    EXPECT_TRUE(io.crossed_buffer_boundary);
+    EXPECT_EQ((*writer)->state(), SegmentWriterState::kError);
+    EXPECT_EQ((*writer)->written_records(), 1u);
+    EXPECT_EQ((*writer)->written_bytes(),
+              kEncodedSegmentHeaderSize + first->size());
+    EXPECT_EQ((*writer)->durable_records(), 0u);
+    EXPECT_EQ((*writer)->stats().io_bytes_written,
+              kEncodedSegmentHeaderSize + first->size() + 7);
+    const size_t calls_after_error = io.calls;
+    EXPECT_EQ((*writer)->Flush(103), failed);
+    EXPECT_EQ((*writer)->Seal(103), failed);
+    EXPECT_EQ(io.calls, calls_after_error);
 }
 
 TEST(SegmentWriterTest, ReportsRecordByteAndDurationRotationSafely) {
@@ -439,6 +629,22 @@ TEST(SegmentWriterTest, SealIsDurableIdempotentAndRejectsFurtherAppends) {
 }
 
 TEST(SegmentWriterTest, CallerErrorsDoNotPoisonOpenWriter) {
+    SegmentWriterOptions invalid_io_options;
+    invalid_io_options.max_writev_bytes = 0;
+    EXPECT_EQ(SegmentWriter::Create(TestPath("invalid_writev_quota"),
+                                    SampleHeader(), 100, invalid_io_options)
+                  .status()
+                  .code(),
+              StatusCode::kInvalidArgument);
+    invalid_io_options = {};
+    invalid_io_options.write_hook = ControlledWrite;
+    invalid_io_options.writev_hook = ControlledWritev;
+    EXPECT_EQ(SegmentWriter::Create(TestPath("conflicting_io_hooks"),
+                                    SampleHeader(), 100, invalid_io_options)
+                  .status()
+                  .code(),
+              StatusCode::kInvalidArgument);
+
     SegmentWriterOptions invalid_options;
     invalid_options.sync_policy = SegmentSyncPolicy::kInterval;
     invalid_options.sync_interval_ns = 0;

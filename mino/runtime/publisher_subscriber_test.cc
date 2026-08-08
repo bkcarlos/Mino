@@ -70,9 +70,9 @@ AlignedBytes AllocateAligned(uint64_t bytes) {
     return memory;
 }
 
-ClassTableConfig AllocatorConfig() {
+ClassTableConfig AllocatorConfig(uint32_t slot_count = 16) {
     ClassTableConfig config;
-    config.classes = {{.slot_size = 64, .slot_count = 16}};
+    config.classes = {{.slot_size = 64, .slot_count = slot_count}};
     return config;
 }
 
@@ -93,6 +93,23 @@ void BlockFirstFinalize(AllocationJournal::PersistencePoint point, uint64_t,
     while (!context->release.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
+}
+
+Result<std::vector<MessageBuilder<RuntimeTestMessage>>> AllocateBatch(
+    Publisher<RuntimeTestMessage>& publisher, uint64_t first_id,
+    size_t count) {
+    std::vector<MessageBuilder<RuntimeTestMessage>> builders;
+    builders.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto builder = publisher.Allocate();
+        if (!builder.ok()) {
+            return builder.status();
+        }
+        (*builder)->id = first_id + i;
+        (*builder)->value = static_cast<uint32_t>(first_id + i);
+        builders.push_back(std::move(*builder));
+    }
+    return builders;
 }
 
 class RuntimeSpscTest : public ::testing::Test {
@@ -896,6 +913,283 @@ TEST_F(RuntimeSpscTest, MpscRuntimeSupportsConcurrentPublishers) {
     }
     EXPECT_EQ(observed.size(), kPublishers);
     EXPECT_TRUE(mpsc->IsEmpty());
+}
+
+TEST_F(RuntimeSpscTest, SpscBatchPublishPollIndividualAndDestructorAck) {
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_);
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
+
+    auto builders = AllocateBatch(publisher, 1, 3);
+    ASSERT_TRUE(builders.ok()) << builders.status().ToString();
+    std::vector<ShmHandle> handles;
+    for (const auto& builder : *builders) {
+        handles.push_back(builder.handle());
+    }
+    const BatchPublishResult published = publisher.PublishBatch(*builders);
+    ASSERT_TRUE(published.ok()) << published.first_error.ToString();
+    EXPECT_EQ(published.requested_count, 3u);
+    EXPECT_EQ(published.committed_count, 3u);
+    EXPECT_EQ(publisher.batch_publish_calls(), 1u);
+    EXPECT_EQ(publisher.batch_committed_items(), 3u);
+
+    auto batch = subscriber.TryPollBatch(3);
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_EQ(batch->size(), 3u);
+    EXPECT_TRUE(batch->poll_status().ok());
+    EXPECT_EQ((*batch)[0]->id, 1u);
+    EXPECT_EQ((*batch)[1]->id, 2u);
+    EXPECT_EQ((*batch)[2]->id, 3u);
+    EXPECT_EQ(subscriber.batch_poll_calls(), 1u);
+    EXPECT_EQ(subscriber.batch_polled_messages(), 3u);
+
+    EXPECT_TRUE(batch->Ack(2).ok()) << "out-of-order ACK must be deferred";
+    EXPECT_FALSE(channel_->IsEmpty());
+    EXPECT_TRUE(batch->Ack(0).ok());
+    EXPECT_FALSE(channel_->IsEmpty());
+    const BatchAckResult acked = batch->AckAll();
+    EXPECT_TRUE(acked.ok()) << acked.first_error.ToString();
+    EXPECT_EQ(acked.acked_count, 2u);
+    EXPECT_TRUE(channel_->IsEmpty());
+    for (ShmHandle handle : handles) {
+        EXPECT_EQ(allocator_.Inspect(handle).status().code(),
+                  StatusCode::kNotFound);
+    }
+
+    auto destructor_builders = AllocateBatch(publisher, 10, 2);
+    ASSERT_TRUE(destructor_builders.ok());
+    EXPECT_TRUE(publisher.PublishBatch(*destructor_builders).ok());
+    {
+        auto destructor_batch = subscriber.TryPollBatch(2);
+        ASSERT_TRUE(destructor_batch.ok());
+        EXPECT_EQ(destructor_batch->size(), 2u);
+    }
+    EXPECT_TRUE(channel_->IsEmpty())
+        << "batch destruction must ACK the remaining prefix safely";
+}
+
+TEST_F(RuntimeSpscTest,
+       SpscBatchReportsPartialFullDropAndDeadlineWithoutLeaks) {
+    Publisher<RuntimeTestMessage> fill(allocator_, *channel_);
+    auto initial = AllocateBatch(fill, 1, kChannelCapacity - 1);
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(fill.PublishBatch(*initial).ok());
+
+    Publisher<RuntimeTestMessage> failing(allocator_, *channel_);
+    auto partial = AllocateBatch(failing, 4, 3);
+    ASSERT_TRUE(partial.ok());
+    const ShmHandle failed = (*partial)[1].handle();
+    const ShmHandle unattempted = (*partial)[2].handle();
+    const BatchPublishResult partial_result = failing.PublishBatch(*partial);
+    ASSERT_FALSE(partial_result.ok());
+    EXPECT_EQ(partial_result.committed_count, 1u);
+    EXPECT_EQ(partial_result.first_failed_index, 1u);
+    EXPECT_EQ(partial_result.first_error.code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_TRUE(partial_result.cleanup_error.ok());
+    EXPECT_EQ(allocator_.Inspect(failed).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(unattempted).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(failing.batch_failed_items(), 2u);
+
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
+    auto full_batch = subscriber.TryPollBatch(kChannelCapacity);
+    ASSERT_TRUE(full_batch.ok());
+    ASSERT_EQ(full_batch->size(), kChannelCapacity);
+    EXPECT_EQ((*full_batch)[3]->id, 4u)
+        << "the committed prefix must remain visible after partial failure";
+    EXPECT_TRUE(full_batch->AckAll().ok());
+
+    auto refill = AllocateBatch(fill, 20, kChannelCapacity);
+    ASSERT_TRUE(refill.ok());
+    ASSERT_TRUE(fill.PublishBatch(*refill).ok());
+
+    PublisherOptions drop_options;
+    drop_options.queue_full_policy = QueueFullPolicy::kDropNewest;
+    Publisher<RuntimeTestMessage> dropping(allocator_, *channel_, drop_options);
+    auto dropped = AllocateBatch(dropping, 30, 2);
+    ASSERT_TRUE(dropped.ok());
+    const ShmHandle dropped_handle = (*dropped)[0].handle();
+    const ShmHandle after_drop = (*dropped)[1].handle();
+    const BatchPublishResult drop_result = dropping.PublishBatch(*dropped);
+    ASSERT_FALSE(drop_result.ok());
+    EXPECT_EQ(drop_result.committed_count, 0u);
+    EXPECT_EQ(drop_result.dropped_input_count, 1u);
+    EXPECT_EQ(drop_result.first_failed_index, 0u);
+    EXPECT_EQ(drop_result.first_error.code(), StatusCode::kDegraded);
+    EXPECT_EQ(allocator_.Inspect(dropped_handle).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(after_drop).status().code(),
+              StatusCode::kNotFound);
+
+    PublisherOptions block_options;
+    block_options.queue_full_policy = QueueFullPolicy::kBlock;
+    Publisher<RuntimeTestMessage> blocking(allocator_, *channel_, block_options);
+    auto timed = AllocateBatch(blocking, 40, 2);
+    ASSERT_TRUE(timed.ok());
+    const BatchPublishResult timeout = blocking.PublishBatch(
+        *timed, Deadline::FromNow(std::chrono::milliseconds(1)));
+    ASSERT_FALSE(timeout.ok());
+    EXPECT_EQ(timeout.committed_count, 0u);
+    EXPECT_EQ(timeout.first_failed_index, 0u);
+    EXPECT_EQ(timeout.first_error.code(), StatusCode::kTimeout);
+}
+
+TEST_F(RuntimeSpscTest, BatchValidationFailureRollsBackUncommittedBuilders) {
+    const size_t journal_size = AllocationJournal::RequiredSize(3, 1);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(journal_memory.get(), journal_size,
+                                           3, 1, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+    Publisher<RuntimeTestMessage> publisher(allocator_, *channel_, *journal);
+    Subscriber<RuntimeTestMessage> subscriber(allocator_, *channel_);
+
+    auto builders = AllocateBatch(publisher, 50, 3);
+    ASSERT_TRUE(builders.ok());
+    (*builders)[1]->id = 0;
+    const ShmHandle invalid = (*builders)[1].handle();
+    const ShmHandle unattempted = (*builders)[2].handle();
+    const BatchPublishResult result = publisher.PublishBatch(*builders);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.committed_count, 1u);
+    EXPECT_EQ(result.first_failed_index, 1u);
+    EXPECT_EQ(result.first_error.code(), StatusCode::kInvalidArgument);
+    EXPECT_TRUE(result.cleanup_error.ok());
+    EXPECT_EQ(allocator_.Inspect(invalid).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(unattempted).status().code(),
+              StatusCode::kNotFound);
+
+    auto committed = subscriber.TryPoll();
+    ASSERT_TRUE(committed.ok());
+    EXPECT_EQ((*committed)->id, 50u);
+    EXPECT_TRUE(std::move(*committed).Ack().ok());
+    auto reusable = AllocateBatch(publisher, 60, 3);
+    ASSERT_TRUE(reusable.ok())
+        << "all Journal transactions must be finalized or rolled back";
+    for (auto& builder : *reusable) {
+        EXPECT_TRUE(publisher.Abort(std::move(builder)).ok());
+    }
+}
+
+TEST_F(RuntimeSpscTest, MpscBatchNormalPartialFullAndConservation) {
+    constexpr uint64_t kCapacity = 64;
+    constexpr uint64_t kAllocatorBytes = 2u << 20;
+    auto allocator_memory = AllocateAligned(kAllocatorBytes);
+    auto large_allocator = CentralSlabAllocator::Create(
+        allocator_memory.get(), kAllocatorBytes, AllocatorConfig(128));
+    ASSERT_TRUE(large_allocator.ok()) << large_allocator.status().ToString();
+    auto channel_memory =
+        AllocateAligned(MpscChannel::RequiredSize(kCapacity));
+    auto mpsc = MpscChannel::Init(channel_memory.get(), kCapacity);
+    ASSERT_TRUE(mpsc.ok()) << mpsc.status().ToString();
+    MpscChannel::ProducerIdentity identity{
+        .owner = ProcessIdentity::Current(),
+        .publisher_id = 0xD603,
+    };
+    Publisher<RuntimeTestMessage> publisher(*large_allocator, *mpsc, identity);
+    Subscriber<RuntimeTestMessage> subscriber(*large_allocator, *mpsc);
+
+    auto initial = AllocateBatch(publisher, 1, kCapacity - 2);
+    ASSERT_TRUE(initial.ok());
+    const BatchPublishResult normal = publisher.PublishBatch(*initial);
+    ASSERT_TRUE(normal.ok()) << normal.first_error.ToString();
+    EXPECT_EQ(normal.committed_count, kCapacity - 2);
+
+    auto partial = AllocateBatch(publisher, kCapacity - 1, 4);
+    ASSERT_TRUE(partial.ok());
+    const ShmHandle failed = (*partial)[2].handle();
+    const ShmHandle unattempted = (*partial)[3].handle();
+    const BatchPublishResult partial_result = publisher.PublishBatch(*partial);
+    ASSERT_FALSE(partial_result.ok());
+    EXPECT_EQ(partial_result.committed_count, 2u);
+    EXPECT_EQ(partial_result.first_failed_index, 2u);
+    EXPECT_EQ(partial_result.first_error.code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_EQ(large_allocator->Inspect(failed).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(large_allocator->Inspect(unattempted).status().code(),
+              StatusCode::kNotFound);
+
+    auto consumed = subscriber.TryPollBatch(kCapacity);
+    ASSERT_TRUE(consumed.ok()) << consumed.status().ToString();
+    ASSERT_EQ(consumed->size(), kCapacity);
+    for (size_t i = 0; i < consumed->size(); ++i) {
+        EXPECT_EQ((*consumed)[i]->id, i + 1);
+    }
+    const BatchAckResult acked = consumed->AckAll();
+    EXPECT_TRUE(acked.ok()) << acked.first_error.ToString();
+    EXPECT_EQ(acked.acked_count, kCapacity);
+    EXPECT_TRUE(mpsc->IsEmpty());
+}
+
+TEST_F(RuntimeSpscTest, BroadcastBatchPinsAcksAndReportsPartialFull) {
+    constexpr uint64_t kCapacity = 4;
+    auto broadcast_memory =
+        AllocateAligned(BroadcastChannel::RequiredSize(kCapacity));
+    auto broadcast = BroadcastChannel::Init(broadcast_memory.get(), kCapacity);
+    ASSERT_TRUE(broadcast.ok()) << broadcast.status().ToString();
+    auto subscriber_handle = broadcast->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(subscriber_handle.ok());
+    auto pin_memory = AllocateAligned(ShmPinTable::RequiredSize());
+    auto pins = ShmPinTable::Init(pin_memory.get(), ShmPinTable::RequiredSize(),
+                                  allocator_);
+    ASSERT_TRUE(pins.ok()) << pins.status().ToString();
+    Publisher<RuntimeTestMessage> publisher(allocator_, *broadcast, *pins);
+    Subscriber<RuntimeTestMessage> subscriber(
+        allocator_, *broadcast, *subscriber_handle, *pins);
+
+    auto builders = AllocateBatch(publisher, 1, 3);
+    ASSERT_TRUE(builders.ok());
+    std::vector<ShmHandle> handles;
+    for (const auto& builder : *builders) {
+        handles.push_back(builder.handle());
+    }
+    ASSERT_TRUE(publisher.PublishBatch(*builders).ok());
+    auto batch = subscriber.TryPollBatch(3);
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_EQ(batch->size(), 3u);
+    for (size_t i = 0; i < batch->size(); ++i) {
+        EXPECT_EQ((*batch)[i]->id, i + 1);
+        EXPECT_EQ(pins->PinCount(handles[i]), 1u);
+    }
+
+    EXPECT_TRUE(batch->Ack(2).ok());
+    EXPECT_EQ(pins->PinCount(handles[2]), 1u)
+        << "deferred out-of-order ACK must retain its Broadcast pin";
+    EXPECT_TRUE(batch->Ack(0).ok());
+    EXPECT_EQ(pins->PinCount(handles[0]), 0u);
+    EXPECT_EQ(pins->PinCount(handles[1]), 1u);
+    EXPECT_EQ(pins->PinCount(handles[2]), 1u);
+    EXPECT_TRUE(batch->AckAll().ok());
+    for (ShmHandle handle : handles) {
+        EXPECT_EQ(pins->PinCount(handle), 0u);
+        EXPECT_EQ(allocator_.Inspect(handle).status().code(),
+                  StatusCode::kNotFound);
+    }
+
+    auto fill = AllocateBatch(publisher, 10, kCapacity - 1);
+    ASSERT_TRUE(fill.ok());
+    ASSERT_TRUE(publisher.PublishBatch(*fill).ok());
+    auto partial = AllocateBatch(publisher, 20, 3);
+    ASSERT_TRUE(partial.ok());
+    const ShmHandle failed = (*partial)[1].handle();
+    const ShmHandle unattempted = (*partial)[2].handle();
+    const BatchPublishResult partial_result = publisher.PublishBatch(*partial);
+    ASSERT_FALSE(partial_result.ok());
+    EXPECT_EQ(partial_result.committed_count, 1u);
+    EXPECT_EQ(partial_result.first_failed_index, 1u);
+    EXPECT_EQ(partial_result.first_error.code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_EQ(allocator_.Inspect(failed).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(unattempted).status().code(),
+              StatusCode::kNotFound);
+
+    {
+        auto remaining = subscriber.TryPollBatch(kCapacity);
+        ASSERT_TRUE(remaining.ok());
+        ASSERT_EQ(remaining->size(), kCapacity);
+        EXPECT_EQ((*remaining)[3]->id, 20u);
+    }
+    EXPECT_EQ(subscriber.TryPoll().status().code(), StatusCode::kWouldBlock);
 }
 
 TEST_F(RuntimeSpscTest, PollDeadlineAndCallbackAck) {

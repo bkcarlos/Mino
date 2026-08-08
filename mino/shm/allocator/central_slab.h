@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 
 #include "mino/abi/shm_handle.h"
@@ -128,6 +129,21 @@ struct CentralSlabSlotMetadata {
     uint16_t class_id = 0;
     uint16_t class_count = 0;
     uint32_t capacity = 0;
+};
+
+// D6-01 tuning is deliberately process-local. It is never serialized into the
+// allocator superblock, so old shared-memory images and Attach remain ABI
+// compatible. The cache stores only bounded scan cursors, never free slots.
+struct AllocatorLocalCacheConfig {
+    bool enabled = true;
+};
+
+struct AllocatorLocalCacheStats {
+    uint64_t hint_hits = 0;
+    uint64_t fallback_scans = 0;
+    uint64_t cache_bypasses = 0;
+    uint64_t exhaustions = 0;
+    uint64_t drain_count = 0;
 };
 
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
@@ -262,6 +278,18 @@ public:
     Result<CentralSlabSlotMetadata> GetSlotMetadata(
         uint64_t header_offset) const;
 
+    // Configures the process-local bounded cursor magazine. Disabling it uses
+    // the legacy class-range scan policy. Configuration and statistics are not
+    // shared between independently attached processes.
+    void ConfigureLocalCache(AllocatorLocalCacheConfig config) noexcept;
+    AllocatorLocalCacheConfig local_cache_config() const noexcept;
+    AllocatorLocalCacheStats local_cache_stats() const noexcept;
+
+    // Invalidates all cursor magazines associated with this facade. Drain does
+    // not touch shared memory because cursor entries never own bitmap slots;
+    // other threads observe the new epoch lazily on their next allocation.
+    void DrainLocalCache() noexcept;
+
     // Total number of slots managed by this allocator.
     uint32_t total_slot_count() const { return class_table_.total_slot_count(); }
 
@@ -290,6 +318,7 @@ public:
     CentralSlabAllocator() = default;
 
 private:
+    struct LocalCacheState;
 
     // Computes all offsets/sizes of the shared layout for `config` and
     // returns the metadata struct (host-side). Used by Create/Attach.
@@ -315,6 +344,7 @@ private:
     Status ReclaimSlotExact(uint32_t slot_index, ShmHandle handle,
                             bool allow_published);
     bool CanReclaim(ShmHandle handle) const noexcept;
+    void RememberLocalCursor(uint16_t class_id, uint32_t slot_index) noexcept;
     SlabHeader& HeaderAt(uint32_t slot_index);
     const SlabHeader& HeaderAt(uint32_t slot_index) const;
 
@@ -334,6 +364,7 @@ private:
     std::atomic<uint64_t>* next_transaction_id_ = nullptr;
     ReclaimGuard reclaim_guard_ = nullptr;
     void* reclaim_guard_context_ = nullptr;
+    std::shared_ptr<LocalCacheState> local_cache_state_;
 };
 
 }  // namespace mino

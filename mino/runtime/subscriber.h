@@ -5,11 +5,16 @@
 #ifndef MINO_RUNTIME_SUBSCRIBER_H_
 #define MINO_RUNTIME_SUBSCRIBER_H_
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
@@ -26,6 +31,20 @@ namespace mino {
 
 template <typename T>
 class Subscriber;
+
+template <typename T>
+class BorrowedMessageBatch;
+
+struct BatchAckResult {
+    static constexpr size_t kNoFailure = std::numeric_limits<size_t>::max();
+
+    size_t requested_count = 0;
+    size_t acked_count = 0;
+    size_t first_failed_index = kNoFailure;
+    Status first_error = Status::Ok();
+
+    bool ok() const noexcept { return first_error.ok(); }
+};
 
 // Runtime borrow for a resolved fixed-layout payload. Unlike the low-level
 // Channel Borrow, destruction performs a best-effort ACK and payload cleanup.
@@ -190,7 +209,116 @@ private:
     bool active_ = false;
 };
 
-// D2-10 fixed-layout Subscriber facade over an SPSC Channel.
+// Move-only, capacity-bounded collection returned by Subscriber::PollBatch.
+// Reading is const-only so ACK ownership cannot escape the collection. Ack(i)
+// accepts out-of-order requests but physically drains only the contiguous
+// prefix, preserving every channel's ordered cursor contract. Destruction
+// requests and drains every remaining ACK in order.
+template <typename T>
+class BorrowedMessageBatch {
+public:
+    BorrowedMessageBatch() noexcept = default;
+    BorrowedMessageBatch(const BorrowedMessageBatch&) = delete;
+    BorrowedMessageBatch& operator=(const BorrowedMessageBatch&) = delete;
+
+    BorrowedMessageBatch(BorrowedMessageBatch&& other) noexcept
+        : messages_(std::move(other.messages_)),
+          ack_requested_(std::move(other.ack_requested_)),
+          next_ack_(other.next_ack_),
+          poll_status_(std::move(other.poll_status_)) {
+        other.next_ack_ = 0;
+    }
+
+    BorrowedMessageBatch& operator=(BorrowedMessageBatch&& other) noexcept {
+        if (this != &other) {
+            (void)AckAll();
+            messages_ = std::move(other.messages_);
+            ack_requested_ = std::move(other.ack_requested_);
+            next_ack_ = other.next_ack_;
+            poll_status_ = std::move(other.poll_status_);
+            other.next_ack_ = 0;
+        }
+        return *this;
+    }
+
+    ~BorrowedMessageBatch() { (void)AckAll(); }
+
+    size_t size() const noexcept { return messages_.size(); }
+    bool empty() const noexcept { return messages_.empty(); }
+    const BorrowedMessage<T>& operator[](size_t index) const noexcept {
+        return messages_[index];
+    }
+    typename std::vector<BorrowedMessage<T>>::const_iterator begin() const
+        noexcept {
+        return messages_.begin();
+    }
+    typename std::vector<BorrowedMessage<T>>::const_iterator end() const
+        noexcept {
+        return messages_.end();
+    }
+
+    // Non-OK only reports a physical ACK failure while draining the newly
+    // contiguous prefix. An out-of-order request is retained and returns OK.
+    Status Ack(size_t index) noexcept {
+        if (index >= messages_.size() || index < next_ack_ ||
+            ack_requested_[index] != 0) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "batch ACK index is invalid or already ACKed");
+        }
+        ack_requested_[index] = 1;
+        Status first_error = Status::Ok();
+        while (next_ack_ < messages_.size() &&
+               ack_requested_[next_ack_] != 0) {
+            const Status ack = std::move(messages_[next_ack_]).Ack();
+            if (first_error.ok() && !ack.ok()) {
+                first_error = ack;
+            }
+            ++next_ack_;
+        }
+        return first_error;
+    }
+
+    BatchAckResult AckAll() noexcept {
+        BatchAckResult outcome;
+        outcome.requested_count = messages_.size() - next_ack_;
+        for (size_t i = next_ack_; i < ack_requested_.size(); ++i) {
+            ack_requested_[i] = 1;
+        }
+        while (next_ack_ < messages_.size()) {
+            const size_t index = next_ack_;
+            const Status ack = std::move(messages_[index]).Ack();
+            if (ack.ok()) {
+                ++outcome.acked_count;
+            } else if (outcome.first_error.ok()) {
+                outcome.first_failed_index = index;
+                outcome.first_error = ack;
+            }
+            ++next_ack_;
+        }
+        return outcome;
+    }
+
+    // A partial batch can carry the first non-tail error encountered after at
+    // least one message was borrowed. kWouldBlock at the current tail is a
+    // normal short batch and leaves this status OK.
+    const Status& poll_status() const noexcept { return poll_status_; }
+
+private:
+    friend class Subscriber<T>;
+
+    BorrowedMessageBatch(std::vector<BorrowedMessage<T>>&& messages,
+                         Status poll_status) noexcept
+        : messages_(std::move(messages)),
+          ack_requested_(messages_.size(), 0),
+          poll_status_(std::move(poll_status)) {}
+
+    std::vector<BorrowedMessage<T>> messages_;
+    std::vector<uint8_t> ack_requested_;
+    size_t next_ack_ = 0;
+    Status poll_status_ = Status::Ok();
+};
+
+// D2-10 fixed-layout Subscriber facade over SPSC, MPSC, or Broadcast.
 template <typename T>
 class Subscriber {
 public:
@@ -275,6 +403,72 @@ public:
             broadcast_subscriber_);
     }
 
+    // The requested vector capacity is explicit and bounded. A successful
+    // result always contains at least one BorrowedMessage; reaching the current
+    // queue tail returns a shorter batch with poll_status()==OK.
+    static constexpr size_t kMaxBatchMessages = 1024;
+
+    Result<BorrowedMessageBatch<T>> TryPollBatch(size_t capacity) noexcept {
+        batch_poll_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (capacity == 0 || capacity > kMaxBatchMessages) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "poll batch capacity must be in [1, kMaxBatchMessages]");
+        }
+
+        Result<BorrowedMessage<T>> first = TryPoll();
+        if (!first.ok()) {
+            return first.status();
+        }
+        std::vector<BorrowedMessage<T>> messages;
+        messages.reserve(capacity);
+        messages.push_back(std::move(*first));
+        const uint64_t head_sequence =
+            messages.front().metadata().sequence_num;
+        Status terminal_status = Status::Ok();
+        for (size_t offset = 1; offset < capacity; ++offset) {
+            Result<BorrowedMessage<T>> next =
+                TryPollAtOffset(head_sequence, offset);
+            if (!next.ok()) {
+                if (next.status().code() != StatusCode::kWouldBlock) {
+                    terminal_status = next.status();
+                }
+                break;
+            }
+            messages.push_back(std::move(*next));
+        }
+        batch_polled_messages_.fetch_add(messages.size(),
+                                         std::memory_order_relaxed);
+        return BorrowedMessageBatch<T>(std::move(messages), terminal_status);
+    }
+
+    Result<BorrowedMessageBatch<T>> PollBatch(
+        size_t capacity,
+        Deadline deadline = Deadline::Infinite()) noexcept {
+        for (;;) {
+            Result<BorrowedMessageBatch<T>> batch = TryPollBatch(capacity);
+            if (batch.ok()) {
+                return batch;
+            }
+            if (batch.status().code() != StatusCode::kWouldBlock) {
+                return batch.status();
+            }
+            if (deadline.expired()) {
+                return Status::Error(StatusCode::kTimeout,
+                                     "subscriber batch poll deadline expired");
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    uint64_t batch_poll_calls() const noexcept {
+        return batch_poll_calls_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t batch_polled_messages() const noexcept {
+        return batch_polled_messages_.load(std::memory_order_relaxed);
+    }
+
     Result<BorrowedMessage<T>> Poll(
         Deadline deadline = Deadline::Infinite()) noexcept {
         for (;;) {
@@ -326,6 +520,35 @@ public:
     }
 
 private:
+    Result<BorrowedMessage<T>> TryPollAtOffset(
+        uint64_t head_sequence, size_t offset) noexcept {
+        if (std::holds_alternative<SpscChannel*>(channel_)) {
+            Result<SpscChannel::Borrow> borrow =
+                std::get<SpscChannel*>(channel_)->PollAtOffset(head_sequence,
+                                                               offset);
+            if (!borrow.ok()) {
+                return borrow.status();
+            }
+            return ResolveBorrow(std::move(*borrow));
+        }
+        if (std::holds_alternative<MpscChannel*>(channel_)) {
+            Result<MpscChannel::Borrow> borrow =
+                std::get<MpscChannel*>(channel_)->PollAtOffset(head_sequence,
+                                                               offset);
+            if (!borrow.ok()) {
+                return borrow.status();
+            }
+            return ResolveBorrow(std::move(*borrow));
+        }
+        Result<BroadcastChannel::Borrow> borrow =
+            std::get<BroadcastChannel*>(channel_)
+                ->PollAtOffsetWhileHeadBorrowed(broadcast_subscriber_, offset);
+        if (!borrow.ok()) {
+            return borrow.status();
+        }
+        return ResolveBorrow(std::move(*borrow));
+    }
+
     static constexpr void ValidateStaticContract() noexcept {
         static_assert(kHasStaticMessageTraits<T>,
                       "StaticMessageTraits<T> must be specialized");
@@ -419,6 +642,8 @@ private:
     ShmPinTable* pin_table_ = nullptr;
     ProcessIdentity pin_owner_;
     BroadcastChannel::SubscriberHandle broadcast_subscriber_;
+    std::atomic<uint64_t> batch_poll_calls_{0};
+    std::atomic<uint64_t> batch_polled_messages_{0};
 };
 
 }  // namespace mino

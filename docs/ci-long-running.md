@@ -7,6 +7,7 @@ Mino 将小时级验证与 PR CI 分开。所有 cron 均使用 UTC；长测 wor
 
 | Workflow | 手工触发 | 定时触发 | PR / push 行为 |
 | --- | --- | --- | --- |
+| `D6-10 72h Long Soak` | `workflow_dispatch`，默认且最短资格时长 259200 秒，可设置 uint64 seed | 每周三 `00:13 UTC` | PR 仅运行 runner self-test 和 15 秒真实 probe smoke；72h job 不在 PR 运行 |
 | `Extended Long-Running Validation` | `workflow_dispatch`，可设置 `duration_seconds`（0–7200）和请求 seed | 每周六 `01:41 UTC` | 不在 PR 或 push 触发 |
 | `Reproducible Recovery Stress` | `workflow_dispatch`；D2 固定 seed 始终保留，可选 uint64 `seed` 仅覆盖第二个 run-derived 槽位并标记为 manual | 每周日 `03:17 UTC` | 不在 PR 或 push 触发 |
 | `D3 Extended Validation` | `workflow_dispatch` | 每周日 `02:23 UTC` | PR 仅运行 60 秒 fuzz smoke；主分支和定时运行 1 小时 fuzz |
@@ -17,7 +18,42 @@ Mino 将小时级验证与 PR CI 分开。所有 cron 均使用 UTC；长测 wor
 在 GitHub Actions 页面选择对应 workflow 后使用 **Run workflow** 即可手工启动。
 定时任务使用默认分支上的 workflow 定义。
 
+## D6-10 统一长稳框架
+
+`.github/workflows/d6-10-long-soak.yml` 是独立的 D6-10 资格 workflow。schedule 和手工触发默认运行
+72 小时（259200 秒），使用 `[self-hosted, linux, x64, mino-soak]` 专用 runner；不能把该 job
+改到 GitHub-hosted runner，因为 hosted job 的执行时长上限不足 72 小时。手工输入小于 259200 秒会在
+启动 probe 前失败。PR 只运行 Python runner self-test 和 15 秒真实 C++ smoke，不启动任何长测。
+
+`//benchmarks/soak_probe:soak_probe` 是一个常驻、固定内存边界的生产 API probe，统一编排：
+
+- **allocator**：持续轮换真实 `CentralSlabAllocator` allocation/abort，并扫描 authoritative bitmap/header；
+- **channel**：保持固定 backlog 的 `BroadcastChannel` reserve/commit/poll/ack；
+- **bridge**：持续执行带 payload CRC 的 canonical `WireFrameCodec` encode/decode；
+- **storage**：保持固定 backlog 的 `RecorderBufferPool` reserve/commit/dequeue，覆盖 recorder storage ingestion；
+- **observability**：持续更新 `MetricRegistry` counter/gauge/histogram，并通过有界 `TelemetryTracer` push/pop。
+
+probe 以 JSONL heartbeat 报告内部指标；`tools/ci/run_long_soak.py` 每 60 秒将其与操作系统进程指标合并。
+每个样本至少包含 RSS、FD 数、allocator occupied/total slots、Slab 占用字节、channel/storage/总 queue
+depth、storage in-use/allocated bytes、telemetry accepted/dropped 和累计 operation 数。Linux 从
+`/proc/<pid>/status` 与 `/proc/<pid>/fd` 读取 RSS/FD；macOS 本地 smoke 使用 `ps` 和 `lsof`。
+任何平台指标缺失、probe 样本字段缺失或 heartbeat 超过 watchdog 都会 fail closed。
+
+Slab 指标是所有 authoritative occupied allocator slot 的 `sizeof(SlabHeader) + capacity` 之和，
+不是从 RSS 反推的代理值。默认前 300 秒为 warmup。对 warmup 后 RSS 和 Slab 各自同时计算：
+
+1. **线性增长率**：最小二乘斜率 × 86400 ÷ 首样本值 × 100%；
+2. **首尾增长率**：`(末样本 - 首样本) ÷ 首样本值 ÷ 实际秒数 × 86400 × 100%`。
+
+四个检查（RSS/Slab × 线性/首尾）都必须严格 `< 5%/24h`。短于 24 小时的 self-test/smoke 仍验证
+采样与证据链，但 manifest 写入 `gate_status: not_evaluated_short_run`，不得作为 D6-10 资格证据。
+
+C++ signal handler 只写 `sig_atomic_t`；runner 收到 SIGINT/SIGTERM 后向独立 probe 进程组发送
+SIGTERM，等待有限 grace 后 SIGKILL。正常 72 小时 deadline 也走同一优雅终止路径。watchdog 以
+JSONL heartbeat 为活性权威，不把“进程仍存在”误当成 workload 仍推进。
+
 ## 覆盖矩阵
+
 
 - **D1 MPMC TSAN**：`run_extended_long_test.py d1-mpmc-tsan` 显式运行
   `//mino/shm/channel:mpmc_ring_stress_test`，使用 `--config=tsan`、有限 Bazel
@@ -61,7 +97,7 @@ Mino 将小时级验证与 PR CI 分开。所有 cron 均使用 UTC；长测 wor
 
 PR 不运行小时级 target。常规 `CI` workflow 会：
 
-1. 在 debug 和 TSAN 配置下显式**编译** manual MPMC stress target，但不执行长测；
+1. 在 debug 和 TSAN 配置下显式**编译** manual MPMC stress target，但不执行长测；D6-10 独立 workflow 只执行 runner self-test 和 15 秒真实五 workload smoke；
 2. 对 `tools/ci` Python 文件做语法检查、对 shell runner 做 `bash -n`；
 3. 运行所有支持 `--self-test` 的 CI runner，包括双机 server/client/manifest 编排的 loopback self-test；
 4. D3 相关 PR 只运行每 sanitizer 60 秒的 fuzz smoke；TLA 相关 PR 会实际运行三个有界 TLC 模型，而非只运行 runner self-test；
@@ -86,6 +122,15 @@ PR 不运行小时级 target。常规 `CI` workflow 会：
   `sigstop_live_sigcont` 也必须完成；marker 来源固定为有 SHA-256 的 `test.log`；
 - 统一顶层 `outcome`、`exit_code` 和 `github` run provenance。
 
+D6-10 的 `manifest.json` 额外记录 exact commit/expected commit、完整 clean/dirty source 状态、seed、
+实际 probe argv/shell 命令、OS/Python/compiler/GitHub runner 环境、全部逐样本内容、双趋势结果、四项
+门禁、termination/exit reason、signal、probe exit code，以及 `probe.log`、`samples.jsonl` 的字节数和
+SHA-256。runner 每个样本后原子刷新进行中 manifest，正常/信号/watchdog 退出后再生成最终 hash。
+`qualification_eligible` 仅在 expected commit 匹配、source clean、请求和实际时长均不少于 72 小时时
+为 true。workflow 的验证步骤使用 `if: always()` 并要求 `outcome=passed`、资格为 true、逐样本文件
+与 manifest 完全一致且每个 hash/size 匹配；artifact 上传使用 `if-no-files-found: error`。runner
+失败、证据缺失或上传内容缺失都不能形成绿色资格结果。
+
 主要文件名为 `manifest.json`；已有 D3/D5 campaign 保持兼容文件名
 `campaign-manifest.json`。qualification runner 必须收到并匹配 `expected_commit`，工作树为
 clean 时才写入 `qualification_eligible: true`；本地可显式传 `--allow-dirty` 运行修改代码，但
@@ -103,6 +148,7 @@ reap，runner 另以 Bazel timeout + 60 秒的进程组 watchdog 兜底。
 以下命令只验证 runner，不启动真实长测：
 
 ```sh
+python3 tools/ci/run_long_soak.py --self-test
 python3 tools/ci/run_extended_long_test.py --self-test
 python3 tools/ci/run_recovery_stress.py --self-test
 python3 tools/ci/run_d3_fuzz_campaign.py --self-test
@@ -114,7 +160,25 @@ python3 tools/ci/finalize_two_host_manifest.py --self-test
 bash -n tools/ci/run_d3_codegen_environment.sh
 ```
 
-`seconds=0` 只产出 `skipped` manifest，不启动任何 test。可用十秒预算检查真实
+D6-10 runner self-test 会实际启动稳定 fake probe、验证趋势公式和 hash 篡改检测，并启动无 heartbeat
+probe 验证 watchdog/进程组清理。真实五 workload 本地 smoke（短测不执行增长门禁）使用：
+
+```sh
+bazel build --lockfile_mode=error --config=debug \\
+  //benchmarks/soak_probe:soak_probe
+install -m 0755 bazel-bin/benchmarks/soak_probe/soak_probe /tmp/mino-soak-probe
+python3 tools/ci/run_long_soak.py \\
+  --duration-seconds=30 --sample-interval-seconds=2 --warmup-seconds=0 \\
+  --watchdog-seconds=10 --seed=610 --allow-dirty \\
+  --probe=/tmp/mino-soak-probe --out=/tmp/mino-d6-10-smoke --clean
+python3 tools/ci/run_long_soak.py \\
+  --verify-manifest=/tmp/mino-d6-10-smoke/manifest.json --require-passed
+```
+
+`--allow-dirty` 只供本地开发；manifest 会保留 dirty 状态且永远不具 qualification 资格。生产 72h
+命令不得使用该选项，并必须传入 `--expected-commit`。
+
+`seconds=0` 只产出 `skipped` manifest，不启动任何 existing extended test。可用十秒预算检查真实
 orchestration（编译时间也计入总预算）：
 
 ```sh

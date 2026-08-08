@@ -860,5 +860,78 @@ TEST(OwnerCleanupTest, BadAllocAfterNodeReplacementIsRetriedIdempotently) {
     EXPECT_EQ(coordinator->ReleaseTopicPin(pin).code(), StatusCode::kNotFound);
 }
 
+TEST(CapacityAdmissionTest, TopicAndRegistrationsCommitAndReleaseExactCharges) {
+    capacity::NodeBudget budget;
+    budget.limit.shm_bytes = 128;
+    budget.limit.topics = 1;
+    budget.limit.publishers = 1;
+    budget.limit.subscribers = 1;
+    auto controller_result = capacity::CapacityController::Create(budget);
+    ASSERT_TRUE(controller_result.ok())
+        << controller_result.status().ToString();
+    auto controller = std::move(*controller_result);
+    auto probe = std::make_shared<FakeLivenessProbe>();
+    auto coordinator_result = Coordinator::CreateForTesting(
+        {}, std::make_shared<InMemoryMonotonicIdAllocator>(), probe, {},
+        controller);
+    ASSERT_TRUE(coordinator_result.ok())
+        << coordinator_result.status().ToString();
+    auto coordinator = std::move(*coordinator_result);
+
+    capacity::ResourceVector topic_resources;
+    topic_resources.shm_bytes = 128;
+    auto topic = coordinator->CreateTopic(
+        DiscoveryTopic("topic/capacity"), topic_resources);
+    ASSERT_TRUE(topic.ok()) << topic.status().ToString();
+    EXPECT_EQ(controller->Snapshot().committed.shm_bytes, 128u);
+    EXPECT_EQ(controller->Snapshot().committed.topics, 1u);
+    EXPECT_EQ(coordinator
+                  ->CreateTopic(DiscoveryTopic("topic/denied"))
+                  .status()
+                  .code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_TRUE(controller->Snapshot().pending.empty());
+
+    ASSERT_TRUE(coordinator
+                    ->ActivateTopic((*topic)->metadata.topic_id,
+                                    ActivationProof((*topic)->metadata))
+                    .ok());
+    const NodeRegistration node = Node(NodeId{31}, 3101, 311, 1000);
+    ASSERT_TRUE(coordinator->RegisterNode(node, 0).ok());
+    const PublisherRegistration publisher{
+        .topic_id = (*topic)->metadata.topic_id,
+        .publisher_id = PublisherId{1},
+        .generation = 1,
+        .owner = Owner(node),
+    };
+    const SubscriberRegistration subscriber{
+        .topic_id = (*topic)->metadata.topic_id,
+        .subscriber_id = SubscriberId{1},
+        .generation = 1,
+        .owner = Owner(node),
+    };
+    ASSERT_TRUE(coordinator->RegisterPublisher(publisher, 1).ok());
+    ASSERT_TRUE(coordinator->RegisterSubscriber(subscriber, 1).ok());
+    // Idempotent retries do not require a second reservation when headroom is 0.
+    ASSERT_TRUE(coordinator->RegisterPublisher(publisher, 1).ok());
+    ASSERT_TRUE(coordinator->RegisterSubscriber(subscriber, 1).ok());
+    EXPECT_EQ(controller->Snapshot().committed.publishers, 1u);
+    EXPECT_EQ(controller->Snapshot().committed.subscribers, 1u);
+
+    ASSERT_TRUE(coordinator->UnregisterPublisher(publisher).ok());
+    ASSERT_TRUE(coordinator->UnregisterSubscriber(subscriber).ok());
+    EXPECT_EQ(controller->Snapshot().committed.publishers, 0u);
+    EXPECT_EQ(controller->Snapshot().committed.subscribers, 0u);
+    ASSERT_TRUE(coordinator->DrainTopic((*topic)->metadata.topic_id).ok());
+    auto draining = coordinator->GetTopic((*topic)->metadata.topic_id);
+    ASSERT_TRUE(draining.ok()) << draining.status().ToString();
+    ASSERT_TRUE(coordinator
+                    ->RetireTopic((*topic)->metadata.topic_id,
+                                  DrainProof((*draining)->metadata))
+                    .ok());
+    ASSERT_TRUE(coordinator->DeleteTopic((*topic)->metadata.topic_id).ok());
+    EXPECT_TRUE(controller->Snapshot().committed.empty());
+}
+
 }  // namespace
 }  // namespace mino::registry

@@ -1,0 +1,158 @@
+# D6-10 is a dedicated steady-state qualification. It does not invoke the
+# existing recovery, fuzz, reconnect, or persistence-fault long campaigns.
+name: D6-10 72h Long Soak
+
+on:
+  schedule:
+    - cron: "13 0 * * 3"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Qualification duration in seconds (default and minimum supported by this workflow: 259200 / 72h)
+        required: false
+        default: "259200"
+        type: string
+      seed:
+        description: Decimal uint64 workload seed
+        required: false
+        type: string
+  pull_request:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/d6-10-long-soak.yml"
+      - "benchmarks/soak_probe/**"
+      - "docs/ci-long-running.md"
+      - "tools/ci/run_long_soak.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d6-10-soak-${{ github.event_name == 'pull_request' && github.ref || 'qualification' }}
+  cancel-in-progress: false
+
+jobs:
+  pr-self-test-smoke:
+    name: Runner self-test and real probe smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      CC: gcc-12
+      CXX: g++-12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-12 g++-12 libatomic1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Runner syntax and self-test
+        run: |
+          python3 -m py_compile tools/ci/run_long_soak.py
+          python3 tools/ci/run_long_soak.py --self-test
+
+      - name: Build and stage real soak probe
+        run: |
+          bazel build --lockfile_mode=error --config=gcc12 --config=debug \
+            //benchmarks/soak_probe:soak_probe
+          install -m 0755 bazel-bin/benchmarks/soak_probe/soak_probe \
+            "${RUNNER_TEMP}/mino-soak-probe"
+
+      - name: Run short real-workload smoke
+        run: |
+          python3 tools/ci/run_long_soak.py \
+            --duration-seconds=15 \
+            --sample-interval-seconds=1 \
+            --warmup-seconds=0 \
+            --watchdog-seconds=5 \
+            --seed=610 \
+            --probe="${RUNNER_TEMP}/mino-soak-probe" \
+            --expected-commit="${GITHUB_SHA}" \
+            --out="${RUNNER_TEMP}/mino-d6-10-smoke"
+
+      - name: Verify smoke evidence fail closed
+        run: |
+          python3 tools/ci/run_long_soak.py \
+            --verify-manifest="${RUNNER_TEMP}/mino-d6-10-smoke/manifest.json" \
+            --expected-commit="${GITHUB_SHA}" \
+            --require-passed
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d6-10-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-d6-10-smoke/
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    name: 72h RSS/Slab qualification
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, x64, mino-soak]
+    timeout-minutes: 4380
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      SOAK_DURATION_SECONDS: ${{ inputs.duration_seconds || '259200' }}
+      SOAK_SEED: ${{ inputs.seed || github.run_number }}
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Reject non-72h qualification input
+        run: |
+          python3 -c 'import os; value=int(os.environ["SOAK_DURATION_SECONDS"]); assert value >= 259200, "D6-10 qualification requires at least 259200 seconds"'
+
+      - name: Build and stage release soak probe
+        run: |
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks/soak_probe:soak_probe
+          git --no-pager diff --exit-code -- MODULE.bazel MODULE.bazel.lock .bazelrc
+          install -m 0755 bazel-bin/benchmarks/soak_probe/soak_probe \
+            "${RUNNER_TEMP}/mino-soak-probe"
+
+      - name: Run unified D6-10 soak
+        run: |
+          python3 tools/ci/run_long_soak.py \
+            --duration-seconds="${SOAK_DURATION_SECONDS}" \
+            --sample-interval-seconds=60 \
+            --warmup-seconds=300 \
+            --watchdog-seconds=180 \
+            --terminate-grace-seconds=30 \
+            --seed="${SOAK_SEED}" \
+            --probe="${RUNNER_TEMP}/mino-soak-probe" \
+            --expected-commit="${GITHUB_SHA}" \
+            --out="${RUNNER_TEMP}/mino-d6-10-soak"
+
+      - name: Verify qualification evidence fail closed
+        if: always()
+        run: |
+          python3 tools/ci/run_long_soak.py \
+            --verify-manifest="${RUNNER_TEMP}/mino-d6-10-soak/manifest.json" \
+            --expected-commit="${GITHUB_SHA}" \
+            --require-passed \
+            --require-qualified
+
+      - name: Upload complete qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d6-10-72h-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-d6-10-soak/
+          if-no-files-found: error
+          retention-days: 90

@@ -314,6 +314,37 @@ bool ValidFlushLevel(RecordAckLevel level) noexcept {
 
 }  // namespace
 
+Result<capacity::ResourceVector> EstimateRecorderTopicResources(
+    const RecorderTopicConfig& config) noexcept {
+    if (config.partition_count == 0) {
+        return Invalid("recorder capacity estimate requires partitions");
+    }
+    MINO_ASSIGN_OR_RETURN(auto effective,
+                          ValidateRecordingPolicy(config.policy));
+
+    capacity::ResourceVector per_partition;
+    if (effective.mode != RecordingMode::kSnapshot) {
+        per_partition.recorder_buffer_bytes =
+            config.buffer_pool_options.global_byte_limit;
+    }
+    // Partition manifest plus active segment/snapshot file. This is a
+    // conservative descriptor ceiling, not an assertion that all are always open.
+    per_partition.file_descriptors = 2;
+    MINO_ASSIGN_OR_RETURN(
+        auto resources,
+        capacity::CheckedScale(per_partition, config.partition_count));
+
+    capacity::ResourceVector topic_resources;
+    topic_resources.file_descriptors = 1;  // Topic/session metadata operation.
+    for (const RecorderTopicSchema& schema : config.schemas) {
+        capacity::ResourceVector artifact;
+        artifact.schema_buffer_bytes = schema.descriptor_artifact.size();
+        MINO_ASSIGN_OR_RETURN(topic_resources,
+                              capacity::CheckedAdd(topic_resources, artifact));
+    }
+    return capacity::CheckedAdd(resources, topic_resources);
+}
+
 class Recorder::Impl final {
 public:
     struct TopicRuntime;
@@ -335,6 +366,8 @@ public:
     };
 
     struct TopicRuntime {
+        // Declared first so the charge is released after every partition.
+        capacity::CapacityLease capacity_lease;
         TopicId topic_id{};
         std::string name;
         uint64_t config_version = 0;
@@ -346,12 +379,14 @@ public:
     Impl(std::filesystem::path session_root, RecorderSessionOptions options,
          std::unique_ptr<RecordingManifest> manifest,
          std::unique_ptr<schema::SchemaRegistry> registry,
-         std::unique_ptr<SchemaStore> schema_store) noexcept
+         std::unique_ptr<SchemaStore> schema_store,
+         std::shared_ptr<capacity::CapacityController> capacity_controller) noexcept
         : session_root_(std::move(session_root)),
           options_(std::move(options)),
           manifest_(std::move(manifest)),
           registry_(std::move(registry)),
-          schema_store_(std::move(schema_store)) {}
+          schema_store_(std::move(schema_store)),
+          capacity_controller_(std::move(capacity_controller)) {}
 
     ~Impl() {
         if (state_ == RecorderState::kCreated ||
@@ -370,7 +405,9 @@ public:
         }
     }
 
-    Status AddTopic(const RecorderTopicConfig& config) {
+    Status AddTopic(
+        const RecorderTopicConfig& config,
+        std::optional<capacity::ResourceVector> capacity_charge) {
         std::lock_guard lock(mutex_);
         try {
             if (state_ != RecorderState::kCreated) {
@@ -395,6 +432,27 @@ public:
             Result<EffectiveRecordingPolicy> effective =
                 ValidateRecordingPolicy(config.policy);
             if (!effective.ok()) return effective.status();
+
+            capacity::CapacityReservation capacity_reservation;
+            if (capacity_controller_) {
+                capacity::ResourceVector charge;
+                if (capacity_charge.has_value()) {
+                    charge = *capacity_charge;
+                } else {
+                    MINO_ASSIGN_OR_RETURN(
+                        charge, EstimateRecorderTopicResources(config));
+                }
+                MINO_ASSIGN_OR_RETURN(
+                    capacity_reservation,
+                    capacity_controller_->Reserve(
+                        capacity::ResourceRequest{
+                            .resources = charge,
+                            .scope = capacity::ResourceScope::kRecorder,
+                            .admission_class =
+                                capacity::AdmissionClass::kDataPlane,
+                            .name = config.topic_name,
+                        }));
+            }
 
             std::vector<SchemaRefSnapshot> schema_snapshot;
             std::vector<RecorderSchemaMetadata> recorder_schemas;
@@ -493,6 +551,9 @@ public:
                 topic->partitions.emplace(partition_id,
                                           std::move(*partition));
             }
+            MINO_ASSIGN_OR_RETURN(auto capacity_lease,
+                                  capacity_reservation.Commit());
+            topic->capacity_lease = std::move(capacity_lease);
             topics_.emplace(config.topic_id.value, std::move(topic));
             return Status::Ok();
         } catch (const std::bad_alloc&) {
@@ -1517,6 +1578,7 @@ private:
     std::unique_ptr<RecordingManifest> manifest_;
     std::unique_ptr<schema::SchemaRegistry> registry_;
     std::unique_ptr<SchemaStore> schema_store_;
+    std::shared_ptr<capacity::CapacityController> capacity_controller_;
     std::map<uint32_t, std::unique_ptr<TopicRuntime>> topics_;
     RecorderState state_ = RecorderState::kCreated;
     Status session_error_ = Status::Ok();
@@ -1526,7 +1588,8 @@ private:
 
 Result<std::unique_ptr<Recorder>> Recorder::FinishCreate(
     const std::filesystem::path& session_root, RecorderSessionOptions options,
-    std::unique_ptr<RecordingManifest> manifest) {
+    std::unique_ptr<RecordingManifest> manifest,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) {
     try {
         auto registry = std::make_unique<schema::SchemaRegistry>();
         Result<std::unique_ptr<SchemaStore>> schema_store = SchemaStore::Open(
@@ -1534,7 +1597,8 @@ Result<std::unique_ptr<Recorder>> Recorder::FinishCreate(
         if (!schema_store.ok()) return schema_store.status();
         auto impl = std::make_unique<Recorder::Impl>(
             session_root, std::move(options), std::move(manifest),
-            std::move(registry), std::move(*schema_store));
+            std::move(registry), std::move(*schema_store),
+            std::move(capacity_controller));
         return std::unique_ptr<Recorder>(new Recorder(std::move(impl)));
     } catch (const std::bad_alloc&) {
         return Exhausted("cannot allocate Recorder session");
@@ -1546,7 +1610,8 @@ Result<std::unique_ptr<Recorder>> Recorder::FinishCreate(
 Result<std::unique_ptr<Recorder>> Recorder::Create(
     const std::filesystem::path& session_root,
     const RecordingSessionMetadata& metadata,
-    const RecorderSessionOptions& options) noexcept {
+    const RecorderSessionOptions& options,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) noexcept {
     try {
         if (session_root.empty()) return Invalid("Recorder session root is empty");
         Status directory = CreateDirectory(session_root);
@@ -1555,7 +1620,8 @@ Result<std::unique_ptr<Recorder>> Recorder::Create(
             RecordingManifest::Create(session_root, metadata,
                                       options.manifest_options);
         if (!manifest.ok()) return manifest.status();
-        return FinishCreate(session_root, options, std::move(*manifest));
+        return FinishCreate(session_root, options, std::move(*manifest),
+                            std::move(capacity_controller));
     } catch (const std::bad_alloc&) {
         return Exhausted("cannot allocate Recorder session");
     } catch (const std::exception& error) {
@@ -1565,13 +1631,15 @@ Result<std::unique_ptr<Recorder>> Recorder::Create(
 
 Result<std::unique_ptr<Recorder>> Recorder::Open(
     const std::filesystem::path& session_root,
-    const RecorderSessionOptions& options) noexcept {
+    const RecorderSessionOptions& options,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) noexcept {
     try {
         if (session_root.empty()) return Invalid("Recorder session root is empty");
         Result<std::unique_ptr<RecordingManifest>> manifest =
             RecordingManifest::Open(session_root, options.manifest_options);
         if (!manifest.ok()) return manifest.status();
-        return FinishCreate(session_root, options, std::move(*manifest));
+        return FinishCreate(session_root, options, std::move(*manifest),
+                            std::move(capacity_controller));
     } catch (const std::bad_alloc&) {
         return Exhausted("cannot allocate Recorder session");
     } catch (const std::exception& error) {
@@ -1584,8 +1652,10 @@ Recorder::Recorder(std::unique_ptr<Impl> impl) noexcept
 
 Recorder::~Recorder() = default;
 
-Status Recorder::AddTopic(const RecorderTopicConfig& config) noexcept {
-    return impl_->AddTopic(config);
+Status Recorder::AddTopic(
+    const RecorderTopicConfig& config,
+    std::optional<capacity::ResourceVector> capacity_charge) noexcept {
+    return impl_->AddTopic(config, std::move(capacity_charge));
 }
 
 Status Recorder::Start(uint64_t now_ns) noexcept {

@@ -25,6 +25,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "mino/abi/shm_handle.h"
 #include "mino/common/status.h"
 #include "mino/shm/allocator/slab_header.h"
@@ -45,6 +51,12 @@ ClassTableConfig TestConfig() {
 }
 
 constexpr uint64_t kRegionSize = 1u << 20;  // 1 MiB, plenty for the test
+
+struct TestAlignedDeleter {
+    void operator()(std::byte* p) const {
+        ::operator delete[](p, std::align_val_t(64));
+    }
+};
 
 class CentralSlabTest : public ::testing::Test {
 protected:
@@ -411,6 +423,60 @@ TEST_F(CentralSlabTest, CrashRecoveryClearsUnpublishedSlot) {
     EXPECT_EQ(reused->generation, handle->generation + 1);
 }
 
+TEST_F(CentralSlabTest, LocalCursorCacheCanBeConfiguredDrainedAndObserved) {
+    EXPECT_TRUE(alloc_.local_cache_config().enabled);
+    auto first = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    auto stats = alloc_.local_cache_stats();
+    EXPECT_EQ(stats.hint_hits, 1u);
+    EXPECT_EQ(stats.fallback_scans, 0u);
+
+    ASSERT_TRUE(alloc_.Retire(*first).ok());
+    ASSERT_TRUE(alloc_.Reclaim(*first).ok());
+    auto reused = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(reused.ok()) << reused.status().ToString();
+    EXPECT_EQ(reused->offset, first->offset);
+
+    const uint64_t drains_before = alloc_.local_cache_stats().drain_count;
+    alloc_.DrainLocalCache();
+    EXPECT_EQ(alloc_.local_cache_stats().drain_count, drains_before + 1);
+
+    alloc_.ConfigureLocalCache({.enabled = false});
+    EXPECT_FALSE(alloc_.local_cache_config().enabled);
+    auto bypassed = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(bypassed.ok()) << bypassed.status().ToString();
+    EXPECT_EQ(alloc_.local_cache_stats().cache_bypasses, 1u);
+}
+
+TEST_F(CentralSlabTest, LocalCursorCacheNeverClaimsAheadOrHidesCapacity) {
+    auto handle = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    uint32_t occupied = 0;
+    for (uint32_t i = 0; i < alloc_.total_slot_count(); ++i) {
+        if (alloc_.IsSlotOccupiedForRecovery(i)) ++occupied;
+    }
+    EXPECT_EQ(occupied, 1u);
+
+    alloc_.DrainLocalCache();
+    occupied = 0;
+    for (uint32_t i = 0; i < alloc_.total_slot_count(); ++i) {
+        if (alloc_.IsSlotOccupiedForRecovery(i)) ++occupied;
+    }
+    EXPECT_EQ(occupied, 1u);
+    ASSERT_TRUE(alloc_.Abort(*handle).ok());
+}
+
+TEST_F(CentralSlabTest, LocalCacheControlDoesNotModifySharedMemoryAbi) {
+    std::vector<std::byte> before(kRegionSize);
+    std::memcpy(before.data(), region_.get(), kRegionSize);
+
+    alloc_.ConfigureLocalCache({.enabled = false});
+    alloc_.DrainLocalCache();
+    alloc_.ConfigureLocalCache({.enabled = true});
+
+    EXPECT_EQ(std::memcmp(before.data(), region_.get(), kRegionSize), 0);
+}
+
 TEST_F(CentralSlabTest, AttachSeesExistingAllocations) {
     auto handle = alloc_.Allocate(Request(32));
     ASSERT_TRUE(handle.ok());
@@ -422,6 +488,12 @@ TEST_F(CentralSlabTest, AttachSeesExistingAllocations) {
     ASSERT_TRUE(view.ok());
     EXPECT_EQ(view->state, ObjectState::kAllocated);
     EXPECT_EQ(view->generation, 1u);
+    EXPECT_TRUE(attached->local_cache_config().enabled);
+    EXPECT_EQ(attached->local_cache_stats().hint_hits, 0u);
+
+    alloc_.ConfigureLocalCache({.enabled = false});
+    EXPECT_FALSE(alloc_.local_cache_config().enabled);
+    EXPECT_TRUE(attached->local_cache_config().enabled);
 
     // The attached instance allocates from the same shared state.
     auto second = attached->Allocate(Request(32));
@@ -436,6 +508,152 @@ TEST_F(CentralSlabTest, AttachRejectsCorruptMagic) {
     ASSERT_FALSE(attached.ok());
     EXPECT_EQ(attached.status().code(), StatusCode::kCorruption);
 }
+
+TEST(CentralSlabContentionTest, ConservesCapacityAcrossExhaustionAndReclaim) {
+    constexpr uint32_t kSlots = 1024;
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = kSlots / kThreads;
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = kSlots}};
+
+    auto region = std::unique_ptr<std::byte[], TestAlignedDeleter>(
+        new (std::align_val_t(64)) std::byte[kRegionSize]);
+    std::memset(region.get(), 0, kRegionSize);
+    auto created = CentralSlabAllocator::Create(region.get(), kRegionSize, config);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    CentralSlabAllocator allocator = *created;
+
+    auto request = [] {
+        AllocationRequest req;
+        req.object_size = 32;
+        req.type_id = TypeId{9};
+        req.schema = {.short_id = 0xD601, .layout_version = 1};
+        return req;
+    };
+
+    std::vector<std::vector<ShmHandle>> handles(kThreads);
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < kThreads; ++thread) {
+        threads.emplace_back([&, thread] {
+            handles[thread].reserve(kPerThread);
+            for (int i = 0; i < kPerThread; ++i) {
+                auto handle = allocator.Allocate(request());
+                if (!handle.ok()) {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                handles[thread].push_back(*handle);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    ASSERT_FALSE(failed.load(std::memory_order_relaxed));
+
+    std::set<uint64_t> offsets;
+    for (const auto& thread_handles : handles) {
+        ASSERT_EQ(thread_handles.size(), static_cast<size_t>(kPerThread));
+        for (ShmHandle handle : thread_handles) {
+            EXPECT_TRUE(offsets.insert(handle.offset).second);
+        }
+    }
+    EXPECT_EQ(offsets.size(), kSlots);
+
+    auto exhausted = allocator.Allocate(request());
+    ASSERT_FALSE(exhausted.ok());
+    EXPECT_EQ(exhausted.status().code(), StatusCode::kResourceExhausted);
+    const AllocatorLocalCacheStats full_stats = allocator.local_cache_stats();
+    EXPECT_GT(full_stats.hint_hits, 0u);
+    EXPECT_GT(full_stats.fallback_scans, 0u);
+    EXPECT_EQ(full_stats.exhaustions, 1u);
+
+    threads.clear();
+    for (int thread = 0; thread < kThreads; ++thread) {
+        threads.emplace_back([&, thread] {
+            for (ShmHandle handle : handles[thread]) {
+                if (!allocator.Retire(handle).ok() ||
+                    !allocator.Reclaim(handle).ok()) {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    ASSERT_FALSE(failed.load(std::memory_order_relaxed));
+
+    offsets.clear();
+    for (uint32_t i = 0; i < kSlots; ++i) {
+        auto handle = allocator.Allocate(request());
+        ASSERT_TRUE(handle.ok()) << "i=" << i << " "
+                                 << handle.status().ToString();
+        EXPECT_TRUE(offsets.insert(handle->offset).second);
+    }
+    EXPECT_EQ(offsets.size(), kSlots);
+}
+
+#if defined(__unix__) || defined(__APPLE__)
+TEST(CentralSlabContentionTest, AttachRecoversAllCapacityAfterProcessCrash) {
+    constexpr uint32_t kSlots = 128;
+    void* mapping = ::mmap(nullptr, kRegionSize, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    std::memset(mapping, 0, kRegionSize);
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = kSlots}};
+    auto created = CentralSlabAllocator::Create(mapping, kRegionSize, config);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+
+    const pid_t child = ::fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        auto attached = CentralSlabAllocator::Attach(mapping, kRegionSize);
+        if (!attached.ok()) ::_exit(10);
+        AllocationRequest request;
+        request.object_size = 32;
+        request.type_id = TypeId{10};
+        request.schema = {.short_id = 0xD601, .layout_version = 1};
+        for (uint32_t i = 0; i < 32; ++i) {
+            if (!attached->Allocate(request).ok()) ::_exit(11);
+        }
+        // Deliberately bypass destructors: cursor magazines are process-local,
+        // while every claimed slot remains visible in the shared bitmap.
+        ::_exit(0);
+    }
+
+    int child_status = 0;
+    ASSERT_EQ(::waitpid(child, &child_status, 0), child);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+
+    auto recovery = CentralSlabAllocator::Attach(mapping, kRegionSize);
+    ASSERT_TRUE(recovery.ok()) << recovery.status().ToString();
+    uint32_t recovered = 0;
+    for (uint32_t i = 0; i < recovery->total_slot_count(); ++i) {
+        if (!recovery->IsSlotOccupiedForRecovery(i)) continue;
+        SlabHeader header{};
+        ASSERT_TRUE(recovery->ReadSlotByIndex(i, &header, nullptr));
+        ASSERT_TRUE(recovery
+                        ->ClearSlotForRecovery(
+                            i, header.object_state.load(std::memory_order_relaxed))
+                        .ok());
+        ++recovered;
+    }
+    EXPECT_EQ(recovered, 32u);
+
+    AllocationRequest request;
+    request.object_size = 32;
+    request.type_id = TypeId{10};
+    request.schema = {.short_id = 0xD601, .layout_version = 1};
+    for (uint32_t i = 0; i < kSlots; ++i) {
+        ASSERT_TRUE(recovery->Allocate(request).ok()) << "i=" << i;
+    }
+    auto exhausted = recovery->Allocate(request);
+    ASSERT_FALSE(exhausted.ok());
+    EXPECT_EQ(exhausted.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(::munmap(mapping, kRegionSize), 0);
+}
+#endif
 
 TEST_F(CentralSlabTest, ConcurrentAllocationsAreUnique) {
     // Class 0 has 8 usable slots; use 4 threads x 2 small allocations so we

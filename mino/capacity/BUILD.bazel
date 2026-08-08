@@ -1,0 +1,34 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "capacity",
+    srcs = ["capacity.cc"],
+    hdrs = ["capacity.h"],
+    deps = [
+        "//mino/common:checked_arithmetic",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "module_integration_test",
+    srcs = ["module_integration_test.cc"],
+    deps = [
+        ":capacity",
+        "//mino/common:status",
+        "//mino/registry",
+        "//mino/runtime/deployment:remote_bridge",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "capacity_test",
+    srcs = ["capacity_test.cc"],
+    deps = [
+        ":capacity",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)

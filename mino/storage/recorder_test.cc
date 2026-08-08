@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -847,6 +848,49 @@ TEST(RecorderTest, IsolatesWriterFailureFromHealthyTopic) {
     EXPECT_EQ((*recorder)->GetPartitionStatus(TopicId{16}, 0, 1002)
                   ->writer_state,
               TopicWriterState::kRunning);
+}
+
+TEST(RecorderCapacityTest, AddTopicCommitsExactEstimateAndDestructionReleasesIt) {
+    auto artifact = CompileArtifact("CapacityRecord");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    RecorderTopicConfig first =
+        TopicConfig(TopicId{90}, "capacity-first", *artifact, 2);
+    auto estimate = EstimateRecorderTopicResources(first);
+    ASSERT_TRUE(estimate.ok()) << estimate.status().ToString();
+
+    capacity::NodeBudget budget;
+    budget.limit = *estimate;
+    auto controller_result = capacity::CapacityController::Create(budget);
+    ASSERT_TRUE(controller_result.ok())
+        << controller_result.status().ToString();
+    auto controller = std::move(*controller_result);
+    auto recorder = Recorder::Create(TestDirectory("capacity"), SessionMetadata(),
+                                     {}, controller);
+    ASSERT_TRUE(recorder.ok()) << recorder.status().ToString();
+    ASSERT_TRUE((*recorder)->AddTopic(first).ok());
+    EXPECT_EQ(controller->Snapshot().committed, *estimate);
+
+    RecorderTopicConfig second =
+        TopicConfig(TopicId{91}, "capacity-second", *artifact, 2);
+    const Status denied = (*recorder)->AddTopic(second);
+    EXPECT_EQ(denied.code(), StatusCode::kResourceExhausted)
+        << denied.ToString();
+    EXPECT_TRUE(controller->Snapshot().pending.empty());
+    EXPECT_EQ(controller->Snapshot().committed, *estimate);
+
+    recorder->reset();
+    EXPECT_TRUE(controller->Snapshot().committed.empty());
+}
+
+TEST(RecorderCapacityTest, EstimateRejectsPartitionMultiplicationOverflow) {
+    auto artifact = CompileArtifact("CapacityOverflow");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    RecorderTopicConfig config =
+        TopicConfig(TopicId{92}, "capacity-overflow", *artifact, 2);
+    config.buffer_pool_options.global_byte_limit =
+        std::numeric_limits<size_t>::max();
+    EXPECT_EQ(EstimateRecorderTopicResources(config).status().code(),
+              StatusCode::kInvalidArgument);
 }
 
 }  // namespace

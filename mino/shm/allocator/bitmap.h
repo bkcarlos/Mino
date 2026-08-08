@@ -42,6 +42,12 @@ inline constexpr uint32_t kBitmapShardBits = 64;
 //     crash-recovery invariant of design doc 8.3) may clear.
 //   - IsSet is a point-in-time observation (acquire) used by recovery scans
 //     and Inspect; it must be combined with object_state to draw conclusions.
+struct BitmapClaim {
+    uint32_t bit_index = 0;
+    uint32_t shard_index = 0;
+    uint32_t shards_probed = 0;
+};
+
 class ShardedBitmap {
 public:
     // Initializes the bitmap over `shard_count` shards located at `storage`
@@ -61,6 +67,14 @@ public:
     // Claims one clear bit in [begin, end). This bounded variant prevents a
     // size-class allocation from spilling into another class's bit range.
     Result<uint32_t> FindAndSetFreeBitInRange(uint32_t begin, uint32_t end);
+
+    // Word-oriented bounded claim used by high-contention allocators. The scan
+    // begins in the shard containing bit_hint, wraps exactly once inside the
+    // range, and never examines a neighbouring size class. BitmapClaim reports
+    // whether the first (hinted) shard succeeded without adding shared state.
+    Result<BitmapClaim> FindAndSetFreeBitInRangeHinted(uint32_t begin,
+                                                      uint32_t end,
+                                                      uint32_t bit_hint);
 
     // Claims bits in the half-open global index range [begin, end) that are
     // currently clear. `end` must be <= bit_count() and `begin` <= `end`.

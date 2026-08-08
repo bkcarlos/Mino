@@ -258,6 +258,16 @@ bool WaitForReadyMessageCount(const TcpDriver& driver, size_t expected,
     return driver.stats().ready_receive_messages == expected;
 }
 
+bool WaitForQueuedSendBytes(const TcpDriver& driver, size_t expected,
+                            std::chrono::milliseconds timeout = 5000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (driver.stats().queued_send_bytes == expected) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return driver.stats().queued_send_bytes == expected;
+}
+
 TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
     TcpDriverOptions options = TestOptions();
     EXPECT_TRUE(ValidateTcpDriverOptions(options).ok());
@@ -567,6 +577,78 @@ TEST(TcpDriverTest, ControlReserveWorksAtFullDataQuotaWithoutInterleaving) {
     ASSERT_TRUE(ReceiveUntil(peer.get(), &received_wire,
                              expected_wire.size(), 5000ms));
     EXPECT_EQ(received_wire, expected_wire);
+}
+
+TEST(TcpDriverTest, GathersQueuedFramesAndPreservesAckCompletionSemantics) {
+    TcpDriverOptions options = TestOptions();
+    options.max_frame_body_bytes = 256 * 1024;
+    options.max_total_send_buffer_bytes = 16 * 1024 * 1024;
+    options.max_connection_send_buffer_bytes = 8 * 1024 * 1024;
+    options.max_control_send_buffer_bytes = 256 * 1024 + 4;
+    options.max_ready_receive_bytes = 16 * 1024 * 1024;
+    options.heartbeat_interval_ms = 1000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+
+    RawListener listener = ListenRaw(4096);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    constexpr size_t kFrameCount = 24;
+    std::vector<std::vector<std::byte>> bodies;
+    std::vector<SendOperation> operations;
+    std::vector<std::byte> expected_wire;
+    bodies.reserve(kFrameCount);
+    operations.reserve(kFrameCount);
+    for (size_t index = 0; index < kFrameCount; ++index) {
+        bodies.push_back(FrameBody(128 * 1024, 1000 + index));
+        const std::vector<std::byte> wire = Prefix(bodies.back());
+        expected_wire.insert(expected_wire.end(), wire.begin(), wire.end());
+        auto sent = driver->Send({
+            .connection_id = connected->id,
+            .payload = bodies.back(),
+            .target_stage = DeliveryStage::kRemoteAccepted,
+        });
+        ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+        operations.push_back(sent->operation);
+    }
+
+    std::vector<std::byte> received_wire;
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received_wire, expected_wire.size(),
+                             10s));
+    EXPECT_EQ(received_wire, expected_wire);
+    ASSERT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+    const TcpDriverStats stats = driver->stats();
+    EXPECT_GT(stats.successful_send_syscalls, 0u);
+    EXPECT_GT(stats.gathered_send_syscalls, 0u);
+    EXPECT_GT(stats.gathered_send_buffers, stats.gathered_send_syscalls);
+    EXPECT_GE(stats.sent_bytes, expected_wire.size());
+
+    for (const SendOperation operation : operations) {
+        ASSERT_TRUE(driver->ConfirmRemoteAccepted(operation).ok());
+    }
+    auto completions = driver->PollCompletions({
+        .max_completions = static_cast<uint32_t>(operations.size()),
+        .timeout_ms = 1000,
+        .connection_id = connected->id,
+    });
+    ASSERT_TRUE(completions.ok()) << completions.status().ToString();
+    ASSERT_EQ(completions->completions.size(), operations.size());
+    for (size_t index = 0; index < operations.size(); ++index) {
+        EXPECT_EQ(completions->completions[index].operation, operations[index]);
+        EXPECT_TRUE(completions->completions[index].status.ok());
+        EXPECT_EQ(completions->completions[index].reached_stage,
+                  DeliveryStage::kRemoteAccepted);
+    }
 }
 
 TEST(TcpDriverTest, IncrementalReaderAcceptsOneBytePrefixAndBodyFragments) {

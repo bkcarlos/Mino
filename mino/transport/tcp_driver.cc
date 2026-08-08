@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -38,6 +39,7 @@ using TimePoint = Clock::time_point;
 
 constexpr size_t kTcpPrefixBytes = 4;
 constexpr size_t kIoBudgetBytes = 256u * 1024u;
+constexpr size_t kMaxGatheredWriteBuffers = 64;
 
 Status Invalid(const char* message) {
     return Status::Error(StatusCode::kInvalidArgument, message);
@@ -149,6 +151,17 @@ ssize_t SendNoSignal(int fd, const void* data, size_t size) noexcept {
     return ::send(fd, data, size, MSG_NOSIGNAL);
 #else
     return ::send(fd, data, size, 0);
+#endif
+}
+
+ssize_t SendMessageNoSignal(int fd, std::span<iovec> buffers) noexcept {
+    msghdr message{};
+    message.msg_iov = buffers.data();
+    message.msg_iovlen = buffers.size();
+#if defined(MSG_NOSIGNAL)
+    return ::sendmsg(fd, &message, MSG_NOSIGNAL);
+#else
+    return ::sendmsg(fd, &message, 0);
 #endif
 }
 
@@ -779,6 +792,10 @@ public:
             .ready_receive_bytes = ready_receive_bytes_,
             .ready_receive_messages = ready_messages_.size(),
             .pending_accepts = accepted_.size(),
+            .successful_send_syscalls = successful_send_syscalls_,
+            .gathered_send_syscalls = gathered_send_syscalls_,
+            .gathered_send_buffers = gathered_send_buffers_,
+            .sent_bytes = sent_bytes_,
         };
     }
 
@@ -1344,6 +1361,8 @@ private:
                 if (sent == 0) {
                     return Unavailable("TCP heartbeat made no progress");
                 }
+                ++successful_send_syscalls_;
+                sent_bytes_ += static_cast<size_t>(sent);
                 connection.heartbeat_offset += static_cast<size_t>(sent);
                 budget -= static_cast<size_t>(sent);
                 connection.last_transmit = Clock::now();
@@ -1356,9 +1375,12 @@ private:
 
             std::deque<PendingWrite>* writes = nullptr;
             bool is_control = false;
+            size_t gather_limit = kMaxGatheredWriteBuffers;
             if (!connection.data_writes.empty() &&
                 connection.data_writes.front().offset != 0) {
                 writes = &connection.data_writes;
+                // Finishing this frame may expose higher-priority control data.
+                if (!connection.control_writes.empty()) gather_limit = 1;
             } else if (!connection.control_writes.empty() &&
                        connection.control_writes.front().offset != 0) {
                 writes = &connection.control_writes;
@@ -1371,40 +1393,72 @@ private:
             }
 
             if (writes != nullptr) {
-                PendingWrite& write = writes->front();
-                const size_t remaining = write.bytes.size() - write.offset;
-                const size_t amount = std::min(remaining, budget);
-                const ssize_t sent = SendNoSignal(
-                    connection.fd, write.bytes.data() + write.offset, amount);
+                std::array<iovec, kMaxGatheredWriteBuffers> vectors{};
+                size_t vector_count = 0;
+                size_t vector_bytes = 0;
+                for (PendingWrite& write : *writes) {
+                    if (vector_count >= gather_limit || vector_bytes >= budget) {
+                        break;
+                    }
+                    const size_t remaining = write.bytes.size() - write.offset;
+                    const size_t amount =
+                        std::min(remaining, budget - vector_bytes);
+                    vectors[vector_count++] = iovec{
+                        .iov_base = write.bytes.data() + write.offset,
+                        .iov_len = amount,
+                    };
+                    vector_bytes += amount;
+                }
+
+                ssize_t sent = -1;
+                do {
+                    sent = SendMessageNoSignal(
+                        connection.fd,
+                        std::span<iovec>(vectors).first(vector_count));
+                } while (sent < 0 && errno == EINTR);
                 if (sent < 0) {
-                    if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         return Status::Ok();
                     }
-                    return Unavailable("TCP send failed");
+                    return Unavailable("TCP gathered send failed");
                 }
                 if (sent == 0) return Unavailable("TCP send made no progress");
-                write.offset += static_cast<size_t>(sent);
-                budget -= static_cast<size_t>(sent);
-                connection.last_transmit = Clock::now();
-                if (write.offset != write.bytes.size()) continue;
 
-                const size_t wire_size = write.bytes.size();
-                if (is_control) {
-                    connection.queued_control_send_bytes -= wire_size;
-                    total_control_send_bytes_ -= wire_size;
-                    --total_control_send_messages_;
-                } else {
-                    if (write.operation.id != kInvalidOperationId) {
-                        connection.awaiting_ack.push_back(write.operation);
-                    }
-                    connection.queued_data_send_bytes -= wire_size;
-                    total_data_send_bytes_ -= wire_size;
+                ++successful_send_syscalls_;
+                if (vector_count > 1) {
+                    ++gathered_send_syscalls_;
+                    gathered_send_buffers_ += vector_count;
                 }
-                writes->pop_front();
-                // Deliberately no successful DeliveryCompletion here: TCP
-                // write is not remote acceptance. The protocol ACK calls
-                // ConfirmRemoteAccepted() for tracked data operations.
+                const size_t sent_bytes = static_cast<size_t>(sent);
+                sent_bytes_ += sent_bytes;
+                budget -= sent_bytes;
+                connection.last_transmit = Clock::now();
+
+                size_t consumed = sent_bytes;
+                while (consumed != 0) {
+                    PendingWrite& write = writes->front();
+                    const size_t remaining = write.bytes.size() - write.offset;
+                    const size_t amount = std::min(remaining, consumed);
+                    write.offset += amount;
+                    consumed -= amount;
+                    if (write.offset != write.bytes.size()) break;
+
+                    const size_t wire_size = write.bytes.size();
+                    if (is_control) {
+                        connection.queued_control_send_bytes -= wire_size;
+                        total_control_send_bytes_ -= wire_size;
+                        --total_control_send_messages_;
+                    } else {
+                        if (write.operation.id != kInvalidOperationId) {
+                            connection.awaiting_ack.push_back(write.operation);
+                        }
+                        connection.queued_data_send_bytes -= wire_size;
+                        total_data_send_bytes_ -= wire_size;
+                    }
+                    writes->pop_front();
+                    // TCP local write is not remote acceptance. The protocol ACK
+                    // confirms tracked operations after each full frame is sent.
+                }
                 continue;
             }
 
@@ -1422,6 +1476,8 @@ private:
             if (sent == 0) {
                 return Unavailable("TCP heartbeat made no progress");
             }
+            ++successful_send_syscalls_;
+            sent_bytes_ += static_cast<size_t>(sent);
             connection.heartbeat_offset = static_cast<size_t>(sent);
             budget -= static_cast<size_t>(sent);
             connection.last_transmit = Clock::now();
@@ -1460,6 +1516,10 @@ private:
     size_t ready_receive_bytes_ = 0;
     size_t reserved_receive_bytes_ = 0;
     size_t reserved_receive_messages_ = 0;
+    uint64_t successful_send_syscalls_ = 0;
+    uint64_t gathered_send_syscalls_ = 0;
+    uint64_t gathered_send_buffers_ = 0;
+    uint64_t sent_bytes_ = 0;
 };
 
 Result<std::unique_ptr<TcpDriver>> TcpDriver::Create(

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <span>
 #include <string>
@@ -178,6 +179,67 @@ TEST(RemoteBridgeTest, RejectsIncompatibleCompositionLimits) {
     auto created = RemoteBridge::Create(std::move(config), &ingress, auth);
     ASSERT_FALSE(created.ok());
     EXPECT_EQ(created.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(RemoteBridgeTest, CapacityAdmissionCommitsAndReleasesEstimatedResources) {
+    const std::filesystem::path first_root = StoreRoot();
+    const std::filesystem::path second_root = StoreRoot();
+    RemoteBridgeConfig config = Config(first_root);
+    auto estimate = EstimateRemoteBridgeResources(config);
+    ASSERT_TRUE(estimate.ok()) << estimate.status().ToString();
+    capacity::NodeBudget budget;
+    budget.limit = *estimate;
+    auto controller_result = capacity::CapacityController::Create(budget);
+    ASSERT_TRUE(controller_result.ok())
+        << controller_result.status().ToString();
+    auto controller = std::move(*controller_result);
+    SinkIngress ingress;
+    auto auth = std::make_shared<AcceptingAuth>();
+
+    auto first = RemoteBridge::Create(std::move(config), &ingress, auth,
+                                      controller);
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    EXPECT_EQ(controller->Snapshot().committed, *estimate);
+
+    auto denied = RemoteBridge::Create(Config(second_root), &ingress, auth,
+                                       controller);
+    ASSERT_FALSE(denied.ok());
+    EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_TRUE(controller->Snapshot().pending.empty());
+    EXPECT_EQ(controller->Snapshot().committed, *estimate);
+
+    first->reset();
+    EXPECT_TRUE(controller->Snapshot().committed.empty());
+    std::error_code ignored;
+    std::filesystem::remove_all(first_root, ignored);
+    std::filesystem::remove_all(second_root, ignored);
+}
+
+TEST(RemoteBridgeTest, CompositionFailureRollsBackPendingCapacity) {
+    const std::filesystem::path root = StoreRoot();
+    {
+        std::ofstream file(root);
+        ASSERT_TRUE(file.good());
+        file << "not a schema store directory";
+    }
+    capacity::NodeBudget budget;
+    budget.limit.bridge_connections = 1;
+    auto controller_result = capacity::CapacityController::Create(budget);
+    ASSERT_TRUE(controller_result.ok())
+        << controller_result.status().ToString();
+    auto controller = std::move(*controller_result);
+    capacity::ResourceVector charge;
+    charge.bridge_connections = 1;
+    SinkIngress ingress;
+    auto auth = std::make_shared<AcceptingAuth>();
+
+    auto failed = RemoteBridge::Create(Config(root), &ingress, auth, controller,
+                                       charge);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_TRUE(controller->Snapshot().pending.empty());
+    EXPECT_TRUE(controller->Snapshot().committed.empty());
+    std::error_code ignored;
+    std::filesystem::remove(root, ignored);
 }
 
 TEST(RemoteBridgeTest, RejectsMissingAuthenticationAndIngress) {

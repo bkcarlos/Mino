@@ -57,6 +57,48 @@ Status ValidateCompositionLimits(const RemoteBridgeConfig& config) {
 
 }  // namespace
 
+Result<capacity::ResourceVector> EstimateRemoteBridgeResources(
+    const RemoteBridgeConfig& config) noexcept {
+    capacity::ResourceVector resources;
+    resources.bridge_connections = 1;
+    resources.threads = 1;  // TcpDriver worker.
+
+    capacity::ResourceVector egress;
+    egress.bridge_egress_bytes = config.connection.max_egress_bytes;
+    capacity::ResourceVector tcp_egress;
+    tcp_egress.bridge_egress_bytes = config.tcp.max_total_send_buffer_bytes;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, egress));
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, tcp_egress));
+    egress = {};
+    egress.bridge_egress_bytes = config.tcp.max_control_send_buffer_bytes;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, egress));
+    egress.bridge_egress_bytes = config.connection.pipeline.retransmit.max_bytes;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, egress));
+
+    capacity::ResourceVector schema_buffers;
+    schema_buffers.schema_buffer_bytes =
+        config.schema_negotiation.max_buffered_bytes;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, schema_buffers));
+    schema_buffers.schema_buffer_bytes =
+        config.schema_negotiation.max_descriptor_bytes;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, schema_buffers));
+
+    capacity::ResourceVector descriptors;
+    descriptors.file_descriptors = config.connection.driver_config.max_connections;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, descriptors));
+    descriptors.file_descriptors = config.connection.driver_config.max_listeners;
+    MINO_ASSIGN_OR_RETURN(resources,
+                          capacity::CheckedAdd(resources, descriptors));
+    return resources;
+}
+
 class RemoteBridge::StorePersistence final
     : public bridge::DescriptorPersistence {
 public:
@@ -80,7 +122,9 @@ private:
 
 Result<std::unique_ptr<RemoteBridge>> RemoteBridge::Create(
     RemoteBridgeConfig config, bridge::BridgeIngressPort* ingress,
-    std::shared_ptr<bridge::DescriptorAuth> descriptor_auth) noexcept {
+    std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+    std::shared_ptr<capacity::CapacityController> capacity_controller,
+    std::optional<capacity::ResourceVector> capacity_charge) noexcept {
     try {
         if (ingress == nullptr || descriptor_auth == nullptr) {
             return Invalid("remote Bridge ingress or descriptor auth is null");
@@ -89,6 +133,25 @@ Result<std::unique_ptr<RemoteBridge>> RemoteBridge::Create(
             return Invalid("remote Bridge schema store root is empty");
         }
         MINO_RETURN_IF_ERROR(ValidateCompositionLimits(config));
+
+        capacity::CapacityReservation capacity_reservation;
+        if (capacity_controller) {
+            capacity::ResourceVector charge;
+            if (capacity_charge.has_value()) {
+                charge = *capacity_charge;
+            } else {
+                MINO_ASSIGN_OR_RETURN(charge,
+                                      EstimateRemoteBridgeResources(config));
+            }
+            MINO_ASSIGN_OR_RETURN(
+                capacity_reservation,
+                capacity_controller->Reserve(capacity::ResourceRequest{
+                    .resources = charge,
+                    .scope = capacity::ResourceScope::kBridge,
+                    .admission_class = capacity::AdmissionClass::kDataPlane,
+                    .name = "remote Bridge",
+                }));
+        }
 
         auto registry = std::make_unique<schema::SchemaRegistry>();
         MINO_ASSIGN_OR_RETURN(
@@ -111,10 +174,12 @@ Result<std::unique_ptr<RemoteBridge>> RemoteBridge::Create(
             bridge::BridgeConnectionManager::Create(
                 std::move(config.connection), driver, ingress,
                 negotiator.get()));
+        MINO_ASSIGN_OR_RETURN(auto capacity_lease,
+                              capacity_reservation.Commit());
         return std::unique_ptr<RemoteBridge>(new RemoteBridge(
-            std::move(registry), std::move(store), std::move(descriptor_auth),
-            std::move(persistence), std::move(negotiator), std::move(driver),
-            std::move(manager)));
+            std::move(capacity_lease), std::move(registry), std::move(store),
+            std::move(descriptor_auth), std::move(persistence),
+            std::move(negotiator), std::move(driver), std::move(manager)));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted,
                              "remote Bridge composition allocation failed");
@@ -125,6 +190,7 @@ Result<std::unique_ptr<RemoteBridge>> RemoteBridge::Create(
 }
 
 RemoteBridge::RemoteBridge(
+    capacity::CapacityLease capacity_lease,
     std::unique_ptr<schema::SchemaRegistry> registry,
     std::unique_ptr<storage::SchemaStore> store,
     std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
@@ -132,7 +198,8 @@ RemoteBridge::RemoteBridge(
     std::unique_ptr<bridge::SchemaNegotiator> negotiator,
     std::shared_ptr<transport::TcpDriver> driver,
     std::unique_ptr<bridge::BridgeConnectionManager> manager) noexcept
-    : registry_(std::move(registry)),
+    : capacity_lease_(std::move(capacity_lease)),
+      registry_(std::move(registry)),
       store_(std::move(store)),
       descriptor_auth_(std::move(descriptor_auth)),
       persistence_(std::move(persistence)),

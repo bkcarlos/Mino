@@ -548,5 +548,41 @@ TEST(RecorderServiceTest, SourceErrorDrainsAckedPendingBeforeStop) {
     ASSERT_TRUE((*service)->Stop().ok());
 }
 
+TEST(RecorderServiceCapacityTest, WorkerThreadChargeIsExclusiveAndReleased) {
+    capacity::NodeBudget budget;
+    budget.limit.threads = 1;
+    auto controller_result = capacity::CapacityController::Create(budget);
+    ASSERT_TRUE(controller_result.ok())
+        << controller_result.status().ToString();
+    auto controller = std::move(*controller_result);
+    const RecordingSessionMetadata metadata{
+        .recording_id = 901,
+        .created_at_ns = 1,
+        .owner_id = 2,
+        .owner_epoch = 3,
+        .config_version = 1,
+    };
+
+    auto first_recorder =
+        Recorder::Create(TestDirectory("capacity-first"), metadata);
+    ASSERT_TRUE(first_recorder.ok()) << first_recorder.status().ToString();
+    auto first_service = RecorderService::Create(
+        std::move(*first_recorder), {}, nullptr, controller);
+    ASSERT_TRUE(first_service.ok()) << first_service.status().ToString();
+    EXPECT_EQ(controller->Snapshot().committed.threads, 1u);
+
+    auto second_recorder =
+        Recorder::Create(TestDirectory("capacity-second"), metadata);
+    ASSERT_TRUE(second_recorder.ok()) << second_recorder.status().ToString();
+    auto denied = RecorderService::Create(
+        std::move(*second_recorder), {}, nullptr, controller);
+    ASSERT_FALSE(denied.ok());
+    EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_TRUE(controller->Snapshot().pending.empty());
+
+    first_service->reset();
+    EXPECT_EQ(controller->Snapshot().committed.threads, 0u);
+}
+
 }  // namespace
 }  // namespace mino::storage

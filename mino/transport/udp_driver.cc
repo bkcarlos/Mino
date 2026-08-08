@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -30,6 +31,9 @@ namespace mino::transport {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
+
+constexpr size_t kReceiveDatagramBudget = 4096;
 
 Status Invalid(const char* message) {
     return Status::Error(StatusCode::kInvalidArgument, message);
@@ -46,11 +50,61 @@ Status Timeout(const char* message) {
 Status Unavailable(const char* message) {
     return Status::Error(StatusCode::kUnavailable, message);
 }
+Status Corruption(const char* message) {
+    return Status::Error(StatusCode::kCorruption, message);
+}
 Status Internal(const char* message) {
     return Status::Error(StatusCode::kInternal, message);
 }
 Status AllocationFailure() {
     return Exhausted("UDP driver allocation failed");
+}
+
+void StoreBe16(uint16_t value, std::span<std::byte> output) noexcept {
+    output[0] = static_cast<std::byte>(value >> 8);
+    output[1] = static_cast<std::byte>(value);
+}
+
+void StoreBe32(uint32_t value, std::span<std::byte> output) noexcept {
+    output[0] = static_cast<std::byte>(value >> 24);
+    output[1] = static_cast<std::byte>(value >> 16);
+    output[2] = static_cast<std::byte>(value >> 8);
+    output[3] = static_cast<std::byte>(value);
+}
+
+void StoreBe64(uint64_t value, std::span<std::byte> output) noexcept {
+    StoreBe32(static_cast<uint32_t>(value >> 32), output.first<4>());
+    StoreBe32(static_cast<uint32_t>(value), output.subspan<4, 4>());
+}
+
+uint16_t LoadBe16(std::span<const std::byte> input) noexcept {
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(std::to_integer<uint8_t>(input[0])) << 8) |
+        static_cast<uint16_t>(std::to_integer<uint8_t>(input[1])));
+}
+
+uint32_t LoadBe32(std::span<const std::byte> input) noexcept {
+    return (static_cast<uint32_t>(std::to_integer<uint8_t>(input[0])) << 24) |
+           (static_cast<uint32_t>(std::to_integer<uint8_t>(input[1])) << 16) |
+           (static_cast<uint32_t>(std::to_integer<uint8_t>(input[2])) << 8) |
+           static_cast<uint32_t>(std::to_integer<uint8_t>(input[3]));
+}
+
+uint64_t LoadBe64(std::span<const std::byte> input) noexcept {
+    return (static_cast<uint64_t>(LoadBe32(input.first<4>())) << 32) |
+           LoadBe32(input.subspan<4, 4>());
+}
+
+uint32_t Crc32(std::span<const std::byte> input) noexcept {
+    uint32_t crc = 0xffffffffu;
+    for (const std::byte value : input) {
+        crc ^= std::to_integer<uint8_t>(value);
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xedb88320u & mask);
+        }
+    }
+    return ~crc;
 }
 
 class UniqueFd final {
@@ -150,12 +204,67 @@ int SocketFamily(const EndpointDescriptor& endpoint) noexcept {
     return -1;
 }
 
+size_t FragmentPayloadCapacity(const UdpDriverOptions& options) noexcept {
+    return options.max_datagram_bytes - kUdpFragmentHeaderBytes;
+}
+
+uint32_t RequiredFragmentCount(size_t message_bytes,
+                               const UdpDriverOptions& options) noexcept {
+    const size_t capacity = FragmentPayloadCapacity(options);
+    return static_cast<uint32_t>((message_bytes + capacity - 1) / capacity);
+}
+
+std::array<std::byte, kUdpFragmentHeaderBytes> BuildFragmentHeader(
+    uint64_t message_id, uint32_t fragment_id, uint32_t fragment_count,
+    uint32_t total_length, uint32_t fragment_offset, uint32_t crc32) noexcept {
+    std::array<std::byte, kUdpFragmentHeaderBytes> header{};
+    StoreBe32(kUdpFragmentMagic, std::span<std::byte>(header).subspan<0, 4>());
+    header[4] = static_cast<std::byte>(kUdpFragmentVersion);
+    header[5] = static_cast<std::byte>(kUdpFragmentFlag);
+    StoreBe16(kUdpFragmentHeaderBytes,
+              std::span<std::byte>(header).subspan<6, 2>());
+    StoreBe64(message_id, std::span<std::byte>(header).subspan<8, 8>());
+    StoreBe32(fragment_id, std::span<std::byte>(header).subspan<16, 4>());
+    StoreBe32(fragment_count, std::span<std::byte>(header).subspan<20, 4>());
+    StoreBe32(total_length, std::span<std::byte>(header).subspan<24, 4>());
+    StoreBe32(fragment_offset, std::span<std::byte>(header).subspan<28, 4>());
+    StoreBe32(crc32, std::span<std::byte>(header).subspan<32, 4>());
+    return header;
+}
+
 }  // namespace
 
 Status ValidateUdpDriverOptions(const UdpDriverOptions& options) {
-    if (options.max_datagram_bytes == 0 ||
+    if (options.max_datagram_bytes < kUdpMinimumFragmentDatagramBytes ||
         options.max_datagram_bytes > kUdpMaximumDatagramBytes) {
         return Invalid("UDP datagram bound is invalid");
+    }
+    if (options.max_message_bytes < options.max_datagram_bytes ||
+        options.max_message_bytes > kMaxPayloadBytes) {
+        return Invalid("UDP message bound is invalid");
+    }
+    if (options.max_fragments_per_message < 2 ||
+        options.max_fragments_per_message > kUdpMaximumFragmentsPerMessage ||
+        RequiredFragmentCount(options.max_message_bytes, options) >
+            options.max_fragments_per_message) {
+        return Invalid("UDP fragment-count bound is invalid");
+    }
+    if (options.max_reassembly_bytes_per_connection <
+            options.max_message_bytes ||
+        options.max_reassembly_bytes_global <
+            options.max_reassembly_bytes_per_connection ||
+        options.max_reassembly_bytes_global > kMaxReceiveBatchBytes) {
+        return Invalid("UDP reassembly byte quotas are inconsistent");
+    }
+    if (options.max_reassembly_messages_per_connection == 0 ||
+        options.max_reassembly_messages_global <
+            options.max_reassembly_messages_per_connection ||
+        options.max_reassembly_messages_global > kMaxQueuedSends) {
+        return Invalid("UDP reassembly message quotas are inconsistent");
+    }
+    if (options.reassembly_timeout_ms == 0 ||
+        options.reassembly_timeout_ms > kMaxOperationTimeoutMs) {
+        return Invalid("UDP reassembly timeout is invalid");
     }
     if (options.socket_receive_buffer_bytes < options.max_datagram_bytes ||
         options.socket_receive_buffer_bytes > kMaxReceiveBatchBytes) {
@@ -210,6 +319,10 @@ public:
         }
         sockets_.clear();
         closed_.clear();
+        reassemblies_.clear();
+        recently_completed_.clear();
+        reassembly_bytes_ = 0;
+        reassembly_messages_ = 0;
         completions_.clear();
         completion_count_ = 0;
         if (wake_read_fd_ >= 0) (void)::close(wake_read_fd_);
@@ -248,8 +361,8 @@ public:
         MINO_ASSIGN_OR_RETURN(auto local_endpoint,
                               FromSocketAddress(local_storage, local_size));
 
-        Wake();
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         if (sockets_.size() >= config_.max_connections) {
             return Exhausted("UDP socket limit reached");
         }
@@ -262,6 +375,7 @@ public:
             .peer_endpoint = request.remote_endpoint,
         };
         sockets_.emplace(id, SocketState{.info = info, .fd = fd.release()});
+        Wake();
         return info;
     }
 
@@ -280,8 +394,8 @@ public:
             return Unavailable("failed to bind UDP listener");
         }
 
-        Wake();
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         size_t listeners = 0;
         for (const auto& [id, socket] : sockets_) {
             (void)id;
@@ -304,13 +418,14 @@ public:
             .peer_endpoint = std::nullopt,
         };
         sockets_.emplace(id, SocketState{.info = info, .fd = fd.release()});
+        Wake();
         return info;
     }
 
     Result<SendResult> Send(const SendRequest& request,
                             SendOperation operation) {
-        Wake();
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         const auto found = sockets_.find(request.connection_id);
         if (found == sockets_.end()) {
             return Status::Error(StatusCode::kNotFound,
@@ -320,20 +435,7 @@ public:
             return Status::Error(StatusCode::kUnsupported,
                                  "UDP listener has no configured send peer");
         }
-        ssize_t sent = -1;
-        do {
-            sent = ::send(found->second.fd, request.payload.data(),
-                          request.payload.size(), 0);
-        } while (sent < 0 && errno == EINTR);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return WouldBlock("UDP socket send buffer is full");
-            }
-            return Unavailable("UDP datagram send failed");
-        }
-        if (static_cast<size_t>(sent) != request.payload.size()) {
-            return Internal("UDP socket reported a partial datagram send");
-        }
+        MINO_RETURN_IF_ERROR(SendMessageLocked(found->second, request.payload));
         if (completion_count_ >= completions_.size()) {
             return Internal("UDP completion ring is inconsistent");
         }
@@ -352,8 +454,8 @@ public:
     }
 
     Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
-        Wake();
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         const auto found = sockets_.find(request.connection_id);
         if (found == sockets_.end()) {
             return Status::Error(StatusCode::kNotFound,
@@ -363,31 +465,29 @@ public:
             return Status::Error(StatusCode::kUnsupported,
                                  "UDP listener has no configured send peer");
         }
-        ssize_t sent = -1;
-        do {
-            sent = ::send(found->second.fd, request.payload.data(),
-                          request.payload.size(), 0);
-        } while (sent < 0 && errno == EINTR);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return WouldBlock("UDP socket send buffer is full");
-            }
-            return Unavailable("UDP datagram send failed");
-        }
-        if (static_cast<size_t>(sent) != request.payload.size()) {
-            return Internal("UDP socket reported a partial datagram send");
-        }
+        MINO_RETURN_IF_ERROR(SendMessageLocked(found->second, request.payload));
         return request.payload.size();
     }
 
     Result<ReceiveResult> PollMessages(const ReceiveRequest& request) {
         std::unique_lock lock(mutex_);
-        const auto deadline =
+        const TimePoint deadline =
             Clock::now() + std::chrono::milliseconds(request.timeout_ms);
+        size_t inspected_datagrams = 0;
         for (;;) {
             if (stop_requested_.load(std::memory_order_acquire)) {
                 return Unavailable("UDP driver is stopping");
             }
+            CleanupExpiredLocked(Clock::now());
+
+            ReceiveResult result;
+            result.messages.reserve(request.max_messages);
+            size_t total_bytes = 0;
+            const Status ready_status =
+                DrainCompletedLocked(request, &result, &total_bytes);
+            if (!ready_status.ok()) return ready_status;
+            if (!result.messages.empty()) return result;
+
             std::vector<pollfd> descriptors;
             std::vector<ConnectionId> ids;
             descriptors.reserve(1 + sockets_.size());
@@ -404,16 +504,19 @@ public:
                     pollfd{.fd = socket.fd, .events = POLLIN, .revents = 0});
                 ids.push_back(id);
             }
+
             int timeout_ms = 0;
             if (request.timeout_ms != 0) {
                 const auto remaining =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         deadline - Clock::now());
                 if (remaining.count() <= 0) {
+                    CleanupExpiredLocked(Clock::now());
                     return Timeout("UDP receive timed out");
                 }
-                timeout_ms = static_cast<int>(std::min<int64_t>(
-                    options_.io_poll_max_ms, remaining.count()));
+                timeout_ms = static_cast<int>(std::max<int64_t>(
+                    1, std::min<int64_t>(options_.io_poll_max_ms,
+                                         remaining.count())));
             }
             const int polled =
                 ::poll(descriptors.data(), descriptors.size(), timeout_ms);
@@ -422,6 +525,7 @@ public:
                 return Unavailable("UDP receive poll failed");
             }
             if (polled == 0) {
+                CleanupExpiredLocked(Clock::now());
                 if (request.timeout_ms == 0) {
                     return WouldBlock("UDP receive queue is empty");
                 }
@@ -430,52 +534,39 @@ public:
                 }
                 continue;
             }
-            if ((descriptors[0].revents & POLLIN) != 0) {
-                DrainWakePipe();
-                lock.unlock();
-                std::this_thread::yield();
-                lock.lock();
-                continue;
-            }
+            if ((descriptors[0].revents & POLLIN) != 0) DrainWakePipe();
 
-            ReceiveResult result;
-            result.messages.reserve(request.max_messages);
             std::vector<std::byte> inspection_buffer(
                 static_cast<size_t>(options_.max_datagram_bytes) + 1);
-            size_t total_bytes = 0;
-            size_t inspected_datagrams = 0;
-            const size_t inspected_datagram_budget = request.max_messages;
-            const size_t socket_descriptor_count = descriptors.size() - 1;
-            size_t next_descriptor_offset = 0;
+            const size_t socket_count = descriptors.size() - 1;
+            if (socket_count == 0) continue;
+            size_t next_offset = 0;
             if (next_poll_connection_id_ != kInvalidConnectionId) {
-                for (size_t offset = 0; offset < socket_descriptor_count;
-                     ++offset) {
+                for (size_t offset = 0; offset < socket_count; ++offset) {
                     if (ids[offset + 1] == next_poll_connection_id_) {
-                        next_descriptor_offset = offset;
+                        next_offset = offset;
                         break;
                     }
                 }
             }
-            while (result.messages.size() < request.max_messages &&
-                   inspected_datagrams < inspected_datagram_budget) {
-                bool inspected_in_sweep = false;
-                const size_t sweep_start = next_descriptor_offset;
-                for (size_t offset = 0;
-                     offset < socket_descriptor_count &&
-                     result.messages.size() < request.max_messages &&
-                     inspected_datagrams < inspected_datagram_budget;
-                     ++offset) {
-                    const size_t descriptor_offset =
-                        (sweep_start + offset) % socket_descriptor_count;
-                    const size_t index = descriptor_offset + 1;
-                    if ((descriptors[index].revents & POLLIN) == 0) continue;
+
+            bool made_progress = false;
+            const size_t sweep_start = next_offset;
+            for (size_t offset = 0;
+                 offset < socket_count &&
+                 result.messages.size() < request.max_messages &&
+                 inspected_datagrams < kReceiveDatagramBudget;
+                 ++offset) {
+                const size_t descriptor_offset =
+                    (sweep_start + offset) % socket_count;
+                const size_t index = descriptor_offset + 1;
+                if ((descriptors[index].revents & POLLIN) == 0) continue;
+
+                while (result.messages.size() < request.max_messages &&
+                       inspected_datagrams < kReceiveDatagramBudget) {
                     if (stop_requested_.load(std::memory_order_acquire)) {
                         if (!result.messages.empty()) return result;
                         return Unavailable("UDP driver is stopping");
-                    }
-                    if (request.timeout_ms != 0 && Clock::now() >= deadline) {
-                        if (!result.messages.empty()) return result;
-                        return Timeout("UDP receive timed out");
                     }
                     ssize_t inspected = -1;
                     do {
@@ -484,88 +575,98 @@ public:
                                            inspection_buffer.size(), MSG_PEEK);
                     } while (inspected < 0 && errno == EINTR);
                     if (inspected < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         return Unavailable("failed to inspect UDP datagram size");
                     }
-                    inspected_in_sweep = true;
+                    made_progress = true;
                     ++inspected_datagrams;
-                    next_descriptor_offset =
-                        (descriptor_offset + 1) % socket_descriptor_count;
-                    next_poll_connection_id_ =
-                        ids[next_descriptor_offset + 1];
-                    const size_t size = static_cast<size_t>(inspected);
-                    if (size > options_.max_datagram_bytes) {
+                    next_offset = (descriptor_offset + 1) % socket_count;
+                    next_poll_connection_id_ = ids[next_offset + 1];
+                    const size_t datagram_size = static_cast<size_t>(inspected);
+                    if (datagram_size > options_.max_datagram_bytes) {
                         if (!result.messages.empty()) return result;
-                        ssize_t discarded = -1;
-                        do {
-                            discarded = ::recv(descriptors[index].fd,
-                                               inspection_buffer.data(),
-                                               inspection_buffer.size(), 0);
-                        } while (discarded < 0 && errno == EINTR);
-                        if (discarded < 0 && errno != EAGAIN &&
-                            errno != EWOULDBLOCK) {
-                            return Unavailable(
-                                "failed to discard oversized UDP datagram");
-                        }
+                        MINO_RETURN_IF_ERROR(DiscardDatagram(descriptors[index].fd,
+                                                            inspection_buffer));
                         return Exhausted("UDP datagram exceeds configured bound");
                     }
-                    if (size == 0) {
-                        std::array<std::byte, 1> discard{};
-                        ssize_t discarded = -1;
-                        do {
-                            discarded = ::recv(descriptors[index].fd,
-                                               discard.data(), discard.size(), 0);
-                        } while (discarded < 0 && errno == EINTR);
-                        if (discarded < 0) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                            return Unavailable(
-                                "failed to discard empty UDP datagram");
-                        }
-                        if (discarded != 0) {
-                            return Internal(
-                                "UDP datagram size changed while receiving");
-                        }
+                    if (datagram_size == 0) {
+                        MINO_RETURN_IF_ERROR(DiscardDatagram(descriptors[index].fd,
+                                                            inspection_buffer));
                         continue;
                     }
-                    if (size > request.max_bytes - total_bytes) {
+
+                    const bool fragment_candidate =
+                        datagram_size >= 4 &&
+                        LoadBe32(std::span<const std::byte>(inspection_buffer)
+                                     .first<4>()) == kUdpFragmentMagic;
+                    if (!fragment_candidate &&
+                        datagram_size > request.max_bytes - total_bytes) {
                         if (result.messages.empty()) {
                             return Exhausted(
                                 "next UDP datagram exceeds receive byte budget");
                         }
                         return result;
                     }
+
                     sockaddr_storage peer{};
                     socklen_t peer_size = sizeof(peer);
-                    std::vector<std::byte> payload(size);
+                    std::vector<std::byte> datagram(datagram_size);
                     ssize_t received = -1;
                     do {
                         received = ::recvfrom(
-                            descriptors[index].fd, payload.data(), payload.size(),
+                            descriptors[index].fd, datagram.data(), datagram.size(),
                             0, reinterpret_cast<sockaddr*>(&peer), &peer_size);
                     } while (received < 0 && errno == EINTR);
                     if (received < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         return Unavailable("UDP datagram receive failed");
                     }
-                    if (static_cast<size_t>(received) != size) {
+                    if (static_cast<size_t>(received) != datagram_size) {
                         return Internal("UDP datagram size changed while receiving");
                     }
                     MINO_ASSIGN_OR_RETURN(auto from,
                                           FromSocketAddress(peer, peer_size));
-                    result.messages.push_back(ReceivedMessage{
-                        .connection_id = ids[index],
-                        .from = from,
-                        .payload = std::move(payload),
-                    });
-                    total_bytes += size;
+                    MINO_ASSIGN_OR_RETURN(
+                        auto message,
+                        ProcessDatagramLocked(ids[index], from, datagram));
+                    if (message.has_value()) {
+                        total_bytes += message->payload.size();
+                        result.messages.push_back(std::move(*message));
+                    }
+                    const Status completed_status =
+                        DrainCompletedLocked(request, &result, &total_bytes);
+                    if (!completed_status.ok()) {
+                        if (!result.messages.empty()) return result;
+                        return completed_status;
+                    }
                 }
-                if (!inspected_in_sweep) break;
             }
             if (!result.messages.empty()) return result;
+            if (inspected_datagrams >= kReceiveDatagramBudget) {
+                if (request.timeout_ms == 0) {
+                    return WouldBlock("UDP receive datagram work quota exhausted");
+                }
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    return Unavailable("UDP driver is stopping");
+                }
+                if (Clock::now() >= deadline) {
+                    CleanupExpiredLocked(Clock::now());
+                    return Timeout("UDP receive timed out");
+                }
+                inspected_datagrams = 0;
+                lock.unlock();
+                std::this_thread::yield();
+                lock.lock();
+                continue;
+            }
             if (request.timeout_ms == 0) {
                 return WouldBlock("UDP receive queue is empty");
             }
-            if (inspected_datagrams != 0) {
+            if (Clock::now() >= deadline) {
+                CleanupExpiredLocked(Clock::now());
+                return Timeout("UDP receive timed out");
+            }
+            if (made_progress) {
                 lock.unlock();
                 std::this_thread::yield();
                 lock.lock();
@@ -576,6 +677,7 @@ public:
     Result<CompletionPollResult> PollCompletions(
         const CompletionPollRequest& request) {
         std::unique_lock lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         const auto has_matching_completion = [this, &request] {
             for (size_t offset = 0; offset < completion_count_; ++offset) {
                 const size_t index =
@@ -628,8 +730,8 @@ public:
     }
 
     Status Close(ConnectionId id) {
-        Wake();
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         const auto found = sockets_.find(id);
         if (found == sockets_.end()) {
             return closed_.contains(id)
@@ -637,14 +739,17 @@ public:
                        : Status::Error(StatusCode::kNotFound,
                                        "UDP connection does not exist");
         }
+        RemoveConnectionReassembliesLocked(id);
         if (found->second.fd >= 0) (void)::close(found->second.fd);
         sockets_.erase(found);
         closed_.insert(id);
+        Wake();
         return Status::Ok();
     }
 
-    UdpDriverStats Stats() const noexcept {
+    UdpDriverStats Stats() noexcept {
         std::lock_guard lock(mutex_);
+        CleanupExpiredLocked(Clock::now());
         size_t listeners = 0;
         for (const auto& [id, socket] : sockets_) {
             (void)id;
@@ -654,6 +759,15 @@ public:
             .connected_sockets = sockets_.size() - listeners,
             .listeners = listeners,
             .pending_completions = completion_count_,
+            .reassembly_bytes = reassembly_bytes_,
+            .reassembly_messages = reassembly_messages_,
+            .fragmented_messages_sent = fragmented_messages_sent_,
+            .fragments_sent = fragments_sent_,
+            .fragments_received = fragments_received_,
+            .duplicate_fragments = duplicate_fragments_,
+            .reassembled_messages = reassembled_messages_,
+            .reassembly_timeouts = reassembly_timeouts_,
+            .rejected_fragments = rejected_fragments_,
         };
     }
 
@@ -661,7 +775,56 @@ private:
     struct SocketState {
         ConnectionInfo info;
         int fd = -1;
+        uint64_t next_message_id = 1;
+        size_t reassembly_bytes = 0;
+        size_t reassembly_messages = 0;
     };
+
+    struct PeerIdentity {
+        EndpointAddressFamily family = EndpointAddressFamily::kUnspecified;
+        std::array<std::byte, EndpointDescriptor::kIpv6AddressBytes> address{};
+        uint16_t port = 0;
+
+        friend bool operator==(const PeerIdentity&, const PeerIdentity&) = default;
+    };
+
+    struct ReassemblyKey {
+        ConnectionId connection_id = kInvalidConnectionId;
+        PeerIdentity peer;
+        uint64_t message_id = 0;
+
+        friend bool operator==(const ReassemblyKey&, const ReassemblyKey&) =
+            default;
+    };
+
+    struct ReassemblyKeyHash {
+        size_t operator()(const ReassemblyKey& key) const noexcept {
+            size_t hash = std::hash<uint64_t>{}(key.connection_id);
+            hash ^= std::hash<uint64_t>{}(key.message_id) + 0x9e3779b9u +
+                    (hash << 6) + (hash >> 2);
+            hash ^= static_cast<size_t>(key.peer.family) + key.peer.port;
+            for (const std::byte value : key.peer.address) {
+                hash = (hash * 16777619u) ^ std::to_integer<uint8_t>(value);
+            }
+            return hash;
+        }
+    };
+
+    struct ReassemblyState {
+        EndpointDescriptor from;
+        uint32_t total_length = 0;
+        uint32_t fragment_count = 0;
+        uint32_t expected_crc32 = 0;
+        uint32_t received_count = 0;
+        size_t received_bytes = 0;
+        TimePoint created{};
+        std::vector<std::byte> payload;
+        std::vector<uint8_t> received;
+        bool complete = false;
+    };
+
+    using ReassemblyMap =
+        std::unordered_map<ReassemblyKey, ReassemblyState, ReassemblyKeyHash>;
 
     Status ConfigureSocket(int fd) const {
         MINO_RETURN_IF_ERROR(SetDescriptorFlags(fd));
@@ -681,6 +844,352 @@ private:
             if (next_id_ == kInvalidConnectionId) next_id_ = 1;
             if (id != kInvalidConnectionId && !sockets_.contains(id)) return id;
         }
+    }
+
+    Status SendMessageLocked(SocketState& socket,
+                             std::span<const std::byte> payload) {
+        if (payload.size() <= options_.max_datagram_bytes) {
+            ssize_t sent = -1;
+            do {
+                sent = ::send(socket.fd, payload.data(), payload.size(), 0);
+            } while (sent < 0 && errno == EINTR);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return WouldBlock("UDP socket send buffer is full");
+                }
+                return Unavailable("UDP datagram send failed");
+            }
+            if (static_cast<size_t>(sent) != payload.size()) {
+                return Internal("UDP socket reported a partial datagram send");
+            }
+            return Status::Ok();
+        }
+
+        const uint32_t fragment_count =
+            RequiredFragmentCount(payload.size(), options_);
+        if (fragment_count > options_.max_fragments_per_message) {
+            return Exhausted("UDP message exceeds fragment-count bound");
+        }
+        uint64_t message_id = socket.next_message_id++;
+        if (message_id == 0) {
+            message_id = socket.next_message_id++;
+        }
+        const uint32_t crc32 = Crc32(payload);
+        const size_t capacity = FragmentPayloadCapacity(options_);
+        for (uint32_t fragment_id = 0; fragment_id < fragment_count;
+             ++fragment_id) {
+            const size_t offset = static_cast<size_t>(fragment_id) * capacity;
+            const size_t fragment_bytes =
+                std::min(capacity, payload.size() - offset);
+            auto header = BuildFragmentHeader(
+                message_id, fragment_id, fragment_count,
+                static_cast<uint32_t>(payload.size()),
+                static_cast<uint32_t>(offset), crc32);
+            std::array<iovec, 2> vectors{
+                iovec{.iov_base = header.data(), .iov_len = header.size()},
+                iovec{.iov_base = const_cast<std::byte*>(payload.data() + offset),
+                      .iov_len = fragment_bytes},
+            };
+            msghdr message{};
+            message.msg_iov = vectors.data();
+            message.msg_iovlen = vectors.size();
+            ssize_t sent = -1;
+            do {
+#if defined(MSG_NOSIGNAL)
+                sent = ::sendmsg(socket.fd, &message, MSG_NOSIGNAL);
+#else
+                sent = ::sendmsg(socket.fd, &message, 0);
+#endif
+            } while (sent < 0 && errno == EINTR);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return WouldBlock("UDP fragment send buffer is full");
+                }
+                return Unavailable("UDP fragment send failed");
+            }
+            if (static_cast<size_t>(sent) != header.size() + fragment_bytes) {
+                return Internal("UDP socket reported a partial fragment send");
+            }
+            ++fragments_sent_;
+        }
+        ++fragmented_messages_sent_;
+        return Status::Ok();
+    }
+
+    static PeerIdentity MakePeerIdentity(
+        const EndpointDescriptor& endpoint) noexcept {
+        PeerIdentity identity;
+        identity.family = endpoint.address_family();
+        identity.port = endpoint.port();
+        const auto address = endpoint.ip_address();
+        std::copy(address.begin(), address.end(), identity.address.begin());
+        return identity;
+    }
+
+    Result<std::optional<ReceivedMessage>> RejectFragment(
+        const Status& status) {
+        ++rejected_fragments_;
+        return status;
+    }
+
+    Result<std::optional<ReceivedMessage>> ProcessDatagramLocked(
+        ConnectionId connection_id, const EndpointDescriptor& from,
+        std::span<const std::byte> datagram) {
+        if (datagram.size() < 4 || LoadBe32(datagram.first<4>()) !=
+                                      kUdpFragmentMagic) {
+            return std::optional<ReceivedMessage>(ReceivedMessage{
+                .connection_id = connection_id,
+                .from = from,
+                .payload = std::vector<std::byte>(datagram.begin(),
+                                                  datagram.end()),
+            });
+        }
+        if (datagram.size() < kUdpFragmentHeaderBytes) {
+            return RejectFragment(Corruption("UDP fragment header is truncated"));
+        }
+        if (std::to_integer<uint8_t>(datagram[4]) != kUdpFragmentVersion ||
+            std::to_integer<uint8_t>(datagram[5]) != kUdpFragmentFlag ||
+            LoadBe16(datagram.subspan<6, 2>()) != kUdpFragmentHeaderBytes) {
+            return RejectFragment(
+                Corruption("UDP fragment version, flags, or header size is invalid"));
+        }
+
+        const uint64_t message_id = LoadBe64(datagram.subspan<8, 8>());
+        const uint32_t fragment_id = LoadBe32(datagram.subspan<16, 4>());
+        const uint32_t fragment_count = LoadBe32(datagram.subspan<20, 4>());
+        const uint32_t total_length = LoadBe32(datagram.subspan<24, 4>());
+        const uint32_t fragment_offset = LoadBe32(datagram.subspan<28, 4>());
+        const uint32_t expected_crc32 = LoadBe32(datagram.subspan<32, 4>());
+        const size_t fragment_bytes = datagram.size() - kUdpFragmentHeaderBytes;
+        const size_t capacity = FragmentPayloadCapacity(options_);
+
+        if (message_id == 0 || fragment_count < 2 ||
+            fragment_count > options_.max_fragments_per_message ||
+            fragment_id >= fragment_count ||
+            total_length <= options_.max_datagram_bytes ||
+            total_length > options_.max_message_bytes || fragment_bytes == 0) {
+            return RejectFragment(Corruption("UDP fragment metadata is out of bounds"));
+        }
+        const uint32_t required_count =
+            RequiredFragmentCount(total_length, options_);
+        const uint64_t required_offset =
+            static_cast<uint64_t>(fragment_id) * capacity;
+        if (fragment_count != required_count ||
+            required_offset != fragment_offset ||
+            required_offset >= total_length) {
+            return RejectFragment(
+                Corruption("UDP fragment count or offset is non-canonical"));
+        }
+        const size_t expected_fragment_bytes = std::min<size_t>(
+            capacity, static_cast<size_t>(total_length) - fragment_offset);
+        if (fragment_bytes != expected_fragment_bytes) {
+            return RejectFragment(
+                Corruption("UDP fragment payload length is invalid"));
+        }
+
+        const ReassemblyKey key{
+            .connection_id = connection_id,
+            .peer = MakePeerIdentity(from),
+            .message_id = message_id,
+        };
+        if (recently_completed_.contains(key)) {
+            ++duplicate_fragments_;
+            return std::optional<ReceivedMessage>{};
+        }
+
+        auto found = reassemblies_.find(key);
+        if (found == reassemblies_.end()) {
+            auto socket = sockets_.find(connection_id);
+            if (socket == sockets_.end()) {
+                return RejectFragment(
+                    Corruption("UDP fragment references a closed connection"));
+            }
+            if (socket->second.reassembly_messages >=
+                    options_.max_reassembly_messages_per_connection ||
+                reassembly_messages_ >=
+                    options_.max_reassembly_messages_global ||
+                total_length >
+                    options_.max_reassembly_bytes_per_connection -
+                        socket->second.reassembly_bytes ||
+                total_length >
+                    options_.max_reassembly_bytes_global - reassembly_bytes_) {
+                ++rejected_fragments_;
+                return Exhausted("UDP reassembly quota is full");
+            }
+            ReassemblyState state{
+                .from = from,
+                .total_length = total_length,
+                .fragment_count = fragment_count,
+                .expected_crc32 = expected_crc32,
+                .created = Clock::now(),
+                .payload = std::vector<std::byte>(total_length),
+                .received = std::vector<uint8_t>(fragment_count, 0),
+            };
+            auto inserted = reassemblies_.emplace(key, std::move(state));
+            found = inserted.first;
+            socket->second.reassembly_bytes += total_length;
+            ++socket->second.reassembly_messages;
+            reassembly_bytes_ += total_length;
+            ++reassembly_messages_;
+        }
+
+        ReassemblyState& state = found->second;
+        if (state.total_length != total_length ||
+            state.fragment_count != fragment_count ||
+            state.expected_crc32 != expected_crc32 || state.from != from) {
+            RemoveReassemblyLocked(found, false);
+            return RejectFragment(
+                Corruption("UDP fragments disagree on message metadata"));
+        }
+        if (state.complete) {
+            ++duplicate_fragments_;
+            return std::optional<ReceivedMessage>{};
+        }
+        const auto fragment_payload =
+            datagram.subspan(kUdpFragmentHeaderBytes);
+        if (state.received[fragment_id] != 0) {
+            const auto existing = std::span<const std::byte>(state.payload)
+                                      .subspan(fragment_offset, fragment_bytes);
+            if (!std::equal(existing.begin(), existing.end(),
+                            fragment_payload.begin())) {
+                RemoveReassemblyLocked(found, false);
+                return RejectFragment(
+                    Corruption("duplicate UDP fragment payload conflicts"));
+            }
+            ++duplicate_fragments_;
+            return std::optional<ReceivedMessage>{};
+        }
+
+        std::copy(fragment_payload.begin(), fragment_payload.end(),
+                  state.payload.begin() + fragment_offset);
+        state.received[fragment_id] = 1;
+        ++state.received_count;
+        state.received_bytes += fragment_bytes;
+        ++fragments_received_;
+        if (state.received_count != state.fragment_count) {
+            return std::optional<ReceivedMessage>{};
+        }
+        if (state.received_bytes != state.total_length ||
+            Crc32(state.payload) != state.expected_crc32) {
+            RemoveReassemblyLocked(found, false);
+            return RejectFragment(
+                Corruption("reassembled UDP message failed integrity check"));
+        }
+        state.complete = true;
+        ++reassembled_messages_;
+        return std::optional<ReceivedMessage>{};
+    }
+
+    Status DrainCompletedLocked(const ReceiveRequest& request,
+                                ReceiveResult* result, size_t* total_bytes) {
+        for (auto found = reassemblies_.begin();
+             found != reassemblies_.end() &&
+             result->messages.size() < request.max_messages;) {
+            ReassemblyState& state = found->second;
+            if (!state.complete ||
+                (request.connection_id != kInvalidConnectionId &&
+                 found->first.connection_id != request.connection_id)) {
+                ++found;
+                continue;
+            }
+            if (state.payload.size() > request.max_bytes - *total_bytes) {
+                if (result->messages.empty()) {
+                    return Exhausted(
+                        "next reassembled UDP message exceeds receive byte budget");
+                }
+                break;
+            }
+            *total_bytes += state.payload.size();
+            result->messages.push_back(ReceivedMessage{
+                .connection_id = found->first.connection_id,
+                .from = state.from,
+                .payload = std::move(state.payload),
+            });
+            found = RemoveReassemblyLocked(found, true);
+        }
+        return Status::Ok();
+    }
+
+    ReassemblyMap::iterator RemoveReassemblyLocked(
+        ReassemblyMap::iterator found, bool remember_completed) {
+        const ReassemblyKey key = found->first;
+        const size_t bytes = found->second.total_length;
+        auto socket = sockets_.find(key.connection_id);
+        if (socket != sockets_.end()) {
+            socket->second.reassembly_bytes -= bytes;
+            --socket->second.reassembly_messages;
+        }
+        reassembly_bytes_ -= bytes;
+        --reassembly_messages_;
+        auto next = reassemblies_.erase(found);
+        if (remember_completed) RememberCompletedLocked(key, Clock::now());
+        return next;
+    }
+
+    void RememberCompletedLocked(const ReassemblyKey& key, TimePoint now) {
+        while (recently_completed_.size() >=
+               options_.max_reassembly_messages_global) {
+            auto oldest = std::min_element(
+                recently_completed_.begin(), recently_completed_.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.second < rhs.second;
+                });
+            if (oldest == recently_completed_.end()) break;
+            recently_completed_.erase(oldest);
+        }
+        recently_completed_.insert_or_assign(key, now);
+    }
+
+    void CleanupExpiredLocked(TimePoint now) {
+        const auto timeout =
+            std::chrono::milliseconds(options_.reassembly_timeout_ms);
+        for (auto found = reassemblies_.begin(); found != reassemblies_.end();) {
+            if (now - found->second.created >= timeout) {
+                found = RemoveReassemblyLocked(found, false);
+                ++reassembly_timeouts_;
+            } else {
+                ++found;
+            }
+        }
+        for (auto found = recently_completed_.begin();
+             found != recently_completed_.end();) {
+            if (now - found->second >= timeout) {
+                found = recently_completed_.erase(found);
+            } else {
+                ++found;
+            }
+        }
+    }
+
+    void RemoveConnectionReassembliesLocked(ConnectionId id) {
+        for (auto found = reassemblies_.begin(); found != reassemblies_.end();) {
+            if (found->first.connection_id == id) {
+                found = RemoveReassemblyLocked(found, false);
+            } else {
+                ++found;
+            }
+        }
+        for (auto found = recently_completed_.begin();
+             found != recently_completed_.end();) {
+            if (found->first.connection_id == id) {
+                found = recently_completed_.erase(found);
+            } else {
+                ++found;
+            }
+        }
+    }
+
+    Status DiscardDatagram(int fd,
+                           std::span<std::byte> inspection_buffer) const {
+        ssize_t discarded = -1;
+        do {
+            discarded = ::recv(fd, inspection_buffer.data(),
+                               inspection_buffer.size(), 0);
+        } while (discarded < 0 && errno == EINTR);
+        if (discarded < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return Unavailable("failed to discard UDP datagram");
+        }
+        return Status::Ok();
     }
 
     void Wake() const noexcept {
@@ -712,6 +1221,18 @@ private:
     size_t completion_head_ = 0;
     size_t completion_tail_ = 0;
     size_t completion_count_ = 0;
+    ReassemblyMap reassemblies_;
+    std::unordered_map<ReassemblyKey, TimePoint, ReassemblyKeyHash>
+        recently_completed_;
+    size_t reassembly_bytes_ = 0;
+    size_t reassembly_messages_ = 0;
+    uint64_t fragmented_messages_sent_ = 0;
+    uint64_t fragments_sent_ = 0;
+    uint64_t fragments_received_ = 0;
+    uint64_t duplicate_fragments_ = 0;
+    uint64_t reassembled_messages_ = 0;
+    uint64_t reassembly_timeouts_ = 0;
+    uint64_t rejected_fragments_ = 0;
 };
 
 Result<std::unique_ptr<UdpDriver>> UdpDriver::Create(UdpDriverOptions options) {
@@ -732,8 +1253,8 @@ TransportCapabilities UdpDriver::capabilities() const noexcept {
     return TransportCapabilities{
         .kind = TransportKind::kNetwork,
         .reliability = TransportReliability::kUnreliable,
-        .max_frame_size = options_.max_datagram_bytes,
-        .max_reassembly_bytes = 0,
+        .max_frame_size = options_.max_message_bytes,
+        .max_reassembly_bytes = options_.max_message_bytes,
         .features = Capability::kConnect | Capability::kListen,
     };
 }
@@ -760,7 +1281,6 @@ Result<size_t> UdpDriver::DoSendUntracked(
     const UntrackedSendRequest& request) {
     return impl_->SendUntracked(request);
 }
-
 Result<ReceiveResult> UdpDriver::DoPoll(const ReceiveRequest& request) {
     return impl_->PollMessages(request);
 }

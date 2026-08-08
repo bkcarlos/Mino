@@ -10,11 +10,13 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include "mino/bridge/bridge_runtime/connection_manager.h"
 #include "mino/bridge/schema_negotiator.h"
+#include "mino/capacity/capacity.h"
 #include "mino/common/result.h"
 #include "mino/registry/metadata.h"
 #include "mino/schema/registry.h"
@@ -30,6 +32,9 @@ struct RemoteBridgeConfig {
     std::filesystem::path schema_store_root;
 };
 
+Result<capacity::ResourceVector> EstimateRemoteBridgeResources(
+    const RemoteBridgeConfig& config) noexcept;
+
 // Single-peer production composition root. It owns the TCP transport, schema
 // registry and durable store, schema negotiator, and reconnecting Bridge manager.
 // The ingress port is externally owned and must outlive RemoteBridge. Descriptor
@@ -39,7 +44,10 @@ class RemoteBridge final {
 public:
     static Result<std::unique_ptr<RemoteBridge>> Create(
         RemoteBridgeConfig config, bridge::BridgeIngressPort* ingress,
-        std::shared_ptr<bridge::DescriptorAuth> descriptor_auth) noexcept;
+        std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {},
+        std::optional<capacity::ResourceVector> capacity_charge =
+            std::nullopt) noexcept;
 
     ~RemoteBridge();
     RemoteBridge(const RemoteBridge&) = delete;
@@ -79,6 +87,7 @@ private:
     class StorePersistence;
 
     RemoteBridge(
+        capacity::CapacityLease capacity_lease,
         std::unique_ptr<schema::SchemaRegistry> registry,
         std::unique_ptr<storage::SchemaStore> store,
         std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
@@ -87,6 +96,9 @@ private:
         std::shared_ptr<transport::TcpDriver> driver,
         std::unique_ptr<bridge::BridgeConnectionManager> manager) noexcept;
 
+    // Declared first so the charge remains held until every composed resource
+    // has been destroyed (members are destroyed in reverse declaration order).
+    capacity::CapacityLease capacity_lease_;
     std::unique_ptr<schema::SchemaRegistry> registry_;
     std::unique_ptr<storage::SchemaStore> store_;
     std::shared_ptr<bridge::DescriptorAuth> descriptor_auth_;

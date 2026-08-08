@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -68,6 +70,93 @@ sockaddr_in UdpLoopbackAddress(uint16_t port) {
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(port);
     return address;
+}
+
+void StoreBe16(uint16_t value, std::span<std::byte> output) {
+    output[0] = static_cast<std::byte>(value >> 8);
+    output[1] = static_cast<std::byte>(value);
+}
+
+void StoreBe32(uint32_t value, std::span<std::byte> output) {
+    output[0] = static_cast<std::byte>(value >> 24);
+    output[1] = static_cast<std::byte>(value >> 16);
+    output[2] = static_cast<std::byte>(value >> 8);
+    output[3] = static_cast<std::byte>(value);
+}
+
+void StoreBe64(uint64_t value, std::span<std::byte> output) {
+    StoreBe32(static_cast<uint32_t>(value >> 32), output.first<4>());
+    StoreBe32(static_cast<uint32_t>(value), output.subspan<4, 4>());
+}
+
+uint32_t TestCrc32(std::span<const std::byte> input) {
+    uint32_t crc = 0xffffffffu;
+    for (const std::byte value : input) {
+        crc ^= std::to_integer<uint8_t>(value);
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xedb88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+std::vector<std::vector<std::byte>> FragmentMessage(
+    std::span<const std::byte> payload, uint32_t max_datagram_bytes,
+    uint64_t message_id, std::optional<uint32_t> crc_override = std::nullopt) {
+    const size_t capacity = max_datagram_bytes - kUdpFragmentHeaderBytes;
+    const uint32_t count =
+        static_cast<uint32_t>((payload.size() + capacity - 1) / capacity);
+    const uint32_t crc = crc_override.value_or(TestCrc32(payload));
+    std::vector<std::vector<std::byte>> fragments;
+    fragments.reserve(count);
+    for (uint32_t fragment_id = 0; fragment_id < count; ++fragment_id) {
+        const size_t offset = static_cast<size_t>(fragment_id) * capacity;
+        const size_t bytes = std::min(capacity, payload.size() - offset);
+        std::vector<std::byte> fragment(kUdpFragmentHeaderBytes + bytes);
+        StoreBe32(kUdpFragmentMagic,
+                  std::span<std::byte>(fragment).subspan<0, 4>());
+        fragment[4] = static_cast<std::byte>(kUdpFragmentVersion);
+        fragment[5] = static_cast<std::byte>(kUdpFragmentFlag);
+        StoreBe16(kUdpFragmentHeaderBytes,
+                  std::span<std::byte>(fragment).subspan<6, 2>());
+        StoreBe64(message_id,
+                  std::span<std::byte>(fragment).subspan<8, 8>());
+        StoreBe32(fragment_id,
+                  std::span<std::byte>(fragment).subspan<16, 4>());
+        StoreBe32(count, std::span<std::byte>(fragment).subspan<20, 4>());
+        StoreBe32(static_cast<uint32_t>(payload.size()),
+                  std::span<std::byte>(fragment).subspan<24, 4>());
+        StoreBe32(static_cast<uint32_t>(offset),
+                  std::span<std::byte>(fragment).subspan<28, 4>());
+        StoreBe32(crc, std::span<std::byte>(fragment).subspan<32, 4>());
+        std::copy(payload.begin() + offset, payload.begin() + offset + bytes,
+                  fragment.begin() + kUdpFragmentHeaderBytes);
+        fragments.push_back(std::move(fragment));
+    }
+    return fragments;
+}
+
+void SendDatagram(int fd, const sockaddr_in& address,
+                  std::span<const std::byte> datagram) {
+    ASSERT_EQ(::sendto(fd, datagram.data(), datagram.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&address),
+                       sizeof(address)),
+              static_cast<ssize_t>(datagram.size()));
+}
+
+UdpDriverOptions FragmentTestOptions() {
+    UdpDriverOptions options;
+    options.max_datagram_bytes = 256;
+    options.max_message_bytes = 4096;
+    options.max_fragments_per_message = 32;
+    options.max_reassembly_bytes_per_connection = 8192;
+    options.max_reassembly_messages_per_connection = 4;
+    options.max_reassembly_bytes_global = 16 * 1024;
+    options.max_reassembly_messages_global = 8;
+    options.reassembly_timeout_ms = 100;
+    options.io_poll_max_ms = 5;
+    return options;
 }
 
 class EmptyDatagramFlood final {
@@ -129,7 +218,7 @@ DriverConfig Config() {
     };
 }
 
-TEST(UdpDriverOptionsTest, ValidatesDatagramAndSocketBounds) {
+TEST(UdpDriverOptionsTest, ValidatesDatagramFragmentAndQuotaBounds) {
     EXPECT_TRUE(ValidateUdpDriverOptions({}).ok());
     UdpDriverOptions options;
     options.max_datagram_bytes = kUdpMaximumDatagramBytes + 1;
@@ -137,6 +226,20 @@ TEST(UdpDriverOptionsTest, ValidatesDatagramAndSocketBounds) {
               StatusCode::kInvalidArgument);
     options = {};
     options.socket_receive_buffer_bytes = options.max_datagram_bytes - 1;
+    EXPECT_EQ(ValidateUdpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = FragmentTestOptions();
+    options.max_fragments_per_message = 2;
+    EXPECT_EQ(ValidateUdpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = FragmentTestOptions();
+    options.max_reassembly_bytes_per_connection =
+        options.max_message_bytes - 1;
+    EXPECT_EQ(ValidateUdpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = FragmentTestOptions();
+    options.max_reassembly_messages_global =
+        options.max_reassembly_messages_per_connection - 1;
     EXPECT_EQ(ValidateUdpDriverOptions(options).code(),
               StatusCode::kInvalidArgument);
 }
@@ -208,6 +311,87 @@ TEST(UdpDriverTest, PreservesDatagramBoundariesAndReportsDegradedLocalCompletion
         EXPECT_EQ(completion.reached_stage, DeliveryStage::kLocalPublished);
         EXPECT_EQ(completion.status.code(), StatusCode::kDegraded);
     }
+}
+
+TEST(UdpDriverTest, FragmentsLargeLoopbackMessageAndAdvertisesMessageLimit) {
+    const UdpDriverOptions options = FragmentTestOptions();
+    auto server_result = UdpDriver::Create(options);
+    auto client_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    ASSERT_TRUE(client_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    std::unique_ptr<UdpDriver> client = std::move(*client_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    ASSERT_TRUE(client->Start(Config()).ok());
+    EXPECT_EQ(client->capabilities().max_frame_size,
+              options.max_message_bytes);
+    EXPECT_EQ(client->capabilities().max_reassembly_bytes,
+              options.max_message_bytes);
+
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+    auto connected = client->Connect({
+        .remote_endpoint = endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 0,
+    });
+    ASSERT_TRUE(connected.ok());
+
+    std::vector<std::byte> payload(2000);
+    for (size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<std::byte>(index);
+    }
+    auto sent = client->Send({
+        .connection_id = connected->id,
+        .payload = payload,
+        .target_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    auto received = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, payload);
+    EXPECT_EQ(server->stats().reassembly_bytes, 0u);
+    EXPECT_EQ(server->stats().reassembly_messages, 0u);
+    EXPECT_EQ(server->stats().reassembled_messages, 1u);
+    EXPECT_EQ(client->stats().fragmented_messages_sent, 1u);
+    EXPECT_EQ(client->stats().fragments_sent,
+              FragmentMessage(payload, options.max_datagram_bytes, 1).size());
+}
+
+TEST(UdpDriverTest, ReassemblesOutOfOrderAndIgnoresIdenticalDuplicate) {
+    const UdpDriverOptions options = FragmentTestOptions();
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
+    std::vector<std::byte> payload(700);
+    for (size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<std::byte>(index * 7);
+    }
+    const auto fragments =
+        FragmentMessage(payload, options.max_datagram_bytes, 77);
+    ASSERT_EQ(fragments.size(), 4u);
+    for (const size_t index : {2u, 0u, 2u, 3u, 1u}) {
+        SendDatagram(peer.get(), address, fragments[index]);
+    }
+
+    auto received = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, payload);
+    EXPECT_EQ(server->stats().duplicate_fragments, 1u);
+    EXPECT_EQ(server->stats().fragments_received, fragments.size());
 }
 
 TEST(UdpDriverTest, ConnectionFiltersPreserveOtherDatagramsAndCompletions) {
@@ -359,9 +543,10 @@ TEST(UdpDriverTest, UntrackedDatagramProducesNoCompletion) {
     EXPECT_EQ(completion.status().code(), StatusCode::kTimeout);
 }
 
-TEST(UdpDriverTest, RejectsOversizedDatagramAndListenerSend) {
-    UdpDriverOptions options;
-    options.max_datagram_bytes = 256;
+TEST(UdpDriverTest, RejectsOversizedMessageAndListenerSend) {
+    UdpDriverOptions options = FragmentTestOptions();
+    options.max_message_bytes = 512;
+    options.max_fragments_per_message = 4;
     auto server_result = UdpDriver::Create(options);
     auto client_result = UdpDriver::Create(options);
     ASSERT_TRUE(server_result.ok());
@@ -380,7 +565,7 @@ TEST(UdpDriverTest, RejectsOversizedDatagramAndListenerSend) {
     });
     ASSERT_TRUE(connected.ok());
 
-    const std::vector<std::byte> oversized(257, std::byte{1});
+    const std::vector<std::byte> oversized(513, std::byte{1});
     auto rejected = client->Send({
         .connection_id = connected->id,
         .payload = oversized,
@@ -399,6 +584,245 @@ TEST(UdpDriverTest, RejectsOversizedDatagramAndListenerSend) {
     EXPECT_EQ(listener_send.status().code(), StatusCode::kUnsupported);
     EXPECT_EQ(server->Accept({.listener_id = listener->id}).status().code(),
               StatusCode::kUnsupported);
+}
+
+TEST(UdpDriverTest, ReassemblyTimeoutReleasesReservedQuota) {
+    UdpDriverOptions options = FragmentTestOptions();
+    options.reassembly_timeout_ms = 20;
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
+    const std::vector<std::byte> payload(700, std::byte{0x44});
+    const auto fragments =
+        FragmentMessage(payload, options.max_datagram_bytes, 91);
+    SendDatagram(peer.get(), address, fragments[0]);
+
+    auto polled = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 80});
+    ASSERT_FALSE(polled.ok());
+    EXPECT_EQ(polled.status().code(), StatusCode::kTimeout);
+    const UdpDriverStats stats = server->stats();
+    EXPECT_EQ(stats.reassembly_bytes, 0u);
+    EXPECT_EQ(stats.reassembly_messages, 0u);
+    EXPECT_EQ(stats.reassembly_timeouts, 1u);
+}
+
+TEST(UdpDriverTest, EnforcesPerConnectionReassemblyQuotaAndCloseCleansIt) {
+    UdpDriverOptions options = FragmentTestOptions();
+    options.max_message_bytes = 1024;
+    options.max_fragments_per_message = 8;
+    options.max_reassembly_bytes_per_connection = 1024;
+    options.max_reassembly_messages_per_connection = 1;
+    options.max_reassembly_bytes_global = 2048;
+    options.max_reassembly_messages_global = 2;
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
+    const std::vector<std::byte> payload(700, std::byte{0x51});
+    const auto first = FragmentMessage(payload, options.max_datagram_bytes, 101);
+    const auto second = FragmentMessage(payload, options.max_datagram_bytes, 102);
+    SendDatagram(peer.get(), address, first[0]);
+    SendDatagram(peer.get(), address, second[0]);
+
+    auto rejected = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(server->stats().reassembly_bytes, payload.size());
+    EXPECT_EQ(server->stats().reassembly_messages, 1u);
+    EXPECT_EQ(server->stats().rejected_fragments, 1u);
+    EXPECT_TRUE(server->Close(listener->id).ok());
+    EXPECT_EQ(server->stats().reassembly_bytes, 0u);
+    EXPECT_EQ(server->stats().reassembly_messages, 0u);
+}
+
+TEST(UdpDriverTest, EnforcesGlobalReassemblyMessageQuotaAcrossListeners) {
+    UdpDriverOptions options = FragmentTestOptions();
+    options.max_reassembly_messages_per_connection = 1;
+    options.max_reassembly_messages_global = 1;
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor first_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    const EndpointDescriptor second_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    auto first_listener = server->Listen(
+        {.local_endpoint = first_endpoint, .backlog = 1});
+    auto second_listener = server->Listen(
+        {.local_endpoint = second_endpoint, .backlog = 1});
+    ASSERT_TRUE(first_listener.ok());
+    ASSERT_TRUE(second_listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const std::vector<std::byte> payload(700, std::byte{0x52});
+    const auto first = FragmentMessage(payload, options.max_datagram_bytes, 201);
+    const auto second = FragmentMessage(payload, options.max_datagram_bytes, 202);
+    SendDatagram(peer.get(), UdpLoopbackAddress(first_endpoint.port()), first[0]);
+    SendDatagram(peer.get(), UdpLoopbackAddress(second_endpoint.port()), second[0]);
+
+    auto rejected = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(server->stats().reassembly_messages, 1u);
+    EXPECT_EQ(server->stats().rejected_fragments, 1u);
+}
+
+TEST(UdpDriverTest, EnforcesGlobalReassemblyByteQuotaAcrossListeners) {
+    UdpDriverOptions options = FragmentTestOptions();
+    options.max_reassembly_bytes_per_connection = 4096;
+    options.max_reassembly_messages_per_connection = 2;
+    options.max_reassembly_bytes_global = 4096;
+    options.max_reassembly_messages_global = 2;
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor first_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    const EndpointDescriptor second_endpoint =
+        UdpLoopback(FindUnusedUdpPort());
+    auto first_listener = server->Listen(
+        {.local_endpoint = first_endpoint, .backlog = 1});
+    auto second_listener = server->Listen(
+        {.local_endpoint = second_endpoint, .backlog = 1});
+    ASSERT_TRUE(first_listener.ok());
+    ASSERT_TRUE(second_listener.ok());
+
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const std::vector<std::byte> payload(3000, std::byte{0x53});
+    const auto first = FragmentMessage(payload, options.max_datagram_bytes, 211);
+    const auto second = FragmentMessage(payload, options.max_datagram_bytes, 212);
+    SendDatagram(peer.get(), UdpLoopbackAddress(first_endpoint.port()), first[0]);
+    SendDatagram(peer.get(), UdpLoopbackAddress(second_endpoint.port()), second[0]);
+
+    auto rejected = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(server->stats().reassembly_bytes, payload.size());
+    EXPECT_EQ(server->stats().reassembly_messages, 1u);
+}
+
+TEST(UdpDriverTest, ShutdownClearsPartialReassemblies) {
+    const UdpDriverOptions options = FragmentTestOptions();
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const std::vector<std::byte> payload(700, std::byte{0x54});
+    const auto fragments =
+        FragmentMessage(payload, options.max_datagram_bytes, 220);
+    SendDatagram(peer.get(), UdpLoopbackAddress(endpoint.port()), fragments[0]);
+    EXPECT_EQ(server->Poll({.max_messages = 1,
+                            .max_bytes = 4096,
+                            .timeout_ms = 0})
+                  .status()
+                  .code(),
+              StatusCode::kWouldBlock);
+    ASSERT_EQ(server->stats().reassembly_messages, 1u);
+    EXPECT_TRUE(server->Shutdown().ok());
+    EXPECT_EQ(server->stats().reassembly_messages, 0u);
+    EXPECT_EQ(server->stats().reassembly_bytes, 0u);
+}
+
+TEST(UdpDriverTest, RejectsMaliciousHeadersConflictingDuplicatesAndBadCrc) {
+    const UdpDriverOptions options = FragmentTestOptions();
+    auto server_result = UdpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok());
+    std::unique_ptr<UdpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(Config()).ok());
+    const EndpointDescriptor endpoint = UdpLoopback(FindUnusedUdpPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 1});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    ASSERT_GE(peer.get(), 0);
+    const sockaddr_in address = UdpLoopbackAddress(endpoint.port());
+    const std::vector<std::byte> payload(700, std::byte{0x63});
+
+    std::vector<std::byte> truncated(8);
+    StoreBe32(kUdpFragmentMagic,
+              std::span<std::byte>(truncated).first<4>());
+    SendDatagram(peer.get(), address, truncated);
+    auto truncated_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(truncated_result.ok());
+    EXPECT_EQ(truncated_result.status().code(), StatusCode::kCorruption);
+
+    auto bad_version =
+        FragmentMessage(payload, options.max_datagram_bytes, 301)[0];
+    bad_version[4] = std::byte{99};
+    SendDatagram(peer.get(), address, bad_version);
+    auto version_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(version_result.ok());
+    EXPECT_EQ(version_result.status().code(), StatusCode::kCorruption);
+
+    auto bad_count =
+        FragmentMessage(payload, options.max_datagram_bytes, 302)[0];
+    StoreBe32(options.max_fragments_per_message + 1,
+              std::span<std::byte>(bad_count).subspan<20, 4>());
+    SendDatagram(peer.get(), address, bad_count);
+    auto count_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(count_result.ok());
+    EXPECT_EQ(count_result.status().code(), StatusCode::kCorruption);
+
+    auto bad_offset =
+        FragmentMessage(payload, options.max_datagram_bytes, 303)[0];
+    StoreBe32(1, std::span<std::byte>(bad_offset).subspan<28, 4>());
+    SendDatagram(peer.get(), address, bad_offset);
+    auto offset_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(offset_result.ok());
+    EXPECT_EQ(offset_result.status().code(), StatusCode::kCorruption);
+
+    auto conflicting =
+        FragmentMessage(payload, options.max_datagram_bytes, 304);
+    SendDatagram(peer.get(), address, conflicting[0]);
+    conflicting[0].back() ^= std::byte{1};
+    SendDatagram(peer.get(), address, conflicting[0]);
+    auto conflict_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(conflict_result.ok());
+    EXPECT_EQ(conflict_result.status().code(), StatusCode::kCorruption);
+
+    const auto bad_crc = FragmentMessage(payload, options.max_datagram_bytes,
+                                         305, TestCrc32(payload) ^ 1u);
+    for (const auto& fragment : bad_crc) {
+        SendDatagram(peer.get(), address, fragment);
+    }
+    auto crc_result = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_FALSE(crc_result.ok());
+    EXPECT_EQ(crc_result.status().code(), StatusCode::kCorruption);
+    EXPECT_EQ(server->stats().reassembly_messages, 0u);
+    EXPECT_GE(server->stats().rejected_fragments, 6u);
 }
 
 TEST(UdpDriverTest, EmptyDatagramDoesNotSpinOrEscapeAsMessage) {

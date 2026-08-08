@@ -1379,6 +1379,68 @@ public:
         }
     }
 
+    // Returns a later message while the caller retains the active head Borrow
+    // returned by Poll(). That head's recoverable claim prevents DropOldest
+    // from advancing this subscriber while the later slot is snapshotted. The
+    // later Borrow intentionally owns no additional shared claim; runtime pins
+    // each payload before exposing it, and ACKs the batch in sequence order.
+    // This preserves the layout-v6 ABI and its single per-subscriber claim.
+    Result<Borrow> PollAtOffsetWhileHeadBorrowed(
+        SubscriberHandle sub, uint64_t offset) noexcept {
+        if (offset == 0) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "broadcast batch offset must be non-zero");
+        }
+        if (!IsActiveGeneration(sub)) {
+            return Status::Error(
+                StatusCode::kNotFound,
+                "subscriber not registered or stale generation");
+        }
+        SubscriberSlot& ss = subs_[sub.id.value];
+        const uint64_t cons = LoadCursorAndHelp(sub.id.value);
+        const uint64_t head_claim = ProtocolToken(cons, kBorrowActive);
+        if (ss.borrow_control.load(std::memory_order_acquire) != head_claim ||
+            ss.borrow_generation.load(std::memory_order_acquire) !=
+                sub.generation) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "broadcast batch requires an active head Borrow");
+        }
+        const uint64_t prod =
+            control_->publisher_cursor.load(std::memory_order_acquire);
+        if (offset >= prod - cons) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast batch reached channel tail");
+        }
+        const uint64_t sequence = cons + offset;
+        const uint64_t phys = sequence & mask_;
+        IndexSlot* slot = &slots_[phys];
+        const uint32_t state = slot->state.load(std::memory_order_acquire);
+        if (state != static_cast<uint32_t>(SlotState::kReady) &&
+            state != static_cast<uint32_t>(SlotState::kRetired) &&
+            state != static_cast<uint32_t>(SlotState::kRetiring)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast batch encountered a non-ready slot");
+        }
+        if (slot->sequence_num.load(std::memory_order_acquire) != sequence ||
+            era_metas_[phys].payload_era.load(std::memory_order_acquire) !=
+                sequence + 1 ||
+            era_metas_[phys].ack_era[sub.id.value].load(
+                std::memory_order_acquire) != sequence + 1) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "broadcast batch slot era mismatch");
+        }
+        IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
+        if (!VerifySnapshotCrc(snapshot)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "broadcast batch slot immutable CRC mismatch");
+        }
+        if (ss.borrow_control.load(std::memory_order_acquire) != head_claim) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "broadcast head Borrow claim changed");
+        }
+        return Borrow(this, sub, snapshot);
+    }
+
     // Standalone Ack for a previously polled sequence: validates the exact
     // subscriber generation and slot era before clearing that generation's
     // bit. Only `seq == cursor` may claim cleanup and advance. A `seq` behind

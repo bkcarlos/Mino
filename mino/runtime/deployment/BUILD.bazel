@@ -7,6 +7,7 @@ cc_library(
     deps = [
         "//mino/bridge:bridge_connection_manager",
         "//mino/bridge:schema_negotiator",
+        "//mino/capacity",
         "//mino/common:result",
         "//mino/common:status",
         "//mino/registry",
@@ -21,6 +22,7 @@ cc_test(
     srcs = ["remote_bridge_test.cc"],
     deps = [
         ":remote_bridge",
+        "//mino/capacity",
         "//mino/common:status",
         "//mino/schema:compiler",
         "//mino/schema:layout",

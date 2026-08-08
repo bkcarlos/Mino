@@ -14,8 +14,10 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mino/capacity/capacity.h"
 #include "mino/common/ids.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
@@ -69,6 +71,9 @@ struct RecorderTopicConfig {
     uint64_t writer_id_base = 0;
     std::vector<RecorderTopicSchema> schemas;
 };
+
+Result<capacity::ResourceVector> EstimateRecorderTopicResources(
+    const RecorderTopicConfig& config) noexcept;
 
 enum class RecorderEnqueueDisposition : uint8_t {
     kBuffered = 0,
@@ -153,22 +158,27 @@ public:
     static Result<std::unique_ptr<Recorder>> Create(
         const std::filesystem::path& session_root,
         const RecordingSessionMetadata& metadata,
-        const RecorderSessionOptions& options = {}) noexcept;
+        const RecorderSessionOptions& options = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept;
     static Result<std::unique_ptr<Recorder>> Open(
         const std::filesystem::path& session_root,
-        const RecorderSessionOptions& options = {}) noexcept;
+        const RecorderSessionOptions& options = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept;
 
     // Explicit aliases make the ownership boundary clear at call sites.
     static Result<std::unique_ptr<Recorder>> CreateSession(
         const std::filesystem::path& session_root,
         const RecordingSessionMetadata& metadata,
-        const RecorderSessionOptions& options = {}) noexcept {
-        return Create(session_root, metadata, options);
+        const RecorderSessionOptions& options = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept {
+        return Create(session_root, metadata, options,
+                      std::move(capacity_controller));
     }
     static Result<std::unique_ptr<Recorder>> OpenSession(
         const std::filesystem::path& session_root,
-        const RecorderSessionOptions& options = {}) noexcept {
-        return Open(session_root, options);
+        const RecorderSessionOptions& options = {},
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {}) noexcept {
+        return Open(session_root, options, std::move(capacity_controller));
     }
 
     ~Recorder();
@@ -180,7 +190,12 @@ public:
 
     // Adds a new manifest topic or attaches the same configuration after Open().
     // An already attached (session, topic, partition) tuple is rejected.
-    Status AddTopic(const RecorderTopicConfig& config) noexcept;
+    // If capacity_charge is absent, EstimateRecorderTopicResources() supplies
+    // a conservative charge from partition/pool/schema limits.
+    Status AddTopic(
+        const RecorderTopicConfig& config,
+        std::optional<capacity::ResourceVector> capacity_charge =
+            std::nullopt) noexcept;
 
     Status Start(uint64_t now_ns) noexcept;
     Result<RecorderEnqueueResult> Enqueue(
@@ -220,7 +235,8 @@ private:
     static Result<std::unique_ptr<Recorder>> FinishCreate(
         const std::filesystem::path& session_root,
         RecorderSessionOptions options,
-        std::unique_ptr<RecordingManifest> manifest);
+        std::unique_ptr<RecordingManifest> manifest,
+        std::shared_ptr<capacity::CapacityController> capacity_controller);
     explicit Recorder(std::unique_ptr<Impl> impl) noexcept;
 
     std::unique_ptr<Impl> impl_;

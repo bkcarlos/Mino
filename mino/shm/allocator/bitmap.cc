@@ -15,6 +15,13 @@
 #include "mino/shm/allocator/bitmap.h"
 
 namespace mino {
+namespace {
+
+constexpr uint64_t LowBits(uint32_t count) {
+    return count == 64 ? ~uint64_t{0} : (uint64_t{1} << count) - 1;
+}
+
+}  // namespace
 
 Result<ShardedBitmap> ShardedBitmap::Create(std::atomic<uint64_t>* storage,
                                             uint32_t shard_count) {
@@ -58,19 +65,62 @@ Result<uint32_t> ShardedBitmap::FindAndSetFreeBit(uint32_t shard_hint) {
 
 Result<uint32_t> ShardedBitmap::FindAndSetFreeBitInRange(uint32_t begin,
                                                          uint32_t end) {
+    MINO_ASSIGN_OR_RETURN(
+        BitmapClaim claim,
+        FindAndSetFreeBitInRangeHinted(begin, end, begin));
+    return claim.bit_index;
+}
+
+Result<BitmapClaim> ShardedBitmap::FindAndSetFreeBitInRangeHinted(
+    uint32_t begin, uint32_t end, uint32_t bit_hint) {
     if (begin >= end || end > bit_count()) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "invalid bitmap allocation range");
     }
-    for (uint32_t index = begin; index < end; ++index) {
-        std::atomic<uint64_t>& shard = storage_[index / kBitmapShardBits];
-        const uint64_t mask = uint64_t{1} << (index % kBitmapShardBits);
+    if (bit_hint < begin || bit_hint >= end) {
+        bit_hint = begin;
+    }
+
+    const uint32_t first_shard = begin / kBitmapShardBits;
+    const uint32_t last_shard = (end - 1) / kBitmapShardBits;
+    const uint32_t range_shards = last_shard - first_shard + 1;
+    const uint32_t start_shard = bit_hint / kBitmapShardBits;
+
+    for (uint32_t probe = 0; probe < range_shards; ++probe) {
+        const uint32_t shard_index =
+            first_shard + (start_shard - first_shard + probe) % range_shards;
+        const uint32_t lower = shard_index == first_shard
+                                   ? begin % kBitmapShardBits
+                                   : 0;
+        const uint32_t upper = shard_index == last_shard
+                                   ? (end - 1) % kBitmapShardBits + 1
+                                   : kBitmapShardBits;
+        const uint64_t valid_mask = LowBits(upper) & ~LowBits(lower);
+        std::atomic<uint64_t>& shard = storage_[shard_index];
         uint64_t word = shard.load(std::memory_order_acquire);
-        while ((word & mask) == 0) {
-            if (shard.compare_exchange_weak(word, word | mask,
+
+        for (;;) {
+            const uint64_t available = ~word & valid_mask;
+            if (available == 0) break;
+
+            uint64_t candidates = available;
+            if (probe == 0) {
+                const uint32_t hint_in_shard = bit_hint % kBitmapShardBits;
+                const uint64_t at_or_after_hint =
+                    available & ~LowBits(hint_in_shard);
+                if (at_or_after_hint != 0) candidates = at_or_after_hint;
+            }
+            const uint32_t bit =
+                static_cast<uint32_t>(__builtin_ctzll(candidates));
+            const uint64_t desired = word | (uint64_t{1} << bit);
+            if (shard.compare_exchange_weak(word, desired,
                                             std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
-                return index;
+                return BitmapClaim{
+                    .bit_index = shard_index * kBitmapShardBits + bit,
+                    .shard_index = shard_index,
+                    .shards_probed = probe + 1,
+                };
             }
         }
     }

@@ -29,6 +29,19 @@ bool ValidOptions(const RecorderServiceOptions& options) noexcept {
            options.pending_flush_attempts != 0;
 }
 
+Result<capacity::CapacityReservation> ReserveServiceThread(
+    const std::shared_ptr<capacity::CapacityController>& controller) {
+    if (!controller) return capacity::CapacityReservation{};
+    capacity::ResourceVector resources;
+    resources.threads = 1;
+    return controller->Reserve(capacity::ResourceRequest{
+        .resources = resources,
+        .scope = capacity::ResourceScope::kRecorder,
+        .admission_class = capacity::AdmissionClass::kDataPlane,
+        .name = "recorder service worker",
+    });
+}
+
 }  // namespace
 
 Result<RecorderCopyResult> RecorderEnqueueSink::ReserveCopyCommit(
@@ -64,14 +77,20 @@ Result<RecorderCopyResult> RecorderEnqueueSink::ReserveCopyCommit(
 
 Result<std::unique_ptr<RecorderService>> RecorderService::Create(
     std::unique_ptr<Recorder> recorder, RecorderServiceOptions options,
-    RecorderClock* clock) noexcept {
+    RecorderClock* clock,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) noexcept {
     if (recorder == nullptr) return Invalid("recorder service recorder is null");
     if (!ValidOptions(options)) {
         return Invalid("recorder service options are invalid");
     }
+    MINO_ASSIGN_OR_RETURN(auto capacity_reservation,
+                          ReserveServiceThread(capacity_controller));
     try {
+        MINO_ASSIGN_OR_RETURN(auto capacity_lease,
+                              capacity_reservation.Commit());
         return std::unique_ptr<RecorderService>(new RecorderService(
-            std::move(recorder), options, clock, std::nullopt));
+            std::move(capacity_lease), std::move(recorder), options, clock,
+            std::nullopt));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted,
                              "cannot allocate recorder service");
@@ -83,7 +102,13 @@ Result<std::unique_ptr<RecorderService>> RecorderService::OpenRecovered(
     const RecorderSessionOptions& recorder_options,
     const SessionRecoveryOptions& recovery_options,
     RecorderServiceOptions service_options,
-    RecorderClock* clock) noexcept {
+    RecorderClock* clock,
+    std::shared_ptr<capacity::CapacityController> capacity_controller) noexcept {
+    if (!ValidOptions(service_options)) {
+        return Invalid("recorder service options are invalid");
+    }
+    MINO_ASSIGN_OR_RETURN(auto capacity_reservation,
+                          ReserveServiceThread(capacity_controller));
     Result<std::unique_ptr<SessionRecoveryCoordinator>> coordinator =
         SessionRecoveryCoordinator::Open(session_root, recovery_options);
     if (!coordinator.ok()) return coordinator.status();
@@ -94,9 +119,11 @@ Result<std::unique_ptr<RecorderService>> RecorderService::OpenRecovered(
         Recorder::Open(session_root, recorder_options);
     if (!recorder.ok()) return recorder.status();
     try {
+        MINO_ASSIGN_OR_RETURN(auto capacity_lease,
+                              capacity_reservation.Commit());
         return std::unique_ptr<RecorderService>(new RecorderService(
-            std::move(*recorder), service_options, clock,
-            std::move(*recovery)));
+            std::move(capacity_lease), std::move(*recorder), service_options,
+            clock, std::move(*recovery)));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted,
                              "cannot allocate recovered recorder service");
@@ -104,10 +131,12 @@ Result<std::unique_ptr<RecorderService>> RecorderService::OpenRecovered(
 }
 
 RecorderService::RecorderService(
+    capacity::CapacityLease capacity_lease,
     std::unique_ptr<Recorder> recorder, RecorderServiceOptions options,
     RecorderClock* clock,
     std::optional<SessionRecoveryReport> recovery_report) noexcept
-    : recorder_(std::move(recorder)),
+    : capacity_lease_(std::move(capacity_lease)),
+      recorder_(std::move(recorder)),
       options_(options),
       clock_(clock == nullptr ? &system_clock_ : clock),
       recovery_report_(std::move(recovery_report)) {}
@@ -158,6 +187,7 @@ Status RecorderService::Start() noexcept {
     const Status started = recorder_->Start(NowNs());
     if (!started.ok() && started.code() != StatusCode::kDegraded) {
         RecordError(started);
+        capacity_lease_.Reset();
         return started;
     }
 
@@ -169,6 +199,7 @@ Status RecorderService::Start() noexcept {
             std::string("cannot start recorder worker: ") + error.what());
         RecordError(failure);
         static_cast<void>(recorder_->Stop(NowNs()));
+        capacity_lease_.Reset();
         return failure;
     } catch (const std::bad_alloc&) {
         const Status failure = Status::Error(
@@ -176,6 +207,7 @@ Status RecorderService::Start() noexcept {
             "cannot allocate recorder worker state");
         RecordError(failure);
         static_cast<void>(recorder_->Stop(NowNs()));
+        capacity_lease_.Reset();
         return failure;
     }
     {
@@ -387,6 +419,7 @@ Status RecorderService::Stop() noexcept {
     intake_paused_.store(true, std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
     if (worker_.joinable()) worker_.join();
+    capacity_lease_.Reset();
     std::lock_guard cycle_lock(cycle_mutex_);
 
     Status result = Status::Ok();

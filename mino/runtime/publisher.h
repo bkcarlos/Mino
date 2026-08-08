@@ -7,13 +7,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
@@ -228,6 +231,24 @@ struct PublisherOptions {
     uint32_t sample_rate = 1;
 };
 
+// Outcome of an ordered batch publish. Items before first_failed_index reached
+// their individual channel Commit point; the failed item and every later item
+// are aborted when they belong to this Publisher. Policy-driven DropNewest and
+// Sample rejection is explicit as kDegraded instead of the single-item API's
+// compatibility success.
+struct BatchPublishResult {
+    static constexpr size_t kNoFailure = std::numeric_limits<size_t>::max();
+
+    size_t requested_count = 0;
+    size_t committed_count = 0;
+    size_t dropped_input_count = 0;
+    size_t first_failed_index = kNoFailure;
+    Status first_error = Status::Ok();
+    Status cleanup_error = Status::Ok();
+
+    bool ok() const noexcept { return first_error.ok(); }
+};
+
 // D2-09 fixed-layout Publisher facade over an SPSC Channel. The public type is
 // intentionally independent of D3 Schema internals: StaticMessageTraits<T> is
 // the seam future CodeGen specializes.
@@ -419,6 +440,62 @@ public:
         return PublishLocalImpl(builder, deadline, nullptr, nullptr);
     }
 
+    // Bounded ordered publish. The span size is the requested capacity and may
+    // not exceed kMaxBatchMessages. Every item independently executes the same
+    // Validate -> Journal publish/bind -> Reserve -> Commit pipeline as
+    // PublishLocal(), using one shared absolute Deadline. Processing stops at
+    // the first error; no later builder is silently retained or dropped.
+    static constexpr size_t kMaxBatchMessages = 1024;
+
+    BatchPublishResult PublishBatch(
+        std::span<MessageBuilder<T>> builders,
+        Deadline deadline = Deadline::Infinite()) noexcept {
+        batch_publish_calls_.fetch_add(1, std::memory_order_relaxed);
+        BatchPublishResult outcome;
+        outcome.requested_count = builders.size();
+        if (builders.size() > kMaxBatchMessages) {
+            outcome.first_failed_index = 0;
+            outcome.first_error = Status::Error(
+                StatusCode::kInvalidArgument,
+                "publish batch exceeds Publisher::kMaxBatchMessages");
+            batch_failed_items_.fetch_add(builders.size(),
+                                          std::memory_order_relaxed);
+            return outcome;
+        }
+
+        for (size_t i = 0; i < builders.size(); ++i) {
+            bool locally_published = false;
+            const Status status = PublishLocalImpl(
+                builders[i], deadline, nullptr, &locally_published);
+            if (!status.ok() || !locally_published) {
+                outcome.first_failed_index = i;
+                if (!status.ok()) {
+                    outcome.first_error = status;
+                } else {
+                    outcome.dropped_input_count = 1;
+                    outcome.first_error = Status::Error(
+                        StatusCode::kDegraded,
+                        "publish batch item was rejected by QueueFullPolicy");
+                }
+                outcome.cleanup_error = AbortBatchRemainder(builders, i + 1);
+                batch_failed_items_.fetch_add(builders.size() - i,
+                                              std::memory_order_relaxed);
+                return outcome;
+            }
+            ++outcome.committed_count;
+            batch_committed_items_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return outcome;
+    }
+
+    BatchPublishResult PublishBatch(
+        std::vector<MessageBuilder<T>>& builders,
+        Deadline deadline = Deadline::Infinite()) noexcept {
+        return PublishBatch(
+            std::span<MessageBuilder<T>>(builders.data(), builders.size()),
+            deadline);
+    }
+
     Result<DeliveryReceipt> Publish(
         MessageBuilder<T>&& builder, OutstandingReceiptTable& receipts,
         const PublisherReceiptIdentity& publisher_identity,
@@ -480,6 +557,18 @@ public:
         return journal_cleanup_debt_count_.load(std::memory_order_relaxed);
     }
 
+    uint64_t batch_publish_calls() const noexcept {
+        return batch_publish_calls_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t batch_committed_items() const noexcept {
+        return batch_committed_items_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t batch_failed_items() const noexcept {
+        return batch_failed_items_.load(std::memory_order_relaxed);
+    }
+
     uint64_t channel_id() const noexcept { return channel_id_; }
 
     // Registers this Publisher's channel and stable ID in one operation. A
@@ -505,6 +594,22 @@ public:
     }
 
 private:
+    Status AbortBatchRemainder(std::span<MessageBuilder<T>> builders,
+                               size_t first) noexcept {
+        Status first_error = Status::Ok();
+        for (size_t i = first; i < builders.size(); ++i) {
+            MessageBuilder<T>& builder = builders[i];
+            if (!builder.active() || builder.allocator_ != allocator_) {
+                continue;
+            }
+            const Status aborted = builder.Abort();
+            if (first_error.ok() && !aborted.ok()) {
+                first_error = aborted;
+            }
+        }
+        return first_error;
+    }
+
     Status PublishLocalImpl(MessageBuilder<T>& builder, Deadline deadline,
                             uint64_t* source_sequence,
                             bool* locally_published) noexcept {
@@ -749,6 +854,9 @@ private:
     std::atomic<uint64_t> published_count_{0};
     std::atomic<uint64_t> dropped_count_{0};
     std::atomic<uint64_t> journal_cleanup_debt_count_{0};
+    std::atomic<uint64_t> batch_publish_calls_{0};
+    std::atomic<uint64_t> batch_committed_items_{0};
+    std::atomic<uint64_t> batch_failed_items_{0};
 };
 
 }  // namespace mino

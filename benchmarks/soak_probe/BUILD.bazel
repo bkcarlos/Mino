@@ -1,0 +1,22 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "soak_probe",
+    srcs = ["soak_probe.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    deps = [
+        "//mino/bridge:wire_frame",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/observability:observability",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/storage:recorder_buffer_pool",
+    ],
+)

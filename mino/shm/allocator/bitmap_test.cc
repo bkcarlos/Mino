@@ -80,6 +80,33 @@ TEST_F(BitmapTest, FindAndSetHonorsShardHint) {
     EXPECT_LT(bit.value(), 3 * kBitmapShardBits);
 }
 
+TEST_F(BitmapTest, HintedRangeStartsAtCursorAndReportsHit) {
+    auto claim = bitmap_.FindAndSetFreeBitInRangeHinted(64, 192, 117);
+    ASSERT_TRUE(claim.ok()) << claim.status().ToString();
+    EXPECT_EQ(claim->bit_index, 117u);
+    EXPECT_EQ(claim->shard_index, 1u);
+    EXPECT_EQ(claim->shards_probed, 1u);
+}
+
+TEST_F(BitmapTest, HintedRangeFallsBackByShardAndWraps) {
+    storage_[2].store(~uint64_t{0}, std::memory_order_relaxed);
+    auto claim = bitmap_.FindAndSetFreeBitInRangeHinted(64, 256, 128);
+    ASSERT_TRUE(claim.ok()) << claim.status().ToString();
+    EXPECT_EQ(claim->bit_index, 192u);
+    EXPECT_EQ(claim->shard_index, 3u);
+    EXPECT_EQ(claim->shards_probed, 2u);
+}
+
+TEST_F(BitmapTest, HintedRangeNeverClaimsBitsOutsidePartialRange) {
+    bitmap_.SetRange(70, 75);
+    auto full = bitmap_.FindAndSetFreeBitInRangeHinted(70, 75, 72);
+    ASSERT_FALSE(full.ok());
+    EXPECT_EQ(full.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(storage_[1].load(std::memory_order_relaxed) & ((uint64_t{1} << 6) - 1),
+              0u);
+    EXPECT_EQ(storage_[1].load(std::memory_order_relaxed) >> 11, 0u);
+}
+
 TEST_F(BitmapTest, FindAndSetWrapsAroundShardHint) {
     // Fill shard 0 completely, then a hint of 0 must spill into shard 1.
     for (uint32_t i = 0; i < kBitmapShardBits; ++i) {

@@ -636,6 +636,52 @@ public:
         }
     }
 
+    // Returns a later ready message without advancing the consumer cursor.
+    // The caller must keep the head Borrow returned by Poll() active while
+    // using this method and ACK all returned Borrows in sequence order. This
+    // process-local API adds no shared-memory state and therefore preserves the
+    // channel ABI.
+    Result<Borrow> PollAtOffset(uint64_t head_sequence,
+                                uint64_t offset) noexcept {
+        if (offset == 0) {
+            return Poll();
+        }
+        const uint64_t cons = control_->consumer_cursor.load(
+            std::memory_order_acquire);
+        if (cons != head_sequence) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "SPSC batch head was overtaken");
+        }
+        const uint64_t prod = control_->producer_cursor.load(
+            std::memory_order_acquire);
+        if (offset >= prod - head_sequence) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "SPSC batch reached queue tail");
+        }
+        const uint64_t sequence = head_sequence + offset;
+        IndexSlot* slot = &slots_[sequence & mask_];
+        const uint32_t state = slot->state.load(std::memory_order_acquire);
+        if (state != static_cast<uint32_t>(SlotState::kReady)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "SPSC batch encountered a non-ready slot");
+        }
+        if (slot->sequence_num.load(std::memory_order_relaxed) != sequence) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "SPSC batch slot sequence mismatch");
+        }
+        IndexSlotSnapshot snapshot = SnapshotIndexSlot(*slot);
+        if (!VerifySnapshotCrc(snapshot)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "SPSC batch slot immutable CRC mismatch");
+        }
+        if (control_->consumer_cursor.load(std::memory_order_acquire) !=
+            head_sequence) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "SPSC batch head changed during snapshot");
+        }
+        return Borrow(this, snapshot);
+    }
+
     // -----------------------------------------------------------------------
     // Observers
     // -----------------------------------------------------------------------
