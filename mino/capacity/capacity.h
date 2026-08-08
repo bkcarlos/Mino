@@ -1,6 +1,6 @@
 // Copyright 2026 The Mino Authors
 //
-// Node-wide resource admission control (D6-15).
+// Node-wide resource admission control.
 
 #ifndef MINO_CAPACITY_CAPACITY_H_
 #define MINO_CAPACITY_CAPACITY_H_

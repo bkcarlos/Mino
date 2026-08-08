@@ -12,8 +12,7 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// D2-05: Broadcast channel (design doc 9.6).
-// D2-06: Broadcast membership (design doc 9.6 / 12.2): subscriber heartbeat
+// Broadcast channel and membership (design doc 9.6 / 12.2): subscriber heartbeat
 // lease, stale-subscriber eviction with generation binding and ACK-responsibility
 // cleanup.
 //
@@ -148,7 +147,7 @@ public:
     // kDropOldest CAS-advances it). The registration fields live on the
     // second cache line: they change only at (un)register/evict time but are
     // read on every Poll, so they must not share a line with the cursor.
-    // heartbeat_ns (D2-06, design doc 12.2 SubscriberLease) rides the same
+    // heartbeat_ns (design doc 12.2 SubscriberLease) rides the same
     // line: it is written only by the owning subscriber's Heartbeat and read
     // only by the eviction scan, both off the Poll hot path.
     enum class SubscriberState : uint32_t {
@@ -174,7 +173,7 @@ public:
         std::atomic<uint64_t> heartbeat_ns{0};
         // Generation that authored heartbeat_ns. A stale Heartbeat racing an
         // eviction/re-registration may write late, but the new generation will
-        // never trust that timestamp (D2-06 generation-bound lease cleanup).
+        // never trust that timestamp (generation-bound lease cleanup).
         std::atomic<uint64_t> heartbeat_generation{0};
         std::atomic<uint64_t> lease_epoch{0};
         unsigned char pad1[kCacheLineSize - 8 - 8 - 4 - 4 - 8 - 8 - 8] = {};
@@ -220,7 +219,7 @@ public:
                   "registration metadata must start the second cache line");
     static_assert(offsetof(SubscriberSlot, heartbeat_ns) ==
                       kCacheLineSize + 8 + 8 + 4 + 4,
-                  "heartbeat must pack into the line-B padding (D2-06)");
+                  "heartbeat must pack into the line-B padding");
     static_assert(offsetof(SubscriberSlot, heartbeat_generation) ==
                       kCacheLineSize + 8 + 8 + 4 + 4 + 8,
                   "heartbeat generation must remain in line B");
@@ -496,7 +495,7 @@ public:
     // messages published from now on (no history replay). Id reuse is safe:
     // the generation is bumped on every registration and validated on Poll.
     //
-    // `now_ns` seeds the lease heartbeat (D2-06, design doc 12.2): the
+    // `now_ns` seeds the lease heartbeat (design doc 12.2): the
     // registration instant is the subscriber's first proof of liveness, so
     // the eviction lease starts counting from here. Callers obtain it from a
     // monotonic clock (see MonotonicNowNs()); passing it in keeps the
@@ -596,7 +595,7 @@ public:
     // Convenience overload seeding the lease from the channel's own
     // monotonic clock. Call sites that do not exercise lease expiry (the
     // common case) stay free of time plumbing; the explicit overload above
-    // remains for the Coordinator (D2-08) and for tests that drive time.
+    // remains for the lease coordinator and for tests that drive time.
     Result<SubscriberHandle> RegisterSubscriber(SubscriberId id,
                                                 uint64_t now_ns) noexcept {
         return RegisterSubscriber(id, ProcessIdentity::Current(), now_ns);
@@ -748,10 +747,10 @@ public:
         return cleared;
     }
 
-    // Monotonic clock in nanoseconds for lease bookkeeping (D2-06). The
+    // Monotonic clock in nanoseconds for lease bookkeeping. The
     // timestamp never enters the SHM ABI as a cross-process absolute value:
     // eviction only compares heartbeat_ns against a now_ns supplied by the
-    // caller, and the Coordinator layer (D2-08) owns the authoritative time
+    // caller, and the lease coordinator owns the authoritative time
     // source. Same rationale as MpscChannel::MonotonicNowNs: durations, not
     // wall-clock agreement, are what matters.
     static uint64_t MonotonicNowNs() noexcept {
@@ -760,7 +759,7 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
     }
 
-    // Renews the subscriber's lease (D2-06, design doc 12.2 SubscriberLease).
+    // Renews the subscriber's lease (design doc 12.2 SubscriberLease).
     // `now_ns` must come from the same monotonic clock family as the now_ns
     // passed to RegisterSubscriber/EvictStaleSubscribers (see
     // MonotonicNowNs()). The timestamp is tagged with the handle generation:
@@ -801,7 +800,7 @@ public:
         return Status::Ok();
     }
 
-    // Lease-expiry eviction orchestration (D2-06; design doc 12.2 steps
+    // Lease-expiry eviction orchestration (design doc 12.2 steps
     // 2/3/4/7 landed at the channel layer). Scans all kMaxSubscribers slots
     // and evicts every subscriber whose state is kActive and whose heartbeat
     // is at least `lease_ns` old relative to `now_ns`. Returns the number of
@@ -826,14 +825,14 @@ public:
     //      in the current window so fully-acked slots can retire.
     //   e. state -> kFree: the eviction is complete and the slot may be
     //      reused. Design doc 12.2 step 7's EVICTED terminal state is a
-    //      Coordinator-level (D2-08) record; at the channel layer the slot
+    //      coordinator-level record; at the channel layer the slot
     //      simply returns to kFree.
     //
     // A paused-but-alive subscriber (fresh heartbeat) is never evicted here.
     // Unlike MPSC crash recovery (design doc 9.5: never judge a crash by
     // timeout alone), the broadcast channel deliberately decides on the
     // heartbeat alone: process-liveness revalidation (12.2 step 1) is layered
-    // above in the D2-08 Coordinator, which chooses when (and whether) to
+    // above in the lease coordinator, which chooses when (and whether) to
     // call this scan. The channel only enforces the lease arithmetic.
     uint64_t EvictStaleSubscribers(uint64_t now_ns, uint64_t lease_ns) noexcept {
         uint64_t evicted = 0;

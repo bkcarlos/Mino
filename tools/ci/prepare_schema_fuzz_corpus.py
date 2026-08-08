@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare deterministic selector-prefixed seeds for the D3 libFuzzer target."""
+"""Prepare deterministic selector-prefixed seeds for the schema fuzz target."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def _self_test() -> None:
         assert first == second
         assert first.read_bytes() == b"same"
         assert len(list(directory.iterdir())) == 1
-    print("prepare_d3_fuzz_corpus.py self-test: PASS")
+    print("prepare_schema_fuzz_corpus.py self-test: PASS")
 
 
 def main() -> int:
@@ -123,7 +123,7 @@ def main() -> int:
         output = workspace / output
     counts = _prepare(workspace, output)
     print(
-        "prepared D3 fuzz corpus: "
+        "prepared schema fuzz corpus: "
         + ", ".join(
             ("IDL", "Descriptor", "CanonicalPayload")[selector]
             + f"={counts[selector]}"

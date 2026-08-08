@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a D3 libFuzzer campaign and emit self-contained JSON evidence."""
+"""Run a schema libFuzzer campaign and emit self-contained JSON evidence."""
 
 from __future__ import annotations
 
@@ -19,12 +19,13 @@ from pathlib import Path
 from typing import Any
 
 TARGET = "//mino/schema/fuzz:libfuzzer_driver"
+SUITE = "schema-fuzz-campaign"
 SELECTOR_NAMES = ("IDL", "Descriptor", "CanonicalPayload")
 SELECTOR_PATTERN = re.compile(
-    r"D3 libFuzzer selectors: IDL=(\d+) Descriptor=(\d+) "
+    r"libFuzzer selectors: IDL=(\d+) Descriptor=(\d+) "
     r"CanonicalPayload=(\d+)"
 )
-MARKER = ".d3-fuzz-campaign"
+MARKER = ".schema-fuzz-campaign"
 
 
 class CampaignError(RuntimeError):
@@ -241,7 +242,7 @@ def _prepare_output(output: Path, clean: bool) -> None:
                 )
             shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
-    (output / MARKER).write_text("D3 fuzz campaign evidence\n", encoding="ascii")
+    (output / MARKER).write_text("Schema fuzz campaign evidence\n", encoding="ascii")
 
 
 def _campaign_command(
@@ -349,7 +350,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
 
     prepare_command = [
         sys.executable,
-        str(workspace / "tools/ci/prepare_d3_fuzz_corpus.py"),
+        str(workspace / "tools/ci/prepare_schema_fuzz_corpus.py"),
         f"--workspace={workspace}",
         f"--out={corpus}",
     ]
@@ -461,6 +462,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
         }
         manifest = {
             "schema_version": 1,
+            "suite": SUITE,
             "commit": _git_commit(workspace),
             "seed": args.seed,
             "seed_consumed": True,
@@ -533,11 +535,11 @@ def _run_campaign(args: argparse.Namespace) -> int:
         }
         _write_json(manifest_path, manifest)
         print(
-            f"D3 fuzz campaign {outcome}: sanitizer={args.sanitizer} "
+            f"Schema fuzz campaign {outcome}: sanitizer={args.sanitizer} "
             f"seconds={args.seconds} manifest={manifest_path}"
         )
         if failure:
-            print(f"D3 fuzz campaign failure: {failure}", file=sys.stderr)
+            print(f"Schema fuzz campaign failure: {failure}", file=sys.stderr)
 
     return return_code
 
@@ -556,7 +558,7 @@ def _self_test() -> None:
 
         log = root / "fuzz.log"
         log.write_text(
-            "noise\nD3 libFuzzer selectors: IDL=11 Descriptor=22 "
+            "noise\nSchema libFuzzer selectors: IDL=11 Descriptor=22 "
             "CanonicalPayload=33\n",
             encoding="utf-8",
         )
@@ -590,7 +592,7 @@ def _self_test() -> None:
         second = _json_bytes(payload)
         assert first == second
         assert first.startswith(b'{\n  "a"')
-    print("run_d3_fuzz_campaign.py self-test: PASS")
+    print("run_schema_fuzz_campaign.py self-test: PASS")
 
 
 def _positive_int(raw: str) -> int:
@@ -602,10 +604,10 @@ def _positive_int(raw: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run a sanitizer-backed D3 libFuzzer campaign"
+        description="Run a sanitizer-backed schema libFuzzer campaign"
     )
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
-    parser.add_argument("--out", type=Path, default=Path("d3-fuzz-campaign"))
+    parser.add_argument("--out", type=Path, default=Path(SUITE))
     parser.add_argument("--bazel", default="bazel")
     parser.add_argument("--sanitizer", choices=("asan", "ubsan"), default="asan")
     parser.add_argument("--seconds", type=_positive_int, default=60)

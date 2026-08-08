@@ -64,18 +64,18 @@ def _mpmc_command(bazel: str, remaining_seconds: int) -> list[str]:
     ]
 
 
-def _d2_lease_kill_command(bazel: str, remaining_seconds: int) -> list[str]:
+def _runtime_lease_kill_command(bazel: str, remaining_seconds: int) -> list[str]:
     return [
         bazel,
         "test",
         *_common_test_options(remaining_seconds),
-        "//mino/runtime:d2_recovery_stress_test",
+        "//mino/runtime:runtime_recovery_stress_test",
         "--test_arg=--gtest_filter="
-        + "D2RecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks",
+        + "RuntimeRecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks",
     ]
 
 
-def _d2_broadcast_kill_command(bazel: str, remaining_seconds: int) -> list[str]:
+def _broadcast_recovery_command(bazel: str, remaining_seconds: int) -> list[str]:
     test_filter = ":".join(
         [
             "BroadcastChannelXprocTest.CrashedAckCleanupTokenIsRecovered",
@@ -91,7 +91,7 @@ def _d2_broadcast_kill_command(bazel: str, remaining_seconds: int) -> list[str]:
     ]
 
 
-def _d4_two_node_command(bazel: str, remaining_seconds: int) -> list[str]:
+def _bridge_two_node_command(bazel: str, remaining_seconds: int) -> list[str]:
     return [
         bazel,
         "test",
@@ -100,7 +100,7 @@ def _d4_two_node_command(bazel: str, remaining_seconds: int) -> list[str]:
     ]
 
 
-def _d4_reconnect_command(bazel: str, remaining_seconds: int) -> list[str]:
+def _bridge_reconnect_command(bazel: str, remaining_seconds: int) -> list[str]:
     test_filter = ":".join(
         [
             "BridgePipelineTest.*Reconnect*",
@@ -117,20 +117,20 @@ def _d4_reconnect_command(bazel: str, remaining_seconds: int) -> list[str]:
 
 
 SUITES = {
-    "d1-mpmc-tsan": Suite(
-        description="D1 MPMC high-contention stress under ThreadSanitizer",
+    "mpmc-tsan": Suite(
+        description="MPMC high-contention stress under ThreadSanitizer",
         repeated=False,
         commands=(_mpmc_command,),
     ),
-    "d2-subscriber-broadcast-kill": Suite(
-        description="D2 killed subscriber and broadcast recovery scenarios",
+    "subscriber-broadcast-recovery": Suite(
+        description="Killed subscriber and broadcast recovery scenarios",
         repeated=True,
-        commands=(_d2_lease_kill_command, _d2_broadcast_kill_command),
+        commands=(_runtime_lease_kill_command, _broadcast_recovery_command),
     ),
-    "d4-two-node-reconnect": Suite(
-        description="D4 real TCP two-node and reconnect/restart soak",
+    "bridge-two-node-reconnect": Suite(
+        description="Real TCP two-node and reconnect/restart soak",
         repeated=True,
-        commands=(_d4_two_node_command, _d4_reconnect_command),
+        commands=(_bridge_two_node_command, _bridge_reconnect_command),
     ),
 }
 
@@ -453,7 +453,7 @@ def _self_test() -> None:
             zero_output = root / "zero-evidence"
             exit_code = _run_suite(
                 workspace,
-                "d4-two-node-reconnect",
+                "bridge-two-node-reconnect",
                 0,
                 42,
                 zero_output,
@@ -475,7 +475,7 @@ def _self_test() -> None:
             started = time.monotonic()
             exit_code = _run_suite(
                 workspace,
-                "d4-two-node-reconnect",
+                "bridge-two-node-reconnect",
                 2,
                 43,
                 timeout_output,

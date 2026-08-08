@@ -28,7 +28,7 @@ class Parser {
 public:
     // Parses one complete IDL v1 source file. Semantic validation (duplicate
     // identities, recursion, annotation names/constraints) is intentionally left
-    // to D3-02. No exception crosses this API.
+    // to the semantic validator. No exception crosses this API.
     static Result<SchemaFile> Parse(
         std::string_view input,
         const ParserOptions& options = {}) noexcept;

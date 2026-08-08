@@ -12,13 +12,13 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// D2-05 broadcast channel unit tests (design doc 9.6 / 9.8, test matrix of
-// the D2-05 design): layout contract, Init/Attach, basic fan-out, ACK
+// Broadcast channel unit tests (design doc 9.6 / 9.8): layout contract,
+// Init/Attach, basic fan-out, ACK
 // bitmap + garbage collection, subscriber-set snapshot binding, unregister,
 // full detection, all five QueueFullPolicy states, abort tombstones,
 // corruption, wraparound, empty membership, and concurrent publisher vs.
 // subscribers.
-// D2-06 broadcast membership tests (design doc 9.6 / 12.2): lease heartbeat
+// Broadcast membership tests (design doc 9.6 / 12.2): lease heartbeat
 // renewal, stale-generation heartbeat rejection, lease-expiry eviction with
 // generation-bound ACK cleanup, paused-but-alive tolerance, and post-evict
 // slot reuse.
@@ -660,7 +660,7 @@ TEST(BroadcastUnregisterTest, UnregisterReclaimsOutstandingBitsAtomically) {
     auto b = Register(*ch, 1);
 
     Publish(*ch, 5);  // bitmap 0b11 on slot 0
-    // Subscriber 1 unregisters WITHOUT acking. D2-06 teardown owns cleanup:
+    // Subscriber 1 unregisters WITHOUT acking. Membership teardown owns cleanup:
     // it blocks ID reuse in kEvicting, removes future membership, clears the
     // old generation's outstanding bit, then returns the slot to kFree.
     ASSERT_TRUE(ch->UnregisterSubscriber(b.id, b.generation).ok());
@@ -1520,7 +1520,7 @@ TEST(BroadcastThreadTest, SubscriberConcurrencyMatrix) {
 }
 
 // ---------------------------------------------------------------------------
-// D2-06: lease heartbeat + stale-subscriber eviction (design doc 12.2)
+// Lease heartbeat + stale-subscriber eviction (design doc 12.2)
 // ---------------------------------------------------------------------------
 //
 // These tests drive a virtual timeline: every timestamp is passed explicitly

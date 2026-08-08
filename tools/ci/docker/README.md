@@ -1,4 +1,4 @@
-# D3 Hermetic CodeGen Docker preflight
+# Hermetic Schema CodeGen Docker preflight
 
 This check builds and runs two isolated Linux user-space environments:
 
@@ -13,7 +13,7 @@ The host compares their logical-path SHA-256 manifests and root hashes.
 Run from the repository root:
 
 ```sh
-python3 tools/ci/run_d3_codegen_docker_check.py
+python3 tools/ci/run_schema_codegen_docker_check.py
 ```
 
 Use `--out=/some/path` to retain evidence elsewhere, or `--skip-build` to reuse
@@ -21,4 +21,4 @@ the two previously built images.
 
 This is a strong cross-environment preflight, but both containers still share a
 host kernel, CPU architecture, and storage stack. The GitHub Actions
-`D3 Extended Validation` workflow remains the formal cross-machine check.
+`Schema Extended Validation` workflow remains the formal cross-machine check.

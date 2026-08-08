@@ -141,7 +141,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 不同进程映射不同虚拟地址时 Handle 正确解析（INV-03，`//mino/shm/region:cross_process_handle_test`：子进程 MAP_FIXED 占坑强制异地址 Attach，解析/payload/stale 拒绝全验，TSAN 通过）
 - [x] MPMC 骨架跨进程守恒/回绕/满空判定测试通过（V-26，`//mino/shm/channel:mpmc_ring_xproc_test`：2P2C fork 进程 10000 条零丢失零重复（~156 次回绕）、满 kResourceExhausted/空 kWouldBlock 跨进程传播）
 - [x] Slab 分配/回收在 TSAN 下无数据竞争（`bazel test --config=tsan //...` 23/23 通过，2026-07-28 macOS arm64）
-- [x] Kill 压力测试（≥1 小时）：`d1_region_recovery_kill_stress_long_test`，seed 67890，1,190,183 次随机恢复迭代，orphan = 0、bitmap/header 一致、survivor 保留、空间恢复基线（2026-08-01 Linux x86-64）
+- [x] Kill 压力测试（≥1 小时）：`region_recovery_kill_stress_long_test`，seed 67890，1,190,183 次随机恢复迭代，orphan = 0、bitmap/header 一致、survivor 保留、空间恢复基线（2026-08-01 Linux x86-64）
 - [x] 恢复扫描器双 Owner 竞争测试通过（V-11，`//mino/shm/recovery:double_owner_test` fork 双进程竞争/Kill 接管/Lease 失效单赢家）
 
 ---
@@ -192,7 +192,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] SPSC 长时间回绕无 ABA、无重复/漏消费（INV-01，`spsc_channel_test` 10000 次回绕 + `spsc_channel_xproc_test` fork 双进程 20000 条 ~312 次回绕零丢失零重复）
 - [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
 - [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
-- [ ] 当前发布候选执行新版 Publisher/Subscriber 多场景随机 campaign ≥1 小时，fixed 与 run-derived seed 均满足五类场景、13 个确定性 SIGKILL 切点、SIGSTOP-live、守恒、ACK/Lease/Journal 清理、allocator 容量恢复及 commit/clean qualification，并归档完整 hash manifest（旧版 `d2_recovery_stress_long_test` 历史运行不替代新版门禁）
+- [ ] 当前发布候选执行新版 Publisher/Subscriber 多场景随机 campaign ≥1 小时，fixed 与 run-derived seed 均满足五类场景、13 个确定性 SIGKILL 切点、SIGSTOP-live、守恒、ACK/Lease/Journal 清理、allocator 容量恢复及 commit/clean qualification，并归档完整 hash manifest（旧版 `runtime_recovery_stress_long_test` 历史运行不替代新版门禁）
 - [x] ASAN/UBSAN/TSAN 全部通过（2026-08-01 修复后全仓无缓存回归各 59/59；D2 新增 JournalChannelRecoveryCoordinator、Broadcast era-bound ACK 与三态 Lease 回归）
 - [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；固定 `.cfg` 与 CI 已落地；TLC v1.7.4 实跑通过：MPSC 55,672、Broadcast 1,241、Lease 106,304 个 distinct states）
 
@@ -326,8 +326,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D5-11 | Retention ✅ | 按时间/字节/Segment 数/归档删除、Reader Pin/Lease、崩溃幂等恢复（`//mino/storage:retention`，详设 17.14） | D5-09 | 3d |
 | D5-12 | `mino` 运维工具 ✅ | record/replay/storage inspect/verify/repair CLI（`//tools/mino:mino`，详设 17.16） | D5-10 | 5d |
 | D5-13 | 录制模式集成 ✅ | `//mino/storage:recording_policy` + `//mino/storage:recorder` + `//mino/storage:snapshot_store`：四种模式、确认/Sync/Buffer 策略、Snapshot 原子覆盖与完整 Session 编排（详设 17.4） | D5-07 | 3d |
-| D5-14 | 正式 SLA 文档 ✅ | `docs/benchmarks/D5_Storage_SLA.md`：硬件、负载、统计口径、实测目标与原始 JSON | 全部 | 3d |
-| D5-15 | Kill/ENOSPC/磁盘抖动测试 ✅（持续） | `//mino/storage:storage_fault_test` + `tools/ci/run_d5_storage_fault_campaign.py`：多阶段真实 SIGKILL，child alarm + parent bounded reap + runner 进程组 watchdog；短写、EINTR、ENOSPC、EIO、EROFS、磁盘暂停；逐场景计数、证据 hash 与 commit/clean qualification fail-closed | 全部 | 持续 |
+| D5-14 | 正式 SLA 文档 ✅ | `docs/benchmarks/Storage_SLA.md`：硬件、负载、统计口径、实测目标与原始 JSON | 全部 | 3d |
+| D5-15 | Kill/ENOSPC/磁盘抖动测试 ✅（持续） | `//mino/storage:storage_fault_test` + `tools/ci/run_storage_fault_campaign.py`：多阶段真实 SIGKILL，child alarm + parent bounded reap + runner 进程组 watchdog；短写、EINTR、ENOSPC、EIO、EROFS、磁盘暂停；逐场景计数、证据 hash 与 commit/clean qualification fail-closed | 全部 | 持续 |
 
 ### 7.2 并行工作流
 
@@ -356,7 +356,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] 缓冲满时按策略背压/丢弃/失败，无静默丢失（INV-12、INV-13；Buffer/Topology/Recorder 测试）
 - [x] Ingestion Sequence 无无法解释的永久空洞（INV-23；Gap/Tombstone + `topic_writer_test`）
 - [x] Replay 可按 Topic/时间/Sequence 过滤回放（`replay_engine_test` + Storage CLI 测试）
-- [x] **正式 SLA 文档发布**（`docs/benchmarks/D5_Storage_SLA.md`）
+- [x] **正式 SLA 文档发布**（`docs/benchmarks/Storage_SLA.md`）
 - [ ] 当前发布候选在 clean、commit-matched qualification 下完成新版六场景、每场景 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、逐场景计数、命令、日志 SHA-256、watchdog 结果和 GitHub run provenance 的 manifest
 
 ---
@@ -380,7 +380,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D6-07 | Fabric Driver（IPCF/NTB/CXL） | FabricWindowDriver 实现（详设 15.3、16.7） | D4-04 | 8d |
 | D6-08 | 大对象专用池优化 | Huge Page、DMA/RDMA Buffer 隔离 | D1-10 | 3d |
 | D6-09 | Topic Partition | 单 Writer 瓶颈后的分区扩展（详设 17.8） | D5-06 | 5d |
-| D6-10 | 长稳测试 ✅（框架完成，资格待执行） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/d6-10-long-soak.yml`；统一 allocator/channel/bridge/storage/observability workload，采样 RSS/Slab/Queue/FD，按 24h 归一化并对 <5% 门禁 fail-closed | 全部 | 持续 |
+| D6-10 | 长稳测试 ✅（框架完成，资格待执行） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/long-soak-validation.yml`；统一 allocator/channel/bridge/storage/observability workload，采样 RSS/Slab/Queue/FD，按 24h 归一化并对 <5% 门禁 fail-closed | 全部 | 持续 |
 
 ### 8.2 产品化（P6）
 
@@ -421,7 +421,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | Litmus Test | 跨进程原子内存序验证 | D0（V-12） |
 | TLA+ 模型 | MPSC/Broadcast/Lease 形式化 | D2 |
 | 故障注入框架 ✅ | SIGKILL/SIGSTOP/连接后网络断开/多阶段存储故障/时钟跳变；D2/D4/D5 runner 生成 commit-matched manifest | D2 起持续 |
-| Benchmark 框架 ✅ | `//benchmarks:d0_d5_validation_benchmark` 覆盖 V-14/V-15/V-16/V-17/V-18/V-27，`//mino/observability:v23_telemetry_benchmark` 覆盖 V-23；资格结果待实跑归档 | D1 起持续 |
+| Benchmark 框架 ✅ | `//benchmarks:validation_benchmark` 覆盖 V-14/V-15/V-16/V-17/V-18/V-27，`//mino/observability:v23_telemetry_benchmark` 覆盖 V-23；资格结果待实跑归档 | D1 起持续 |
 
 ### 9.2 可观测性
 

@@ -6,7 +6,7 @@ bazel-*
 .bazelrc.local
 __pycache__/
 *.py[cod]
-d5-storage-fault-campaign/
+storage-fault-campaign/
 
 # Compiled artifacts
 *.o

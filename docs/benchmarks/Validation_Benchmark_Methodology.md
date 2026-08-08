@@ -1,10 +1,10 @@
-# D0–D5 尚缺验证 Benchmark 方法与报告模板
+# Validation Benchmark 方法与报告模板
 
 - 状态：**PENDING（尚未在资格硬件上实跑）**
-- Benchmark target：`//benchmarks:d0_d5_validation_benchmark`
-- Artifact schema：`mino.d0_d5_validation_benchmark.v1`
-- JSON Schema：`docs/benchmarks/d0_d5_validation_benchmark.schema.json`
-- 空结果模板：`docs/benchmarks/d0_d5_validation_pending.json`
+- Benchmark target：`//benchmarks:validation_benchmark`
+- Artifact schema：`mino.validation_benchmark.v1`
+- JSON Schema：`docs/benchmarks/validation_benchmark.schema.json`
+- 空结果模板：`docs/benchmarks/validation_benchmark_pending.json`
 
 本文只定义可复现方法和结果字段，不提供推测性能数字。仓库中的模板以 `PENDING` 和 `null` 明确表示未实跑。
 
@@ -24,7 +24,7 @@
 资格结果必须使用 Release 配置，并显式注入 commit 和硬件信息：
 
 ```bash
-bazel build --config=release //benchmarks:d0_d5_validation_benchmark
+bazel build --config=release //benchmarks:validation_benchmark
 
 MINO_BENCHMARK_COMMIT="$(git rev-parse HEAD)" \
 MINO_BENCHMARK_BUILD_CONFIG="bazel --config=release" \
@@ -32,7 +32,7 @@ MINO_BENCHMARK_CPU_MODEL="<CPU model>" \
 MINO_BENCHMARK_MEMORY="<DIMMs/capacity/speed>" \
 MINO_BENCHMARK_STORAGE_DEVICE="<device/controller>" \
 MINO_BENCHMARK_FILESYSTEM="<filesystem and mount options>" \
-bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
+bazel run --config=release //benchmarks:validation_benchmark -- \
   --suite=all \
   --iterations=10000 \
   --storage-records=1000 \
@@ -40,7 +40,7 @@ bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
   --payload-bytes=64 \
   --pin-count=1000 \
   --directory=/tmp \
-  --output-json=/tmp/mino-d0-d5-validation.json
+  --output-json=/tmp/mino-validation-benchmark.json
 ```
 
 同名 CLI 参数优先于环境变量，例如 `--commit` 覆盖 `MINO_BENCHMARK_COMMIT`。未注入的 provenance 字段写为 `PENDING`，不会猜测。程序自动记录 UTC 运行时间、完整 argv、编译器 `__VERSION__`、`__cplusplus`、`uname`、logical CPU count 和可获取的 physical memory bytes。
@@ -48,15 +48,30 @@ bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
 可以分开运行，避免磁盘阶段干扰内存阶段：
 
 ```bash
-bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
+bazel run --config=release //benchmarks:validation_benchmark -- \
   --suite=memory --commit=<sha> --build-config='bazel --config=release'
 
-bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
+bazel run --config=release //benchmarks:validation_benchmark -- \
   --suite=storage --commit=<sha> --build-config='bazel --config=release' \
   --directory=<qualified filesystem path>
 ```
 
 被 `--suite` 排除的验证项在输出中保留，并标记为 `PENDING`，而不是写入零值冒充结果。
+
+### 2.1 实现与快速契约测试结构
+
+`benchmarks/validation_benchmark.cc` 仅负责执行顺序、输出文件和失败退出的薄入口。实现位于 `benchmarks/validation/`：
+
+- `common/`：CLI/config、provenance、nearest-rank 统计、JSON 基础函数、运行状态、payload 和受控临时目录；
+- `report/`：顶层 artifact JSON 与失败 artifact 组装；
+- `validations/`：V-14、V-15、V-16、V-17、V-18、V-27 各自独立的 `.cc/.h`，验证项私有 helper 只存在于对应 `.cc`；
+- `tests/contract_smoke_test.py`：使用 Python 标准库 `json`（不依赖 `jq`）分别运行小规模 memory/storage，并验证六个 V key、`MEASURED`/`PENDING` 与失败 artifact 的 `FAILED` 语义。
+
+快速回归命令：
+
+```bash
+bazel test //benchmarks:validation_contract_smoke_test
+```
 
 ## 3. 统计口径
 
@@ -100,15 +115,15 @@ Static 路径使用项目已有 codegen golden 生成物 `TelemetryAccessor::seq
 
 steady-state 路径对 exact `TopicPinRegistration` 做 acquire/release。cleanup 路径先持有参数化数量的 Recorder Pin，再让 owner lease 到期，并由注入的 `LivenessProbe` 明确返回 `kDead`；随后计时 `SweepExpiredNodes`，且强制验证 `pins_removed == acquired pins`。`kUnknown` liveness 不属于本 benchmark 的授权清理条件。
 
-## 5. `d5_storage_64b.json` 命名审计
+## 5. `storage_64b.json` 命名审计
 
-已读取 `docs/benchmarks/d5_storage_64b.json`：
+已读取 `docs/benchmarks/storage_64b.json`：
 
 - `configuration.payload_bytes` 为 **64**；
-- 文件名 `d5_storage_64b.json` 的 `64b` 与实际 payload **一致**；
-- 因此无需重命名或修正内容；按要求未修改任何现有 D5 JSON。
+- 文件名 `storage_64b.json` 的 `64b` 与实际 payload **一致**；
+- 因此无需修正内容；按要求未修改现有 storage JSON。
 
-审计结论也写入 `docs/benchmarks/d0_d5_validation_pending.json` 的 `audits`，与性能结果的 `PENDING` 状态分离。
+审计结论也写入 `docs/benchmarks/validation_benchmark_pending.json` 的 `audits`，与性能结果的 `PENDING` 状态分离。
 
 ## 6. 正式结果填写规则
 
@@ -116,4 +131,4 @@ steady-state 路径对 exact `TopicPinRegistration` 做 acquire/release。cleanu
 2. `artifact_status=MEASURED` 只表示程序完成测量且运行时 API 未报告错误，不自动代表 SLA PASS；`FAILED` artifact 必须保留用于诊断但不得作为资格证据。
 3. 任一 errors/sync_errors 非零、V-27 Pin 守恒失败或 provenance 仍为 `PENDING`，均不得作为发布资格证据。
 4. V-18 公式值必须继续标为 modeled，不可改称 measured。
-5. 使用 `docs/benchmarks/d0_d5_validation_benchmark.schema.json` 校验 artifact 后，再在独立评审报告中定义门槛与 PASS/FAIL；本次补齐不改开发计划，也不凭空设 SLA。
+5. 使用 `docs/benchmarks/validation_benchmark.schema.json` 校验 artifact 后，再在独立评审报告中定义门槛与 PASS/FAIL；本次补齐不改开发计划，也不凭空设 SLA。

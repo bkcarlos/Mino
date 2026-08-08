@@ -21,7 +21,7 @@ inline constexpr int kStorageExitUsage = 2;
 inline constexpr int kStorageExitInvalidData = 3;
 inline constexpr int kStorageExitPermissionDenied = 4;
 
-// D4 installs a Bus-backed implementation at process assembly time. The CLI
+// Process assembly installs a Bus-backed implementation. The CLI
 // owns neither the launcher nor the resulting long-running service.
 class RecorderServiceLauncher {
 public:

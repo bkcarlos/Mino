@@ -438,7 +438,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     auto* sb = static_cast<SuperBlock*>(segment.base());
 
     // Steps 3-7: immutable header validation. The set of feature flags this
-    // reader supports is, for D1, "none required"; callers requiring specific
+    // reader supports is currently "none required"; callers requiring specific
     // features pass them via expected_feature_flags (currently 0).
     MINO_RETURN_IF_ERROR(ValidateImmutableHeader(*sb, object_size,
                                                  /*expected_feature_flags=*/0));

@@ -56,8 +56,8 @@ void ArmStorageChildWatchdog() noexcept {
 }
 
 constexpr std::string_view kRoundsEnvironment =
-    "MINO_D5_STORAGE_FAULT_ROUNDS";
-constexpr std::string_view kSeedEnvironment = "MINO_D5_STORAGE_FAULT_SEED";
+    "MINO_STORAGE_FAULT_ROUNDS";
+constexpr std::string_view kSeedEnvironment = "MINO_STORAGE_FAULT_SEED";
 
 std::filesystem::path TestDirectory(std::string_view name) {
     static std::atomic<uint64_t> sequence{0};
@@ -66,7 +66,7 @@ std::filesystem::path TestDirectory(std::string_view name) {
         temporary == nullptr ? std::filesystem::temp_directory_path()
                              : std::filesystem::path(temporary);
     const std::filesystem::path path =
-        base / ("mino_d5_storage_fault_" + std::string(name) + "_" +
+        base / ("mino_storage_fault_" + std::string(name) + "_" +
                 std::to_string(static_cast<uint64_t>(::getpid())) + "_" +
                 std::to_string(sequence.fetch_add(1)));
     std::error_code ignored;
@@ -229,7 +229,7 @@ void WriteOneByte(const std::filesystem::path& path) {
     ASSERT_TRUE(output.good());
 }
 
-TEST(D5StorageFaultTest, ReopenObservesOnlyAtomicSchemaAndManifestStates) {
+TEST(StorageFaultTest, ReopenObservesOnlyAtomicSchemaAndManifestStates) {
     auto artifact = CompileArtifact();
     ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
 
@@ -413,7 +413,7 @@ constexpr std::array<ErrnoExpectation, 3> kIoErrors = {
     ErrnoExpectation{EROFS, StatusCode::kPermissionDenied},
 };
 
-TEST(D5StorageFaultTest, WriterIoFaultsAreStickyAndRecoveryLosesNoCommit) {
+TEST(StorageFaultTest, WriterIoFaultsAreStickyAndRecoveryLosesNoCommit) {
     {
         const std::filesystem::path root = TestDirectory("short_eintr");
         const std::filesystem::path path = root / "segment.mino";
@@ -592,7 +592,7 @@ int WaitForChild(pid_t child) {
 
 void ReportScenario(std::string_view scenario, uint64_t rounds,
                     uint64_t cases, uint64_t seed) {
-    std::cout << "D5_SCENARIO_RESULT scenario=" << scenario
+    std::cout << "STORAGE_FAULT_SCENARIO_RESULT scenario=" << scenario
               << " rounds=" << rounds << " cases=" << cases
               << " seed=" << seed << std::endl;
 }
@@ -605,7 +605,7 @@ bool ChildWasKilled(int status) {
     return status != -1 && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
-TEST(D5StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
+TEST(StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr size_t kRecordCount = 4;
     const size_t encoded_size = *EncodedRecordSize(SampleRecord(1).payload.size());
@@ -715,7 +715,7 @@ int KillAroundDataSync(int fd, void* context) noexcept {
     KillCurrentProcess(112);
 }
 
-TEST(D5StorageFaultTest, SigkillBeforeAndAfterRecordAndSealSync) {
+TEST(StorageFaultTest, SigkillBeforeAndAfterRecordAndSealSync) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr std::array<std::pair<bool, bool>, 4> cuts = {{
         {false, false},
@@ -792,7 +792,7 @@ Status KillAtSchemaPoint(SchemaStoreFaultPoint point, void* context) noexcept {
     return Status::Ok();
 }
 
-TEST(D5StorageFaultTest, SigkillAcrossSchemaPersistencePhases) {
+TEST(StorageFaultTest, SigkillAcrossSchemaPersistencePhases) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr std::array<SchemaStoreFaultPoint, 8> points = {
         SchemaStoreFaultPoint::kAfterDescriptorTempWrite,
@@ -870,7 +870,7 @@ Status KillAtManifestPoint(ManifestFaultPoint point, void* context) noexcept {
     return Status::Ok();
 }
 
-TEST(D5StorageFaultTest, SigkillAcrossManifestPersistencePhases) {
+TEST(StorageFaultTest, SigkillAcrossManifestPersistencePhases) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr std::array<ManifestFaultPoint, 4> points = {
         ManifestFaultPoint::kAfterTempWrite,
@@ -945,7 +945,7 @@ SegmentManifestEntry CampaignSegment(SegmentPersistentState state) {
     };
 }
 
-TEST(D5StorageFaultTest, SigkillAcrossSealAndCheckpointPersistence) {
+TEST(StorageFaultTest, SigkillAcrossSealAndCheckpointPersistence) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr std::array<ManifestFaultPoint, 4> points = {
         ManifestFaultPoint::kAfterTempWrite,
@@ -1036,7 +1036,7 @@ TEST(D5StorageFaultTest, SigkillAcrossSealAndCheckpointPersistence) {
 #endif
 }
 
-TEST(D5StorageFaultTest, SigkillAcrossOrphanQuarantinePersistence) {
+TEST(StorageFaultTest, SigkillAcrossOrphanQuarantinePersistence) {
 #if defined(__unix__) || defined(__APPLE__)
     constexpr std::array<ManifestFaultPoint, 2> points = {
         ManifestFaultPoint::kAfterOrphanRename,
@@ -1161,7 +1161,7 @@ bool ReserveAndCommit(RecorderBufferPool* pool, uint64_t tag) {
     return std::move(reserved->reservation).Commit().ok();
 }
 
-TEST(D5StorageFaultTest, PausedDiskKeepsBufferingBoundedAndAppliesPolicy) {
+TEST(StorageFaultTest, PausedDiskKeepsBufferingBoundedAndAppliesPolicy) {
     RecorderBufferPoolOptions pool_options;
     pool_options.global_byte_limit = 12u * 1024u;
     pool_options.default_topic_byte_limit = pool_options.global_byte_limit;

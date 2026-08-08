@@ -1,4 +1,4 @@
-# Mino CI（开发计划 D0-03）
+# Mino CI
 #
 # 触发：push 到 master/main + pull_request
 # 矩阵：debug / release / asan / ubsan / tsan 五配置（sanitizer 互斥，分 job 运行）
@@ -166,15 +166,15 @@ jobs:
       - name: Python and shell syntax checks
         run: |
           python3 -m compileall -q tools/ci
-          bash -n tools/ci/run_d3_codegen_environment.sh
+          bash -n tools/ci/run_schema_codegen_environment.sh
 
       - name: Runner self-tests
         run: |
           python3 tools/ci/collect_codegen_artifacts.py --self-test
-          python3 tools/ci/prepare_d3_fuzz_corpus.py --self-test
-          python3 tools/ci/run_d3_codegen_docker_check.py --self-test
-          python3 tools/ci/run_d3_fuzz_campaign.py --self-test
-          python3 tools/ci/run_d5_storage_fault_campaign.py --self-test
+          python3 tools/ci/prepare_schema_fuzz_corpus.py --self-test
+          python3 tools/ci/run_schema_codegen_docker_check.py --self-test
+          python3 tools/ci/run_schema_fuzz_campaign.py --self-test
+          python3 tools/ci/run_storage_fault_campaign.py --self-test
           python3 tools/ci/run_extended_long_test.py --self-test
           python3 tools/ci/run_recovery_stress.py --self-test
           python3 tools/ci/run_tla_validation.py --self-test

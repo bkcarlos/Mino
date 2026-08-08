@@ -36,7 +36,7 @@ struct MessageSource {
     friend bool operator==(const MessageSource&, const MessageSource&) = default;
 };
 
-// Metadata accompanying canonical payload bytes through D5-04 to D5-06.
+// Metadata accompanying canonical payload bytes from buffer admission through writing.
 // ingestion_sequence is intentionally absent: TopicWriter assigns it only
 // after queue admission.
 struct RecorderRecordMetadata {

@@ -216,7 +216,7 @@ bool VerifyIndexSlotImmutableCrc(const IndexSlot& slot) noexcept;
 // producer may reuse and overwrite the slot (e.g. under kDropOldest) without
 // tearing the consumer's view. The payload itself stays zero-copy — the
 // snapshot only carries its ShmHandle; payload lifetime is guarded by the
-// slab generation and, once D2-11 lands, the reference Pin (ADR-0013).
+// slab generation and the reference Pin protocol (ADR-0013).
 struct IndexSlotSnapshot {
     uint32_t msg_type = 0;
     uint32_t schema_version = 0;

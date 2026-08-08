@@ -1,6 +1,6 @@
-# D6-10 is a dedicated steady-state qualification. It does not invoke the
-# existing recovery, fuzz, reconnect, or persistence-fault long campaigns.
-name: D6-10 72h Long Soak
+# Long-soak validation is a dedicated steady-state qualification. It does not
+# invoke the existing recovery, fuzz, reconnect, or persistence-fault campaigns.
+name: Long Soak Validation
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       duration_seconds:
-        description: Qualification duration in seconds (default and minimum supported by this workflow: 259200 / 72h)
+        description: "Qualification duration in seconds (default and minimum supported by this workflow: 259200 / 72h)"
         required: false
         default: "259200"
         type: string
@@ -19,16 +19,15 @@ on:
   pull_request:
     branches: [master, main]
     paths:
-      - ".github/workflows/d6-10-long-soak.yml"
+      - ".github/workflows/long-soak-validation.yml"
       - "benchmarks/soak_probe/**"
-      - "docs/ci-long-running.md"
       - "tools/ci/run_long_soak.py"
 
 permissions:
   contents: read
 
 concurrency:
-  group: d6-10-soak-${{ github.event_name == 'pull_request' && github.ref || 'qualification' }}
+  group: long-soak-${{ github.event_name == 'pull_request' && github.ref || 'steady-state-qualification' }}
   cancel-in-progress: false
 
 jobs:
@@ -76,12 +75,12 @@ jobs:
             --seed=610 \
             --probe="${RUNNER_TEMP}/mino-soak-probe" \
             --expected-commit="${GITHUB_SHA}" \
-            --out="${RUNNER_TEMP}/mino-d6-10-smoke"
+            --out="${RUNNER_TEMP}/mino-long-soak-smoke"
 
       - name: Verify smoke evidence fail closed
         run: |
           python3 tools/ci/run_long_soak.py \
-            --verify-manifest="${RUNNER_TEMP}/mino-d6-10-smoke/manifest.json" \
+            --verify-manifest="${RUNNER_TEMP}/mino-long-soak-smoke/manifest.json" \
             --expected-commit="${GITHUB_SHA}" \
             --require-passed
 
@@ -89,8 +88,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d6-10-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/mino-d6-10-smoke/
+          name: long-soak-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-long-soak-smoke/
           if-no-files-found: error
           retention-days: 14
 
@@ -116,7 +115,7 @@ jobs:
 
       - name: Reject non-72h qualification input
         run: |
-          python3 -c 'import os; value=int(os.environ["SOAK_DURATION_SECONDS"]); assert value >= 259200, "D6-10 qualification requires at least 259200 seconds"'
+          python3 -c 'import os; value=int(os.environ["SOAK_DURATION_SECONDS"]); assert value >= 259200, "Long-soak steady-state qualification requires at least 259200 seconds"'
 
       - name: Build and stage release soak probe
         run: |
@@ -126,7 +125,7 @@ jobs:
           install -m 0755 bazel-bin/benchmarks/soak_probe/soak_probe \
             "${RUNNER_TEMP}/mino-soak-probe"
 
-      - name: Run unified D6-10 soak
+      - name: Run long-soak steady-state qualification
         run: |
           python3 tools/ci/run_long_soak.py \
             --duration-seconds="${SOAK_DURATION_SECONDS}" \
@@ -137,13 +136,13 @@ jobs:
             --seed="${SOAK_SEED}" \
             --probe="${RUNNER_TEMP}/mino-soak-probe" \
             --expected-commit="${GITHUB_SHA}" \
-            --out="${RUNNER_TEMP}/mino-d6-10-soak"
+            --out="${RUNNER_TEMP}/mino-long-soak-qualification"
 
       - name: Verify qualification evidence fail closed
         if: always()
         run: |
           python3 tools/ci/run_long_soak.py \
-            --verify-manifest="${RUNNER_TEMP}/mino-d6-10-soak/manifest.json" \
+            --verify-manifest="${RUNNER_TEMP}/mino-long-soak-qualification/manifest.json" \
             --expected-commit="${GITHUB_SHA}" \
             --require-passed \
             --require-qualified
@@ -152,7 +151,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d6-10-72h-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/mino-d6-10-soak/
+          name: long-soak-steady-state-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-long-soak-qualification/
           if-no-files-found: error
           retention-days: 90

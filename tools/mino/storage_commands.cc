@@ -1218,7 +1218,7 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
                 "record",
                 Status::Error(
                     StatusCode::kUnsupported,
-                    "no RecorderService launcher is installed; D4 Bus assembly is required"),
+                    "no RecorderService launcher is installed; Bus-backed process assembly is required"),
                 err);
         }
         const Status started = service_launcher->Run(root);

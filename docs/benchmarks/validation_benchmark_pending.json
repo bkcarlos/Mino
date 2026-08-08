@@ -1,5 +1,5 @@
 {
-  "schema": "mino.d0_d5_validation_benchmark.v1",
+  "schema": "mino.validation_benchmark.v1",
   "artifact_status": "PENDING",
   "clock": "std::chrono::steady_clock",
   "provenance": {
@@ -43,7 +43,7 @@
     "V-27": {"status": "PENDING", "reason": "benchmark not run", "metrics": null}
   },
   "audits": {
-    "docs/benchmarks/d5_storage_64b.json": {
+    "docs/benchmarks/storage_64b.json": {
       "observed_configuration_payload_bytes": 64,
       "filename_payload_label_bytes": 64,
       "conclusion": "CONSISTENT",

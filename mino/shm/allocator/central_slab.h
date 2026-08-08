@@ -131,7 +131,7 @@ struct CentralSlabSlotMetadata {
     uint32_t capacity = 0;
 };
 
-// D6-01 tuning is deliberately process-local. It is never serialized into the
+// Allocator scan tuning is deliberately process-local. It is never serialized into the
 // allocator superblock, so old shared-memory images and Attach remain ABI
 // compatible. The cache stores only bounded scan cursors, never free slots.
 struct AllocatorLocalCacheConfig {
@@ -259,9 +259,9 @@ public:
     Status Retire(ShmHandle handle);
 
     // Reclaims the slot: clears the allocation bitmap so the slot becomes
-    // reusable (design doc 8.4). Per the D1 scope the caller asserts that no
-    // valid Borrow and no live Pin exist; this is enforced once the Borrow /
-    // Pin registry (design doc 11) lands. Requires the slot to be in
+    // reusable (design doc 8.4). The caller asserts that no valid Borrow and
+    // no live Pin exist, as required by the Borrow/Pin protocol (design doc 11).
+    // Requires the slot to be in
     // kRetired (or an unpublished/intermediate state for recovery-driven
     // reclaim).
     Status Reclaim(ShmHandle handle);

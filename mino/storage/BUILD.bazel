@@ -409,7 +409,7 @@ cc_test(
 cc_test(
     name = "storage_fault_test",
     srcs = ["storage_fault_test.cc"],
-    tags = ["d5-storage-fault"],
+    tags = ["storage-fault"],
     timeout = "long",
     target_compatible_with = POSIX_ONLY,
     deps = [

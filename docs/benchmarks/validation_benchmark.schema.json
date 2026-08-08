@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mino.dev/schemas/d0_d5_validation_benchmark.v1.schema.json",
-  "title": "Mino D0-D5 validation benchmark artifact",
+  "$id": "https://mino.dev/schemas/validation_benchmark.v1.schema.json",
+  "title": "Mino validation benchmark artifact",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,7 @@
   ],
   "properties": {
     "schema": {
-      "const": "mino.d0_d5_validation_benchmark.v1"
+      "const": "mino.validation_benchmark.v1"
     },
     "artifact_status": {
       "enum": ["MEASURED", "FAILED", "PENDING"]
@@ -70,7 +70,7 @@
       "type": "object",
       "required": ["status"],
       "properties": {
-        "status": {"enum": ["MEASURED", "MEASURED_AND_MODELED", "FAILED", "PENDING"]}
+        "status": {"enum": ["MEASURED", "MEASURED_AND_MODELED", "FAILED", "PENDING"]},
         "reason": {"type": "string"},
         "metrics": {"type": ["object", "array", "null"]}
       },

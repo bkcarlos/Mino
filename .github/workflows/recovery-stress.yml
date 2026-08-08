@@ -32,19 +32,19 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - id: d1-fixed
-            suite: d1
-            name: D1 Region recovery (2h, fixed seed)
+          - id: region-fixed
+            suite: region
+            name: Region recovery (2h, fixed seed)
             seed_kind: fixed
             seed: "910009"
-          - id: d2-fixed
-            suite: d2
-            name: D2 Runtime recovery (2h, fixed seed)
+          - id: runtime-fixed
+            suite: runtime
+            name: Runtime recovery (2h, fixed seed)
             seed_kind: fixed
             seed: "920009"
-          - id: d2-run-derived
-            suite: d2
-            name: D2 Runtime recovery (2h, run-derived seed)
+          - id: runtime-run-derived
+            suite: runtime
+            name: Runtime recovery (2h, run-derived seed)
             seed_kind: run-derived
             seed: ""
 
@@ -115,7 +115,7 @@ jobs:
               assert artifact.is_file()
               assert isinstance(hashes.get(name), str)
               assert hashlib.sha256(artifact.read_bytes()).hexdigest() == hashes[name]
-          if manifest["suite"] == "d2":
+          if manifest["suite"] == "runtime":
               expected_classes = {
                   "publisher_crash", "subscriber_kill", "slow_subscriber",
                   "lease_boundary", "pid_incarnation",

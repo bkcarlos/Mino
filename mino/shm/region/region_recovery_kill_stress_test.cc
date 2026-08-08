@@ -410,7 +410,7 @@ bool PrepareChildBaseline(CentralSlabAllocator* allocator,
     ReachCrashPoint(shared, CrashScenario::kRecovery, interruption);
 }
 
-class D1RegionRecoveryKillStressTest : public ::testing::Test {
+class RegionRecoveryKillStressTest : public ::testing::Test {
 protected:
     void SetUp() override {
         void* mapped = ::mmap(nullptr, sizeof(SharedControl),
@@ -436,7 +436,7 @@ protected:
     std::string NextRegionName() {
         static std::atomic<uint64_t> sequence{0};
         const uint64_t value = sequence.fetch_add(1, std::memory_order_relaxed);
-        std::string name = "/d1k_" + std::to_string(::getpid()) + "_" +
+        std::string name = "/rrk_" + std::to_string(::getpid()) + "_" +
                            std::to_string(value);
         EXPECT_LE(name.size(), 31u);
         return name;
@@ -777,17 +777,17 @@ protected:
     std::string wait_reached_failure_;
 };
 
-TEST_F(D1RegionRecoveryKillStressTest, RandomizedTimedRecoveryStress) {
+TEST_F(RegionRecoveryKillStressTest, RandomizedTimedRecoveryStress) {
     uint64_t stress_seconds = 0;
     uint64_t seed = DefaultStressSeed();
     std::string seconds_error;
     std::string seed_error;
     ASSERT_TRUE(ReadUnsignedEnvironment(
-        "MINO_D1_REGION_RECOVERY_STRESS_SECONDS", kDefaultStressSeconds,
+        "MINO_REGION_RECOVERY_STRESS_SECONDS", kDefaultStressSeconds,
         &stress_seconds, &seconds_error))
         << seconds_error;
     ASSERT_TRUE(ReadUnsignedEnvironment(
-        "MINO_D1_REGION_RECOVERY_STRESS_SEED", seed, &seed, &seed_error))
+        "MINO_REGION_RECOVERY_STRESS_SEED", seed, &seed, &seed_error))
         << seed_error;
 
     const auto started = StressClock::now();
@@ -804,7 +804,7 @@ TEST_F(D1RegionRecoveryKillStressTest, RandomizedTimedRecoveryStress) {
 
     RecordProperty("stress_seed", std::to_string(seed));
     RecordProperty("stress_seconds", std::to_string(stress_seconds));
-    std::cout << "D1 Region recovery kill stress: seed=" << seed
+    std::cout << "Region recovery kill stress: seed=" << seed
               << " seconds=" << stress_seconds
               << " cleanup_reserve_ms=" << cleanup_reserve.count()
               << std::endl;
@@ -847,14 +847,14 @@ TEST_F(D1RegionRecoveryKillStressTest, RandomizedTimedRecoveryStress) {
             << "stress scheduled no rounds; seed=" << seed;
     }
     RecordProperty("iterations", std::to_string(iteration));
-    std::cout << "D1 Region recovery kill stress completed: seed=" << seed
+    std::cout << "Region recovery kill stress completed: seed=" << seed
               << " iterations=" << iteration << " elapsed_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                      .count()
               << std::endl;
 }
 
-TEST_F(D1RegionRecoveryKillStressTest,
+TEST_F(RegionRecoveryKillStressTest,
        EveryLifecyclePointHandlesSigkillAndSigstop) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
@@ -874,7 +874,7 @@ TEST_F(D1RegionRecoveryKillStressTest,
     }
 }
 
-TEST_F(D1RegionRecoveryKillStressTest,
+TEST_F(RegionRecoveryKillStressTest,
        RequiresPosixSharedMemoryAndProcessSignals) {
     SUCCEED();
 }
@@ -884,7 +884,7 @@ TEST_F(D1RegionRecoveryKillStressTest,
 
 #else
 
-TEST(D1RegionRecoveryKillStressTest,
+TEST(RegionRecoveryKillStressTest,
      RequiresPosixSharedMemoryAndProcessSignals) {
     GTEST_SKIP() << "requires POSIX fork, mmap, shm_open, and process signals";
 }

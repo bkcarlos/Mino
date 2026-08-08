@@ -1,4 +1,4 @@
-name: D0-D5 Fuzz Validation
+name: Extended Fuzz Validation
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ on:
     branches: [master, main]
     paths:
       - .bazelrc
-      - .github/workflows/d0-d5-fuzz-validation.yml
+      - .github/workflows/extended-fuzz-validation.yml
       - MODULE.bazel
       - MODULE.bazel.lock
       - mino/abi/**
@@ -27,7 +27,7 @@ on:
     branches: [master, main]
     paths:
       - .bazelrc
-      - .github/workflows/d0-d5-fuzz-validation.yml
+      - .github/workflows/extended-fuzz-validation.yml
       - MODULE.bazel
       - MODULE.bazel.lock
       - mino/abi/**
@@ -42,7 +42,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: d0-d5-fuzz-${{ github.workflow }}-${{ github.ref }}
+  group: extended-fuzz-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -139,14 +139,14 @@ jobs:
             --sanitizer=${{ matrix.sanitizer }} \
             --seconds="${FUZZ_SECONDS}" \
             --seed="${FUZZ_SEED}" \
-            --out=fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
+            --out=extended-fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
 
       - name: Verify required evidence fail closed
         if: always()
         run: |
           python3 tools/ci/run_extended_fuzz_campaign.py \
             --verify \
-            --out=fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }} \
+            --out=extended-fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }} \
             --expected-commit="${GITHUB_SHA}" \
             --expected-seed="${FUZZ_SEED}" \
             --expected-selector=${{ matrix.selector }} \
@@ -157,7 +157,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d0-d5-fuzz-${{ matrix.selector }}-${{ matrix.sanitizer }}-${{ github.run_id }}
-          path: fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
+          name: extended-fuzz-${{ matrix.selector }}-${{ matrix.sanitizer }}-${{ github.run_id }}
+          path: extended-fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
           if-no-files-found: error
           retention-days: 90

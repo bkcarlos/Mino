@@ -249,9 +249,9 @@ struct BatchPublishResult {
     bool ok() const noexcept { return first_error.ok(); }
 };
 
-// D2-09 fixed-layout Publisher facade over an SPSC Channel. The public type is
-// intentionally independent of D3 Schema internals: StaticMessageTraits<T> is
-// the seam future CodeGen specializes.
+// Fixed-layout Publisher facade over an SPSC Channel. The public type is
+// intentionally independent of Schema internals: StaticMessageTraits<T> is the
+// seam CodeGen specializes.
 template <typename T>
 class Publisher {
 public:
@@ -648,11 +648,11 @@ private:
         static_assert(std::is_standard_layout_v<T>,
                       "SHM messages must have standard layout");
         static_assert(std::is_trivially_copyable_v<T>,
-                      "D2 fixed-layout messages must be trivially copyable");
+                      "fixed-layout messages must be trivially copyable");
         static_assert(std::is_trivially_default_constructible_v<T>,
-                      "D2 fixed-layout messages must be trivially default constructible");
+                      "fixed-layout messages must be trivially default constructible");
         static_assert(std::is_trivially_destructible_v<T>,
-                      "D2 fixed-layout messages must be trivially destructible");
+                      "fixed-layout messages must be trivially destructible");
     }
 
     template <typename Reservation>

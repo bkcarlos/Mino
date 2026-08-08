@@ -113,7 +113,7 @@ struct BufferReservationRequest {
     uint64_t user_tag = 0;
     BufferFullPolicy full_policy = BufferFullPolicy::kBlock;
     std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max();
-    // Optional preserves the generic D5-04 byte-buffer API. RecorderSubscriber
+    // Optional preserves the generic byte-buffer API. RecorderSubscriber
     // always supplies this value.
     std::optional<RecorderRecordMetadata> metadata;
 };

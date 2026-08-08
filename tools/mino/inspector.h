@@ -39,7 +39,7 @@ struct RegionV4UpgradeOptions;
 namespace mino::tools {
 
 // ---------------------------------------------------------------------------
-// Inspector (D1-11): offline diagnostic tool for Mino shared-memory regions.
+// Inspector: offline diagnostic tool for Mino shared-memory regions.
 //
 // Implements architecture doc 15.6:
 //   - Slab 一致性扫描 (SlabConsistencyReport)

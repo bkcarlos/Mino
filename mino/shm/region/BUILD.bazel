@@ -169,13 +169,13 @@ cc_test(
     ],
 )
 
-# D1 Region/Allocator/RecoveryScanner fork + MAP_SHARED kill stress.
+# Region/Allocator/RecoveryScanner fork + MAP_SHARED kill stress.
 # The default target is a short smoke. Reproduce failures with:
-#   --test_env=MINO_D1_REGION_RECOVERY_STRESS_SEED=<seed>
-# and adjust duration with MINO_D1_REGION_RECOVERY_STRESS_SECONDS.
+#   --test_env=MINO_REGION_RECOVERY_STRESS_SEED=<seed>
+# and adjust duration with MINO_REGION_RECOVERY_STRESS_SECONDS.
 cc_test(
-    name = "d1_region_recovery_kill_stress_test",
-    srcs = ["d1_region_recovery_kill_stress_test.cc"],
+    name = "region_recovery_kill_stress_test",
+    srcs = ["region_recovery_kill_stress_test.cc"],
     target_compatible_with = LINUX_ONLY,
     deps = [
         ":region",
@@ -192,18 +192,18 @@ cc_test(
 
 # Explicit one-hour randomized variant, excluded from wildcard CI. Invoke with
 # a finite outer watchdog, for example:
-#   bazel test //mino/shm/region:d1_region_recovery_kill_stress_long_test \
+#   bazel test //mino/shm/region:region_recovery_kill_stress_long_test \
 #     --test_timeout=3660 --test_output=streamed \
-#     --test_env=MINO_D1_REGION_RECOVERY_STRESS_SEED=12345
+#     --test_env=MINO_REGION_RECOVERY_STRESS_SEED=12345
 cc_test(
-    name = "d1_region_recovery_kill_stress_long_test",
+    name = "region_recovery_kill_stress_long_test",
     timeout = "long",
-    srcs = ["d1_region_recovery_kill_stress_test.cc"],
+    srcs = ["region_recovery_kill_stress_test.cc"],
     args = [
-        "--gtest_filter=D1RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:" +
-        "D1RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+        "--gtest_filter=RegionRecoveryKillStressTest.RandomizedTimedRecoveryStress:" +
+        "RegionRecoveryKillStressTest.RequiresPosixSharedMemoryAndProcessSignals",
     ],
-    env = {"MINO_D1_REGION_RECOVERY_STRESS_SECONDS": "3600"},
+    env = {"MINO_REGION_RECOVERY_STRESS_SECONDS": "3600"},
     tags = [
         "large",
         "manual",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D6-10 unified long-running soak runner with fail-closed evidence."""
+"""Long-soak steady-state qualification runner with fail-closed evidence."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA = "mino.d6_10.long_soak.v1"
-MARKER = ".mino-d6-10-soak-evidence"
+SCHEMA = "mino.long_soak.steady_state_qualification.v1"
+MARKER = ".mino-long-soak-steady-state-qualification-evidence"
 DEFAULT_DURATION_SECONDS = 72 * 60 * 60
 DAY_SECONDS = 24 * 60 * 60
 GROWTH_LIMIT_PERCENT = 5.0
@@ -156,7 +156,9 @@ def _prepare_output(output: Path, clean: bool) -> None:
                 raise ValueError(f"refusing to clean unmarked output: {output}")
             shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
-    (output / MARKER).write_text("Mino D6-10 soak evidence\n", encoding="ascii")
+    (output / MARKER).write_text(
+        "Mino long-soak steady-state qualification evidence\n", encoding="ascii"
+    )
 
 
 class ProcessSampler:
@@ -867,7 +869,7 @@ def _parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--probe", default="bazel-bin/benchmarks/soak_probe/soak_probe"
     )
-    parser.add_argument("--out", default="soak-results")
+    parser.add_argument("--out", default="long-soak-evidence")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--clean", action="store_true")
     args = parser.parse_args(argv)

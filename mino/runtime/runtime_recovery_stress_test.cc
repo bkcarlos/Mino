@@ -46,13 +46,13 @@
 
 namespace mino {
 
-struct D2RecoveryStressMessage {
+struct RuntimeRecoveryStressMessage {
     uint64_t id;
     uint64_t checksum;
 };
 
 template <>
-struct StaticMessageTraits<D2RecoveryStressMessage> {
+struct StaticMessageTraits<RuntimeRecoveryStressMessage> {
     static constexpr bool kIsSpecialized = true;
     static constexpr TypeId type_id{0xD213};
     static constexpr uint32_t message_type = 0xD2130001u;
@@ -62,7 +62,7 @@ struct StaticMessageTraits<D2RecoveryStressMessage> {
     static constexpr uint32_t index_flags = kIndexSlotFlagHasChildSlabs;
     static constexpr uint64_t kMask = 0xA55AA55AA55AA55AULL;
 
-    static Status Validate(const D2RecoveryStressMessage& message) noexcept {
+    static Status Validate(const RuntimeRecoveryStressMessage& message) noexcept {
         return message.id != 0 && message.checksum == (message.id ^ kMask)
                    ? Status::Ok()
                    : Status::Error(StatusCode::kInvalidArgument,
@@ -262,7 +262,7 @@ const char* InterruptionMarkerName(Interruption interruption) {
 
 void ReportCutEvent(std::string_view event, CrashScenario scenario,
                     std::string_view interruption) {
-    std::cout << "D2_RECOVERY_CUT_" << event
+    std::cout << "RUNTIME_RECOVERY_CUT_" << event
               << " cut=" << ScenarioName(scenario)
               << " interruption=" << interruption << std::endl;
 }
@@ -290,12 +290,12 @@ ClassTableConfig AllocatorConfig() {
 
 AllocationRequest RootRequest() {
     AllocationRequest request;
-    request.object_size = sizeof(D2RecoveryStressMessage);
-    request.type_id = StaticMessageTraits<D2RecoveryStressMessage>::type_id;
+    request.object_size = sizeof(RuntimeRecoveryStressMessage);
+    request.type_id = StaticMessageTraits<RuntimeRecoveryStressMessage>::type_id;
     request.schema = SchemaIdentity{
-        .short_id = StaticMessageTraits<D2RecoveryStressMessage>::schema_short_id,
-        .layout_version = StaticMessageTraits<D2RecoveryStressMessage>::layout_version};
-    request.alignment = alignof(D2RecoveryStressMessage);
+        .short_id = StaticMessageTraits<RuntimeRecoveryStressMessage>::schema_short_id,
+        .layout_version = StaticMessageTraits<RuntimeRecoveryStressMessage>::layout_version};
+    request.alignment = alignof(RuntimeRecoveryStressMessage);
     return request;
 }
 
@@ -534,7 +534,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
         .owner = owner,
         .publisher_id = static_cast<uint64_t>(scenario),
     };
-    Publisher<D2RecoveryStressMessage> publisher(
+    Publisher<RuntimeRecoveryStressMessage> publisher(
         *allocator, *channel, kMpscChannelId, producer, *journal);
     auto builder = publisher.Allocate();
     if (!builder.ok()) {
@@ -543,7 +543,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
     shared->root = builder->handle();
     (*builder)->id = 0xD2130000ULL + static_cast<uint32_t>(scenario);
     (*builder)->checksum =
-            (*builder)->id ^ StaticMessageTraits<D2RecoveryStressMessage>::kMask;
+            (*builder)->id ^ StaticMessageTraits<RuntimeRecoveryStressMessage>::kMask;
 
     auto child_build = builder->AllocateChild(ChildRequest());
     if (!child_build.ok()) {
@@ -561,7 +561,7 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
     _exit(status.ok() ? 0 : 14);
 }
 
-class D2RecoveryStressTest : public ::testing::Test {
+class RuntimeRecoveryStressTest : public ::testing::Test {
 protected:
     void SetUp() override {
         void* mapped = ::mmap(nullptr, sizeof(SharedBlock),
@@ -587,7 +587,7 @@ protected:
             .owner = ProcessIdentity::Current(),
             .publisher_id = kMpscChannelId,
         };
-        Publisher<D2RecoveryStressMessage> registered_publisher(
+        Publisher<RuntimeRecoveryStressMessage> registered_publisher(
             allocator_, *mpsc_, kMpscChannelId, registration_identity,
             *journal_);
         ASSERT_TRUE(
@@ -1001,7 +1001,7 @@ protected:
         RecoverProducts();
         EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
 
-        Subscriber<D2RecoveryStressMessage> subscriber(allocator_, *mpsc_);
+        Subscriber<RuntimeRecoveryStressMessage> subscriber(allocator_, *mpsc_);
         auto message = subscriber.TryPoll();
         const bool expected_visible =
             child_completed ? ExpectedVisibleAfterCompletion(scenario)
@@ -1083,21 +1083,21 @@ protected:
             .owner = ProcessIdentity::Current(),
             .publisher_id = 0xD213000000000000ULL ^ iteration,
         };
-        Publisher<D2RecoveryStressMessage> publisher(
+        Publisher<RuntimeRecoveryStressMessage> publisher(
             allocator_, *mpsc_, kMpscChannelId, producer, *journal_);
         auto builder = publisher.Allocate();
         ASSERT_TRUE(builder.ok()) << builder.status().ToString();
         const ShmHandle progress_root = builder->handle();
         (*builder)->id = 0xD213000000000000ULL ^ (iteration + 1);
         (*builder)->checksum =
-            (*builder)->id ^ StaticMessageTraits<D2RecoveryStressMessage>::kMask;
+            (*builder)->id ^ StaticMessageTraits<RuntimeRecoveryStressMessage>::kMask;
         auto child = builder->AllocateChild(ChildRequest());
         ASSERT_TRUE(child.ok()) << child.status().ToString();
         const ShmHandle progress_child = child->handle;
         *static_cast<uint64_t*>(child->data) = (*builder)->id;
         ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
 
-        Subscriber<D2RecoveryStressMessage> subscriber(allocator_, *mpsc_);
+        Subscriber<RuntimeRecoveryStressMessage> subscriber(allocator_, *mpsc_);
         auto message = subscriber.TryPoll();
         ASSERT_TRUE(message.ok()) << message.status().ToString();
         EXPECT_EQ(message->metadata().payload, progress_root);
@@ -1128,16 +1128,16 @@ protected:
     uint32_t baseline_available_slots_ = 0;
 };
 
-TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
+TEST_F(RuntimeRecoveryStressTest, RandomizedTimedRecoveryStress) {
     uint64_t stress_seconds = 0;
     uint64_t seed = DefaultStressSeed();
     std::string seconds_error;
     std::string seed_error;
     const bool seconds_ok = ReadUnsignedEnvironment(
-        "MINO_D2_RECOVERY_STRESS_SECONDS", kDefaultStressSeconds,
+        "MINO_RUNTIME_RECOVERY_STRESS_SECONDS", kDefaultStressSeconds,
         &stress_seconds, &seconds_error);
     const bool seed_ok = ReadUnsignedEnvironment(
-        "MINO_D2_RECOVERY_STRESS_SEED", seed, &seed, &seed_error);
+        "MINO_RUNTIME_RECOVERY_STRESS_SEED", seed, &seed, &seed_error);
     ASSERT_TRUE(seconds_ok) << seconds_error;
     ASSERT_TRUE(seed_ok) << seed_error;
 
@@ -1145,7 +1145,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
     const auto maximum_seconds = std::chrono::duration_cast<std::chrono::seconds>(
         StressClock::time_point::max() - started - kElapsedUpperSlack).count();
     ASSERT_LE(stress_seconds, static_cast<uint64_t>(maximum_seconds))
-        << "MINO_D2_RECOVERY_STRESS_SECONDS is too large";
+        << "MINO_RUNTIME_RECOVERY_STRESS_SECONDS is too large";
     const auto configured_duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::seconds(stress_seconds));
@@ -1162,7 +1162,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
     RecordProperty("stress_seconds", std::to_string(stress_seconds));
     RecordProperty("cleanup_reserve_ms",
                    std::to_string(cleanup_reserve.count()));
-    std::cout << "D2 recovery stress: seed=" << seed
+    std::cout << "Runtime recovery stress: seed=" << seed
               << " seconds=" << stress_seconds
               << " cleanup_reserve_ms=" << cleanup_reserve.count()
               << " round_start_budget_ms="
@@ -1189,7 +1189,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
         const StressRound round = MakeRandomRound(&random, forced_campaign);
         const char* campaign_name = CampaignScenarioName(round.campaign);
         ++attempted_counts[CampaignScenarioIndex(round.campaign)];
-        std::cout << "D2_RECOVERY_SCENARIO_ATTEMPT class=" << campaign_name
+        std::cout << "RUNTIME_RECOVERY_SCENARIO_ATTEMPT class=" << campaign_name
                   << std::endl;
         if (round.campaign == CampaignScenario::kPublisherCrash) {
             ReportCutEvent("ATTEMPT", round.scenario,
@@ -1247,7 +1247,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
         ASSERT_NO_FATAL_FAILURE(
             VerifyQueueProgressAndCapacity(iteration, cleanup_deadline));
         ++completed_counts[CampaignScenarioIndex(round.campaign)];
-        std::cout << "D2_RECOVERY_SCENARIO_COMPLETED class=" << campaign_name
+        std::cout << "RUNTIME_RECOVERY_SCENARIO_COMPLETED class=" << campaign_name
                   << std::endl;
         if (round.campaign == CampaignScenario::kPublisherCrash) {
             ReportCutEvent("COMPLETED", round.scenario,
@@ -1284,7 +1284,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
                        std::to_string(attempted_counts[index]));
         RecordProperty("scenario_" + name + "_completed",
                        std::to_string(completed_counts[index]));
-        std::cout << "D2_RECOVERY_SCENARIO_COUNT class=" << name
+        std::cout << "RUNTIME_RECOVERY_SCENARIO_COUNT class=" << name
                   << " attempted=" << attempted_counts[index]
                   << " completed=" << completed_counts[index] << std::endl;
         if (stress_seconds >= 10) {
@@ -1296,7 +1296,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
         "elapsed_ms",
         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                            elapsed).count()));
-    std::cout << "D2 recovery stress completed: seed=" << seed
+    std::cout << "Runtime recovery stress completed: seed=" << seed
               << " iterations=" << iteration
               << " elapsed_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
@@ -1304,7 +1304,7 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
               << std::endl;
 }
 
-TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
+TEST_F(RuntimeRecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     uint64_t iteration = 0;
@@ -1318,7 +1318,7 @@ TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
     }
 }
 
-TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
+TEST_F(RuntimeRecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     shared_->reached.store(0, std::memory_order_relaxed);
@@ -1347,7 +1347,7 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
 
-    Subscriber<D2RecoveryStressMessage> subscriber(allocator_, *mpsc_);
+    Subscriber<RuntimeRecoveryStressMessage> subscriber(allocator_, *mpsc_);
     auto message = subscriber.TryPoll();
     ASSERT_TRUE(message.ok()) << message.status().ToString();
     EXPECT_TRUE(std::move(*message).Ack().ok());
@@ -1357,7 +1357,7 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
                    "sigstop_live_sigcont");
 }
 
-TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
+TEST_F(RuntimeRecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     ASSERT_NO_FATAL_FAILURE(
@@ -1365,21 +1365,21 @@ TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
     ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
 }
 
-TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
+TEST_F(RuntimeRecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     ASSERT_NO_FATAL_FAILURE(RunSubscriberKillScenario(deadline));
     ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
 }
 
-TEST_F(D2RecoveryStressTest, SlowSubscriberBackpressurePreservesConservation) {
+TEST_F(RuntimeRecoveryStressTest, SlowSubscriberBackpressurePreservesConservation) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     ASSERT_NO_FATAL_FAILURE(RunSlowSubscriberScenario(/*yields=*/4));
     ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
 }
 
-TEST_F(D2RecoveryStressTest, DeadSubscriberLeaseBoundaryIsExact) {
+TEST_F(RuntimeRecoveryStressTest, DeadSubscriberLeaseBoundaryIsExact) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
     ASSERT_NO_FATAL_FAILURE(RunLeaseBoundaryScenario(deadline));
@@ -1391,8 +1391,8 @@ TEST_F(D2RecoveryStressTest, DeadSubscriberLeaseBoundaryIsExact) {
 
 #else
 
-TEST(D2RecoveryStressTest, RequiresPosixSharedMemoryAndProcessSignals) {
-    GTEST_SKIP() << "D2 recovery stress requires POSIX mmap/fork/signals";
+TEST(RuntimeRecoveryStressTest, RequiresPosixSharedMemoryAndProcessSignals) {
+    GTEST_SKIP() << "Runtime recovery stress requires POSIX mmap/fork/signals";
 }
 
 #endif  // defined(__unix__) || defined(__APPLE__)

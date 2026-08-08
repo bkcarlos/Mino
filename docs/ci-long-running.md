@@ -7,10 +7,10 @@ Mino 将小时级验证与 PR CI 分开。所有 cron 均使用 UTC；长测 wor
 
 | Workflow | 手工触发 | 定时触发 | PR / push 行为 |
 | --- | --- | --- | --- |
-| `D6-10 72h Long Soak` | `workflow_dispatch`，默认且最短资格时长 259200 秒，可设置 uint64 seed | 每周三 `00:13 UTC` | PR 仅运行 runner self-test 和 15 秒真实 probe smoke；72h job 不在 PR 运行 |
+| `Long Soak Validation` | `workflow_dispatch`，默认且最短资格时长 259200 秒，可设置 uint64 seed | 每周三 `00:13 UTC` | PR 仅运行 runner self-test 和 15 秒真实 probe smoke；72h job 不在 PR 运行 |
 | `Extended Long-Running Validation` | `workflow_dispatch`，可设置 `duration_seconds`（0–7200）和请求 seed | 每周六 `01:41 UTC` | 不在 PR 或 push 触发 |
-| `Reproducible Recovery Stress` | `workflow_dispatch`；D2 固定 seed 始终保留，可选 uint64 `seed` 仅覆盖第二个 run-derived 槽位并标记为 manual | 每周日 `03:17 UTC` | 不在 PR 或 push 触发 |
-| `D3 Extended Validation` | `workflow_dispatch` | 每周日 `02:23 UTC` | PR 仅运行 60 秒 fuzz smoke；主分支和定时运行 1 小时 fuzz |
+| `Reproducible Recovery Stress` | `workflow_dispatch`；Runtime 固定 seed 始终保留，可选 uint64 `seed` 仅覆盖第二个 run-derived 槽位并标记为 manual | 每周日 `03:17 UTC` | 不在 PR 或 push 触发 |
+| `Schema Extended Validation` | `workflow_dispatch` | 每周日 `02:23 UTC` | PR 仅运行 60 秒 fuzz smoke；主分支和定时运行 1 小时 fuzz |
 | `Formal Validation` | `workflow_dispatch` | 每周一 `03:17 UTC` | `docs/formal/**`、`mino/runtime/**`、`mino/shm/channel/**` 等相关路径 PR 与 push 均运行 MPSC、Broadcast、Lease 三个模型；PR 每模型 300 秒、总计 900 秒上限 |
 | `Huge Page Validation` | `workflow_dispatch`，可选预留 2 MiB Huge Pages 并挂载 hugetlbfs | 无 | 仅 `[self-hosted, linux, mino-hugepage]` 手工运行；trap 恢复原 reservation/mount 权限，不修改公共 PR runner |
 | `Physical Two-Host Mino Validation` | `workflow_dispatch`，必须提供两端地址 | 无 | 仅两个指定 self-hosted 物理节点执行真实 Mino 网络角色；PR 只做 fake-binary self-test |
@@ -18,9 +18,9 @@ Mino 将小时级验证与 PR CI 分开。所有 cron 均使用 UTC；长测 wor
 在 GitHub Actions 页面选择对应 workflow 后使用 **Run workflow** 即可手工启动。
 定时任务使用默认分支上的 workflow 定义。
 
-## D6-10 统一长稳框架
+## 统一长稳框架
 
-`.github/workflows/d6-10-long-soak.yml` 是独立的 D6-10 资格 workflow。schedule 和手工触发默认运行
+`.github/workflows/long-soak-validation.yml` 是独立的稳态资格 workflow。schedule 和手工触发默认运行
 72 小时（259200 秒），使用 `[self-hosted, linux, x64, mino-soak]` 专用 runner；不能把该 job
 改到 GitHub-hosted runner，因为 hosted job 的执行时长上限不足 72 小时。手工输入小于 259200 秒会在
 启动 probe 前失败。PR 只运行 Python runner self-test 和 15 秒真实 C++ smoke，不启动任何长测。
@@ -46,7 +46,7 @@ Slab 指标是所有 authoritative occupied allocator slot 的 `sizeof(SlabHeade
 2. **首尾增长率**：`(末样本 - 首样本) ÷ 首样本值 ÷ 实际秒数 × 86400 × 100%`。
 
 四个检查（RSS/Slab × 线性/首尾）都必须严格 `< 5%/24h`。短于 24 小时的 self-test/smoke 仍验证
-采样与证据链，但 manifest 写入 `gate_status: not_evaluated_short_run`，不得作为 D6-10 资格证据。
+采样与证据链，但 manifest 写入 `gate_status: not_evaluated_short_run`，不得作为长期稳态资格证据。
 
 C++ signal handler 只写 `sig_atomic_t`；runner 收到 SIGINT/SIGTERM 后向独立 probe 进程组发送
 SIGTERM，等待有限 grace 后 SIGKILL。正常 72 小时 deadline 也走同一优雅终止路径。watchdog 以
@@ -55,38 +55,38 @@ JSONL heartbeat 为活性权威，不把“进程仍存在”误当成 workload 
 ## 覆盖矩阵
 
 
-- **D1 MPMC TSAN**：`run_extended_long_test.py d1-mpmc-tsan` 显式运行
+- **MPMC TSAN**：`run_extended_long_test.py mpmc-tsan` 显式运行
   `//mino/shm/channel:mpmc_ring_stress_test`，使用 `--config=tsan`、有限 Bazel
   timeout 和固定计数 conservation phase。
-- **D1 / D2 recovery stress**：`recovery-stress.yml` 并行运行一个固定 seed 的 Region
+- **Region / Runtime recovery stress**：`recovery-stress.yml` 并行运行一个固定 seed 的 Region
   recovery，以及固定 seed、run-derived seed 两个 Runtime recovery，默认各 7200 秒。
-  D2 timed campaign 的首个 coverage bag 按 seed 打乱但固定包含 publisher crash、subscriber
+  Runtime timed campaign 的首个 coverage bag 按 seed 打乱但固定包含 publisher crash、subscriber
   kill、慢 subscriber、lease 精确边界和 PID incarnation 五类，之后再进行 publisher 偏重的
-  随机抽样；每次 D2 runner 还执行 13 个持久化切点的确定性 SIGKILL 用例和
+  随机抽样；每次 Runtime runner 还执行 13 个持久化切点的确定性 SIGKILL 用例和
   SIGSTOP-live/SIGCONT 用例。因此长测不会退化成只杀 publisher，manifest 也不以粗粒度
   `publisher_crash` 计数替代真实切点/信号证据。subscriber kill 在持有真实 broadcast Borrow
   时执行，lease 场景分别验证
   `lease-1` 不剔除与精确边界剔除，慢 subscriber 验证背压存在且 live owner 不因超时被清理。
-- **D1 Huge Page**：`huge-page-validation.yml` 检查/可选配置 hugetlbfs 与预留页，验证
+- **Huge Page**：`huge-page-validation.yml` 检查/可选配置 hugetlbfs 与预留页，验证
   实际 `MAP_HUGETLB`、smaps backing、跨进程 Open/读写，以及 Region Attach + Handle
   解析；主机配置和测试结果归档 90 天。详见 `docs/huge-pages.md`。
-- **D2 subscriber / broadcast kill**：循环运行 dead subscriber lease ACK/Borrow 清理、
+- **Subscriber / Broadcast recovery**：循环运行 dead subscriber lease ACK/Borrow 清理、
   慢 subscriber 背压、lease 边界、PID incarnation、cross-process ACK cleanup token 恢复和
   publisher tombstone skip 场景。每轮检查 `obligations = acknowledged + recovered`、ACK era
   清零、lease 无 ACTIVE/过渡态、Journal transaction 为零、MPSC 为空、allocator slab 与可用
   容量回到 baseline。
-- **D3 fuzz / TLA / CodeGen**：复用 `d3-extended-validation.yml` 与
+- **Schema fuzz / TLA / CodeGen**：复用 `schema-extended-validation.yml` 与
   `formal-validation.yml`，避免同一小时级 fuzz campaign 被重复执行。
-- **D4 双节点 / 重连长稳**：循环运行真实 fork + loopback TCP 双节点测试，以及
+- **Bridge 双节点 / 重连长稳**：循环运行真实 fork + loopback TCP 双节点测试，以及
   Bridge reconnect / receiver restart 测试。
-- **D5 fault campaign**：extended workflow 对当前 `GITHUB_SHA` 运行完整的 fork/SIGKILL
+- **Storage fault campaign**：extended workflow 对当前 `GITHUB_SHA` 运行完整的 fork/SIGKILL
   场景矩阵，每个场景 100 rounds：Record partial/full write（8 cuts/round）、Record/Seal
   sync 前后（4 cuts/round）、Schema descriptor/manifest 的 temp-write/data-sync/rename/
   directory-sync（8 cuts/round）、Recording Manifest 的同四阶段（4 cuts/round）、Partition
   seal/checkpoint 的同四阶段（合计 8 cuts/round），以及 orphan quarantine rename/
   directory-sync（2 cuts/round）。因此每轮确定性执行 34 个真实子进程 kill 切点，seed
   只改变轮内切点顺序，不会让某切点因随机抽样而缺失。
-- D5 runner 逐场景单独执行并要求唯一的 `D5_SCENARIO_RESULT` 完成标记；manifest 记录每场景
+- Storage runner 逐场景单独执行并要求唯一的 `STORAGE_FAULT_SCENARIO_RESULT` 完成标记；manifest 记录每场景
   rounds、预期/报告 case 计数、commit、seed、实际命令和独立 console log SHA-256。任一场景
   未运行、被 skip、标记重复/缺失、计数不符、命令失败或 log 缺失均 fail closed。
 - 短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停仍保留在常规
@@ -97,10 +97,10 @@ JSONL heartbeat 为活性权威，不把“进程仍存在”误当成 workload 
 
 PR 不运行小时级 target。常规 `CI` workflow 会：
 
-1. 在 debug 和 TSAN 配置下显式**编译** manual MPMC stress target，但不执行长测；D6-10 独立 workflow 只执行 runner self-test 和 15 秒真实五 workload smoke；
+1. 在 debug 和 TSAN 配置下显式**编译** manual MPMC stress target，但不执行长测；Long Soak workflow 只执行 runner self-test 和 15 秒真实五 workload smoke；
 2. 对 `tools/ci` Python 文件做语法检查、对 shell runner 做 `bash -n`；
 3. 运行所有支持 `--self-test` 的 CI runner，包括双机 server/client/manifest 编排的 loopback self-test；
-4. D3 相关 PR 只运行每 sanitizer 60 秒的 fuzz smoke；TLA 相关 PR 会实际运行三个有界 TLC 模型，而非只运行 runner self-test；
+4. Schema 相关 PR 只运行每 sanitizer 60 秒的 fuzz smoke；TLA 相关 PR 会实际运行三个有界 TLC 模型，而非只运行 runner self-test；
 5. 独立运行 `--config=hermetic` 的 Linux build/test；不会调度真实双物理主机 workflow。
 
 ## Artifact manifest
@@ -114,15 +114,15 @@ PR 不运行小时级 target。常规 `CI` workflow 会：
 - 实际命令或命令列表；
 - 请求时长/timeout（适用时）和实际 elapsed time；TLA 分别记录
   `per_model_timeout_seconds` 与 `total_timeout_seconds`；
-- console、test、fuzz、TLC 或 CodeGen 日志的 SHA-256；D5 额外逐场景记录独立 log hash、
+- console、test、fuzz、TLC 或 CodeGen 日志的 SHA-256；Storage campaign 额外逐场景记录独立 log hash、
   `expected_cases`、`reported_cases` 与 `marker_valid`；
-- D2 recovery 顶层 `scenario_attempt_counts` 与 `scenario_counts` 明确记录五类 campaign，
+- Runtime recovery 顶层 `scenario_attempt_counts` 与 `scenario_counts` 明确记录五类 campaign，
   `cutpoint_attempt_counts` / `cutpoint_counts` 记录 13 个持久化切点与四种 interruption，且
   attempted 必须等于 completed；每个切点必须有确定性 `sigkill` 完成记录，
   `sigstop_live_sigcont` 也必须完成；marker 来源固定为有 SHA-256 的 `test.log`；
 - 统一顶层 `outcome`、`exit_code` 和 `github` run provenance。
 
-D6-10 的 `manifest.json` 额外记录 exact commit/expected commit、完整 clean/dirty source 状态、seed、
+Long Soak 的 `manifest.json` 额外记录 exact commit/expected commit、完整 clean/dirty source 状态、seed、
 实际 probe argv/shell 命令、OS/Python/compiler/GitHub runner 环境、全部逐样本内容、双趋势结果、四项
 门禁、termination/exit reason、signal、probe exit code，以及 `probe.log`、`samples.jsonl` 的字节数和
 SHA-256。runner 每个样本后原子刷新进行中 manifest，正常/信号/watchdog 退出后再生成最终 hash。
@@ -131,16 +131,16 @@ SHA-256。runner 每个样本后原子刷新进行中 manifest，正常/信号/w
 与 manifest 完全一致且每个 hash/size 匹配；artifact 上传使用 `if-no-files-found: error`。runner
 失败、证据缺失或上传内容缺失都不能形成绿色资格结果。
 
-主要文件名为 `manifest.json`；已有 D3/D5 campaign 保持兼容文件名
+主要文件名为 `manifest.json`；Schema/Storage campaign 使用
 `campaign-manifest.json`。qualification runner 必须收到并匹配 `expected_commit`，工作树为
 clean 时才写入 `qualification_eligible: true`；本地可显式传 `--allow-dirty` 运行修改代码，但
 manifest 会记录 `source_state: dirty` 且不具资格。artifact 上传步骤使用 `if: always()`，以便
-测试失败时仍尽量保留 runner 已完成写入的 manifest 和日志。D2/D5 上传均使用
+测试失败时仍尽量保留 runner 已完成写入的 manifest 和日志。Runtime/Storage 上传均使用
 `if-no-files-found: error`，并在上传前复核 commit、资格状态、计数与每个 log hash；证据不完整
 不会变成绿灯。
-Formal Validation 同样 fail closed：D2 runtime/channel 实现路径会触发三模型 workflow，上传前
+Formal Validation 同样 fail closed：Runtime/channel 实现路径会触发三模型 workflow，
 要求 commit/clean qualification、manifest 成功且完整、模型集合匹配、每个 stdout/stderr 存在且
-SHA-256 一致，artifact 缺失直接失败。D5 每个 fork child 有 30 秒 alarm、父进程有 35 秒有界
+SHA-256 一致，artifact 缺失直接失败。Storage fault 每个 fork child 有 30 秒 alarm、父进程有 35 秒有界
 reap，runner 另以 Bazel timeout + 60 秒的进程组 watchdog 兜底。
 
 ## 本地短 smoke
@@ -151,16 +151,16 @@ reap，runner 另以 Bazel timeout + 60 秒的进程组 watchdog 兜底。
 python3 tools/ci/run_long_soak.py --self-test
 python3 tools/ci/run_extended_long_test.py --self-test
 python3 tools/ci/run_recovery_stress.py --self-test
-python3 tools/ci/run_d3_fuzz_campaign.py --self-test
-python3 tools/ci/run_d5_storage_fault_campaign.py --self-test
+python3 tools/ci/run_schema_fuzz_campaign.py --self-test
+python3 tools/ci/run_storage_fault_campaign.py --self-test
 python3 tools/ci/run_tla_validation.py --self-test
 python3 tools/ci/run_two_host_server.py --self-test
 python3 tools/ci/run_two_host_client.py --self-test
 python3 tools/ci/finalize_two_host_manifest.py --self-test
-bash -n tools/ci/run_d3_codegen_environment.sh
+bash -n tools/ci/run_schema_codegen_environment.sh
 ```
 
-D6-10 runner self-test 会实际启动稳定 fake probe、验证趋势公式和 hash 篡改检测，并启动无 heartbeat
+Long Soak runner self-test 会实际启动稳定 fake probe、验证趋势公式和 hash 篡改检测，并启动无 heartbeat
 probe 验证 watchdog/进程组清理。真实五 workload 本地 smoke（短测不执行增长门禁）使用：
 
 ```sh
@@ -170,9 +170,9 @@ install -m 0755 bazel-bin/benchmarks/soak_probe/soak_probe /tmp/mino-soak-probe
 python3 tools/ci/run_long_soak.py \\
   --duration-seconds=30 --sample-interval-seconds=2 --warmup-seconds=0 \\
   --watchdog-seconds=10 --seed=610 --allow-dirty \\
-  --probe=/tmp/mino-soak-probe --out=/tmp/mino-d6-10-smoke --clean
+  --probe=/tmp/mino-soak-probe --out=/tmp/mino-long-soak-smoke --clean
 python3 tools/ci/run_long_soak.py \\
-  --verify-manifest=/tmp/mino-d6-10-smoke/manifest.json --require-passed
+  --verify-manifest=/tmp/mino-long-soak-smoke/manifest.json --require-passed
 ```
 
 `--allow-dirty` 只供本地开发；manifest 会保留 dirty 状态且永远不具 qualification 资格。生产 72h
@@ -182,8 +182,8 @@ python3 tools/ci/run_long_soak.py \\
 orchestration（编译时间也计入总预算）：
 
 ```sh
-python3 tools/ci/run_extended_long_test.py d4-two-node-reconnect \
-  --seconds=10 --seed=1 --out=/tmp/mino-d4-smoke
+python3 tools/ci/run_extended_long_test.py bridge-two-node-reconnect \
+  --seconds=10 --seed=1 --out=/tmp/mino-bridge-smoke
 ```
 
 ## Hermetic LLVM / Clang

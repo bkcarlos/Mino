@@ -318,7 +318,7 @@ private:
     Status poll_status_ = Status::Ok();
 };
 
-// D2-10 fixed-layout Subscriber facade over SPSC, MPSC, or Broadcast.
+// Fixed-layout Subscriber facade over SPSC, MPSC, or Broadcast.
 template <typename T>
 class Subscriber {
 public:
@@ -554,7 +554,7 @@ private:
                       "StaticMessageTraits<T> must be specialized");
         static_assert(std::is_standard_layout_v<T> &&
                           std::is_trivially_copyable_v<T>,
-                      "D2 fixed-layout messages must be SHM-safe POD types");
+                      "fixed-layout messages must be SHM-safe POD types");
     }
 
     template <typename ChannelBorrow>

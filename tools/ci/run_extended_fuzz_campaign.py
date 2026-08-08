@@ -444,7 +444,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
         elapsed = round(time.monotonic() - started_monotonic, 3)
         manifest = {
             "schema_version": 1,
-            "suite": "d0-d5-extended-fuzz",
+            "suite": "extended-fuzz-validation",
             "commit": _git_commit(workspace),
             "seed": args.seed,
             "seed_consumed": True,
@@ -504,7 +504,7 @@ def _verify_evidence(
     if (
         not isinstance(manifest, dict)
         or manifest.get("schema_version") != 1
-        or manifest.get("suite") != "d0-d5-extended-fuzz"
+        or manifest.get("suite") != "extended-fuzz-validation"
         or manifest.get("outcome") != "passed"
         or manifest.get("exit_code") != 0
     ):

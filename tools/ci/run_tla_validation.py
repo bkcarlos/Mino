@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and archive the repository's three D2 TLA+ model checks."""
+"""Run and archive the repository's runtime TLA+ model checks."""
 
 from __future__ import annotations
 
@@ -445,7 +445,7 @@ Model checking completed. No error has been found.
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run all D2 TLA+ models and archive machine-readable evidence."
+        description="Run all runtime TLA+ models and archive machine-readable evidence."
     )
     _ = parser.add_argument(
         "--jar", type=Path, help="path to a verified tla2tools.jar"

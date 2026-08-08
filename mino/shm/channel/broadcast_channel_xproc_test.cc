@@ -12,8 +12,7 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// D2-05 (cross-process): broadcast channel tests across a real process
-// boundary (design doc 9.6, dev plan D2 DoD).
+// Broadcast channel tests across a real process boundary (design doc 9.6).
 //
 // broadcast_channel_test.cc exercises the channel with std::thread inside
 // one process; these tests place the channel (control block + slots +

@@ -124,7 +124,7 @@ public:
     Result<AllocationTransaction> Begin(
         const ProcessIdentity& owner) noexcept;
 
-    // Source-compatibility trap for pre-D2 callers. It always returns
+    // Source-compatibility trap for callers of the legacy API. It always returns
     // kUnsupported because accepting an already-allocated root would reopen the
     // untracked Allocate -> Begin crash window. Migrate to Begin() followed by
     // AllocateRoot().

@@ -1,7 +1,14 @@
 package(default_visibility = ["//visibility:public"])
 
+VALIDATION_COPTS = [
+    "-std=c++20",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+]
+
 cc_library(
-    name = "d0_d5_golden_generated",
+    name = "validation_golden_generated",
     hdrs = ["//mino/schema/codegen:testdata/golden.generated.h"],
     deps = [
         "//mino/runtime:runtime_types",
@@ -11,37 +18,193 @@ cc_library(
     ],
 )
 
-cc_binary(
-    name = "d0_d5_validation_benchmark",
-    srcs = ["d0_d5_validation_benchmark.cc"],
-    copts = [
-        "-std=c++20",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
+cc_library(
+    name = "validation_aligned_memory",
+    srcs = ["validation/common/aligned_memory.cc"],
+    hdrs = ["validation/common/aligned_memory.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_runtime",
+    srcs = ["validation/common/runtime.cc"],
+    hdrs = ["validation/common/runtime.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
     ],
+)
+
+cc_library(
+    name = "validation_stats",
+    srcs = ["validation/common/stats.cc"],
+    hdrs = ["validation/common/stats.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_json",
+    srcs = ["validation/common/json.cc"],
+    hdrs = ["validation/common/json.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_cli",
+    srcs = ["validation/common/config.cc"],
+    hdrs = ["validation/common/config.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_provenance",
+    srcs = ["validation/common/provenance.cc"],
+    hdrs = ["validation/common/provenance.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_temporary_directory",
+    srcs = ["validation/common/temporary_directory.cc"],
+    hdrs = ["validation/common/temporary_directory.h"],
+    copts = VALIDATION_COPTS,
+    deps = [":validation_runtime"],
+)
+
+cc_library(
+    name = "validation_payload",
+    srcs = ["validation/common/payload.cc"],
+    hdrs = ["validation/common/payload.h"],
+    copts = VALIDATION_COPTS,
+)
+
+cc_library(
+    name = "validation_report",
+    srcs = ["validation/report/report.cc"],
+    hdrs = ["validation/report/report.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_cli",
+        ":validation_json",
+        ":validation_provenance",
+        ":validation_runtime",
+        ":validation_temporary_directory",
+    ],
+)
+
+cc_library(
+    name = "validation_broadcast_ack",
+    srcs = ["validation/validations/broadcast_ack.cc"],
+    hdrs = ["validation/validations/broadcast_ack.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_aligned_memory",
+        ":validation_runtime",
+        ":validation_stats",
+        "//mino/shm/channel:broadcast",
+    ],
+)
+
+cc_library(
+    name = "validation_dynamic_view",
+    srcs = ["validation/validations/dynamic_view.cc"],
+    hdrs = ["validation/validations/dynamic_view.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_aligned_memory",
+        ":validation_golden_generated",
+        ":validation_runtime",
+        ":validation_stats",
+        "//mino/runtime:allocation_journal",
+        "//mino/schema:compiler",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:layout",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_library(
+    name = "validation_topic_writer_scaling",
+    srcs = ["validation/validations/topic_writer_scaling.cc"],
+    hdrs = ["validation/validations/topic_writer_scaling.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_payload",
+        ":validation_runtime",
+        "//mino/storage:recorder_buffer_pool",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:topic_writer",
+    ],
+)
+
+cc_library(
+    name = "validation_sync_policy",
+    srcs = ["validation/validations/sync_policy.cc"],
+    hdrs = ["validation/validations/sync_policy.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_payload",
+        ":validation_runtime",
+        ":validation_stats",
+        "//mino/storage:segment_format",
+        "//mino/storage:segment_writer",
+    ],
+)
+
+cc_library(
+    name = "validation_buffer_capacity",
+    srcs = ["validation/validations/buffer_capacity.cc"],
+    hdrs = ["validation/validations/buffer_capacity.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_runtime",
+        "//mino/storage:recorder_buffer_pool",
+    ],
+)
+
+cc_library(
+    name = "validation_pin_lease",
+    srcs = ["validation/validations/pin_lease.cc"],
+    hdrs = ["validation/validations/pin_lease.h"],
+    copts = VALIDATION_COPTS,
+    deps = [
+        ":validation_runtime",
+        ":validation_stats",
+        "//mino/registry:registry",
+    ],
+)
+
+cc_binary(
+    name = "validation_benchmark",
+    srcs = ["validation_benchmark.cc"],
+    copts = VALIDATION_COPTS,
     linkopts = select({
         "@platforms//os:linux": ["-pthread"],
         "//conditions:default": [],
     }),
     deps = [
-        ":d0_d5_golden_generated",
-        "//mino/registry:registry",
-        "//mino/runtime:allocation_journal",
-        "//mino/runtime:runtime_types",
-        "//mino/schema:compiler",
-        "//mino/schema:dynamic_object",
-        "//mino/schema:layout",
-        "//mino/schema:wire",
-        "//mino/shm/allocator:central_slab",
-        "//mino/shm/channel:broadcast",
-        "//mino/shm/channel:index_slot",
-        "//mino/storage:recorder_buffer_pool",
-        "//mino/storage:recording_manifest",
-        "//mino/storage:segment_format",
-        "//mino/storage:segment_writer",
-        "//mino/storage:topic_writer",
+        ":validation_cli",
+        ":validation_json",
+        ":validation_report",
+        ":validation_runtime",
+        ":validation_temporary_directory",
+        ":validation_broadcast_ack",
+        ":validation_dynamic_view",
+        ":validation_topic_writer_scaling",
+        ":validation_sync_policy",
+        ":validation_buffer_capacity",
+        ":validation_pin_lease",
     ],
+)
+
+py_test(
+    name = "validation_contract_smoke_test",
+    srcs = ["validation/tests/contract_smoke_test.py"],
+    data = [":validation_benchmark"],
+    main = "validation/tests/contract_smoke_test.py",
+    python_version = "PY3",
+    size = "small",
 )
 
 cc_binary(

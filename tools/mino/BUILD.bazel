@@ -1,4 +1,4 @@
-# mino: Mino CLI tool (D1-11 Inspector + recovery entry point).
+# mino: Mino CLI tool for inspection, recovery, and storage operations.
 package(default_visibility = ["//visibility:private"])
 
 LINUX_ONLY = select({

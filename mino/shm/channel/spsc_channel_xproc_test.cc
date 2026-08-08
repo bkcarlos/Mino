@@ -13,7 +13,7 @@
 // the License.
 
 // INV-01 (cross-process): SPSC long-wrap with no ABA, no loss, no duplication
-// across a real process boundary (design doc 9.4, dev plan D2 DoD).
+// across a real process boundary (design doc 9.4).
 //
 // spsc_channel_test.cc exercises the channel with std::thread inside one
 // process; this test places the channel (control block + slots) in MAP_SHARED

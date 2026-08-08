@@ -102,13 +102,13 @@ int main() try {
     using namespace mino::schema::fuzz;
     uint64_t seconds = 0;
     uint64_t seed = 0;
-    if (!ParseEnvironment("MINO_D3_FUZZ_SECONDS", kDefaultSeconds, seconds) ||
+    if (!ParseEnvironment("MINO_SCHEMA_FUZZ_SECONDS", kDefaultSeconds, seconds) ||
         seconds > kMaxSeconds) {
-        std::cerr << "MINO_D3_FUZZ_SECONDS must be an integer in [0, 3600]\n";
+        std::cerr << "MINO_SCHEMA_FUZZ_SECONDS must be an integer in [0, 3600]\n";
         return 2;
     }
-    if (!ParseEnvironment("MINO_D3_FUZZ_SEED", kDefaultSeed, seed)) {
-        std::cerr << "MINO_D3_FUZZ_SEED must be an unsigned integer\n";
+    if (!ParseEnvironment("MINO_SCHEMA_FUZZ_SEED", kDefaultSeed, seed)) {
+        std::cerr << "MINO_SCHEMA_FUZZ_SEED must be an unsigned integer\n";
         return 2;
     }
     if (seed == 0) seed = kDefaultSeed;
@@ -145,7 +145,7 @@ int main() try {
         ++iterations;
     } while (std::chrono::steady_clock::now() < deadline);
 
-    std::cout << "D3-14 standalone fuzz: seconds=" << seconds
+    std::cout << "Schema standalone fuzz: seconds=" << seconds
               << " seed=" << seed << " iterations=" << iterations << '\n';
     for (size_t code = 0; code < statuses.size(); ++code) {
         if (statuses[code] != 0) {

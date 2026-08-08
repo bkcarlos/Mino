@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fail-closed D5 storage SIGKILL recovery scenario matrix."""
+"""Run the fail-closed storage SIGKILL recovery scenario matrix."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ from pathlib import Path
 from typing import Any
 
 TARGET = "//mino/storage:storage_fault_test"
-MARKER = ".d5-storage-fault-campaign"
+MARKER = ".storage-fault-campaign"
 MAX_ROUNDS = 1000
 UINT64_MAX = (1 << 64) - 1
 RESULT_PATTERN = re.compile(
-    r"D5_SCENARIO_RESULT\s+scenario=(?P<scenario>[a-z0-9-]+)\s+"
+    r"STORAGE_FAULT_SCENARIO_RESULT\s+scenario=(?P<scenario>[a-z0-9-]+)\s+"
     r"rounds=(?P<rounds>[0-9]+)\s+cases=(?P<cases>[0-9]+)\s+"
     r"seed=(?P<seed>[0-9]+)"
 )
@@ -42,32 +42,32 @@ class Scenario:
 SCENARIOS = (
     Scenario(
         "record-write",
-        "D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit",
+        "StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit",
         8,
     ),
     Scenario(
         "record-sync",
-        "D5StorageFaultTest.SigkillBeforeAndAfterRecordAndSealSync",
+        "StorageFaultTest.SigkillBeforeAndAfterRecordAndSealSync",
         4,
     ),
     Scenario(
         "schema",
-        "D5StorageFaultTest.SigkillAcrossSchemaPersistencePhases",
+        "StorageFaultTest.SigkillAcrossSchemaPersistencePhases",
         8,
     ),
     Scenario(
         "manifest",
-        "D5StorageFaultTest.SigkillAcrossManifestPersistencePhases",
+        "StorageFaultTest.SigkillAcrossManifestPersistencePhases",
         4,
     ),
     Scenario(
         "checkpoint-seal",
-        "D5StorageFaultTest.SigkillAcrossSealAndCheckpointPersistence",
+        "StorageFaultTest.SigkillAcrossSealAndCheckpointPersistence",
         8,
     ),
     Scenario(
         "orphan",
-        "D5StorageFaultTest.SigkillAcrossOrphanQuarantinePersistence",
+        "StorageFaultTest.SigkillAcrossOrphanQuarantinePersistence",
         2,
     ),
 )
@@ -177,7 +177,7 @@ def _prepare_output(output: Path, clean: bool) -> None:
                 else:
                     child.unlink()
     output.mkdir(parents=True, exist_ok=True)
-    (output / MARKER).write_text("D5 storage fault campaign evidence\n", encoding="ascii")
+    (output / MARKER).write_text("storage fault campaign evidence\n", encoding="ascii")
 
 
 def _command(
@@ -194,8 +194,8 @@ def _command(
         "--lockfile_mode=error",
         TARGET,
         f"--test_timeout={timeout}",
-        f"--test_env=MINO_D5_STORAGE_FAULT_ROUNDS={rounds}",
-        f"--test_env=MINO_D5_STORAGE_FAULT_SEED={seed}",
+        f"--test_env=MINO_STORAGE_FAULT_ROUNDS={rounds}",
+        f"--test_env=MINO_STORAGE_FAULT_SEED={seed}",
         "--test_output=streamed",
         "--nocache_test_results",
         f"--test_arg=--gtest_filter={scenario.test}",
@@ -485,7 +485,7 @@ def _run(args: argparse.Namespace) -> int:
     print(f"evidence={output}", flush=True)
     if missing:
         print(
-            "missing or invalid D5 scenarios: " + ", ".join(missing),
+            "missing or invalid storage fault scenarios: " + ", ".join(missing),
             file=sys.stderr,
             flush=True,
         )
@@ -550,14 +550,14 @@ def _self_test() -> None:
     command = _command("bazel", 7, 9, 260, scenario)
     assert TARGET in command
     assert command[:3] == ["bazel", "--batch", "test"]
-    assert "--test_env=MINO_D5_STORAGE_FAULT_ROUNDS=7" in command
-    assert "--test_env=MINO_D5_STORAGE_FAULT_SEED=9" in command
+    assert "--test_env=MINO_STORAGE_FAULT_ROUNDS=7" in command
+    assert "--test_env=MINO_STORAGE_FAULT_SEED=9" in command
     assert command[-1] == f"--test_arg=--gtest_filter={scenario.test}"
     assert _positive_rounds(str(MAX_ROUNDS)) == MAX_ROUNDS
     assert _seed(str(UINT64_MAX)) == UINT64_MAX
     assert _commit("A" * 40) == "a" * 40
     match = RESULT_PATTERN.search(
-        "D5_SCENARIO_RESULT scenario=record-write rounds=7 cases=56 seed=9\n"
+        "STORAGE_FAULT_SCENARIO_RESULT scenario=record-write rounds=7 cases=56 seed=9\n"
     )
     assert match is not None
     assert int(match.group("cases"), 10) == 7 * scenario.cuts_per_round
@@ -568,18 +568,18 @@ def _self_test() -> None:
             pass
         else:
             raise AssertionError(f"invalid rounds accepted: {invalid}")
-    print("run_d5_storage_fault_campaign.py self-test: PASS")
+    print("run_storage_fault_campaign.py self-test: PASS")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the complete D5 storage fork/SIGKILL scenario matrix"
+        description="Run the complete storage fork/SIGKILL scenario matrix"
     )
     parser.add_argument(
         "--workspace", type=Path, default=Path(__file__).resolve().parents[2]
     )
     parser.add_argument(
-        "--out", type=Path, default=Path("d5-storage-fault-campaign")
+        "--out", type=Path, default=Path("storage-fault-campaign")
     )
     parser.add_argument("--bazel", default="bazel")
     parser.add_argument("--rounds", type=_positive_rounds, default=1)

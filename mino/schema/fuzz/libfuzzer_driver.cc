@@ -21,7 +21,7 @@ struct HarnessStatistics {
 
     ~HarnessStatistics() {
         std::fprintf(stderr,
-                     "D3 libFuzzer selectors: IDL=%llu Descriptor=%llu "
+                     "Schema libFuzzer selectors: IDL=%llu Descriptor=%llu "
                      "CanonicalPayload=%llu\n",
                      static_cast<unsigned long long>(
                          calls[0].load(std::memory_order_relaxed)),
@@ -53,7 +53,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     const mino::Status status = mino::schema::fuzz::FuzzOneInput(input);
     if (!mino::schema::fuzz::IsExpectedFuzzStatus(harness, status.code())) {
         std::fprintf(stderr,
-                     "D3 libFuzzer harness returned unexpected status: "
+                     "Schema libFuzzer harness returned unexpected status: "
                      "selector=%zu code=%u\n",
                      selector, static_cast<unsigned>(status.code()));
         std::abort();

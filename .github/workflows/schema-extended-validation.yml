@@ -1,4 +1,4 @@
-name: D3 Extended Validation
+name: Schema Extended Validation
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
   push:
     branches: [master, main]
     paths:
-      - .github/workflows/d3-extended-validation.yml
+      - .github/workflows/schema-extended-validation.yml
       - .bazelrc
       - MODULE.bazel
       - MODULE.bazel.lock
@@ -15,15 +15,15 @@ on:
       - schemas/**
       - tools/ci/collect_codegen_artifacts.py
       - tools/ci/docker/**
-      - tools/ci/prepare_d3_fuzz_corpus.py
-      - tools/ci/run_d3_codegen_docker_check.py
-      - tools/ci/run_d3_codegen_environment.sh
-      - tools/ci/run_d3_fuzz_campaign.py
+      - tools/ci/prepare_schema_fuzz_corpus.py
+      - tools/ci/run_schema_codegen_docker_check.py
+      - tools/ci/run_schema_codegen_environment.sh
+      - tools/ci/run_schema_fuzz_campaign.py
       - tools/minoc/**
   pull_request:
     branches: [master, main]
     paths:
-      - .github/workflows/d3-extended-validation.yml
+      - .github/workflows/schema-extended-validation.yml
       - .bazelrc
       - MODULE.bazel
       - MODULE.bazel.lock
@@ -31,17 +31,17 @@ on:
       - schemas/**
       - tools/ci/collect_codegen_artifacts.py
       - tools/ci/docker/**
-      - tools/ci/prepare_d3_fuzz_corpus.py
-      - tools/ci/run_d3_codegen_docker_check.py
-      - tools/ci/run_d3_codegen_environment.sh
-      - tools/ci/run_d3_fuzz_campaign.py
+      - tools/ci/prepare_schema_fuzz_corpus.py
+      - tools/ci/run_schema_codegen_docker_check.py
+      - tools/ci/run_schema_codegen_environment.sh
+      - tools/ci/run_schema_fuzz_campaign.py
       - tools/minoc/**
 
 permissions:
   contents: read
 
 concurrency:
-  group: d3-extended-${{ github.workflow }}-${{ github.ref }}
+  group: schema-extended-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -220,7 +220,7 @@ jobs:
           jobs = f"--jobs={os.environ['CODEGEN_JOBS']}"
           manifest = {
               "schema_version": 1,
-              "suite": "d3-codegen-determinism",
+              "suite": "schema-codegen-determinism",
               "environment": os.environ["CODEGEN_ENVIRONMENT"],
               "commit": os.environ["GITHUB_SHA"],
               "seed": None,
@@ -284,7 +284,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d3-codegen-${{ matrix.id }}
+          name: schema-codegen-${{ matrix.id }}
           path: ${{ matrix.checkout_path }}/hermetic-codegen
           if-no-files-found: error
           retention-days: 90
@@ -298,13 +298,13 @@ jobs:
       - name: Download GCC artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: d3-codegen-ubuntu22-gcc12
+          name: schema-codegen-ubuntu22-gcc12
           path: compare/ubuntu22-gcc12
 
       - name: Download Clang artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: d3-codegen-ubuntu24-clang18
+          name: schema-codegen-ubuntu24-clang18
           path: compare/ubuntu24-clang18
 
       - name: Compare exactly 15 logical outputs
@@ -415,7 +415,7 @@ jobs:
 
           status = "PASS" if passed else "FAIL"
           summary = [
-              "## D3 CodeGen deterministic comparison",
+              "## Schema CodeGen deterministic comparison",
               "",
               f"**{status}** — compared {len(comparisons)}/{expected_count} expected outputs.",
               "",
@@ -450,7 +450,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d3-codegen-comparison-${{ github.run_id }}
+          name: schema-codegen-comparison-${{ github.run_id }}
           path: codegen-comparison
           if-no-files-found: warn
           retention-days: 90
@@ -495,7 +495,7 @@ jobs:
       - name: Run sanitizer fuzz campaign
         run: |
           if [ "${FUZZ_SECONDS}" = "3600" ]; then
-            python3 tools/ci/run_d3_fuzz_campaign.py \
+            python3 tools/ci/run_schema_fuzz_campaign.py \
               --sanitizer=${{ matrix.sanitizer }} \
               --seconds="${FUZZ_SECONDS}" \
               --seed=${{ github.run_number }} \
@@ -503,7 +503,7 @@ jobs:
               --minimize \
               --clean
           else
-            python3 tools/ci/run_d3_fuzz_campaign.py \
+            python3 tools/ci/run_schema_fuzz_campaign.py \
               --sanitizer=${{ matrix.sanitizer }} \
               --seconds="${FUZZ_SECONDS}" \
               --seed=${{ github.run_number }} \
@@ -515,7 +515,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: d3-fuzz-${{ matrix.sanitizer }}-${{ github.run_id }}
+          name: schema-fuzz-${{ matrix.sanitizer }}-${{ github.run_id }}
           path: fuzz-evidence-${{ matrix.sanitizer }}
           if-no-files-found: warn
           retention-days: 90

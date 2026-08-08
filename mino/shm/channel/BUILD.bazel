@@ -19,7 +19,7 @@ cc_library(
     ],
 )
 
-# D2-01: IndexSlot ABI (design doc 9.2, ADR-0003). The fixed 128-byte
+# IndexSlot ABI (design doc 9.2, ADR-0003). The fixed 128-byte
 # control-plane record carried by every channel ring slot, plus the
 # channel-specific sidecar metadata types (broadcast / work queue / MPSC
 # reservation) and the immutable-metadata CRC.
@@ -41,7 +41,7 @@ cc_test(
     ],
 )
 
-# D2-07: QueueFullPolicy (design doc 9.8). The policy applied when a
+# QueueFullPolicy (design doc 9.8). The policy applied when a
 # producer publishes into a full channel; shared by SPSC / MPSC /
 # broadcast / work queue.
 cc_library(
@@ -49,7 +49,7 @@ cc_library(
     hdrs = ["queue_full_policy.h"],
 )
 
-# D2-03/D2-04: MPSC channel (design doc 9.5). Multi-producer / single-
+# MPSC channel (design doc 9.5). Multi-producer / single-
 # consumer strictly-ordered ring with Vyukov probe-then-claim reservation,
 # an ordered commit bitmap (INV-17), owner-identity sidecars, and crash
 # recovery via AbortOrphanedReservations(). Header-only: a non-owning view
@@ -99,7 +99,7 @@ cc_test(
     ],
 )
 
-# D2-02: SPSC channel (design doc 9.3, 9.4). Single-producer /
+# SPSC channel (design doc 9.3, 9.4). Single-producer /
 # single-consumer channel with cache-line-separated cursors, built on the
 # IndexSlot ABI. Header-only: it is a non-owning view over shared memory.
 cc_library(
@@ -142,7 +142,7 @@ cc_test(
     ],
 )
 
-# D2-05: Broadcast channel (design doc 9.6). Single-publisher / N-subscriber
+# Broadcast channel (design doc 9.6). Single-publisher / N-subscriber
 # fan-out with per-subscriber cursors, per-slot AckBitmap sidecars bound to a
 # seqlock-style subscriber-set snapshot, and cache-line-separated subscriber
 # slots. Header-only: a non-owning view over shared memory.
@@ -174,7 +174,7 @@ cc_test(
     ],
 )
 
-# D2-05 (cross-process): fork + MAP_SHARED broadcast tests. Fan-out
+# Cross-process fork + MAP_SHARED broadcast tests. Fan-out
 # conservation (1 publisher process x 3 subscriber processes over many wrap
 # cycles) and publisher-crash tombstone skipping across a process boundary.
 cc_test(

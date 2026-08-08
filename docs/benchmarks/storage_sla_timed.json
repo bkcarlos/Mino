@@ -1,6 +1,6 @@
 {
   "schema": "mino.storage_benchmark.v1",
-  "benchmark": "D5-14",
+  "benchmark": "storage-sla",
   "clock": "std::chrono::steady_clock",
   "configuration": {
     "records": 20000,

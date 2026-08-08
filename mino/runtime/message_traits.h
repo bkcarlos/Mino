@@ -12,10 +12,10 @@
 
 namespace mino {
 
-// D2 bridge to the D3 static CodeGen contract. Applications may specialize
-// this trait for fixed-layout SHM messages today; D3-generated types will emit
-// equivalent specializations. Runtime intentionally does not invent a partial
-// Schema Registry here.
+// Bridge between fixed-layout SHM messages and the static Schema CodeGen
+// contract. Applications may specialize this trait directly; generated types
+// emit equivalent specializations. Runtime intentionally does not invent a
+// partial Schema Registry here.
 template <typename T>
 struct StaticMessageTraits {
     static constexpr bool kIsSpecialized = false;

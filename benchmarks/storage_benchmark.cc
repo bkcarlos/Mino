@@ -53,7 +53,7 @@ constexpr uint64_t kPayloadSeed = 0x4d494e4f44353134ULL;
 constexpr std::string_view kDirectoryPrefix = "mino-storage-benchmark-";
 constexpr std::string_view kOwnershipMarker = ".mino-storage-benchmark-owned";
 constexpr std::string_view kOwnershipMarkerContents =
-    "Mino D5-14 storage benchmark temporary directory\n";
+    "Mino storage-sla benchmark temporary directory\n";
 
 std::atomic<uint64_t> g_benchmark_sink{0};
 
@@ -956,7 +956,7 @@ std::string BuildJson(const Config& config,
     output << std::setprecision(17);
     output << "{\n"
            << "  \"schema\": \"mino.storage_benchmark.v1\",\n"
-           << "  \"benchmark\": \"D5-14\",\n"
+           << "  \"benchmark\": \"storage-sla\",\n"
            << "  \"clock\": \"std::chrono::steady_clock\",\n"
            << "  \"configuration\": {\n"
            << "    \"records\": " << config.records << ",\n"
@@ -1083,7 +1083,7 @@ void PrintHumanSummary(const Config& config, const EncodeMetrics& encode,
                        const RecoveryMetrics& recovery,
                        const BufferMetrics& buffer) {
     std::cerr << std::fixed << std::setprecision(2);
-    std::cerr << "Mino D5-14 storage benchmark\n"
+    std::cerr << "Mino storage-sla benchmark\n"
               << "  config: records=" << config.records
               << ", payload=" << config.payload_bytes
               << " B, sync-policy=" << config.sync_policy_name << '\n'

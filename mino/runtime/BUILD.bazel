@@ -149,14 +149,14 @@ cc_test(
     ],
 )
 
-# D2-13: fork + MAP_SHARED publisher/subscriber SIGKILL, slow-subscriber,
+# Runtime fork + MAP_SHARED publisher/subscriber SIGKILL, slow-subscriber,
 # lease-boundary, SIGSTOP, and PID-incarnation recovery stress.
 # The default target runs a short randomized smoke and is included in //...
-# MINO_D2_RECOVERY_STRESS_SECONDS controls the randomized phase duration;
-# MINO_D2_RECOVERY_STRESS_SEED makes a failing sequence reproducible.
+# MINO_RUNTIME_RECOVERY_STRESS_SECONDS controls the randomized phase duration;
+# MINO_RUNTIME_RECOVERY_STRESS_SEED makes a failing sequence reproducible.
 cc_test(
-    name = "d2_recovery_stress_test",
-    srcs = ["d2_recovery_stress_test.cc"],
+    name = "runtime_recovery_stress_test",
+    srcs = ["runtime_recovery_stress_test.cc"],
     deps = [
         ":allocation_journal",
         ":journal_channel_recovery",
@@ -177,25 +177,25 @@ cc_test(
 # Explicit 3600-second variant, excluded from wildcard CI. Bazel timeout
 # classes do not encode arbitrary seconds, so the finite 3900-second outer
 # watchdog includes deterministic cutpoint/lease checks after the timed phase:
-#   bazel test //mino/runtime:d2_recovery_stress_long_test \
+#   bazel test //mino/runtime:runtime_recovery_stress_long_test \
 #     --test_timeout=3900 \
 #     --test_output=streamed \
-#     --test_env=MINO_D2_RECOVERY_STRESS_SEED=12345
+#     --test_env=MINO_RUNTIME_RECOVERY_STRESS_SEED=12345
 cc_test(
-    name = "d2_recovery_stress_long_test",
+    name = "runtime_recovery_stress_long_test",
     timeout = "long",
-    srcs = ["d2_recovery_stress_test.cc"],
+    srcs = ["runtime_recovery_stress_test.cc"],
     args = [
-        "--gtest_filter=D2RecoveryStressTest.RandomizedTimedRecoveryStress:" +
-        "D2RecoveryStressTest.SigkillAtEveryPersistentStoreRecovers:" +
-        "D2RecoveryStressTest.SigstopLiveOwnerIsNeverRecovered:" +
-        "D2RecoveryStressTest.ForeignLivePidIncarnationMismatchIsUnknown:" +
-        "D2RecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks:" +
-        "D2RecoveryStressTest.SlowSubscriberBackpressurePreservesConservation:" +
-        "D2RecoveryStressTest.DeadSubscriberLeaseBoundaryIsExact:" +
-        "D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals",
+        "--gtest_filter=RuntimeRecoveryStressTest.RandomizedTimedRecoveryStress:" +
+        "RuntimeRecoveryStressTest.SigkillAtEveryPersistentStoreRecovers:" +
+        "RuntimeRecoveryStressTest.SigstopLiveOwnerIsNeverRecovered:" +
+        "RuntimeRecoveryStressTest.ForeignLivePidIncarnationMismatchIsUnknown:" +
+        "RuntimeRecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks:" +
+        "RuntimeRecoveryStressTest.SlowSubscriberBackpressurePreservesConservation:" +
+        "RuntimeRecoveryStressTest.DeadSubscriberLeaseBoundaryIsExact:" +
+        "RuntimeRecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals",
     ],
-    env = {"MINO_D2_RECOVERY_STRESS_SECONDS": "3600"},
+    env = {"MINO_RUNTIME_RECOVERY_STRESS_SECONDS": "3600"},
     tags = [
         "large",
         "manual",

@@ -1,7 +1,7 @@
 # Mino 根包
 #
-# 工程按《Mino 详细设计文档》3.1 与开发计划 D0~D6 组织。
-# D0~D5 核心模块、验证工具和测试位于 //mino/...、//tools/...、
-# //benchmarks/... 与 //tests/litmus；D6 继续推进性能和产品化。
+# 工程按《Mino 详细设计文档》3.1 的领域边界组织。
+# 核心模块、验证工具和测试位于 //mino/...、//tools/...、
+# //benchmarks/... 与 //tests/litmus。
 
 package(default_visibility = ["//visibility:public"])

@@ -12,7 +12,7 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// mino: Mino CLI tool (D1-11).
+// mino: Mino operations CLI.
 //
 // Subcommands:
 //   mino inspect <region_name> [--output <file>]

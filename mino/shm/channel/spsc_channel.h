@@ -100,8 +100,8 @@ inline void SpinPause() noexcept {
 // Borrow lifetime vs. kDropOldest (design doc 9.8): a Borrow owns a snapshot,
 // not the slot, so the producer overwriting the slot never tears the
 // consumer's view of the header. The payload it points to is NOT reclaimed
-// with the slot (9.8: reuse only after no borrows remain); before D2-11
-// (ShmSharedPtr / ADR-0013 pin) lands, a kDropOldest topic must either
+// with the slot (9.8: reuse only after no borrows remain). Without a
+// ShmSharedPtr / ADR-0013 pin, a kDropOldest topic must either
 // tolerate the payload being recycled while a slow consumer still holds its
 // handle, or keep the consumer fast enough that it never lags a full ring
 // behind. The snapshot makes the header side of this guarantee exact today.
@@ -116,7 +116,7 @@ inline void SpinPause() noexcept {
 //   kFail       -> kResourceExhausted immediately.
 //   kBlock      -> spin (with pause) until space frees up. The channel layer
 //                  deliberately offers no timeout: bounded waiting is a
-//                  Runtime-level concern (D2-09 Publisher API) layered on
+//                  Runtime-level concern handled by the Publisher API layered on
 //                  top of this primitive. A producer blocked here burns CPU
 //                  until the consumer advances — use kFail/kDrop* when the
 //                  consumer may die.

@@ -1,4 +1,4 @@
-# Registry and single-authority coordinator (D4-01/D4-02).
+# Registry and single-authority coordinator.
 package(default_visibility = ["//visibility:public"])
 
 cc_library(

@@ -50,7 +50,7 @@ struct TcpDriverStats {
 // POSIX non-blocking TCP implementation. Send/Poll payloads are complete
 // canonical Wire Frame bodies without the four-byte stream prefix; this driver
 // adds/removes that prefix. TCP write completion is deliberately not reported
-// as kRemoteAccepted. D4-09 supplies the message ACK protocol.
+// as kRemoteAccepted. The bridge reliability layer supplies the message ACK protocol.
 class TcpDriver final : public TransportDriver {
 public:
     static Result<std::unique_ptr<TcpDriver>> Create(

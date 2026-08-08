@@ -118,7 +118,7 @@ struct FieldDeclaration {
     FieldCardinality cardinality = FieldCardinality::kUnspecified;
     TypeReference type;
     std::string name;
-    // The parser preserves the syntactic integer. D3-02 validates the v1 range.
+    // The parser preserves the syntactic integer; semantic validation checks the v1 range.
     uint64_t id = 0;
     std::vector<Annotation> annotations;
     SourceRange source;

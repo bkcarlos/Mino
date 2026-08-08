@@ -1,13 +1,13 @@
-# Mino D5 Storage SLA 与基线报告
+# Mino Storage SLA 与基线报告
 
-- 状态：D5 正式基线（单机、单 Recording Owner）
+- 状态：正式基线（单机、单 Recording Owner）
 - 测试日期：2026-08-02
 - Benchmark schema：`mino.storage_benchmark.v1`
 - 可复现目标：`//benchmarks:storage_benchmark`
 
 ## 1. 适用范围
 
-本 SLA 只覆盖 D5 首版 Storage：Schema Store、Recorder Buffer、Per-Topic/Partition Single Writer、Segment/Manifest、Crash Recovery、Replay 和 Retention。它不承诺分布式一致性日志、跨 Recorder exactly-once、多个 Writer 并发写同一 Segment，或底层硬件在断电时违反 flush/FUA 语义仍可持久。
+本 SLA 只覆盖首版 Storage：Schema Store、Recorder Buffer、Per-Topic/Partition Single Writer、Segment/Manifest、Crash Recovery、Replay 和 Retention。它不承诺分布式一致性日志、跨 Recorder exactly-once、多个 Writer 并发写同一 Segment，或底层硬件在断电时违反 flush/FUA 语义仍可持久。
 
 “Durable”表示 Mino 已完成配置要求的 `fdatasync/fsync` 和必要的目录同步；最终介质保证仍依赖文件系统、挂载选项、控制器和设备固件。
 
@@ -64,7 +64,7 @@ bazel run --config=release //benchmarks:storage_benchmark -- \
   --payload-bytes=1024 \
   --sync-policy=per-batch \
   --directory=/code/Mino/.cache \
-  --output-json=docs/benchmarks/d5_storage_sla_timed.json
+  --output-json=docs/benchmarks/storage_sla_timed.json
 ```
 
 ## 5. 性能 SLA
@@ -94,10 +94,10 @@ bazel run --config=release //benchmarks:storage_benchmark -- \
 
 原始证据：
 
-- `docs/benchmarks/d5_storage_64b.json`
-- `docs/benchmarks/d5_storage_sla_timed.json`
-- `docs/benchmarks/d5_storage_64k.json`
-- `docs/benchmarks/d5_storage_1m.json`
+- `docs/benchmarks/storage_64b.json`
+- `docs/benchmarks/storage_sla_timed.json`
+- `docs/benchmarks/storage_64k.json`
+- `docs/benchmarks/storage_1m.json`
 
 上述首版 JSON 保存负载配置和测量结果，运行日期、硬件、OS 与编译器 provenance 由本报告第 3 节记录；它们尚未内嵌 commit SHA，因此不能单独作为当前发布候选的资格证明。后续重新资格认证必须将 commit SHA、完整命令、Bazel 配置、编译器、OS、硬件/存储和运行时间写入同一 artifact manifest，并记录 JSON 与日志的 SHA-256。
 
@@ -122,8 +122,8 @@ per_topic_capacity >= topic_peak_bytes_per_second × tolerated_disk_pause_second
 扩展 campaign：
 
 ```bash
-tools/ci/run_d5_storage_fault_campaign.py --rounds=100 --seed=42 \
-  --out=d5-storage-fault-campaign
+tools/ci/run_storage_fault_campaign.py --rounds=100 --seed=42 \
+  --out=storage-fault-campaign
 ```
 
 ## 8. 重新资格认证条件
