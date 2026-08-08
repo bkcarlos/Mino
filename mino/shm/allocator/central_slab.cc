@@ -980,14 +980,6 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
     MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
 
     const SlabHeader& header = HeaderAt(slot_index);
-    const uint32_t observed_state =
-        header.object_state.load(std::memory_order_acquire);
-    if (observed_state == static_cast<uint32_t>(ObjectState::kFree) ||
-        observed_state == static_cast<uint32_t>(ObjectState::kReclaiming) ||
-        observed_state == static_cast<uint32_t>(ObjectState::kAllocating)) {
-        return Status::Error(StatusCode::kNotFound,
-                             "slot is not inspectable during lifecycle transition");
-    }
     if (!VerifyImmutableHeader(header)) {
         return Status::Error(StatusCode::kCorruption,
                              "immutable header CRC mismatch");
@@ -995,7 +987,8 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
 
     SlabView view;
     view.handle = handle;
-    view.state = static_cast<ObjectState>(observed_state);
+    view.state = static_cast<ObjectState>(
+        header.object_state.load(std::memory_order_acquire));
     view.class_id = header.class_id;
     view.generation = generations_.Get(slot_index);
     view.capacity = header.capacity;
@@ -1010,12 +1003,6 @@ Result<SlabView> CentralSlabAllocator::Inspect(ShmHandle handle) const {
         header.allocation_role.load(std::memory_order_acquire) &
         kAllocationFlagMask;
     view.data = reinterpret_cast<const std::byte*>(&header) + sizeof(SlabHeader);
-    if (header.object_state.load(std::memory_order_acquire) != observed_state ||
-        generations_.Get(slot_index) != handle.generation ||
-        header.generation.load(std::memory_order_acquire) != handle.generation) {
-        return Status::Error(StatusCode::kNotFound,
-                             "slot changed while being inspected");
-    }
     return view;
 }
 
