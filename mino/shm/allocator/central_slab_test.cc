@@ -308,6 +308,28 @@ TEST_F(CentralSlabTest, ReclaimFreesSlotForReuse) {
     EXPECT_EQ(second->generation, first->generation + 1);
 }
 
+TEST_F(CentralSlabTest, ExactGenerationFreeStateIsConcurrentReclaimSuccess) {
+    auto handle = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(handle.ok());
+    ASSERT_TRUE(alloc_.Retire(*handle).ok());
+
+    auto* header = reinterpret_cast<SlabHeader*>(region_.get() + handle->offset);
+    header->object_state.store(static_cast<uint32_t>(ObjectState::kFree),
+                               std::memory_order_release);
+
+    // Another exact-generation reclaimer may have published kFree but not yet
+    // cleared the bitmap. Joining that in-flight reclaim is idempotent success.
+    EXPECT_TRUE(alloc_.Reclaim(*handle).ok());
+    auto metadata = alloc_.GetSlotMetadata(handle->offset);
+    ASSERT_TRUE(metadata.ok());
+    EXPECT_TRUE(metadata->occupied);
+
+    // Restore the synthetic state so this test also verifies normal cleanup.
+    header->object_state.store(static_cast<uint32_t>(ObjectState::kRetired),
+                               std::memory_order_release);
+    EXPECT_TRUE(alloc_.Reclaim(*handle).ok());
+}
+
 TEST_F(CentralSlabTest, ReclaimRejectsNonRetiredSlot) {
     auto handle = alloc_.Allocate(Request(32));
     ASSERT_TRUE(handle.ok());

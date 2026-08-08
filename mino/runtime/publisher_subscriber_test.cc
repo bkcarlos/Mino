@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -797,13 +798,28 @@ TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
                                               *pins);
     std::atomic<bool> publisher_done{false};
     std::atomic<uint64_t> failures{0};
+    std::atomic<uint32_t> first_failure{0};
+    std::atomic<uint16_t> first_status{
+        static_cast<uint16_t>(StatusCode::kOk)};
+    std::string first_status_detail;
     std::atomic<uint64_t> gap_signals{0};
+    auto record_failure = [&](uint32_t category, const Status& status) {
+        uint32_t expected = 0;
+        if (first_failure.compare_exchange_strong(
+                expected, category, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            first_status.store(static_cast<uint16_t>(status.code()),
+                               std::memory_order_relaxed);
+            first_status_detail = status.ToString();
+        }
+        failures.fetch_add(1, std::memory_order_relaxed);
+    };
 
     std::thread publishing([&]() {
         for (uint64_t id = 1; id <= kMessages;) {
             auto builder = publisher.Allocate();
             if (!builder.ok()) {
-                failures.fetch_add(1, std::memory_order_relaxed);
+                record_failure(1, builder.status());
                 break;
             }
             (*builder)->id = id;
@@ -813,7 +829,7 @@ TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
                 continue;
             }
             if (status.code() != StatusCode::kWouldBlock) {
-                failures.fetch_add(1, std::memory_order_relaxed);
+                record_failure(2, status);
                 break;
             }
             std::this_thread::yield();
@@ -831,12 +847,14 @@ TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
             auto message = subscriber.TryPoll();
             if (message.ok()) {
                 if ((*message)->id <= last_id) {
-                    failures.fetch_add(1, std::memory_order_relaxed);
+                    record_failure(
+                        3, Status::Error(StatusCode::kCorruption,
+                                         "non-monotonic message ID"));
                 }
                 last_id = (*message)->id;
                 const Status ack = std::move(*message).Ack();
                 if (!ack.ok()) {
-                    failures.fetch_add(1, std::memory_order_relaxed);
+                    record_failure(4, ack);
                 }
                 continue;
             }
@@ -845,7 +863,7 @@ TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
                 continue;
             }
             if (message.status().code() != StatusCode::kWouldBlock) {
-                failures.fetch_add(1, std::memory_order_relaxed);
+                record_failure(5, message.status());
                 return;
             }
             if (publisher_done.load(std::memory_order_acquire)) {
@@ -857,7 +875,11 @@ TEST_F(RuntimeSpscTest, BroadcastDropOldestPublisherAndSubscriberRaceSafely) {
 
     publishing.join();
     consuming.join();
-    ASSERT_EQ(failures.load(std::memory_order_relaxed), 0u);
+    ASSERT_EQ(failures.load(std::memory_order_relaxed), 0u)
+        << "first failure category="
+        << first_failure.load(std::memory_order_relaxed)
+        << " status=" << first_status.load(std::memory_order_relaxed)
+        << " detail=" << first_status_detail;
     EXPECT_EQ(publisher.published_count(), kMessages);
     EXPECT_GT(publisher.dropped_count(), 0u);
     EXPECT_GT(gap_signals.load(std::memory_order_relaxed), 0u);

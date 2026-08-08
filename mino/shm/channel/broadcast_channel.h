@@ -70,6 +70,7 @@ class BroadcastChannel {
 public:
     using PayloadRetireObserver = Status (*)(ShmHandle, void*) noexcept;
     using RetirePersistenceHook = void (*)(uint64_t, void*) noexcept;
+    using PollCursorHook = void (*)(uint64_t, void*) noexcept;
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "BroadcastChannel requires lock-free 64-bit atomics");
 
@@ -1300,6 +1301,10 @@ public:
             const uint64_t cons = LoadCursorAndHelp(sub.id.value);
             const uint64_t prod =
                 control_->publisher_cursor.load(std::memory_order_acquire);
+            if (poll_cursor_hook_for_testing_ != nullptr) {
+                poll_cursor_hook_for_testing_(
+                    cons, poll_cursor_context_for_testing_);
+            }
             if (cons == prod) {
                 return Status::Error(StatusCode::kWouldBlock,
                                      "broadcast channel empty");
@@ -1355,7 +1360,14 @@ public:
             // above already published the sequence, so a relaxed load
             // suffices.
             if (slot->sequence_num.load(std::memory_order_relaxed) != cons) {
-                AdvanceCursorPast(sub.id.value, cons);
+                // DropOldest may advance this subscriber after Poll loaded cons,
+                // then let the publisher reuse the physical slot. That is a
+                // legitimate gap, not corruption; retry so ConsumePendingGap()
+                // reports it through the ordered kDegraded path. A stable cursor
+                // still bound to cons makes the mismatch genuine corruption.
+                if (!AdvanceCursorPast(sub.id.value, cons)) {
+                    continue;
+                }
                 return Status::Error(
                     StatusCode::kCorruption,
                     "broadcast slot sequence mismatch (skipped)");
@@ -1521,6 +1533,12 @@ public:
         RetirePersistenceHook hook, void* context = nullptr) noexcept {
         retire_persistence_hook_ = hook;
         retire_persistence_context_ = context;
+    }
+
+    static void SetPollCursorHookForTesting(
+        PollCursorHook hook, void* context = nullptr) noexcept {
+        poll_cursor_hook_for_testing_ = hook;
+        poll_cursor_context_for_testing_ = context;
     }
 
     // -----------------------------------------------------------------------
@@ -1782,15 +1800,20 @@ private:
         return true;
     }
 
-    void AdvanceCursorPast(uint32_t id, uint64_t sequence) const noexcept {
+    bool AdvanceCursorPast(uint32_t id, uint64_t sequence) const noexcept {
         uint64_t expected = sequence;
         if (subs_[id].cursor.compare_exchange_strong(
                 expected, CursorCleanupToken(sequence),
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
             FinishCursorCleanup(id, sequence);
-        } else if (IsCursorCleanupToken(expected)) {
-            FinishCursorCleanup(id, CursorSequence(expected));
+            return true;
         }
+        if (IsCursorCleanupToken(expected)) {
+            const uint64_t cleanup_sequence = CursorSequence(expected);
+            FinishCursorCleanup(id, cleanup_sequence);
+            return cleanup_sequence == sequence;
+        }
+        return false;
     }
 
     // Removes one subscriber from future publication snapshots and advances
@@ -2423,6 +2446,9 @@ private:
     void* payload_retire_context_ = nullptr;
     RetirePersistenceHook retire_persistence_hook_ = nullptr;
     void* retire_persistence_context_ = nullptr;
+    static inline thread_local PollCursorHook poll_cursor_hook_for_testing_ =
+        nullptr;
+    static inline thread_local void* poll_cursor_context_for_testing_ = nullptr;
 };
 
 static_assert(std::is_trivially_copyable_v<BroadcastChannel>,

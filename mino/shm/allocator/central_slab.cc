@@ -725,7 +725,8 @@ Status CentralSlabAllocator::ReclaimSlotExact(uint32_t slot_index,
                                  "stale handle during reclaim");
         }
         uint32_t state = header.object_state.load(std::memory_order_acquire);
-        if (state == static_cast<uint32_t>(ObjectState::kReclaiming)) {
+        if (state == static_cast<uint32_t>(ObjectState::kReclaiming) ||
+            state == static_cast<uint32_t>(ObjectState::kFree)) {
             return Status::Ok();
         }
         if (state == static_cast<uint32_t>(ObjectState::kPublished) &&
@@ -768,13 +769,16 @@ Status CentralSlabAllocator::ReclaimSlotExact(uint32_t slot_index,
             return Status::Error(StatusCode::kWouldBlock,
                                  "reclaim identity or Pin guard changed");
         }
+        // Capture all generation-local metadata before releasing bitmap
+        // ownership. Allocate may rewrite the header immediately after ClearBit.
+        const uint16_t reclaimed_class_id = header.class_id;
         // Publish kFree while the bitmap still excludes Allocate; only this
         // exact-generation reclaimer can clear the bit, so reuse cannot race the
         // final state store.
         header.object_state.store(static_cast<uint32_t>(ObjectState::kFree),
                                   std::memory_order_release);
         const Status cleared = bitmap_.ClearBit(slot_index);
-        if (cleared.ok()) RememberLocalCursor(header.class_id, slot_index);
+        if (cleared.ok()) RememberLocalCursor(reclaimed_class_id, slot_index);
         return cleared;
     }
 }

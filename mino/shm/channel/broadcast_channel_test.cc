@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -186,6 +187,19 @@ Status CountingRetireObserver(ShmHandle, void* opaque) noexcept {
     static_cast<std::atomic<uint64_t>*>(opaque)->fetch_add(
         1, std::memory_order_relaxed);
     return Status::Ok();
+}
+
+struct BlockingPollCursorContext {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+
+void BlockingPollCursor(uint64_t, void* opaque) noexcept {
+    auto* context = static_cast<BlockingPollCursorContext*>(opaque);
+    context->entered.store(true, std::memory_order_release);
+    while (!context->release.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 }
 
 // Monotonic clock used throughout the membership tests: registration,
@@ -861,6 +875,61 @@ TEST(BroadcastPolicyTest, DropOldestAdvancesOneEraAndReportsGap) {
     ASSERT_TRUE(b1.ok());
     EXPECT_EQ(b1->slot()->sequence_num, 1u);
     ASSERT_TRUE(std::move(*b1).Ack().ok());
+}
+
+TEST(BroadcastPolicyTest, ConcurrentDropAndSlotReuseReportsGapNotCorruption) {
+    ChannelFixture<4> f;
+    auto ch = BroadcastChannel::Init(f.storage, 4);
+    ASSERT_TRUE(ch.ok());
+    auto sub = Register(*ch, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        Publish(*ch, i);
+    }
+
+    BlockingPollCursorContext context;
+    std::atomic<bool> polling_done{false};
+    Status poll_status = Status::Ok();
+    std::thread polling([&]() {
+        BroadcastChannel::SetPollCursorHookForTesting(&BlockingPollCursor,
+                                                      &context);
+        auto result = ch->Poll(sub);
+        BroadcastChannel::SetPollCursorHookForTesting(nullptr);
+        poll_status = result.ok()
+                          ? Status::Error(StatusCode::kInternal,
+                                          "Poll unexpectedly returned a Borrow")
+                          : result.status();
+        polling_done.store(true, std::memory_order_release);
+    });
+    const auto hook_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!context.entered.load(std::memory_order_acquire) &&
+           !polling_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < hook_deadline) {
+        std::this_thread::yield();
+    }
+    if (!context.entered.load(std::memory_order_acquire)) {
+        context.release.store(true, std::memory_order_release);
+        polling.join();
+        FAIL() << "Poll did not reach the cursor race hook";
+    }
+
+    auto replacement = ch->Reserve(QueueFullPolicy::kDropOldest);
+    Status publish_status = replacement.ok()
+                                ? Status::Ok()
+                                : replacement.status();
+    if (replacement.ok()) {
+        FillSlot(*replacement, 4);
+        publish_status = std::move(*replacement).Commit();
+    }
+    context.release.store(true, std::memory_order_release);
+    polling.join();
+
+    ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
+    ASSERT_TRUE(publish_status.ok()) << publish_status.ToString();
+    EXPECT_EQ(poll_status.code(), StatusCode::kDegraded)
+        << poll_status.ToString();
+    EXPECT_EQ(f.subs()[0].cursor.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(f.slots()[0].sequence_num.load(std::memory_order_acquire), 4u);
 }
 
 TEST(BroadcastPolicyTest, DropOldestCountsOneMessageAcrossTiedSubscribers) {
