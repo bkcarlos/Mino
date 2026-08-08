@@ -343,7 +343,10 @@ TcpDriverOptions DriverOptions() {
     TcpDriverOptions options;
     options.max_frame_body_bytes = kMaxProbeFrameBytes;
     options.max_total_send_buffer_bytes = 2 * kMaxProbeFrameBytes;
-    options.max_connection_send_buffer_bytes = kMaxProbeFrameBytes;
+    options.max_connection_send_buffer_bytes =
+        kMaxProbeFrameBytes + sizeof(uint32_t);
+    options.max_control_send_buffer_bytes =
+        kMaxProbeFrameBytes + sizeof(uint32_t);
     options.max_ready_receive_bytes = 2 * kMaxProbeFrameBytes;
     options.max_ready_receive_messages = 128;
     options.max_pending_accepts = 8;
