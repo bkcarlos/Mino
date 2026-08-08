@@ -64,6 +64,28 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "region_id_allocator",
+    srcs = ["region_id_allocator.cc"],
+    hdrs = ["region_id_allocator.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "region_id_allocator_test",
+    srcs = ["region_id_allocator_test.cc"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":region_id_allocator",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The Region lifecycle and the Recovery Owner protocol are compiled into a
 # single library because they are mutually dependent at the source level:
 # region.cc drives recovery on Attach, while recovery.cc reads the Region's
@@ -81,6 +103,7 @@ cc_library(
     deps = [
         ":channel_directory",
         ":recovery_directory",
+        ":region_id_allocator",
         ":superblock",
         "//mino/common:checked_arithmetic",
         "//mino/common:result",

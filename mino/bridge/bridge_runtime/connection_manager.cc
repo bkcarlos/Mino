@@ -187,6 +187,36 @@ uint64_t BridgeConnectionManager::EffectiveNow(
             .count());
 }
 
+void BridgeConnectionManager::RecordTelemetry(
+    observability::TraceStage stage, uint64_t now_ns, uint64_t duration_ns,
+    uint32_t payload_bytes, uint32_t wire_bytes) noexcept {
+    if (options_.telemetry == nullptr) return;
+    uint64_t sequence = ++telemetry_sequence_;
+    if (sequence == 0) sequence = ++telemetry_sequence_;
+    const observability::SampleKey key{
+        .topic_id = 0,
+        .source_identity = options_.local_identity.node_id.value,
+        .sequence = sequence,
+    };
+    const observability::TraceEvent event{
+        .trace_id_high = observability::StableSampleHash(key),
+        .trace_id_low = observability::StableSampleHash(
+            {sequence, options_.expected_peer.node_id.value,
+             options_.local_identity.node_id.value}),
+        .topic_id = 0,
+        .monotonic_time_ns = now_ns,
+        .duration_ns = duration_ns,
+        .hop_id = options_.telemetry_hop_id,
+        .component_instance = options_.telemetry_component_instance,
+        .payload_bytes = payload_bytes,
+        .wire_bytes = wire_bytes,
+        .flags = observability::kPerfTraceSampled,
+        .stage = stage,
+    };
+    (void)options_.telemetry->TryRecordEvent(
+        key, event, options_.telemetry_shard, now_ns);
+}
+
 uint64_t BridgeConnectionManager::GenerateNewEpoch() noexcept {
     static std::atomic<uint64_t> fallback_seed{1};
     uint64_t candidate = 0;
@@ -561,6 +591,8 @@ Result<BridgeConnectionPumpResult> BridgeConnectionManager::Pump(
         if ((state_ == BridgeConnectionState::kHandshaking &&
              remote_session_epoch_ != 0) ||
             state_ == BridgeConnectionState::kActive) {
+            const uint64_t telemetry_begin =
+                options_.telemetry == nullptr ? 0 : EffectiveNow(0);
             auto pumped = pipeline_->Pump(budget);
             if (!pumped.ok()) {
                 if (!IsConnectionFailure(pumped.status())) {
@@ -571,6 +603,27 @@ Result<BridgeConnectionPumpResult> BridgeConnectionManager::Pump(
                                &result);
             } else {
                 result.pipeline = std::move(*pumped);
+                if (options_.telemetry != nullptr &&
+                    (result.pipeline.outbound_frames != 0 ||
+                     result.pipeline.inbound_frames != 0)) {
+                    const uint64_t telemetry_end = EffectiveNow(0);
+                    const uint64_t duration = telemetry_end >= telemetry_begin
+                                                  ? telemetry_end - telemetry_begin
+                                                  : 0;
+                    const uint32_t bytes = static_cast<uint32_t>(std::min<size_t>(
+                        result.pipeline.bytes,
+                        std::numeric_limits<uint32_t>::max()));
+                    if (result.pipeline.outbound_frames != 0) {
+                        RecordTelemetry(
+                            observability::TraceStage::kSocketWriteComplete,
+                            telemetry_end, duration, 0, bytes);
+                    }
+                    if (result.pipeline.inbound_frames != 0) {
+                        RecordTelemetry(
+                            observability::TraceStage::kRemoteFrameComplete,
+                            telemetry_end, duration, bytes, bytes);
+                    }
+                }
                 if (state_ == BridgeConnectionState::kHandshaking &&
                     pipeline_->session_ready()) {
                     state_ = BridgeConnectionState::kActive;
@@ -579,8 +632,14 @@ Result<BridgeConnectionPumpResult> BridgeConnectionManager::Pump(
                     next_probe_ns_ = SaturatingAdd(
                         now, options_.health_probe_interval_ns);
                     ++stats_.completed_handshakes;
-                    if (ever_active_) ++stats_.reconnects;
+                    const bool reconnected = ever_active_;
+                    if (reconnected) ++stats_.reconnects;
                     ever_active_ = true;
+                    if (reconnected && options_.telemetry != nullptr) {
+                        RecordTelemetry(
+                            observability::TraceStage::kBridgeReconnect,
+                            EffectiveNow(0), 0, 0, 0);
+                    }
                     last_failure_ = Status::Ok();
                     result.handshake_completed = true;
                 }

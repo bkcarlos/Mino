@@ -1,3 +1,20 @@
+# Validation benchmarks
+
+## D0–D5 validation target
+
+`//benchmarks:d0_d5_validation_benchmark` directly exercises existing production APIs for V-14, V-15, V-16, V-17, V-18, and V-27. Build and run:
+
+```bash
+bazel build --config=release //benchmarks:d0_d5_validation_benchmark
+MINO_BENCHMARK_COMMIT="$(git rev-parse HEAD)" \
+MINO_BENCHMARK_BUILD_CONFIG="bazel --config=release" \
+bazel run --config=release //benchmarks:d0_d5_validation_benchmark -- \
+  --suite=all --directory=/tmp \
+  --output-json=/tmp/mino-d0-d5-validation.json
+```
+
+Use `--suite=memory` or `--suite=storage` to isolate phases. Full options, methodology, JSON Schema, and the no-data template are documented in `docs/benchmarks/D0_D5_Validation_Methodology.md`.
+
 # Storage benchmark (D5-14)
 
 `//benchmarks:storage_benchmark` is a dependency-free C++20 benchmark driver for the production storage path. It directly exercises `segment_format`, `segment_writer`, `segment_recovery`, and `recorder_buffer_pool`; it does not use Google Benchmark.

@@ -930,4 +930,43 @@ Result<SchemaRef> SchemaStore::FindRef(
     }
 }
 
+Status SchemaStore::HydrateRegistry() noexcept {
+    try {
+        if (registry_ == nullptr) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "schema store registry is unavailable");
+        }
+        for (const auto& [ref, entry] : by_ref_) {
+            static_cast<void>(ref);
+            MINO_ASSIGN_OR_RETURN(
+                auto bytes,
+                ReadRegularFile(entry.descriptor_path,
+                                options_.max_descriptor_bytes,
+                                StatusCode::kCorruption,
+                                StatusCode::kCorruption));
+            MINO_ASSIGN_OR_RETURN(
+                auto validated,
+                registry_->ValidateDescriptorArtifact(bytes));
+            if (!ArtifactContainsIdentity(validated, entry.identity)) {
+                return Corruption(
+                    "stored descriptor artifact identity does not match manifest");
+            }
+            MINO_ASSIGN_OR_RETURN(
+                auto published,
+                registry_->PublishDescriptorArtifact(std::move(validated)));
+            static_cast<void>(published);
+            MINO_ASSIGN_OR_RETURN(auto restored, registry_->Find(entry.identity));
+            if (!SameIdentity(restored->identity(), entry.identity)) {
+                return Mismatch(
+                    "hydrated descriptor identity does not match manifest");
+            }
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
 }  // namespace mino::storage

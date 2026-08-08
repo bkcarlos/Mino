@@ -1,6 +1,12 @@
 # Recorder, storage, replay.
 package(default_visibility = ["//visibility:public"])
 
+POSIX_ONLY = select({
+    "@platforms//os:linux": [],
+    "@platforms//os:macos": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 cc_library(
     name = "schema_store",
     srcs = ["schema_store.cc"],
@@ -400,6 +406,9 @@ cc_test(
 cc_test(
     name = "storage_fault_test",
     srcs = ["storage_fault_test.cc"],
+    tags = ["d5-storage-fault"],
+    timeout = "long",
+    target_compatible_with = POSIX_ONLY,
     deps = [
         ":recorder_buffer_pool",
         ":recording_manifest",

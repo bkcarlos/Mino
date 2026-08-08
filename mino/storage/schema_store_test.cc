@@ -253,6 +253,34 @@ TEST(SchemaStoreTest, PersistsResolvesAndRecoversMonotonicRefs) {
     EXPECT_EQ(*gamma_ref, 3u);
 }
 
+TEST(SchemaStoreTest, HydratesDurableDescriptorsIntoFreshRegistry) {
+    const std::filesystem::path root = TestDirectory("hydrate");
+    auto artifact = CompileArtifact(
+        "option schema_version = \"1.0\"; package store; "
+        "message Hydrated { uint64 value = 1; }");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+
+    schema::SchemaRegistry writer_registry;
+    auto writer = SchemaStore::Open(root, &writer_registry);
+    ASSERT_TRUE(writer.ok()) << writer.status().ToString();
+    ASSERT_TRUE((*writer)
+                    ->Persist(artifact->identities[0], Bytes(artifact->bytes))
+                    .ok());
+    writer->reset();
+
+    schema::SchemaRegistry recovered_registry;
+    auto recovered = SchemaStore::Open(root, &recovered_registry);
+    ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
+    EXPECT_EQ(recovered_registry.size(), 0u);
+    ASSERT_TRUE((*recovered)->HydrateRegistry().ok());
+    EXPECT_EQ(recovered_registry.size(), artifact->identities.size());
+    auto found = recovered_registry.Find(artifact->identities[0]);
+    ASSERT_TRUE(found.ok()) << found.status().ToString();
+    EXPECT_TRUE(SameIdentity((*found)->identity(), artifact->identities[0]));
+    EXPECT_TRUE((*recovered)->HydrateRegistry().ok());
+    EXPECT_EQ(recovered_registry.size(), artifact->identities.size());
+}
+
 TEST(SchemaStoreTest, EnforcesSingleOwnerAndBoundedOptions) {
     const std::filesystem::path root = TestDirectory("owner");
     schema::SchemaRegistry registry;

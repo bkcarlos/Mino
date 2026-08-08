@@ -59,6 +59,11 @@ class ModelEvidence(TypedDict):
 class Manifest(TypedDict):
     schema_version: int
     commit: str | None
+    expected_commit: str | None
+    source_state: str
+    source_changes: list[str] | None
+    allow_dirty: bool
+    qualification_eligible: bool
     seed: None
     seed_consumed: bool
     command: list[list[str]]
@@ -85,6 +90,8 @@ class Arguments(argparse.Namespace):
     timeout_seconds: int | None = None
     total_timeout_seconds: int | None = None
     model: list[str] | None = None
+    expected_commit: str | None = None
+    allow_dirty: bool = False
     self_test: bool = False
 
 
@@ -144,9 +151,43 @@ def _git_commit(workspace: Path) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return os.environ.get("GITHUB_SHA")
     candidate = result.stdout.strip().splitlines()
-    if result.returncode == 0 and candidate and len(candidate[-1]) == 40:
-        return candidate[-1]
-    return os.environ.get("GITHUB_SHA")
+    if result.returncode == 0 and candidate:
+        commit = candidate[-1].lower()
+        if re.fullmatch(r"[0-9a-f]{40}", commit):
+            return commit
+    fallback = os.environ.get("GITHUB_SHA")
+    if fallback and re.fullmatch(r"[0-9a-fA-F]{40}", fallback):
+        return fallback.lower()
+    return None
+
+
+def _git_worktree_changes(workspace: Path) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=workspace,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _commit(value: str) -> str:
+    normalized = value.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+        raise argparse.ArgumentTypeError(
+            "expected commit must be a 40-character hexadecimal SHA"
+        )
+    return normalized
 
 
 def _github_provenance(environment: Mapping[str, str]) -> dict[str, str | None]:
@@ -398,6 +439,7 @@ Model checking completed. No error has been found.
     assert [model.name for model in _selected_models(["BroadcastMembership"])] == [
         "BroadcastMembership"
     ]
+    assert _commit("A" * 40) == "a" * 40
     print("run_tla_validation.py self-test: PASS")
 
 
@@ -429,6 +471,12 @@ def main() -> int:
         choices=[model.name for model in MODELS],
         help="run only this model; may be repeated (default: all models)",
     )
+    _ = parser.add_argument("--expected-commit", type=_commit)
+    _ = parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="allow dirty local evidence, marked qualification_eligible=false",
+    )
     _ = parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(namespace=Arguments())
 
@@ -453,6 +501,22 @@ def main() -> int:
             if not path.is_file():
                 parser.error(f"required formal input is missing: {path}")
 
+    commit = _git_commit(workspace)
+    if args.expected_commit is not None and commit != args.expected_commit:
+        parser.error(
+            f"workspace commit {commit!r} does not match expected commit "
+            f"{args.expected_commit}"
+        )
+    changes = _git_worktree_changes(workspace)
+    if args.expected_commit is not None and changes is None:
+        parser.error("unable to verify qualification worktree cleanliness")
+    if changes and not args.allow_dirty:
+        parser.error(
+            "worktree is dirty; pass --allow-dirty for non-qualification development evidence"
+        )
+    source_state = "unknown" if changes is None else ("dirty" if changes else "clean")
+    qualification_eligible = args.expected_commit is not None and changes == []
+
     output = args.out.expanduser().resolve()
     try:
         _prepare_output(output)
@@ -462,8 +526,13 @@ def main() -> int:
     manifest_path = output / "manifest.json"
     started_monotonic = time.monotonic()
     manifest: Manifest = {
-        "schema_version": 1,
-        "commit": _git_commit(workspace),
+        "schema_version": 2,
+        "commit": commit,
+        "expected_commit": args.expected_commit,
+        "source_state": source_state,
+        "source_changes": changes,
+        "allow_dirty": args.allow_dirty,
+        "qualification_eligible": qualification_eligible,
         "seed": None,
         "seed_consumed": False,
         "command": [],

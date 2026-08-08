@@ -13,8 +13,25 @@ cc_binary(
     srcs = ["mino_two_host_probe.cc"],
     deps = [
         "//mino/bridge:bridge_connection_manager",
+        "//mino/bridge:schema_negotiator",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema:registry",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:schema_store",
         "//mino/transport:tcp_driver",
     ],
+)
+
+py_test(
+    name = "two_host_protocol_test",
+    srcs = [
+        "finalize_two_host_manifest.py",
+        "two_host_protocol.py",
+    ],
+    args = ["--self-test"],
+    main = "finalize_two_host_manifest.py",
+    python_version = "PY3",
 )

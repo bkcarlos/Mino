@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include <utility>
@@ -307,6 +308,16 @@ TEST_F(RegionTest, DuplicateCreateFails) {
 }
 
 TEST_F(RegionTest, RejectsInvalidCreateOptions) {
+  RegionCreateOptions read_only;
+  read_only.name = Name("ro");
+  read_only.size_bytes = 1024 * 1024;
+  read_only.read_only = true;
+  auto read_only_create = SharedMemoryRegion::Create(read_only);
+  ASSERT_FALSE(read_only_create.ok());
+  EXPECT_EQ(read_only_create.status().code(), StatusCode::kInvalidArgument);
+  EXPECT_NE(read_only_create.status().ToString().find("read_only"),
+            std::string::npos);
+
   RegionCreateOptions zero;
   zero.name = Name("z");
   EXPECT_EQ(SharedMemoryRegion::Create(zero).status().code(),
@@ -323,6 +334,48 @@ TEST_F(RegionTest, RejectsInvalidCreateOptions) {
   bad_name.size_bytes = 1024 * 1024;
   EXPECT_EQ(SharedMemoryRegion::Create(bad_name).status().code(),
             StatusCode::kInvalidArgument);
+}
+
+TEST_F(RegionTest, AttachRequiresNameAndOptionallyMatchesRegionId) {
+  const std::string name = Name("ao");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  const uint32_t region_id = region->region_id();
+
+  RegionAttachOptions name_only;
+  name_only.name = name;
+  name_only.read_only = true;
+  auto by_name = SharedMemoryRegion::Attach(name_only);
+  ASSERT_TRUE(by_name.ok()) << by_name.status().ToString();
+  EXPECT_EQ(by_name->region_id(), region_id);
+
+  RegionAttachOptions matching;
+  matching.name = name;
+  matching.region_id = region_id;
+  matching.read_only = true;
+  auto matched = SharedMemoryRegion::Attach(matching);
+  ASSERT_TRUE(matched.ok()) << matched.status().ToString();
+  EXPECT_EQ(matched->region_id(), region_id);
+
+  RegionAttachOptions mismatching = matching;
+  mismatching.region_id = region_id == std::numeric_limits<uint32_t>::max()
+                              ? region_id - 1
+                              : region_id + 1;
+  auto mismatch = SharedMemoryRegion::Attach(mismatching);
+  ASSERT_FALSE(mismatch.ok());
+  EXPECT_EQ(mismatch.status().code(), StatusCode::kNotFound);
+
+  RegionAttachOptions id_only;
+  id_only.region_id = region_id;
+  id_only.read_only = true;
+  auto without_name = SharedMemoryRegion::Attach(id_only);
+  ASSERT_FALSE(without_name.ok());
+  EXPECT_EQ(without_name.status().code(), StatusCode::kInvalidArgument);
+  EXPECT_NE(without_name.status().ToString().find("ID-only"),
+            std::string::npos);
+
+  EXPECT_TRUE(matched->Detach().ok());
+  EXPECT_TRUE(by_name->Detach().ok());
 }
 
 TEST_F(RegionTest, AttachRejectsBadMagic) {

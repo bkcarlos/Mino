@@ -1,0 +1,70 @@
+package(default_visibility = ["//visibility:public"])
+
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+cc_library(
+    name = "fuzz_harness",
+    srcs = ["fuzz_harness.cc"],
+    hdrs = ["fuzz_harness.h"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        "//mino/abi:shm_abi",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/region:handle_resolver",
+        "//mino/shm/region:region",
+        "//mino/shm/region:superblock",
+    ],
+)
+
+cc_library(
+    name = "corpus_support",
+    hdrs = ["corpus_support.h"],
+    target_compatible_with = LINUX_ONLY,
+)
+
+cc_test(
+    name = "corpus_smoke_test",
+    size = "small",
+    srcs = ["corpus_smoke_test.cc"],
+    data = glob(["testdata/*.hex"]),
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":corpus_support",
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)
+
+cc_binary(
+    name = "standalone_fuzz_driver",
+    srcs = ["standalone_fuzz_driver.cc"],
+    data = glob(["testdata/*.hex"]),
+    tags = ["manual"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":corpus_support",
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)
+
+cc_binary(
+    name = "libfuzzer_driver",
+    srcs = ["libfuzzer_driver.cc"],
+    tags = [
+        "large",
+        "manual",
+    ],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)

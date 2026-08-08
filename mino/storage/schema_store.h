@@ -84,6 +84,10 @@ public:
     Result<SchemaRef> FindRef(
         const schema::CanonicalDigest& digest) const noexcept;
 
+    // Revalidates and publishes every durable descriptor into the registry
+    // supplied to Open(). Safe to call repeatedly; publication is idempotent.
+    Status HydrateRegistry() noexcept;
+
     size_t size() const noexcept { return by_ref_.size(); }
     SchemaRef high_watermark() const noexcept { return high_watermark_; }
 

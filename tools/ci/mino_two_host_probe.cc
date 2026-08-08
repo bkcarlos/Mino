@@ -27,8 +27,14 @@
 #include <vector>
 
 #include "mino/bridge/bridge_runtime/connection_manager.h"
+#include "mino/bridge/schema_negotiator.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/schema/codegen/artifact_codec.h"
+#include "mino/schema/compiler.h"
+#include "mino/schema/layout.h"
+#include "mino/schema/registry.h"
+#include "mino/storage/schema_store.h"
 #include "mino/transport/tcp_driver.h"
 
 namespace {
@@ -45,21 +51,27 @@ using mino::bridge::BridgeConnectionState;
 using mino::bridge::BridgeIngressPort;
 using mino::bridge::BridgeNodeIdentityFence;
 using mino::bridge::BridgePumpBudget;
+using mino::bridge::DescriptorAuth;
+using mino::bridge::DescriptorPersistence;
 using mino::bridge::EncodedOutboundFrame;
-using mino::bridge::WireFrame;
 using mino::bridge::FrameFlag;
 using mino::bridge::FrameType;
 using mino::bridge::FlagValue;
+using mino::bridge::SchemaNegotiator;
+using mino::bridge::WireFrame;
 using mino::registry::Reliability;
 using mino::transport::EndpointDescriptor;
 using mino::transport::TcpDriver;
 using mino::transport::TcpDriverOptions;
 
-constexpr std::string_view kProtocol = "mino-two-host-mino-v1";
-constexpr std::string_view kEnvelopeMagic = "MINO_TWO_HOST_MINO_V1";
+constexpr std::string_view kProtocol = "mino-two-host-mino-v2";
+constexpr std::string_view kEnvelopeMagic = "MINO_TWO_HOST_MINO_V2";
 constexpr size_t kCommitLength = 40;
 constexpr size_t kDigestLength = 64;
 constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;
+constexpr size_t kMaxProbeFrameBytes = 256u * 1024u;
+constexpr uint64_t kInitialSequence = 1;
+constexpr uint64_t kReconnectSequence = 2;
 
 std::atomic<bool> g_stop_requested{false};
 
@@ -152,16 +164,47 @@ struct ProbeResult {
     std::string peer_machine_identity;
     std::string local_address;
     std::string peer_address;
+    std::string local_schema_digest;
+    std::string peer_schema_digest;
+    std::string persisted_schema_digest;
     std::string error;
     bool session_discovery = false;
     bool bridge_active = false;
     bool reliable_sent = false;
     bool reliable_received = false;
     bool remote_acknowledged = false;
+    bool schema_identity_nonempty = false;
+    bool descriptor_artifact_nonempty = false;
+    bool schema_announcement = false;
+    bool schema_request = false;
+    bool schema_persisted = false;
+    bool persisted_schema_identity_verified = false;
+    bool persisted_schema_bytes_verified = false;
+    bool forced_disconnect = false;
+    bool automatic_reconnect = false;
+    bool session_epoch_changed = false;
+    bool pending_reliable_before_disconnect = false;
+    bool pending_reliable_recovered = false;
+    bool pending_reliable_retransmitted = false;
+    bool reliable_replay_sent = false;
+    bool reliable_replay_pending_observed = false;
+    bool dedup_state_preserved = false;
+    bool duplicate_suppressed = false;
+    bool bidirectional_ack = false;
+    uint64_t initial_local_session_epoch = 0;
+    uint64_t initial_remote_session_epoch = 0;
     uint64_t local_session_epoch = 0;
     uint64_t remote_session_epoch = 0;
     uint64_t connection_attempts = 0;
     uint64_t accepted_connections = 0;
+    uint64_t completed_handshakes = 0;
+    uint64_t reconnects = 0;
+    uint64_t disconnects = 0;
+    uint64_t accepted_acks = 0;
+    uint64_t duplicate_checks = 0;
+    uint64_t descriptor_authentications = 0;
+    uint64_t descriptor_persistences = 0;
+    uint64_t descriptor_artifact_bytes = 0;
     uint64_t elapsed_ms = 0;
 };
 
@@ -298,10 +341,10 @@ BridgeNodeIdentityFence PeerFence(std::string_view role) {
 
 TcpDriverOptions DriverOptions() {
     TcpDriverOptions options;
-    options.max_frame_body_bytes = 4096;
-    options.max_total_send_buffer_bytes = 64 * 1024;
-    options.max_connection_send_buffer_bytes = 32 * 1024;
-    options.max_ready_receive_bytes = 64 * 1024;
+    options.max_frame_body_bytes = kMaxProbeFrameBytes;
+    options.max_total_send_buffer_bytes = 2 * kMaxProbeFrameBytes;
+    options.max_connection_send_buffer_bytes = kMaxProbeFrameBytes;
+    options.max_ready_receive_bytes = 2 * kMaxProbeFrameBytes;
     options.max_ready_receive_messages = 128;
     options.max_pending_accepts = 8;
     options.heartbeat_interval_ms = 1000;
@@ -339,12 +382,14 @@ BridgeConnectionManagerOptions ManagerOptions(
     manager.max_reconnect_backoff_ns = 5 * kNanosecondsPerSecond;
     manager.health_probe_interval_ns = kNanosecondsPerSecond;
     manager.max_egress_frames = 32;
-    manager.max_egress_bytes = 64 * 1024;
-    manager.pipeline.wire_limits.max_payload_length = 4096;
-    manager.pipeline.wire_limits.max_buffered_bytes = 8192;
+    manager.max_egress_bytes = kMaxProbeFrameBytes;
+    manager.pipeline.max_control_bytes = kMaxProbeFrameBytes;
+    manager.pipeline.max_pending_inbound_bytes = 2 * kMaxProbeFrameBytes;
+    manager.pipeline.wire_limits.max_payload_length = kMaxProbeFrameBytes;
+    manager.pipeline.wire_limits.max_buffered_bytes = kMaxProbeFrameBytes;
     manager.pipeline.retransmit.max_age_ns = 60 * kNanosecondsPerSecond;
     manager.pipeline.retransmit.max_entries = 32;
-    manager.pipeline.retransmit.max_bytes = 64 * 1024;
+    manager.pipeline.retransmit.max_bytes = kMaxProbeFrameBytes;
     return manager;
 }
 
@@ -399,32 +444,171 @@ Result<Envelope> DecodeEnvelope(std::span<const std::byte> payload) {
     };
 }
 
+struct ProbeSchema {
+    mino::schema::SchemaHandle handle;
+    std::vector<std::byte> artifact;
+};
+
+std::span<const std::byte> Bytes(std::string_view value) {
+    return std::as_bytes(std::span<const char>(value.data(), value.size()));
+}
+
+std::string DigestHex(const mino::schema::CanonicalDigest& digest) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(digest.size() * 2);
+    for (std::byte byte : digest) {
+        const uint8_t value = static_cast<uint8_t>(byte);
+        encoded.push_back(kHex[value >> 4]);
+        encoded.push_back(kHex[value & 0x0fu]);
+    }
+    return encoded;
+}
+
+bool CompleteSchemaIdentity(const mino::schema::SchemaIdentity& identity) {
+    const bool digest_nonzero = std::any_of(
+        identity.canonical_digest().begin(), identity.canonical_digest().end(),
+        [](std::byte byte) { return byte != std::byte{0}; });
+    return identity.short_id() != 0 && digest_nonzero &&
+           identity.schema_version() != 0 && identity.layout_version() != 0;
+}
+
+Result<ProbeSchema> BuildProbeSchema(std::string_view role) {
+    const std::string idl =
+        "option schema_version = \"1.0\"; package mino_two_host_" +
+        std::string(role) +
+        "; message ProbeEnvelope { string payload = 1 [max_bytes = 2048]; }";
+    MINO_ASSIGN_OR_RETURN(auto compiled,
+                          mino::schema::SchemaCompiler::Compile(idl));
+    if (compiled.types().size() != 1) {
+        return Corruption("two-host probe schema did not compile to one type");
+    }
+    MINO_ASSIGN_OR_RETURN(
+        auto layout,
+        mino::schema::LayoutPlanner::Plan(*compiled.types().front()));
+    const std::array<mino::schema::LayoutPlan, 1> layouts = {
+        std::move(layout)};
+    MINO_ASSIGN_OR_RETURN(
+        auto artifact,
+        mino::schema::codegen::EncodeDescriptorArtifact(compiled, layouts));
+    if (artifact.empty()) return Corruption("compiled descriptor artifact is empty");
+    const auto bytes = Bytes(artifact);
+    return ProbeSchema{
+        .handle = compiled.types().front(),
+        .artifact = std::vector<std::byte>(bytes.begin(), bytes.end()),
+    };
+}
+
+bool SameIdentity(const mino::schema::SchemaIdentity& lhs,
+                  const mino::schema::SchemaIdentity& rhs) {
+    return lhs.short_id() == rhs.short_id() &&
+           lhs.canonical_digest() == rhs.canonical_digest() &&
+           lhs.schema_version() == rhs.schema_version() &&
+           lhs.layout_version() == rhs.layout_version();
+}
+
+class ExactDescriptorAuth final : public DescriptorAuth {
+public:
+    explicit ExactDescriptorAuth(const ProbeSchema* expected)
+        : expected_(expected) {}
+
+    Status Authenticate(
+        const mino::schema::SchemaIdentity& identity,
+        std::span<const std::byte> descriptor_artifact) override {
+        ++authentications;
+        if (expected_ == nullptr || expected_->handle == nullptr ||
+            !SameIdentity(identity, expected_->handle->identity()) ||
+            !std::equal(descriptor_artifact.begin(), descriptor_artifact.end(),
+                        expected_->artifact.begin(), expected_->artifact.end())) {
+            return Status::Error(StatusCode::kPermissionDenied,
+                                 "peer descriptor artifact authentication failed");
+        }
+        return Status::Ok();
+    }
+
+    uint64_t authentications = 0;
+
+private:
+    const ProbeSchema* expected_;
+};
+
+class StorePersistence final : public DescriptorPersistence {
+public:
+    explicit StorePersistence(mino::storage::SchemaStore* store)
+        : store_(store) {}
+
+    Status Persist(
+        const mino::schema::SchemaIdentity& identity,
+        std::span<const std::byte> descriptor_artifact) override {
+        ++attempts;
+        if (store_ == nullptr) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "probe schema store is unavailable");
+        }
+        auto persisted = store_->Persist(identity, descriptor_artifact);
+        if (!persisted.ok()) return persisted.status();
+        persisted_ref = *persisted;
+        return Status::Ok();
+    }
+
+    uint64_t attempts = 0;
+    mino::storage::SchemaRef persisted_ref = mino::storage::kInvalidSchemaRef;
+
+private:
+    mino::storage::SchemaStore* store_;
+};
+
 class ProbeIngress final : public BridgeIngressPort {
 public:
+    explicit ProbeIngress(std::shared_ptr<TcpDriver> driver)
+        : driver_(std::move(driver)) {}
+
+    void Attach(BridgeConnectionManager* manager) { manager_ = manager; }
+
     Status DecodeValidatePublish(const WireFrame& frame) override {
         auto decoded = DecodeEnvelope(frame.payload);
         if (!decoded.ok()) return decoded.status();
+        if (!forced_disconnect && frame.header.sequence_num == kReconnectSequence &&
+            manager_ != nullptr && driver_ != nullptr) {
+            forced_disconnect = true;
+            const Status closed = driver_->Close(manager_->connection_id());
+            if (!closed.ok()) return closed;
+            // Publication has not committed, so dedup HWM remains at the first
+            // message and the sender must retransmit this pending reliable frame
+            // after BridgeConnectionManager reconnects.
+            return Status::Error(StatusCode::kNotFound,
+                                 "two-host probe injected disconnect");
+        }
+        sequences.push_back(frame.header.sequence_num);
         envelopes.push_back(std::move(*decoded));
         return Status::Ok();
     }
 
+    std::vector<uint64_t> sequences;
     std::vector<Envelope> envelopes;
+    bool forced_disconnect = false;
+
+private:
+    std::shared_ptr<TcpDriver> driver_;
+    BridgeConnectionManager* manager_ = nullptr;
 };
 
-WireFrame DataFrame(const Options& options) {
+WireFrame DataFrame(const Options& options,
+                    const mino::schema::SchemaIdentity& identity,
+                    uint64_t sequence) {
     WireFrame frame;
     frame.header.frame_type = FrameType::kData;
     frame.header.flags = FlagValue(FrameFlag::kPayloadCrcPresent);
     frame.header.topic_id = 7001;
-    frame.header.msg_type = 1;
-    frame.header.schema_version = 1;
-    frame.header.layout_version = 1;
+    frame.header.msg_type = static_cast<uint32_t>(identity.short_id());
+    frame.header.schema_version = identity.schema_version();
+    frame.header.layout_version = identity.layout_version();
     frame.header.source_node_id = LocalFence(options.role).node_id.value;
     frame.header.source_publisher_id =
         options.role == "client" ? 7101 : 7201;
     frame.header.source_publisher_epoch =
         options.role == "client" ? 8101 : 8201;
-    frame.header.sequence_num = 1;
+    frame.header.sequence_num = sequence;
     const std::string envelope = EncodeEnvelope(options);
     frame.payload.resize(envelope.size());
     std::transform(envelope.begin(), envelope.end(), frame.payload.begin(),
@@ -452,41 +636,107 @@ Status ValidatePeerEnvelope(const Options& options, const Envelope& peer) {
 }
 
 Status EnqueueReliable(BridgeConnectionManager* manager,
-                       const Options& options) {
+                       const Options& options, const ProbeSchema& schema,
+                       uint64_t sequence) {
     return manager->Enqueue(EncodedOutboundFrame{
-        .frame = DataFrame(options),
+        .frame = DataFrame(options, schema.handle->identity(), sequence),
         .reliability = Reliability::kReliableOrdered,
         .allow_drop = false,
-        .schema_identity = std::nullopt,
-        .descriptor_artifact = {},
+        .schema_identity = schema.handle->identity(),
+        .descriptor_artifact = schema.artifact,
     });
 }
 
+void CaptureManagerEvidence(const BridgeConnectionManager& manager,
+                            ProbeResult* result) {
+    result->local_session_epoch = manager.local_session_epoch();
+    result->remote_session_epoch = manager.remote_session_epoch();
+    result->connection_attempts = manager.stats().connection_attempts;
+    result->accepted_connections = manager.stats().accepted_connections;
+    result->completed_handshakes = manager.stats().completed_handshakes;
+    result->reconnects = manager.stats().reconnects;
+    result->disconnects = manager.stats().disconnects;
+    if (manager.pipeline() != nullptr) {
+        result->accepted_acks =
+            manager.pipeline()->retransmit_stats().accepted_acks;
+        result->duplicate_checks =
+            manager.pipeline()->dedup_stats().duplicate_checks;
+    }
+}
+
 Status RunProbe(const Options& options, ProbeResult* result) {
+    MINO_ASSIGN_OR_RETURN(auto client_schema, BuildProbeSchema("client"));
+    MINO_ASSIGN_OR_RETURN(auto server_schema, BuildProbeSchema("server"));
+    const ProbeSchema& local_schema =
+        options.role == "client" ? client_schema : server_schema;
+    const ProbeSchema& peer_schema =
+        options.role == "client" ? server_schema : client_schema;
+    result->local_schema_digest =
+        DigestHex(local_schema.handle->identity().canonical_digest());
+    result->peer_schema_digest =
+        DigestHex(peer_schema.handle->identity().canonical_digest());
+    result->schema_identity_nonempty =
+        CompleteSchemaIdentity(local_schema.handle->identity()) &&
+        CompleteSchemaIdentity(peer_schema.handle->identity());
+    result->descriptor_artifact_nonempty = !local_schema.artifact.empty() &&
+                                           !peer_schema.artifact.empty();
+    result->descriptor_artifact_bytes = local_schema.artifact.size();
+    if (!result->schema_identity_nonempty ||
+        !result->descriptor_artifact_nonempty) {
+        return Corruption("probe schema identity or artifact is empty");
+    }
+
+    mino::schema::SchemaRegistry registry;
+    MINO_ASSIGN_OR_RETURN(
+        auto local_registered,
+        registry.RegisterDescriptor(local_schema.handle));
+    static_cast<void>(local_registered);
+    std::filesystem::path store_root = options.output.parent_path();
+    if (store_root.empty()) store_root = ".";
+    store_root /= "schema-store";
+    std::error_code remove_error;
+    std::filesystem::remove_all(store_root, remove_error);
+    if (remove_error) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "cannot reset probe schema store");
+    }
+    MINO_ASSIGN_OR_RETURN(
+        auto store, mino::storage::SchemaStore::Open(store_root, &registry));
+    ExactDescriptorAuth descriptor_auth(&peer_schema);
+    StorePersistence descriptor_persistence(store.get());
+    SchemaNegotiator schema_negotiator(&registry, &descriptor_auth,
+                                       &descriptor_persistence);
+
     MINO_ASSIGN_OR_RETURN(auto endpoint,
                           ResolveEndpoint(options.address, options.port));
     MINO_ASSIGN_OR_RETURN(auto created, TcpDriver::Create(DriverOptions()));
     auto driver = std::shared_ptr<TcpDriver>(std::move(created));
-    ProbeIngress ingress;
+    ProbeIngress ingress(driver);
     MINO_ASSIGN_OR_RETURN(
         auto manager,
         BridgeConnectionManager::Create(ManagerOptions(options, endpoint),
-                                        driver, &ingress));
+                                        driver, &ingress, &schema_negotiator));
+    ingress.Attach(manager.get());
     MINO_RETURN_IF_ERROR(manager->Start(NowNs()));
 
     const uint64_t started_ns = NowNs();
     const uint64_t deadline_ns =
         started_ns + static_cast<uint64_t>(options.deadline_seconds) *
                          kNanosecondsPerSecond;
-    bool message_enqueued = false;
-    bool frame_left_queue = false;
-    bool peer_validated = false;
+    size_t validated_inbound = 0;
+    bool initial_enqueued = false;
+    bool reconnect_enqueued = false;
+    bool replay_enqueued = false;
+    bool initial_acknowledged = false;
+    bool pending_observed = false;
+    bool replay_pending_observed = false;
     while (!g_stop_requested.load(std::memory_order_relaxed) &&
            NowNs() < deadline_ns) {
         BridgePumpBudget budget;
         budget.now_ns = NowNs();
         auto pumped = manager->Pump(budget);
         if (!pumped.ok()) {
+            CaptureManagerEvidence(*manager, result);
             (void)manager->Shutdown();
             return pumped.status();
         }
@@ -494,58 +744,230 @@ Status RunProbe(const Options& options, ProbeResult* result) {
             result->bridge_active = true;
             result->session_discovery = manager->local_session_epoch() != 0 &&
                                         manager->remote_session_epoch() != 0;
-            if (options.role == "client" && !message_enqueued) {
-                MINO_RETURN_IF_ERROR(EnqueueReliable(manager.get(), options));
-                message_enqueued = true;
+            if (result->initial_local_session_epoch == 0) {
+                result->initial_local_session_epoch =
+                    manager->local_session_epoch();
+                result->initial_remote_session_epoch =
+                    manager->remote_session_epoch();
+            }
+            if (options.role == "client" && !initial_enqueued) {
+                MINO_RETURN_IF_ERROR(EnqueueReliable(
+                    manager.get(), options, local_schema, kInitialSequence));
+                initial_enqueued = true;
                 result->reliable_sent = true;
             }
         }
-        if (message_enqueued && manager->queued_egress_frames() == 0) {
-            frame_left_queue = true;
-        }
-        if (!ingress.envelopes.empty() && !peer_validated) {
-            MINO_RETURN_IF_ERROR(
-                ValidatePeerEnvelope(options, ingress.envelopes.front()));
-            const Envelope& peer = ingress.envelopes.front();
+
+        result->schema_announcement =
+            result->schema_announcement ||
+            schema_negotiator.local_ref_high_watermark() != 0 ||
+            schema_negotiator.remote_ref_high_watermark() != 0;
+        result->schema_request = result->schema_request ||
+                                 schema_negotiator.pending_request_count() != 0;
+
+        while (validated_inbound < ingress.envelopes.size()) {
+            MINO_RETURN_IF_ERROR(ValidatePeerEnvelope(
+                options, ingress.envelopes[validated_inbound]));
+            const uint64_t sequence = ingress.sequences[validated_inbound];
+            if (sequence != kInitialSequence &&
+                sequence != kReconnectSequence) {
+                return Corruption("peer reliable sequence is unexpected");
+            }
+            const Envelope& peer = ingress.envelopes[validated_inbound];
             result->peer_commit = peer.commit;
             result->peer_machine_identity = peer.machine_identity;
             result->peer_address = peer.advertised_address;
-            result->reliable_received = true;
-            peer_validated = true;
-            if (options.role == "server") {
-                MINO_RETURN_IF_ERROR(EnqueueReliable(manager.get(), options));
-                message_enqueued = true;
-                result->reliable_sent = true;
-            }
+            ++validated_inbound;
         }
-        const bool acknowledged =
-            message_enqueued && frame_left_queue && manager->pipeline() != nullptr &&
+
+        const bool initial_received = std::find(
+            ingress.sequences.begin(), ingress.sequences.end(),
+            kInitialSequence) != ingress.sequences.end();
+        const bool reconnect_received = std::find(
+            ingress.sequences.begin(), ingress.sequences.end(),
+            kReconnectSequence) != ingress.sequences.end();
+        if (options.role == "server" && initial_received &&
+            !initial_enqueued && manager->state() == BridgeConnectionState::kActive) {
+            MINO_RETURN_IF_ERROR(EnqueueReliable(
+                manager.get(), options, local_schema, kInitialSequence));
+            initial_enqueued = true;
+            result->reliable_sent = true;
+        }
+
+        if (initial_enqueued && initial_received && manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() == 0 &&
+            manager->pipeline()->retransmit_stats().accepted_acks >= 1) {
+            initial_acknowledged = true;
+        }
+        if (options.role == "client" && initial_acknowledged &&
+            !reconnect_enqueued &&
+            manager->state() == BridgeConnectionState::kActive) {
+            MINO_RETURN_IF_ERROR(EnqueueReliable(
+                manager.get(), options, local_schema, kReconnectSequence));
+            reconnect_enqueued = true;
+        }
+        if (reconnect_enqueued && manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() != 0 &&
+            manager->stats().reconnects == 0) {
+            pending_observed = true;
+            result->pending_reliable_before_disconnect = true;
+        }
+
+        const bool first_reconnect_recovered =
+            manager->stats().reconnects >= 1 && manager->pipeline() != nullptr &&
             manager->pipeline()->retransmit_entries() == 0;
-        if (acknowledged) result->remote_acknowledged = true;
-        if (peer_validated && acknowledged) {
-            // The receiver's ACK is flushed in the same BridgePipeline::Pump that
-            // commits ingress. A short grace period keeps the connection alive
-            // while the peer consumes that ACK and writes its own result.
+        if (options.role == "client" && reconnect_enqueued &&
+            first_reconnect_recovered && !replay_enqueued &&
+            manager->state() == BridgeConnectionState::kActive) {
+            MINO_RETURN_IF_ERROR(EnqueueReliable(
+                manager.get(), options, local_schema, kReconnectSequence));
+            replay_enqueued = true;
+            result->reliable_replay_sent = true;
+        }
+        if (options.role == "server" && reconnect_received &&
+            manager->pipeline() != nullptr &&
+            manager->pipeline()->dedup_stats().duplicate_checks >= 1 &&
+            !reconnect_enqueued &&
+            manager->state() == BridgeConnectionState::kActive) {
+            MINO_RETURN_IF_ERROR(EnqueueReliable(
+                manager.get(), options, local_schema, kReconnectSequence));
+            reconnect_enqueued = true;
+        }
+        if (options.role == "server" && reconnect_enqueued &&
+            manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() != 0 &&
+            manager->stats().reconnects < 2) {
+            pending_observed = true;
+            result->pending_reliable_before_disconnect = true;
+        }
+        const bool second_reconnect_recovered =
+            manager->stats().reconnects >= 2 && manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() == 0;
+        if (options.role == "server" && reconnect_enqueued &&
+            second_reconnect_recovered && !replay_enqueued &&
+            manager->state() == BridgeConnectionState::kActive) {
+            MINO_RETURN_IF_ERROR(EnqueueReliable(
+                manager.get(), options, local_schema, kReconnectSequence));
+            replay_enqueued = true;
+            result->reliable_replay_sent = true;
+        }
+
+        if (replay_enqueued && manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() != 0) {
+            replay_pending_observed = true;
+            result->reliable_replay_pending_observed = true;
+        }
+
+        CaptureManagerEvidence(*manager, result);
+        result->forced_disconnect = ingress.forced_disconnect;
+        result->automatic_reconnect = result->reconnects >= 2;
+        result->session_epoch_changed =
+            result->initial_local_session_epoch != 0 &&
+            result->initial_remote_session_epoch != 0 &&
+            result->local_session_epoch != 0 &&
+            result->remote_session_epoch != 0 &&
+            result->initial_local_session_epoch != result->local_session_epoch &&
+            result->initial_remote_session_epoch != result->remote_session_epoch;
+        result->pending_reliable_recovered =
+            pending_observed && result->reconnects >= 1 &&
+            manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() == 0;
+        result->pending_reliable_retransmitted =
+            result->pending_reliable_recovered;
+        result->dedup_state_preserved =
+            manager->pipeline() != nullptr &&
+            !manager->pipeline()->reliability_degraded();
+        result->duplicate_suppressed =
+            result->duplicate_checks >= 1 && ingress.envelopes.size() == 2;
+        result->remote_acknowledged =
+            replay_enqueued && replay_pending_observed &&
+            manager->pipeline() != nullptr &&
+            manager->pipeline()->retransmit_entries() == 0 &&
+            result->accepted_acks >= 3;
+        result->bidirectional_ack = result->remote_acknowledged &&
+                                    reconnect_received &&
+                                    result->duplicate_suppressed;
+        result->reliable_received = initial_received && reconnect_received;
+        result->schema_persisted = descriptor_persistence.attempts >= 1;
+        result->descriptor_authentications = descriptor_auth.authentications;
+        result->descriptor_persistences = descriptor_persistence.attempts;
+
+        const bool complete =
+            result->session_discovery && result->bridge_active &&
+            result->reliable_sent && result->reliable_received &&
+            result->remote_acknowledged && result->schema_announcement &&
+            result->schema_request && result->schema_persisted &&
+            result->forced_disconnect && result->automatic_reconnect &&
+            result->session_epoch_changed &&
+            result->pending_reliable_before_disconnect &&
+            result->pending_reliable_recovered &&
+            result->pending_reliable_retransmitted &&
+            result->reliable_replay_sent &&
+            result->reliable_replay_pending_observed &&
+            result->dedup_state_preserved &&
+            result->duplicate_suppressed && result->bidirectional_ack;
+        if (complete) {
+            auto persisted = store->FindRef(peer_schema.handle->identity());
+            if (!persisted.ok() ||
+                *persisted == mino::storage::kInvalidSchemaRef ||
+                *persisted != descriptor_persistence.persisted_ref) {
+                CaptureManagerEvidence(*manager, result);
+                (void)manager->Shutdown();
+                return Corruption("peer descriptor persistence cannot be resolved");
+            }
+            MINO_ASSIGN_OR_RETURN(auto entry, store->Resolve(*persisted));
+            const std::string expected_digest =
+                DigestHex(peer_schema.handle->identity().canonical_digest());
+            const std::string expected_filename = expected_digest + ".schema";
+            if (!SameIdentity(entry.identity, peer_schema.handle->identity()) ||
+                entry.descriptor_path.filename() != expected_filename) {
+                CaptureManagerEvidence(*manager, result);
+                (void)manager->Shutdown();
+                return Corruption(
+                    "persisted peer descriptor identity or digest is inconsistent");
+            }
+            result->persisted_schema_identity_verified = true;
+            result->persisted_schema_digest = expected_digest;
+
+            std::error_code file_error;
+            const uintmax_t persisted_size =
+                std::filesystem::file_size(entry.descriptor_path, file_error);
+            if (file_error || persisted_size != peer_schema.artifact.size()) {
+                CaptureManagerEvidence(*manager, result);
+                (void)manager->Shutdown();
+                return Corruption("persisted peer descriptor artifact is missing");
+            }
+            std::ifstream persisted_input(entry.descriptor_path,
+                                          std::ios::in | std::ios::binary);
+            std::vector<std::byte> persisted_bytes(peer_schema.artifact.size());
+            if (!persisted_input ||
+                !persisted_input.read(
+                    reinterpret_cast<char*>(persisted_bytes.data()),
+                    static_cast<std::streamsize>(persisted_bytes.size())) ||
+                persisted_input.peek() != std::char_traits<char>::eof() ||
+                persisted_bytes != peer_schema.artifact) {
+                CaptureManagerEvidence(*manager, result);
+                (void)manager->Shutdown();
+                return Corruption(
+                    "persisted peer descriptor artifact bytes differ");
+            }
+            result->persisted_schema_bytes_verified = true;
             for (size_t grace = 0; grace < 100; ++grace) {
                 budget.now_ns = NowNs();
                 auto grace_pump = manager->Pump(budget);
                 if (!grace_pump.ok()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
-            result->local_session_epoch = manager->local_session_epoch();
-            result->remote_session_epoch = manager->remote_session_epoch();
-            result->connection_attempts = manager->stats().connection_attempts;
-            result->accepted_connections = manager->stats().accepted_connections;
+            CaptureManagerEvidence(*manager, result);
             result->outcome = "passed";
             const Status shutdown = manager->Shutdown();
             return shutdown.ok() ? Status::Ok() : shutdown;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    result->local_session_epoch = manager->local_session_epoch();
-    result->remote_session_epoch = manager->remote_session_epoch();
-    result->connection_attempts = manager->stats().connection_attempts;
-    result->accepted_connections = manager->stats().accepted_connections;
+    CaptureManagerEvidence(*manager, result);
+    result->descriptor_authentications = descriptor_auth.authentications;
+    result->descriptor_persistences = descriptor_persistence.attempts;
     (void)manager->Shutdown();
     return g_stop_requested.load(std::memory_order_relaxed)
                ? Status::Error(StatusCode::kUnavailable,
@@ -569,7 +991,7 @@ Status WriteResult(const Options& options, const ProbeResult& result) {
                              "cannot open result JSON");
     }
     output << "{\n"
-           << "  \"schema_version\": 1,\n"
+           << "  \"schema_version\": 4,\n"
            << "  \"protocol\": \"" << kProtocol << "\",\n"
            << "  \"role\": \"" << JsonEscape(result.role) << "\",\n"
            << "  \"outcome\": \"" << JsonEscape(result.outcome) << "\",\n"
@@ -593,6 +1015,59 @@ Status WriteResult(const Options& options, const ProbeResult& result) {
            << (result.reliable_received ? "true" : "false") << ",\n"
            << "  \"remote_acknowledged\": "
            << (result.remote_acknowledged ? "true" : "false") << ",\n"
+           << "  \"schema_identity_nonempty\": "
+           << (result.schema_identity_nonempty ? "true" : "false") << ",\n"
+           << "  \"descriptor_artifact_nonempty\": "
+           << (result.descriptor_artifact_nonempty ? "true" : "false")
+           << ",\n"
+           << "  \"schema_announcement\": "
+           << (result.schema_announcement ? "true" : "false") << ",\n"
+           << "  \"schema_request\": "
+           << (result.schema_request ? "true" : "false") << ",\n"
+           << "  \"schema_persisted\": "
+           << (result.schema_persisted ? "true" : "false") << ",\n"
+           << "  \"persisted_schema_identity_verified\": "
+           << (result.persisted_schema_identity_verified ? "true" : "false")
+           << ",\n"
+           << "  \"persisted_schema_bytes_verified\": "
+           << (result.persisted_schema_bytes_verified ? "true" : "false")
+           << ",\n"
+           << "  \"persisted_schema_digest\": \""
+           << result.persisted_schema_digest << "\",\n"
+           << "  \"forced_disconnect\": "
+           << (result.forced_disconnect ? "true" : "false") << ",\n"
+           << "  \"automatic_reconnect\": "
+           << (result.automatic_reconnect ? "true" : "false") << ",\n"
+           << "  \"session_epoch_changed\": "
+           << (result.session_epoch_changed ? "true" : "false") << ",\n"
+           << "  \"pending_reliable_before_disconnect\": "
+           << (result.pending_reliable_before_disconnect ? "true" : "false")
+           << ",\n"
+           << "  \"pending_reliable_recovered\": "
+           << (result.pending_reliable_recovered ? "true" : "false")
+           << ",\n"
+           << "  \"pending_reliable_retransmitted\": "
+           << (result.pending_reliable_retransmitted ? "true" : "false")
+           << ",\n"
+           << "  \"reliable_replay_sent\": "
+           << (result.reliable_replay_sent ? "true" : "false") << ",\n"
+           << "  \"reliable_replay_pending_observed\": "
+           << (result.reliable_replay_pending_observed ? "true" : "false")
+           << ",\n"
+           << "  \"dedup_state_preserved\": "
+           << (result.dedup_state_preserved ? "true" : "false") << ",\n"
+           << "  \"duplicate_suppressed\": "
+           << (result.duplicate_suppressed ? "true" : "false") << ",\n"
+           << "  \"bidirectional_ack\": "
+           << (result.bidirectional_ack ? "true" : "false") << ",\n"
+           << "  \"local_schema_digest\": \""
+           << result.local_schema_digest << "\",\n"
+           << "  \"peer_schema_digest\": \""
+           << result.peer_schema_digest << "\",\n"
+           << "  \"initial_local_session_epoch\": "
+           << result.initial_local_session_epoch << ",\n"
+           << "  \"initial_remote_session_epoch\": "
+           << result.initial_remote_session_epoch << ",\n"
            << "  \"local_session_epoch\": " << result.local_session_epoch
            << ",\n"
            << "  \"remote_session_epoch\": " << result.remote_session_epoch
@@ -601,6 +1076,18 @@ Status WriteResult(const Options& options, const ProbeResult& result) {
            << ",\n"
            << "  \"accepted_connections\": " << result.accepted_connections
            << ",\n"
+           << "  \"completed_handshakes\": " << result.completed_handshakes
+           << ",\n"
+           << "  \"reconnects\": " << result.reconnects << ",\n"
+           << "  \"disconnects\": " << result.disconnects << ",\n"
+           << "  \"accepted_acks\": " << result.accepted_acks << ",\n"
+           << "  \"duplicate_checks\": " << result.duplicate_checks << ",\n"
+           << "  \"descriptor_authentications\": "
+           << result.descriptor_authentications << ",\n"
+           << "  \"descriptor_persistences\": "
+           << result.descriptor_persistences << ",\n"
+           << "  \"descriptor_artifact_bytes\": "
+           << result.descriptor_artifact_bytes << ",\n"
            << "  \"elapsed_ms\": " << result.elapsed_ms << ",\n"
            << "  \"error\": \"" << JsonEscape(result.error) << "\"\n"
            << "}\n";

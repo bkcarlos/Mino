@@ -32,69 +32,12 @@
 #include "mino/common/checked_arithmetic.h"
 #include "mino/shm/channel/mpmc_ring.h"
 #include "mino/shm/region/recovery.h"
+#include "mino/shm/region/region_id_allocator.h"
 
 namespace mino {
 namespace {
 
-// Name of the durable high-water mark segment used to allocate persistent,
-// never-reused region_ids (design doc section 13.10). A full Authoritative
-// Registry service replaces this in a later milestone; for D1 the HWM is a
-// single atomic counter in a well-known POSIX shm object.
-constexpr const char* kRegionIdHwmName = "/mino_region_id_hwm";
 
-struct RegionIdHwm {
-    // Plain integer accessed via std::atomic_ref (consistent with SuperBlock).
-    uint32_t next_id;
-};
-
-// Allocates the next persistent region_id via the durable high-water mark.
-// The new high-water mark is stored (fetch_add) before the id is returned, so
-// ids are never reused even across crashes (section 13.10).
-Result<uint32_t> AllocateRegionId() {
-    // Open-or-create the HWM segment. We intentionally do not use O_EXCL here.
-    int fd = -1;
-    bool created = false;
-#if defined(__unix__) || defined(__APPLE__)
-    fd = ::shm_open(kRegionIdHwmName, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) {
-        return Status::Error(StatusCode::kInternal,
-                             "failed to open region id high-water mark");
-    }
-    struct stat st_buf;
-    if (::fstat(fd, &st_buf) != 0) {
-        ::close(fd);
-        return Status::Error(StatusCode::kInternal, "fstat(hwm) failed");
-    }
-    if (st_buf.st_size < static_cast<off_t>(sizeof(RegionIdHwm))) {
-        if (::ftruncate(fd, sizeof(RegionIdHwm)) != 0) {
-            ::close(fd);
-            return Status::Error(StatusCode::kInternal, "ftruncate(hwm) failed");
-        }
-        created = true;
-    }
-    void* p = ::mmap(nullptr, sizeof(RegionIdHwm), PROT_READ | PROT_WRITE,
-                     MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (p == MAP_FAILED) {
-        return Status::Error(StatusCode::kInternal, "mmap(hwm) failed");
-    }
-    auto* hwm = static_cast<RegionIdHwm*>(p);
-    if (created) {
-        // Construct the atomic in place and start ids at 1 (0 is reserved as
-        // "unset" in RegionAttachOptions).
-        std::atomic_ref(hwm->next_id).store(1, std::memory_order_relaxed);
-    }
-    const uint32_t id =
-        std::atomic_ref(hwm->next_id).fetch_add(1, std::memory_order_acq_rel);
-    ::munmap(p, sizeof(RegionIdHwm));
-    return id;
-#else
-    (void)fd;
-    (void)created;
-    return Status::Error(StatusCode::kUnsupported,
-                         "region id allocation unsupported on this platform");
-#endif
-}
 
 // Generates a 128-bit region UUID from a secure random source (design doc 6.4).
 void GenerateRegionUuid(uint64_t* lo, uint64_t* hi) {
@@ -252,6 +195,11 @@ void SharedMemoryRegion::CloseWithoutLifecycleUpdate() noexcept {
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     const RegionCreateOptions& options) {
+    if (options.read_only) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "Create does not support read_only; create writable and Attach read-only");
+    }
     if (options.size_bytes == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "region size must be > 0");
@@ -291,8 +239,11 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
         return Status::Error(StatusCode::kInvalidArgument, "layout overflow");
     }
 
-    // Allocate a persistent region id from the authoritative high-water mark.
-    MINO_ASSIGN_OR_RETURN(const uint32_t region_id, AllocateRegionId());
+    // Commit the following durable HWM before exposing this ID. ID 0 is
+    // reserved and exhaustion is represented above UINT32_MAX so the counter
+    // cannot wrap.
+    MINO_ASSIGN_OR_RETURN(const uint32_t region_id,
+                          region_internal::AllocateRegionId());
 
     // Create and map the segment.
     SharedMemoryCreateOptions shm_opts;
@@ -461,6 +412,11 @@ Status SharedMemoryRegion::ValidateSubRegionBounds(const SuperBlock& sb) {
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     const RegionAttachOptions& options) {
+    if (options.name.empty()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "Attach requires a Region name; ID-only Attach is unsupported");
+    }
+
     // Step 1 (permissions) is enforced by opening the object: a read-write
     // open fails with EACCES if the caller lacks write permission.
     //

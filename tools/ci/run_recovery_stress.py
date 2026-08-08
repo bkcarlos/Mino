@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -34,6 +35,51 @@ class StressConfig:
     testlog_relative: Path
 
 
+D2_SCENARIO_CLASSES = (
+    "publisher_crash",
+    "subscriber_kill",
+    "slow_subscriber",
+    "lease_boundary",
+    "pid_incarnation",
+)
+D2_CUTPOINTS = (
+    "journal-initializing-tagged",
+    "journal-building-published",
+    "journal-allocation-published",
+    "journal-handle-appended",
+    "mpsc-claim-tagged",
+    "mpsc-owner-published",
+    "mpsc-cursor-advanced",
+    "mpsc-writing-published",
+    "mpsc-ready-published",
+    "mpsc-turn-published",
+    "journal-reclaim-tagged",
+    "journal-reclaim-progress",
+    "journal-finalizing-tagged",
+)
+D2_INTERRUPTION_CLASSES = (
+    "sigkill",
+    "sigstop_then_sigkill",
+    "sigstop_then_sigcont",
+    "sigstop_live_sigcont",
+)
+_D2_SCENARIO_COUNT_RE = re.compile(
+    r"^D2_RECOVERY_SCENARIO_COUNT class=(?P<class>\w+) "
+    r"attempted=(?P<attempted>\d+) completed=(?P<completed>\d+)$",
+    re.MULTILINE,
+)
+_D2_SCENARIO_EVENT_RE = re.compile(
+    r"^D2_RECOVERY_SCENARIO_(?P<event>ATTEMPT|COMPLETED) "
+    r"class=(?P<class>\w+)$",
+    re.MULTILINE,
+)
+_D2_CUT_EVENT_RE = re.compile(
+    r"^D2_RECOVERY_CUT_(?P<event>ATTEMPT|COMPLETED) "
+    r"cut=(?P<cut>[a-z0-9-]+) interruption=(?P<interruption>[a-z0-9_]+)$",
+    re.MULTILINE,
+)
+
+
 CONFIGS = {
     "d1": StressConfig(
         target="//mino/shm/region:d1_region_recovery_kill_stress_test",
@@ -53,6 +99,12 @@ CONFIGS = {
         seed_env="MINO_D2_RECOVERY_STRESS_SEED",
         gtest_filter=(
             "D2RecoveryStressTest.RandomizedTimedRecoveryStress:"
+            "D2RecoveryStressTest.SigkillAtEveryPersistentStoreRecovers:"
+            "D2RecoveryStressTest.SigstopLiveOwnerIsNeverRecovered:"
+            "D2RecoveryStressTest.ForeignLivePidIncarnationMismatchIsUnknown:"
+            "D2RecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks:"
+            "D2RecoveryStressTest.SlowSubscriberBackpressurePreservesConservation:"
+            "D2RecoveryStressTest.DeadSubscriberLeaseBoundaryIsExact:"
             "D2RecoveryStressTest.RequiresPosixSharedMemoryAndProcessSignals"
         ),
         testlog_relative=Path("mino/runtime/d2_recovery_stress_test"),
@@ -126,9 +178,37 @@ def _git_commit(
     commit = _capture(
         ["git", "rev-parse", "HEAD"], cwd=workspace, environment=environment
     )
-    if commit and len(commit.splitlines()[-1]) == 40:
-        return commit.splitlines()[-1]
-    return environment.get("GITHUB_SHA")
+    if commit:
+        candidate = commit.splitlines()[-1].lower()
+        if re.fullmatch(r"[0-9a-f]{40}", candidate):
+            return candidate
+    fallback = environment.get("GITHUB_SHA")
+    if fallback and re.fullmatch(r"[0-9a-fA-F]{40}", fallback):
+        return fallback.lower()
+    return None
+
+
+def _git_worktree_changes(
+    workspace: Path, environment: Mapping[str, str]
+) -> Optional[list[str]]:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=workspace,
+            env=dict(environment),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def _toolchain(
@@ -253,6 +333,69 @@ def _copy_test_evidence(
     return records, hashes
 
 
+def _d2_scenario_counts(
+    output: Path,
+) -> tuple[dict[str, int], dict[str, int], Optional[str]]:
+    attempted = {name: 0 for name in D2_SCENARIO_CLASSES}
+    completed = {name: 0 for name in D2_SCENARIO_CLASSES}
+    for candidate in (output / "test.log", output / "bazel-console.log"):
+        if not candidate.is_file():
+            continue
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+        final_counts = list(_D2_SCENARIO_COUNT_RE.finditer(text))
+        if final_counts:
+            for match in final_counts:
+                scenario = match.group("class")
+                if scenario in attempted:
+                    attempted[scenario] = int(match.group("attempted"))
+                    completed[scenario] = int(match.group("completed"))
+            return attempted, completed, candidate.name
+
+        events = list(_D2_SCENARIO_EVENT_RE.finditer(text))
+        if events:
+            for match in events:
+                scenario = match.group("class")
+                if scenario not in attempted:
+                    continue
+                destination = (
+                    attempted if match.group("event") == "ATTEMPT" else completed
+                )
+                destination[scenario] += 1
+            return attempted, completed, candidate.name
+    return attempted, completed, None
+
+
+def _d2_cut_counts(
+    output: Path,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]], Optional[str]]:
+    def empty_counts() -> dict[str, dict[str, int]]:
+        return {
+            cut: {interruption: 0 for interruption in D2_INTERRUPTION_CLASSES}
+            for cut in D2_CUTPOINTS
+        }
+
+    attempted = empty_counts()
+    completed = empty_counts()
+    for candidate in (output / "test.log", output / "bazel-console.log"):
+        if not candidate.is_file():
+            continue
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+        events = list(_D2_CUT_EVENT_RE.finditer(text))
+        if not events:
+            continue
+        for match in events:
+            cut = match.group("cut")
+            interruption = match.group("interruption")
+            if cut not in attempted or interruption not in attempted[cut]:
+                continue
+            destination = (
+                attempted if match.group("event") == "ATTEMPT" else completed
+            )
+            destination[cut][interruption] += 1
+        return attempted, completed, candidate.name
+    return attempted, completed, None
+
+
 def _stream_command(
     command: list[str], *, cwd: Path, environment: Mapping[str, str], log: Path
 ) -> int:
@@ -308,12 +451,29 @@ def _run_stress(
     *,
     bazel: str = "bazel",
     environment: Optional[Mapping[str, str]] = None,
+    expected_commit: Optional[str] = None,
+    allow_dirty: bool = False,
+    seed_kind: str = "unspecified",
 ) -> int:
     config = CONFIGS[suite]
     process_environment = dict(os.environ if environment is None else environment)
+    commit = _git_commit(workspace, process_environment)
+    changes = _git_worktree_changes(workspace, process_environment)
+    if expected_commit is not None and commit != expected_commit:
+        raise RuntimeError(
+            f"workspace commit {commit!r} does not match expected commit {expected_commit}"
+        )
+    if expected_commit is not None and changes is None:
+        raise RuntimeError("unable to verify qualification worktree cleanliness")
+    if changes and not allow_dirty:
+        raise RuntimeError(
+            "worktree is dirty; pass --allow-dirty for non-qualification development evidence"
+        )
+    source_state = "unknown" if changes is None else ("dirty" if changes else "clean")
+    qualification_eligible = expected_commit is not None and changes == []
     _prepare_output(output)
     testlogs = _find_bazel_testlogs(workspace, bazel, process_environment)
-    timeout_seconds = seconds + 120
+    timeout_seconds = seconds + 240
     command = [
         bazel,
         "test",
@@ -331,11 +491,17 @@ def _run_stress(
     started_at = _utc_now()
     started_monotonic = time.monotonic()
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 3,
         "suite": suite,
-        "commit": _git_commit(workspace, process_environment),
+        "commit": commit,
+        "expected_commit": expected_commit,
+        "source_state": source_state,
+        "source_changes": changes,
+        "allow_dirty": allow_dirty,
+        "qualification_eligible": qualification_eligible,
         "target": config.target,
         "seed": seed,
+        "seed_kind": seed_kind,
         "seed_consumed": True,
         "duration_seconds": seconds,
         "requested_duration_seconds": seconds,
@@ -353,6 +519,18 @@ def _run_stress(
         "testlogs_root": str(testlogs),
         "test_logs": {},
         "test_log_hashes": {},
+        "scenario_attempt_counts": (
+            {name: 0 for name in D2_SCENARIO_CLASSES} if suite == "d2" else {}
+        ),
+        "scenario_counts": (
+            {name: 0 for name in D2_SCENARIO_CLASSES} if suite == "d2" else {}
+        ),
+        "scenario_count_source": None,
+        "cutpoint_attempt_counts": {},
+        "cutpoint_counts": {},
+        "cutpoint_count_source": None,
+        "interruption_attempt_counts": {},
+        "interruption_counts": {},
     }
     _write_json_atomic(manifest_path, manifest)
 
@@ -391,6 +569,107 @@ def _run_stress(
                 if internal_error
                 else f"evidence copy failed: {copy_error}"
             )
+        missing_evidence = [
+            name
+            for name in ("test.log", "test.xml", "bazel-console.log")
+            if not hashes.get(name)
+        ]
+        if missing_evidence:
+            evidence_error = "missing required hashed evidence: " + ", ".join(
+                missing_evidence
+            )
+            internal_error = (
+                f"{internal_error}; {evidence_error}"
+                if internal_error
+                else evidence_error
+            )
+        if suite == "d2":
+            attempted, completed, count_source = _d2_scenario_counts(output)
+            cut_attempted, cut_completed, cut_source = _d2_cut_counts(output)
+            interruption_attempted = {
+                interruption: sum(
+                    counts[interruption] for counts in cut_attempted.values()
+                )
+                for interruption in D2_INTERRUPTION_CLASSES
+            }
+            interruption_completed = {
+                interruption: sum(
+                    counts[interruption] for counts in cut_completed.values()
+                )
+                for interruption in D2_INTERRUPTION_CLASSES
+            }
+            manifest["scenario_attempt_counts"] = attempted
+            manifest["scenario_counts"] = completed
+            manifest["scenario_count_source"] = count_source
+            manifest["cutpoint_attempt_counts"] = cut_attempted
+            manifest["cutpoint_counts"] = cut_completed
+            manifest["cutpoint_count_source"] = cut_source
+            manifest["interruption_attempt_counts"] = interruption_attempted
+            manifest["interruption_counts"] = interruption_completed
+
+            validation_errors = []
+            if count_source is None:
+                validation_errors.append("scenario count marker source is missing")
+            else:
+                count_text = (output / count_source).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                final_markers = list(_D2_SCENARIO_COUNT_RE.finditer(count_text))
+                marker_classes = [match.group("class") for match in final_markers]
+                if len(final_markers) != len(D2_SCENARIO_CLASSES) or sorted(
+                    marker_classes
+                ) != sorted(D2_SCENARIO_CLASSES):
+                    validation_errors.append(
+                        "scenario final markers are missing, duplicated, or unknown"
+                    )
+            if cut_source is None:
+                validation_errors.append("cutpoint marker source is missing")
+            if seconds >= 10:
+                invalid_classes = [
+                    name
+                    for name in D2_SCENARIO_CLASSES
+                    if attempted[name] == 0
+                    or completed[name] == 0
+                    or attempted[name] != completed[name]
+                ]
+                if invalid_classes:
+                    validation_errors.append(
+                        "invalid scenario attempted/completed counts: "
+                        + ", ".join(invalid_classes)
+                    )
+            invalid_cuts = [
+                cut
+                for cut in D2_CUTPOINTS
+                if cut_attempted[cut]["sigkill"] == 0
+                or cut_attempted[cut]["sigkill"]
+                != cut_completed[cut]["sigkill"]
+            ]
+            if invalid_cuts:
+                validation_errors.append(
+                    "missing or incomplete deterministic SIGKILL cutpoints: "
+                    + ", ".join(invalid_cuts)
+                )
+            if (
+                interruption_attempted["sigstop_live_sigcont"] == 0
+                or interruption_attempted["sigstop_live_sigcont"]
+                != interruption_completed["sigstop_live_sigcont"]
+            ):
+                validation_errors.append(
+                    "deterministic SIGSTOP-live/SIGCONT evidence is missing or incomplete"
+                )
+            for cut in D2_CUTPOINTS:
+                for interruption in D2_INTERRUPTION_CLASSES:
+                    if cut_attempted[cut][interruption] != cut_completed[cut][interruption]:
+                        validation_errors.append(
+                            f"cutpoint attempted/completed mismatch: {cut}/{interruption}"
+                        )
+            if validation_errors:
+                coverage_error = "; ".join(validation_errors)
+                internal_error = (
+                    f"{internal_error}; {coverage_error}"
+                    if internal_error
+                    else coverage_error
+                )
         manifest.update(
             {
                 "end_time_utc": _utc_now(),
@@ -436,6 +715,15 @@ def _seed(value: str) -> int:
     return parsed
 
 
+def _commit(value: str) -> str:
+    normalized = value.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+        raise argparse.ArgumentTypeError(
+            "expected commit must be a 40-character hexadecimal SHA"
+        )
+    return normalized
+
+
 def _self_test() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -463,6 +751,50 @@ if args and args[0] == "test":
     target = target_arg[2:].replace(":", "/")
     output = Path(os.environ["FAKE_TESTLOGS"]) / target
     output.mkdir(parents=True, exist_ok=True)
+    if "d2_recovery_stress_test" in target:
+        classes = (
+            "publisher_crash",
+            "subscriber_kill",
+            "slow_subscriber",
+            "lease_boundary",
+            "pid_incarnation",
+        )
+        cuts = (
+            "journal-initializing-tagged",
+            "journal-building-published",
+            "journal-allocation-published",
+            "journal-handle-appended",
+            "mpsc-claim-tagged",
+            "mpsc-owner-published",
+            "mpsc-cursor-advanced",
+            "mpsc-writing-published",
+            "mpsc-ready-published",
+            "mpsc-turn-published",
+            "journal-reclaim-tagged",
+            "journal-reclaim-progress",
+            "journal-finalizing-tagged",
+        )
+        lines = [
+            f"D2_RECOVERY_SCENARIO_COUNT class={name} attempted=1 completed=1"
+            for name in classes
+        ]
+        for cut in cuts:
+            lines.append(
+                f"D2_RECOVERY_CUT_ATTEMPT cut={cut} interruption=sigkill"
+            )
+            lines.append(
+                f"D2_RECOVERY_CUT_COMPLETED cut={cut} interruption=sigkill"
+            )
+        lines.extend((
+            "D2_RECOVERY_CUT_ATTEMPT cut=mpsc-writing-published "
+            "interruption=sigstop_live_sigcont",
+            "D2_RECOVERY_CUT_COMPLETED cut=mpsc-writing-published "
+            "interruption=sigstop_live_sigcont",
+        ))
+        (output / "test.log").write_text("\\n".join(lines) + "\\n")
+        (output / "test.xml").write_text("<testsuites failures=\\\"0\\\"/>\\n")
+        print("fake D2 recovery stress passed with complete coverage")
+        raise SystemExit(0)
     (output / "test.log").write_text("reproducible failure evidence\\n")
     (output / "test.xml").write_text("<testsuites failures=\\\"1\\\"/>\\n")
     print("fake recovery stress failed as requested")
@@ -497,8 +829,46 @@ raise SystemExit(2)
         for name in ("test.log", "test.xml", "bazel-console.log"):
             assert (output / name).is_file()
             assert manifest["test_log_hashes"][name] == _sha256(output / name)
+
+        d2_output = root / "d2-evidence"
+        d2_exit_code = _run_stress(
+            workspace,
+            "d2",
+            10,
+            987654321,
+            d2_output,
+            bazel=str(fake_bazel),
+            environment=environment,
+        )
+        assert d2_exit_code == 0
+        d2_manifest = json.loads((d2_output / "manifest.json").read_text())
+        assert d2_manifest["status"] == "passed"
+        assert d2_manifest["schema_version"] == 3
+        assert d2_manifest["qualification_eligible"] is False
+        assert d2_manifest["scenario_count_source"] == "test.log"
+        assert d2_manifest["scenario_attempt_counts"] == {
+            name: 1 for name in D2_SCENARIO_CLASSES
+        }
+        assert d2_manifest["scenario_counts"] == {
+            name: 1 for name in D2_SCENARIO_CLASSES
+        }
+        assert d2_manifest["cutpoint_count_source"] == "test.log"
+        for cut in D2_CUTPOINTS:
+            assert d2_manifest["cutpoint_counts"][cut]["sigkill"] == 1
+        assert d2_manifest["interruption_counts"]["sigstop_live_sigcont"] == 1
+        for required_test in (
+            "SigkillAtEveryPersistentStoreRecovers",
+            "SigstopLiveOwnerIsNeverRecovered",
+            "DeadBroadcastSubscriberLeaseClearsRealAcks",
+            "SlowSubscriberBackpressurePreservesConservation",
+            "DeadSubscriberLeaseBoundaryIsExact",
+            "ForeignLivePidIncarnationMismatchIsUnknown",
+        ):
+            assert required_test in " ".join(d2_manifest["command"])
+
         assert _positive_seconds("7200") == 7200
         assert _seed(str(UINT64_MAX)) == UINT64_MAX
+        assert _commit("A" * 40) == "a" * 40
         for invalid in ("-1", "1;touch /tmp/not-run", str(UINT64_MAX + 1)):
             try:
                 _seed(invalid)
@@ -516,7 +886,18 @@ def main() -> int:
     parser.add_argument("suite", nargs="?", choices=sorted(CONFIGS))
     parser.add_argument("--seconds", type=_positive_seconds)
     parser.add_argument("--seed", type=_seed)
+    parser.add_argument(
+        "--seed-kind",
+        choices=("fixed", "run-derived", "manual", "unspecified"),
+        default="unspecified",
+    )
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--expected-commit", type=_commit)
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="allow dirty local evidence, marked qualification_eligible=false",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -536,7 +917,16 @@ def main() -> int:
         parser.error(f"cannot locate Mino workspace from {__file__}")
     output = args.out.resolve()
     try:
-        return _run_stress(workspace, args.suite, args.seconds, args.seed, output)
+        return _run_stress(
+            workspace,
+            args.suite,
+            args.seconds,
+            args.seed,
+            output,
+            expected_commit=args.expected_commit,
+            allow_dirty=args.allow_dirty,
+            seed_kind=args.seed_kind,
+        )
     except RuntimeError as error:
         parser.error(str(error))
     return 2

@@ -94,7 +94,8 @@ BridgeConnectionManagerOptions ManagerOptions(
     const transport::EndpointDescriptor& endpoint,
     BridgeNodeIdentityFence local_identity,
     BridgeNodeIdentityFence expected_peer,
-    bool manage_driver_lifecycle = true) {
+    bool manage_driver_lifecycle = true,
+    observability::TraceEventSink* telemetry = nullptr) {
     BridgeConnectionManagerOptions options;
     options.mode = mode;
     if (mode == BridgeConnectionMode::kListen) {
@@ -121,6 +122,9 @@ BridgeConnectionManagerOptions ManagerOptions(
     options.health_probe_interval_ns = 2'000'000ull;
     options.max_egress_frames = 32;
     options.max_egress_bytes = 64 * 1024;
+    options.telemetry = telemetry;
+    options.telemetry_component_instance = 9;
+    options.telemetry_hop_id = 2;
     options.pipeline.wire_limits.max_payload_length = 4096;
     options.pipeline.wire_limits.max_buffered_bytes = 8192;
     options.pipeline.retransmit.max_age_ns = 30'000'000'000ull;
@@ -157,7 +161,28 @@ public:
     std::vector<WireFrame> frames;
 };
 
+class CountingTelemetrySink final : public observability::TraceEventSink {
+public:
+    bool TryRecordEvent(const observability::SampleKey&,
+                        const observability::TraceEvent& event, size_t,
+                        uint64_t) noexcept override {
+        const size_t index = static_cast<size_t>(event.stage);
+        if (index < counts.size()) ++counts[index];
+        last_event = event;
+        return true;
+    }
+
+    uint64_t Count(observability::TraceStage stage) const noexcept {
+        return counts[static_cast<size_t>(stage)];
+    }
+
+    std::array<uint64_t, 32> counts{};
+    observability::TraceEvent last_event;
+};
+
 struct ManagerPair {
+    CountingTelemetrySink connector_telemetry;
+    CountingTelemetrySink listener_telemetry;
     std::shared_ptr<transport::TcpDriver> connector_driver;
     std::shared_ptr<transport::TcpDriver> listener_driver;
     std::unique_ptr<BridgeConnectionManager> connector;
@@ -190,11 +215,13 @@ ManagerPair MakePair(bool listener_rejects_connector = false) {
                                    : connector_identity;
     auto connector = BridgeConnectionManager::Create(
         ManagerOptions(BridgeConnectionMode::kConnect, endpoint,
-                       connector_identity, listener_identity),
+                       connector_identity, listener_identity, true,
+                       &pair.connector_telemetry),
         pair.connector_driver, &pair.connector_ingress);
     auto listener = BridgeConnectionManager::Create(
         ManagerOptions(BridgeConnectionMode::kListen, endpoint,
-                       listener_identity, expected_connector),
+                       listener_identity, expected_connector, true,
+                       &pair.listener_telemetry),
         pair.listener_driver, &pair.listener_ingress);
     EXPECT_TRUE(connector.ok()) << connector.status().ToString();
     EXPECT_TRUE(listener.ok()) << listener.status().ToString();
@@ -443,6 +470,14 @@ TEST(BridgeConnectionManagerTest,
     EXPECT_EQ(pair.listener_ingress.frames.front().payload,
               std::vector<std::byte>(64, std::byte{0x41}));
     EXPECT_EQ(pair.connector->queued_egress_frames(), 0u);
+    EXPECT_GT(pair.connector_telemetry.Count(
+                  observability::TraceStage::kSocketWriteComplete),
+              0u);
+    EXPECT_GT(pair.listener_telemetry.Count(
+                  observability::TraceStage::kRemoteFrameComplete),
+              0u);
+    EXPECT_EQ(pair.connector_telemetry.last_event.component_instance, 9u);
+    EXPECT_EQ(pair.connector_telemetry.last_event.hop_id, 2u);
     ASSERT_TRUE(QueueReliable(pair.connector.get(), 99, std::byte{0x7f}).ok());
     EXPECT_EQ(pair.connector->queued_egress_frames(), 1u);
     EXPECT_TRUE(pair.connector->Shutdown().ok());
@@ -479,6 +514,12 @@ TEST(BridgeConnectionManagerTest,
     ASSERT_TRUE(recovered.ok()) << recovered.ToString();
     EXPECT_NE(pair.connector->local_session_epoch(), first_connector_epoch);
     EXPECT_NE(pair.listener->local_session_epoch(), first_listener_epoch);
+    EXPECT_GT(pair.connector_telemetry.Count(
+                  observability::TraceStage::kBridgeReconnect),
+              0u);
+    EXPECT_GT(pair.listener_telemetry.Count(
+                  observability::TraceStage::kBridgeReconnect),
+              0u);
     EXPECT_EQ(pair.listener_ingress.frames.front().payload,
               std::vector<std::byte>(64, std::byte{0x52}));
 

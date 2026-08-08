@@ -154,12 +154,55 @@ enum class Interruption : uint8_t {
     kSigstopThenContinue,
 };
 
+enum class CampaignScenario : uint8_t {
+    kPublisherCrash,
+    kSubscriberKill,
+    kSlowSubscriber,
+    kLeaseBoundary,
+    kPidIncarnation,
+    kCount,
+};
+
+constexpr std::array<CampaignScenario, 5> kCampaignScenarios = {
+    CampaignScenario::kPublisherCrash,
+    CampaignScenario::kSubscriberKill,
+    CampaignScenario::kSlowSubscriber,
+    CampaignScenario::kLeaseBoundary,
+    CampaignScenario::kPidIncarnation,
+};
+constexpr uint64_t kSubscriberT0 = 10'000;
+constexpr uint64_t kSubscriberLeaseNs = 100;
+constexpr uint32_t kSubscriberBorrowReached = 0xD215;
+
 struct StressRound {
-    bool pid_incarnation = false;
+    CampaignScenario campaign = CampaignScenario::kPublisherCrash;
     bool mutate_epoch = false;
     CrashScenario scenario = CrashScenario::kJournalInitializingTagged;
     Interruption interruption = Interruption::kSigkill;
+    uint32_t slow_yields = 0;
 };
+
+const char* CampaignScenarioName(CampaignScenario scenario) {
+    switch (scenario) {
+        case CampaignScenario::kPublisherCrash:
+            return "publisher_crash";
+        case CampaignScenario::kSubscriberKill:
+            return "subscriber_kill";
+        case CampaignScenario::kSlowSubscriber:
+            return "slow_subscriber";
+        case CampaignScenario::kLeaseBoundary:
+            return "lease_boundary";
+        case CampaignScenario::kPidIncarnation:
+            return "pid_incarnation";
+        case CampaignScenario::kCount:
+            break;
+    }
+    return "unknown_campaign_scenario";
+}
+
+constexpr size_t CampaignScenarioIndex(CampaignScenario scenario) {
+    return static_cast<size_t>(scenario);
+}
 
 const char* ScenarioName(CrashScenario scenario) {
     switch (scenario) {
@@ -203,6 +246,25 @@ const char* InterruptionName(Interruption interruption) {
             return "SIGSTOP->SIGCONT";
     }
     return "unknown-signal";
+}
+
+const char* InterruptionMarkerName(Interruption interruption) {
+    switch (interruption) {
+        case Interruption::kSigkill:
+            return "sigkill";
+        case Interruption::kSigstopThenKill:
+            return "sigstop_then_sigkill";
+        case Interruption::kSigstopThenContinue:
+            return "sigstop_then_sigcont";
+    }
+    return "unknown";
+}
+
+void ReportCutEvent(std::string_view event, CrashScenario scenario,
+                    std::string_view interruption) {
+    std::cout << "D2_RECOVERY_CUT_" << event
+              << " cut=" << ScenarioName(scenario)
+              << " interruption=" << interruption << std::endl;
 }
 
 struct SharedBlock {
@@ -301,29 +363,42 @@ bool ReadUnsignedEnvironment(const char* name, uint64_t fallback,
     return true;
 }
 
-StressRound MakeRandomRound(std::mt19937_64* random) {
-    std::uniform_int_distribution<size_t> scenario(0, kScenarios.size());
-    const size_t selected = scenario(*random);
-    if (selected == kScenarios.size()) {
-        return StressRound{
-            .pid_incarnation = true,
-            .mutate_epoch = ((*random)() & 1u) != 0,
-        };
+StressRound MakeRandomRound(
+    std::mt19937_64* random,
+    std::optional<CampaignScenario> forced_campaign = std::nullopt) {
+    CampaignScenario campaign = CampaignScenario::kPublisherCrash;
+    if (forced_campaign.has_value()) {
+        campaign = *forced_campaign;
+    } else {
+        // Publisher crash points remain dominant while subscriber-side recovery
+        // continuously receives a meaningful share of a long campaign.
+        std::uniform_int_distribution<uint32_t> campaign_distribution(0, 11);
+        const uint32_t selected = campaign_distribution(*random);
+        if (selected >= 8) {
+            campaign = kCampaignScenarios[1 + (selected - 8)];
+        }
     }
+
+    StressRound round;
+    round.campaign = campaign;
+    round.mutate_epoch = ((*random)() & 1u) != 0;
+    round.slow_yields = static_cast<uint32_t>((*random)() & 7u);
+    if (campaign != CampaignScenario::kPublisherCrash) {
+        return round;
+    }
+
+    std::uniform_int_distribution<size_t> scenario(0, kScenarios.size() - 1);
+    round.scenario = kScenarios[scenario(*random)];
 
     // Keep SIGKILL dominant while continuously exercising both SIGSTOP paths.
     std::uniform_int_distribution<uint32_t> signal(0, 7);
     const uint32_t selected_signal = signal(*random);
-    Interruption interruption = Interruption::kSigkill;
     if (selected_signal == 0) {
-        interruption = Interruption::kSigstopThenKill;
+        round.interruption = Interruption::kSigstopThenKill;
     } else if (selected_signal == 1) {
-        interruption = Interruption::kSigstopThenContinue;
+        round.interruption = Interruption::kSigstopThenContinue;
     }
-    return StressRound{
-        .scenario = kScenarios[selected],
-        .interruption = interruption,
-    };
+    return round;
 }
 
 struct HookContext {
@@ -397,6 +472,42 @@ void MpscHook(MpscChannel::PersistencePoint point, uint64_t,
     if (match && !context->triggered) {
         context->triggered = true;
         ReachHook(context);
+    }
+}
+
+[[noreturn]] void SubscriberChild(SharedBlock* shared,
+                                  bool hold_borrow,
+                                  StressDeadline deadline) {
+    ArmChildWatchdog(deadline);
+    auto channel = BroadcastChannel::Attach(shared->broadcast_storage);
+    auto leases = SubscriberLeaseTable::Attach(shared->lease_storage);
+    if (!channel.ok() || !leases.ok()) {
+        _exit(20);
+    }
+    const ProcessIdentity owner = ProcessIdentity::Current();
+    SubscriberLeaseCoordinator coordinator(*channel, *leases);
+    auto lease = coordinator.Register(SubscriberId{0}, owner, kSubscriberT0);
+    if (!lease.ok()) {
+        _exit(21);
+    }
+    shared->child_identity = owner;
+    shared->child_ready.store(1, std::memory_order_release);
+    while (shared->child_command.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    if (!hold_borrow) {
+        for (;;) {
+            ::pause();
+        }
+    }
+    auto borrow = channel->Poll(lease->subscriber);
+    if (!borrow.ok()) {
+        _exit(22);
+    }
+    shared->reached.store(kSubscriberBorrowReached,
+                          std::memory_order_release);
+    for (;;) {
+        ::pause();
     }
 }
 
@@ -636,6 +747,8 @@ protected:
         ASSERT_TRUE(WaitForExit(reap_deadline, &status))
             << "child did not exit within the bounded cleanup budget";
         ASSERT_TRUE(WIFSIGNALED(status));
+        ASSERT_EQ(WTERMSIG(status), SIGKILL)
+            << "child terminated by an unexpected signal";
     }
 
     bool ExpectedVisible(CrashScenario scenario) const {
@@ -658,6 +771,190 @@ protected:
         (void)mpsc_->AbortOrphanedReservations(NowNs() + 1000,
                                                /*lease_ns=*/1);
         (void)recovery_->RecoverOrphans();
+    }
+
+    uint64_t OutstandingBroadcastAcks() const {
+        const auto* era_metas =
+            reinterpret_cast<const BroadcastChannel::BroadcastEraMeta*>(
+                shared_->broadcast_storage +
+                BroadcastChannel::EraMetasOffset(kBroadcastCapacity));
+        uint64_t outstanding = 0;
+        for (uint64_t slot = 0; slot < kBroadcastCapacity; ++slot) {
+            for (uint32_t id = 0; id < BroadcastChannel::kMaxSubscribers; ++id) {
+                if (era_metas[slot].ack_era[id].load(
+                        std::memory_order_acquire) != 0) {
+                    ++outstanding;
+                }
+            }
+        }
+        return outstanding;
+    }
+
+    void PublishBroadcast(uint64_t count) {
+        for (uint64_t i = 0; i < count; ++i) {
+            auto reservation = broadcast_->Reserve();
+            ASSERT_TRUE(reservation.ok())
+                << reservation.status().ToString();
+            const uint64_t sequence = reservation->sequence();
+            reservation->slot()->msg_type =
+                static_cast<uint32_t>(0xD2150000u ^ sequence);
+            reservation->slot()->schema_version = 1;
+            reservation->slot()->schema_short_id = 0xD215000000000000ULL ^ sequence;
+            reservation->slot()->schema_layout_version = 1;
+            reservation->slot()->timestamp_ns = sequence;
+            reservation->slot()->payload = {};
+            reservation->slot()->payload_len = 0;
+            reservation->slot()->flags = 0;
+            ASSERT_TRUE(std::move(*reservation).Commit().ok());
+        }
+    }
+
+    void DrainBroadcast(BroadcastChannel::SubscriberHandle subscriber,
+                        uint64_t count, uint32_t yields = 0) {
+        for (uint64_t i = 0; i < count; ++i) {
+            for (uint32_t delay = 0; delay < yields; ++delay) {
+                std::this_thread::yield();
+            }
+            auto borrow = broadcast_->Poll(subscriber);
+            ASSERT_TRUE(borrow.ok()) << borrow.status().ToString();
+            ASSERT_TRUE(std::move(*borrow).Ack().ok());
+        }
+    }
+
+    void VerifyConservation(uint64_t obligations, uint64_t acknowledged,
+                            uint64_t recovered) {
+        broadcast_->CollectGarbage();
+        EXPECT_EQ(obligations, acknowledged + recovered)
+            << "every broadcast responsibility must be ACKed or recovered";
+        EXPECT_EQ(OutstandingBroadcastAcks(), 0u)
+            << "no broadcast ACK responsibility may remain orphaned";
+        EXPECT_FALSE(broadcast_->IsFull());
+        for (uint32_t id = 0; id < SubscriberLeaseTable::kMaxSubscribers; ++id) {
+            const SubscriberLeaseState state = leases_->State(id);
+            EXPECT_TRUE(state == SubscriberLeaseState::kFree ||
+                        state == SubscriberLeaseState::kEvicted)
+                << "subscriber lease " << id << " remained transitional/active";
+        }
+        EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+        EXPECT_TRUE(mpsc_->IsEmpty());
+        EXPECT_EQ(LiveSlabs(), 0u)
+            << "broadcast recovery must not retain allocator slabs";
+    }
+
+    void ResetSubscriberChildState() {
+        shared_->child_ready.store(0, std::memory_order_relaxed);
+        shared_->child_command.store(0, std::memory_order_relaxed);
+        shared_->reached.store(0, std::memory_order_relaxed);
+        shared_->child_identity = {};
+    }
+
+    void RunSubscriberKillScenario(StressDeadline deadline) {
+        ResetSubscriberChildState();
+        child_pid_ = ::fork();
+        ASSERT_NE(child_pid_, -1) << std::strerror(errno);
+        if (child_pid_ == 0) {
+            SubscriberChild(shared_, /*hold_borrow=*/true, deadline);
+        }
+        ASSERT_TRUE(WaitForAtomic(&shared_->child_ready, 1, deadline));
+        auto observed = leases_->Read(0);
+        ASSERT_TRUE(observed.ok()) << observed.status().ToString();
+        ASSERT_EQ(observed->state, SubscriberLeaseState::kActive);
+        const SubscriberLeaseHandle stale = observed->handle;
+
+        ASSERT_NO_FATAL_FAILURE(PublishBroadcast(kBroadcastCapacity));
+        ASSERT_TRUE(broadcast_->IsFull());
+        shared_->child_command.store(1, std::memory_order_release);
+        ASSERT_TRUE(WaitReached(kSubscriberBorrowReached, deadline))
+            << "subscriber did not acquire a recoverable Borrow";
+        KillAndReap();
+
+        SubscriberLeaseCoordinator coordinator(*broadcast_, *leases_);
+        ASSERT_EQ(coordinator.EvictExpired(
+                      kSubscriberT0 + kSubscriberLeaseNs,
+                      kSubscriberLeaseNs),
+                  1u);
+        EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kEvicted);
+        EXPECT_EQ(broadcast_->Poll(stale.subscriber).status().code(),
+                  StatusCode::kNotFound);
+
+        auto replacement = coordinator.Register(
+            SubscriberId{0}, ProcessIdentity::Current(),
+            kSubscriberT0 + kSubscriberLeaseNs + 1);
+        ASSERT_TRUE(replacement.ok()) << replacement.status().ToString();
+        EXPECT_GT(replacement->subscriber.generation,
+                  stale.subscriber.generation);
+        EXPECT_GT(replacement->lease_epoch, stale.lease_epoch);
+        EXPECT_EQ(coordinator.Heartbeat(stale,
+                                       kSubscriberT0 + kSubscriberLeaseNs + 2)
+                      .code(),
+                  StatusCode::kNotFound);
+        ASSERT_NO_FATAL_FAILURE(PublishBroadcast(1));
+        ASSERT_NO_FATAL_FAILURE(DrainBroadcast(replacement->subscriber, 1));
+        ASSERT_TRUE(coordinator.Unregister(*replacement).ok());
+        VerifyConservation(kBroadcastCapacity + 1, /*acknowledged=*/1,
+                           /*recovered=*/kBroadcastCapacity);
+    }
+
+    void RunSlowSubscriberScenario(uint32_t yields) {
+        SubscriberLeaseCoordinator coordinator(*broadcast_, *leases_);
+        auto fast = coordinator.Register(SubscriberId{0},
+                                         ProcessIdentity::Current(),
+                                         kSubscriberT0);
+        auto slow = coordinator.Register(SubscriberId{1},
+                                         ProcessIdentity::Current(),
+                                         kSubscriberT0);
+        ASSERT_TRUE(fast.ok()) << fast.status().ToString();
+        ASSERT_TRUE(slow.ok()) << slow.status().ToString();
+
+        ASSERT_NO_FATAL_FAILURE(PublishBroadcast(kBroadcastCapacity));
+        ASSERT_TRUE(broadcast_->IsFull());
+        ASSERT_NO_FATAL_FAILURE(
+            DrainBroadcast(fast->subscriber, kBroadcastCapacity));
+        EXPECT_TRUE(broadcast_->IsFull())
+            << "the slowest subscriber must continue to apply backpressure";
+        EXPECT_EQ(coordinator.EvictExpired(
+                      kSubscriberT0 + 100 * kSubscriberLeaseNs,
+                      kSubscriberLeaseNs),
+                  0u)
+            << "a slow but live subscriber must not be evicted by timeout";
+        ASSERT_NO_FATAL_FAILURE(
+            DrainBroadcast(slow->subscriber, kBroadcastCapacity, yields));
+        EXPECT_FALSE(broadcast_->IsFull());
+        ASSERT_TRUE(coordinator.Unregister(*fast).ok());
+        ASSERT_TRUE(coordinator.Unregister(*slow).ok());
+        VerifyConservation(2 * kBroadcastCapacity,
+                           /*acknowledged=*/2 * kBroadcastCapacity,
+                           /*recovered=*/0);
+    }
+
+    void RunLeaseBoundaryScenario(StressDeadline deadline) {
+        ResetSubscriberChildState();
+        child_pid_ = ::fork();
+        ASSERT_NE(child_pid_, -1) << std::strerror(errno);
+        if (child_pid_ == 0) {
+            SubscriberChild(shared_, /*hold_borrow=*/false, deadline);
+        }
+        ASSERT_TRUE(WaitForAtomic(&shared_->child_ready, 1, deadline));
+        ASSERT_NO_FATAL_FAILURE(PublishBroadcast(kBroadcastCapacity));
+        ASSERT_TRUE(broadcast_->IsFull());
+        shared_->child_command.store(1, std::memory_order_release);
+        KillAndReap();
+
+        SubscriberLeaseCoordinator coordinator(*broadcast_, *leases_);
+        EXPECT_EQ(coordinator.EvictExpired(
+                      kSubscriberT0 + kSubscriberLeaseNs - 1,
+                      kSubscriberLeaseNs),
+                  0u);
+        EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kActive);
+        EXPECT_TRUE(broadcast_->IsFull());
+        EXPECT_EQ(OutstandingBroadcastAcks(), kBroadcastCapacity);
+        ASSERT_EQ(coordinator.EvictExpired(
+                      kSubscriberT0 + kSubscriberLeaseNs,
+                      kSubscriberLeaseNs),
+                  1u)
+            << "a dead lease must become eligible at the exact boundary";
+        VerifyConservation(kBroadcastCapacity, /*acknowledged=*/0,
+                           /*recovered=*/kBroadcastCapacity);
     }
 
     void RunScenario(
@@ -872,36 +1169,90 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
               << kEstimatedMinimumRoundBudget.count() << std::endl;
 
     std::mt19937_64 random(seed);
+    std::array<CampaignScenario, kCampaignScenarios.size()> coverage_order =
+        kCampaignScenarios;
+    std::shuffle(coverage_order.begin(), coverage_order.end(), random);
+    std::array<uint64_t, kCampaignScenarios.size()> attempted_counts{};
+    std::array<uint64_t, kCampaignScenarios.size()> completed_counts{};
     uint64_t iteration = 0;
     // Preserve both the estimated minimum round budget and the cleanup reserve;
-    // never start a new child close to the hard deadline.
+    // never start a new child close to the hard deadline. The first five rounds
+    // are a seed-shuffled coverage bag; subsequent rounds use weighted random
+    // selection. Long campaigns therefore cannot accidentally become
+    // publisher-only, while the one-second smoke remains deadline bounded.
     while (scheduling_deadline - StressClock::now() >=
            kEstimatedMinimumRoundBudget) {
-        const StressRound round = MakeRandomRound(&random);
+        const std::optional<CampaignScenario> forced_campaign =
+            iteration < coverage_order.size()
+                ? std::optional<CampaignScenario>(coverage_order[iteration])
+                : std::nullopt;
+        const StressRound round = MakeRandomRound(&random, forced_campaign);
+        const char* campaign_name = CampaignScenarioName(round.campaign);
+        ++attempted_counts[CampaignScenarioIndex(round.campaign)];
+        std::cout << "D2_RECOVERY_SCENARIO_ATTEMPT class=" << campaign_name
+                  << std::endl;
+        if (round.campaign == CampaignScenario::kPublisherCrash) {
+            ReportCutEvent("ATTEMPT", round.scenario,
+                           InterruptionMarkerName(round.interruption));
+        }
+
         std::ostringstream trace;
         trace << "seed=" << seed << " iteration=" << iteration
-              << " scenario=";
-        if (round.pid_incarnation) {
-            trace << "pid-incarnation-reuse"
-                  << " mutation="
-                  << (round.mutate_epoch ? "start-time+epoch"
-                                         : "start-time");
-        } else {
-            trace << ScenarioName(round.scenario)
-                  << " signal=" << InterruptionName(round.interruption);
+              << " campaign=" << campaign_name;
+        switch (round.campaign) {
+            case CampaignScenario::kPublisherCrash:
+                trace << " scenario=" << ScenarioName(round.scenario)
+                      << " signal=" << InterruptionName(round.interruption);
+                break;
+            case CampaignScenario::kSlowSubscriber:
+                trace << " yields=" << round.slow_yields;
+                break;
+            case CampaignScenario::kPidIncarnation:
+                trace << " mutation="
+                      << (round.mutate_epoch ? "start-time+epoch"
+                                             : "start-time");
+                break;
+            case CampaignScenario::kSubscriberKill:
+            case CampaignScenario::kLeaseBoundary:
+            case CampaignScenario::kCount:
+                break;
         }
         SCOPED_TRACE(trace.str());
 
-        if (round.pid_incarnation) {
-            ASSERT_NO_FATAL_FAILURE(
-                RunPidIncarnationScenario(round.mutate_epoch, hard_deadline));
-        } else {
-            ASSERT_NO_FATAL_FAILURE(
-                RunScenario(round.scenario, hard_deadline,
-                            round.interruption));
+        switch (round.campaign) {
+            case CampaignScenario::kPublisherCrash:
+                ASSERT_NO_FATAL_FAILURE(
+                    RunScenario(round.scenario, hard_deadline,
+                                round.interruption));
+                break;
+            case CampaignScenario::kSubscriberKill:
+                ASSERT_NO_FATAL_FAILURE(
+                    RunSubscriberKillScenario(hard_deadline));
+                break;
+            case CampaignScenario::kSlowSubscriber:
+                ASSERT_NO_FATAL_FAILURE(
+                    RunSlowSubscriberScenario(round.slow_yields));
+                break;
+            case CampaignScenario::kLeaseBoundary:
+                ASSERT_NO_FATAL_FAILURE(
+                    RunLeaseBoundaryScenario(hard_deadline));
+                break;
+            case CampaignScenario::kPidIncarnation:
+                ASSERT_NO_FATAL_FAILURE(RunPidIncarnationScenario(
+                    round.mutate_epoch, hard_deadline));
+                break;
+            case CampaignScenario::kCount:
+                FAIL() << "invalid campaign scenario";
         }
         ASSERT_NO_FATAL_FAILURE(
             VerifyQueueProgressAndCapacity(iteration, cleanup_deadline));
+        ++completed_counts[CampaignScenarioIndex(round.campaign)];
+        std::cout << "D2_RECOVERY_SCENARIO_COMPLETED class=" << campaign_name
+                  << std::endl;
+        if (round.campaign == CampaignScenario::kPublisherCrash) {
+            ReportCutEvent("COMPLETED", round.scenario,
+                           InterruptionMarkerName(round.interruption));
+        }
         ++iteration;
     }
 
@@ -922,6 +1273,25 @@ TEST_F(D2RecoveryStressTest, RandomizedTimedRecoveryStress) {
         EXPECT_GT(iteration, 0u)
             << "timed stress scheduled no rounds; seed=" << seed;
     }
+    if (stress_seconds >= 10) {
+        EXPECT_GE(iteration, kCampaignScenarios.size())
+            << "long campaign did not complete its shuffled coverage bag";
+    }
+    for (CampaignScenario scenario : kCampaignScenarios) {
+        const size_t index = CampaignScenarioIndex(scenario);
+        const std::string name = CampaignScenarioName(scenario);
+        RecordProperty("scenario_" + name + "_attempted",
+                       std::to_string(attempted_counts[index]));
+        RecordProperty("scenario_" + name + "_completed",
+                       std::to_string(completed_counts[index]));
+        std::cout << "D2_RECOVERY_SCENARIO_COUNT class=" << name
+                  << " attempted=" << attempted_counts[index]
+                  << " completed=" << completed_counts[index] << std::endl;
+        if (stress_seconds >= 10) {
+            EXPECT_GT(completed_counts[index], 0u)
+                << "long campaign omitted scenario class " << name;
+        }
+    }
     RecordProperty(
         "elapsed_ms",
         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -940,9 +1310,11 @@ TEST_F(D2RecoveryStressTest, SigkillAtEveryPersistentStoreRecovers) {
     uint64_t iteration = 0;
     for (CrashScenario scenario : kScenarios) {
         SCOPED_TRACE(ScenarioName(scenario));
+        ReportCutEvent("ATTEMPT", scenario, "sigkill");
         ASSERT_NO_FATAL_FAILURE(RunScenario(scenario, deadline));
         ASSERT_NO_FATAL_FAILURE(
             VerifyQueueProgressAndCapacity(iteration++, deadline));
+        ReportCutEvent("COMPLETED", scenario, "sigkill");
     }
 }
 
@@ -951,6 +1323,8 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
         StressClock::now() + kDeterministicWatchdog;
     shared_->reached.store(0, std::memory_order_relaxed);
     shared_->child_command.store(0, std::memory_order_relaxed);
+    ReportCutEvent("ATTEMPT", CrashScenario::kMpscWritingPublished,
+                   "sigstop_live_sigcont");
     child_pid_ = ::fork();
     ASSERT_NE(child_pid_, -1);
     if (child_pid_ == 0) {
@@ -979,6 +1353,8 @@ TEST_F(D2RecoveryStressTest, SigstopLiveOwnerIsNeverRecovered) {
     EXPECT_TRUE(std::move(*message).Ack().ok());
     EXPECT_EQ(LiveSlabs(), 0u);
     VerifyQueueProgressAndCapacity(0, deadline);
+    ReportCutEvent("COMPLETED", CrashScenario::kMpscWritingPublished,
+                   "sigstop_live_sigcont");
 }
 
 TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
@@ -992,42 +1368,22 @@ TEST_F(D2RecoveryStressTest, ForeignLivePidIncarnationMismatchIsUnknown) {
 TEST_F(D2RecoveryStressTest, DeadBroadcastSubscriberLeaseClearsRealAcks) {
     const StressDeadline deadline =
         StressClock::now() + kDeterministicWatchdog;
-    child_pid_ = ::fork();
-    ASSERT_NE(child_pid_, -1);
-    if (child_pid_ == 0) {
-        ArmChildWatchdog(deadline);
-        shared_->child_identity = ProcessIdentity::Current();
-        shared_->child_ready.store(1, std::memory_order_release);
-        for (;;) {
-            ::pause();
-        }
-    }
-    ASSERT_TRUE(WaitForAtomic(&shared_->child_ready, 1, deadline));
+    ASSERT_NO_FATAL_FAILURE(RunSubscriberKillScenario(deadline));
+    ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
+}
 
-    constexpr uint64_t kT0 = 10'000;
-    SubscriberLeaseCoordinator coordinator(*broadcast_, *leases_);
-    auto lease = coordinator.Register(SubscriberId{0}, shared_->child_identity,
-                                      kT0);
-    ASSERT_TRUE(lease.ok());
-    for (uint64_t i = 1; i <= kBroadcastCapacity; ++i) {
-        auto reservation = broadcast_->Reserve();
-        ASSERT_TRUE(reservation.ok());
-        reservation->slot()->msg_type = static_cast<uint32_t>(i);
-        reservation->slot()->schema_version = 1;
-        reservation->slot()->schema_short_id = i;
-        reservation->slot()->schema_layout_version = 1;
-        reservation->slot()->timestamp_ns = i;
-        reservation->slot()->payload = {};
-        reservation->slot()->payload_len = 0;
-        reservation->slot()->flags = 0;
-        ASSERT_TRUE(std::move(*reservation).Commit().ok());
-    }
-    ASSERT_TRUE(broadcast_->IsFull());
+TEST_F(D2RecoveryStressTest, SlowSubscriberBackpressurePreservesConservation) {
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    ASSERT_NO_FATAL_FAILURE(RunSlowSubscriberScenario(/*yields=*/4));
+    ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
+}
 
-    KillAndReap();
-    EXPECT_EQ(coordinator.EvictExpired(kT0 + 100, 1), 1u);
-    EXPECT_FALSE(broadcast_->IsFull());
-    EXPECT_EQ(leases_->State(0), SubscriberLeaseState::kEvicted);
+TEST_F(D2RecoveryStressTest, DeadSubscriberLeaseBoundaryIsExact) {
+    const StressDeadline deadline =
+        StressClock::now() + kDeterministicWatchdog;
+    ASSERT_NO_FATAL_FAILURE(RunLeaseBoundaryScenario(deadline));
+    ASSERT_NO_FATAL_FAILURE(VerifyQueueProgressAndCapacity(0, deadline));
 }
 
 }  // namespace

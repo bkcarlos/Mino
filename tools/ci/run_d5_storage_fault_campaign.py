@@ -1,29 +1,76 @@
 #!/usr/bin/env python3
-"""Build and run the D5 storage fault campaign without editing BUILD files."""
+"""Run the fail-closed D5 storage SIGKILL recovery scenario matrix."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
 import hashlib
 import json
 import os
+import re
+import selectors
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-TARGET = "//d5_storage_fault_campaign:storage_fault_test"
-ROUNDS_SCOPE = "D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit"
+TARGET = "//mino/storage:storage_fault_test"
 MARKER = ".d5-storage-fault-campaign"
 MAX_ROUNDS = 1000
 UINT64_MAX = (1 << 64) - 1
+RESULT_PATTERN = re.compile(
+    r"D5_SCENARIO_RESULT\s+scenario=(?P<scenario>[a-z0-9-]+)\s+"
+    r"rounds=(?P<rounds>[0-9]+)\s+cases=(?P<cases>[0-9]+)\s+"
+    r"seed=(?P<seed>[0-9]+)"
+)
+
+
+@dataclass(frozen=True)
+class Scenario:
+    name: str
+    test: str
+    cuts_per_round: int
+
+
+SCENARIOS = (
+    Scenario(
+        "record-write",
+        "D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit",
+        8,
+    ),
+    Scenario(
+        "record-sync",
+        "D5StorageFaultTest.SigkillBeforeAndAfterRecordAndSealSync",
+        4,
+    ),
+    Scenario(
+        "schema",
+        "D5StorageFaultTest.SigkillAcrossSchemaPersistencePhases",
+        8,
+    ),
+    Scenario(
+        "manifest",
+        "D5StorageFaultTest.SigkillAcrossManifestPersistencePhases",
+        4,
+    ),
+    Scenario(
+        "checkpoint-seal",
+        "D5StorageFaultTest.SigkillAcrossSealAndCheckpointPersistence",
+        8,
+    ),
+    Scenario(
+        "orphan",
+        "D5StorageFaultTest.SigkillAcrossOrphanQuarantinePersistence",
+        2,
+    ),
+)
 
 
 class CampaignError(RuntimeError):
@@ -58,9 +105,30 @@ def _git_commit(workspace: Path) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return os.environ.get("GITHUB_SHA")
     candidate = result.stdout.strip().splitlines()
-    if result.returncode == 0 and candidate and len(candidate[-1]) == 40:
-        return candidate[-1]
-    return os.environ.get("GITHUB_SHA")
+    if result.returncode == 0 and candidate and re.fullmatch(r"[0-9a-fA-F]{40}", candidate[-1]):
+        return candidate[-1].lower()
+    fallback = os.environ.get("GITHUB_SHA")
+    return fallback.lower() if fallback else None
+
+
+def _git_worktree_changes(workspace: Path) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=workspace,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def _github_provenance(environment: Mapping[str, str]) -> dict[str, str | None]:
@@ -83,9 +151,11 @@ def _github_provenance(environment: Mapping[str, str]) -> dict[str, str | None]:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    temporary.replace(path)
 
 
 def _prepare_output(output: Path, clean: bool) -> None:
@@ -101,84 +171,61 @@ def _prepare_output(output: Path, clean: bool) -> None:
                 raise CampaignError(
                     f"refusing to clean an unmarked campaign directory: {output}"
                 )
-            shutil.rmtree(output)
+            for child in output.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
     output.mkdir(parents=True, exist_ok=True)
     (output / MARKER).write_text("D5 storage fault campaign evidence\n", encoding="ascii")
 
 
-def _overlay_build() -> str:
-    return """package(default_visibility = [\"//visibility:public\"])
-
-cc_test(
-    name = \"storage_fault_test\",
-    srcs = [\"storage_fault_test.cc\"],
-    deps = [
-        \"//mino/common:status\",
-        \"//mino/schema:canonical\",
-        \"//mino/schema:compiler\",
-        \"//mino/schema:layout\",
-        \"//mino/schema:registry\",
-        \"//mino/schema/codegen:artifact_codec\",
-        \"//mino/storage:recorder_buffer_pool\",
-        \"//mino/storage:recording_manifest\",
-        \"//mino/storage:schema_store\",
-        \"//mino/storage:segment_format\",
-        \"//mino/storage:segment_recovery\",
-        \"//mino/storage:segment_writer\",
-        \"@googletest//:gtest_main\",
-    ],
-)
-"""
-
-
-def _create_overlay(workspace: Path, root: Path) -> None:
-    source = workspace / "mino/storage/storage_fault_test.cc"
-    if not source.is_file():
-        raise CampaignError(f"storage fault test source is missing: {source}")
-    package = root / "d5_storage_fault_campaign"
-    package.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, package / source.name)
-    (package / "BUILD.bazel").write_text(_overlay_build(), encoding="utf-8")
-
-
-def _filter_selects_rounds_test(gtest_filter: str | None) -> bool:
-    if gtest_filter is None:
-        return True
-    positive_filters = gtest_filter.split("-", 1)[0].split(":")
-    return any(
-        fnmatch.fnmatchcase(ROUNDS_SCOPE, pattern)
-        for pattern in positive_filters
-        if pattern
-    )
-
-
 def _command(
     bazel: str,
-    overlay: Path,
     rounds: int,
     seed: int,
     timeout: int,
-    gtest_filter: str | None,
+    scenario: Scenario,
 ) -> list[str]:
-    command = [
+    return [
         bazel,
+        "--batch",
         "test",
         "--lockfile_mode=error",
-        f"--package_path=%workspace%{os.pathsep}{overlay}",
         TARGET,
         f"--test_timeout={timeout}",
         f"--test_env=MINO_D5_STORAGE_FAULT_ROUNDS={rounds}",
         f"--test_env=MINO_D5_STORAGE_FAULT_SEED={seed}",
         "--test_output=streamed",
         "--nocache_test_results",
+        f"--test_arg=--gtest_filter={scenario.test}",
     ]
-    if gtest_filter:
-        command.append(f"--test_arg=--gtest_filter={gtest_filter}")
-    return command
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _stream(
-    command: list[str], workspace: Path, log_path: Path
+    command: list[str], workspace: Path, log_path: Path, runner_timeout: int
 ) -> int:
     printable = shlex.join(command)
     print(f"+ {printable}", flush=True)
@@ -195,32 +242,104 @@ def _stream(
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                start_new_session=True,
             )
         except OSError as error:
             log.write(f"unable to start Bazel: {error}\n")
             return 127
         assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + runner_timeout
         try:
-            for line in process.stdout:
-                log.write(line)
-                log.flush()
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            return process.wait()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = (
+                        f"runner exceeded {runner_timeout}-second process-group timeout\n"
+                    )
+                    log.write(message)
+                    log.flush()
+                    print(message, end="", file=sys.stderr, flush=True)
+                    _terminate_process_group(process)
+                    return 124
+                for key, _ in selector.select(timeout=min(0.25, remaining)):
+                    line = key.fileobj.readline()
+                    if line:
+                        log.write(line)
+                        log.flush()
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    else:
+                        selector.unregister(key.fileobj)
+                if process.poll() is not None:
+                    tail = process.stdout.read()
+                    if tail:
+                        log.write(tail)
+                        log.flush()
+                        sys.stdout.write(tail)
+                        sys.stdout.flush()
+                    return process.returncode
         except KeyboardInterrupt:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            _terminate_process_group(process)
             return 130
+        finally:
+            selector.close()
+
+
+def _reported_results(log_path: Path) -> list[dict[str, int | str]]:
+    if not log_path.is_file():
+        return []
+    results: list[dict[str, int | str]] = []
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    for match in RESULT_PATTERN.finditer(text):
+        results.append(
+            {
+                "scenario": match.group("scenario"),
+                "rounds": int(match.group("rounds"), 10),
+                "cases": int(match.group("cases"), 10),
+                "seed": int(match.group("seed"), 10),
+            }
+        )
+    return results
+
+
+def _scenario_record(
+    scenario: Scenario, rounds: int, seed: int, timeout: int, command: list[str]
+) -> dict[str, Any]:
+    return {
+        "name": scenario.name,
+        "test": scenario.test,
+        "rounds": rounds,
+        "seed": seed,
+        "cuts_per_round": scenario.cuts_per_round,
+        "expected_cases": rounds * scenario.cuts_per_round,
+        "reported_cases": None,
+        "command": command,
+        "timeout_seconds": timeout,
+        "started_at": None,
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "outcome": "not_run",
+        "exit_code": None,
+        "marker_valid": False,
+        "reported_markers": [],
+        "log": {
+            "path": f"{scenario.name}.log",
+            "sha256": None,
+            "size_bytes": None,
+        },
+    }
 
 
 def _run(args: argparse.Namespace) -> int:
     workspace = args.workspace.resolve()
     if not (workspace / "MODULE.bazel").is_file():
         raise CampaignError(f"workspace does not contain MODULE.bazel: {workspace}")
+    source = workspace / "mino/storage/storage_fault_test.cc"
+    build_file = workspace / "mino/storage/BUILD.bazel"
+    if not source.is_file() or not build_file.is_file():
+        raise CampaignError("storage fault test source or BUILD target is missing")
 
     output = args.out
     if not output.is_absolute():
@@ -228,86 +347,149 @@ def _run(args: argparse.Namespace) -> int:
     output = output.resolve()
     if output == workspace or workspace not in output.parents:
         raise CampaignError(f"output must be below the workspace: {output}")
+
+    commit = _git_commit(workspace)
+    expected_commit = args.expected_commit.lower() if args.expected_commit else None
+    if commit is None:
+        raise CampaignError("unable to identify the tested git commit")
+    if expected_commit and not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise CampaignError("expected commit must be a 40-character hexadecimal SHA")
+    if expected_commit and commit != expected_commit:
+        raise CampaignError(
+            f"workspace commit {commit} does not match expected commit {expected_commit}"
+        )
+    changes = _git_worktree_changes(workspace)
+    if expected_commit and changes is None:
+        raise CampaignError("unable to verify qualification worktree cleanliness")
+    if changes and not args.allow_dirty:
+        raise CampaignError(
+            "worktree is dirty; pass --allow-dirty for non-qualification development evidence"
+        )
+    source_state = "unknown" if changes is None else ("dirty" if changes else "clean")
+    qualification_eligible = expected_commit is not None and changes == []
     _prepare_output(output, args.clean)
 
-    overlay_parent = output if args.keep_overlay else None
-    temporary: tempfile.TemporaryDirectory[str] | None = None
-    if overlay_parent is None:
-        temporary = tempfile.TemporaryDirectory(prefix="mino-d5-storage-fault-")
-        overlay = Path(temporary.name) / "repository"
-    else:
-        overlay = overlay_parent / "overlay"
-    _create_overlay(workspace, overlay)
-
     timeout = args.timeout if args.timeout is not None else 120 + args.rounds * 20
-    command = _command(
-        args.bazel,
-        overlay,
-        args.rounds,
-        args.seed,
-        timeout,
-        args.gtest_filter,
-    )
+    records = []
+    for scenario in SCENARIOS:
+        command = _command(args.bazel, args.rounds, args.seed, timeout, scenario)
+        records.append(_scenario_record(scenario, args.rounds, args.seed, timeout, command))
+
     manifest_path = output / "campaign-manifest.json"
-    log_path = output / "bazel-console.log"
     started_at = _utc_now()
     started_monotonic = time.monotonic()
-    source = workspace / "mino/storage/storage_fault_test.cc"
-    seed_consumed = _filter_selects_rounds_test(args.gtest_filter)
-    exit_code = 125
-    try:
-        exit_code = _stream(command, workspace, log_path)
-    finally:
-        elapsed_seconds = round(time.monotonic() - started_monotonic, 3)
-        manifest = {
-            "schema_version": 1,
-            "commit": _git_commit(workspace),
-            "seed": args.seed if seed_consumed else None,
-            "requested_seed": args.seed,
-            "seed_consumed": seed_consumed,
-            "seed_scope": ROUNDS_SCOPE if seed_consumed else None,
-            "command": command,
-            "requested_duration_seconds": None,
-            "test_timeout_seconds": timeout,
-            "elapsed_seconds": elapsed_seconds,
-            "outcome": "passed" if exit_code == 0 else "failed",
-            "exit_code": exit_code,
-            "github": _github_provenance(os.environ),
-            "campaign": {
-                "target": TARGET,
-                "rounds": args.rounds,
-                "rounds_scope": ROUNDS_SCOPE,
-                "seed": args.seed if seed_consumed else None,
-                "requested_seed": args.seed,
-                "seed_scope": ROUNDS_SCOPE if seed_consumed else None,
-                "timeout_seconds": timeout,
-                "gtest_filter": args.gtest_filter,
-                "started_at": started_at,
-                "finished_at": _utc_now(),
-                "elapsed_seconds": elapsed_seconds,
+    manifest: dict[str, Any] = {
+        "schema_version": 3,
+        "commit": commit,
+        "expected_commit": expected_commit,
+        "source_state": source_state,
+        "source_changes": changes,
+        "allow_dirty": args.allow_dirty,
+        "qualification_eligible": qualification_eligible,
+        "seed": args.seed,
+        "seed_consumed": True,
+        "seed_scope": [scenario.test for scenario in SCENARIOS],
+        "rounds": args.rounds,
+        "scenario_count": len(SCENARIOS),
+        "expected_total_cases": sum(
+            args.rounds * scenario.cuts_per_round for scenario in SCENARIOS
+        ),
+        "reported_total_cases": 0,
+        "command": [record["command"] for record in records],
+        "requested_duration_seconds": None,
+        "test_timeout_seconds_per_scenario": timeout,
+        "started_at": started_at,
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "outcome": "running",
+        "exit_code": None,
+        "missing_or_invalid_scenarios": [scenario.name for scenario in SCENARIOS],
+        "github": _github_provenance(os.environ),
+        "scenarios": records,
+        "evidence": {
+            "test_source": {
+                "path": str(source.relative_to(workspace)),
+                "sha256": _sha256(source),
             },
-            "result": {
-                "outcome": "passed" if exit_code == 0 else "failed",
-                "exit_code": exit_code,
+            "build_file": {
+                "path": str(build_file.relative_to(workspace)),
+                "sha256": _sha256(build_file),
             },
-            "evidence": {
-                "console_log": {
-                    "path": log_path.name,
-                    "sha256": _sha256(log_path) if log_path.is_file() else None,
-                    "size_bytes": log_path.stat().st_size if log_path.is_file() else None,
-                },
-                "test_source": {
-                    "path": str(source.relative_to(workspace)),
-                    "sha256": _sha256(source),
-                },
-                "overlay_retained": args.keep_overlay,
+            "runner": {
+                "path": str(Path(__file__).resolve().relative_to(workspace)),
+                "sha256": _sha256(Path(__file__).resolve()),
             },
+        },
+    }
+    _write_json(manifest_path, manifest)
+
+    first_failure = 0
+    for scenario, record in zip(SCENARIOS, records, strict=True):
+        log_path = output / record["log"]["path"]
+        record["started_at"] = _utc_now()
+        scenario_started = time.monotonic()
+        exit_code = _stream(
+            record["command"], workspace, log_path, timeout + 60
+        )
+        record["finished_at"] = _utc_now()
+        record["elapsed_seconds"] = round(time.monotonic() - scenario_started, 3)
+        record["exit_code"] = exit_code
+        markers = _reported_results(log_path)
+        record["reported_markers"] = markers
+        if len(markers) == 1:
+            marker = markers[0]
+            record["reported_cases"] = marker["cases"]
+            record["marker_valid"] = (
+                marker["scenario"] == scenario.name
+                and marker["rounds"] == args.rounds
+                and marker["cases"] == record["expected_cases"]
+                and marker["seed"] == args.seed
+            )
+        record["log"] = {
+            "path": log_path.name,
+            "sha256": _sha256(log_path) if log_path.is_file() else None,
+            "size_bytes": log_path.stat().st_size if log_path.is_file() else None,
         }
+        record["outcome"] = (
+            "passed" if exit_code == 0 and record["marker_valid"] else "failed"
+        )
+        if record["outcome"] != "passed" and first_failure == 0:
+            first_failure = exit_code if exit_code != 0 else 1
+
+        valid_records = [item for item in records if item["outcome"] == "passed"]
+        manifest["reported_total_cases"] = sum(
+            int(item["reported_cases"]) for item in valid_records
+        )
+        manifest["missing_or_invalid_scenarios"] = [
+            item["name"] for item in records if item["outcome"] != "passed"
+        ]
         _write_json(manifest_path, manifest)
-        if temporary is not None:
-            temporary.cleanup()
+        if exit_code == 130:
+            break
+
+    missing = [record["name"] for record in records if record["outcome"] != "passed"]
+    if missing and first_failure == 0:
+        first_failure = 1
+    manifest["reported_total_cases"] = sum(
+        int(record["reported_cases"])
+        for record in records
+        if record["outcome"] == "passed"
+    )
+    manifest["missing_or_invalid_scenarios"] = missing
+    manifest["finished_at"] = _utc_now()
+    manifest["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 3)
+    manifest["outcome"] = "passed" if not missing else "failed"
+    manifest["exit_code"] = first_failure
+    _write_json(manifest_path, manifest)
+
     print(f"evidence={output}", flush=True)
-    return exit_code
+    if missing:
+        print(
+            "missing or invalid D5 scenarios: " + ", ".join(missing),
+            file=sys.stderr,
+            flush=True,
+        )
+    return first_failure
 
 
 def _positive_rounds(raw: str) -> int:
@@ -342,6 +524,15 @@ def _seed(raw: str) -> int:
     return value
 
 
+def _commit(raw: str) -> str:
+    value = raw.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError(
+            "expected commit must be a 40-character hexadecimal SHA"
+        )
+    return value
+
+
 def _default_seed() -> int:
     raw = os.environ.get("GITHUB_RUN_NUMBER", "1")
     try:
@@ -352,44 +543,37 @@ def _default_seed() -> int:
 
 
 def _self_test() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        workspace = root / "workspace"
-        source = workspace / "mino/storage/storage_fault_test.cc"
-        source.parent.mkdir(parents=True)
-        source.write_text("// test\n", encoding="utf-8")
-        overlay = root / "overlay"
-        _create_overlay(workspace, overlay)
-        package = overlay / "d5_storage_fault_campaign"
-        assert (package / "BUILD.bazel").read_text(encoding="utf-8") == _overlay_build()
-        assert (package / source.name).read_text(encoding="utf-8") == "// test\n"
-        command = _command("bazel", overlay, 7, 9, 260, "Suite.Test")
-        assert f"--test_env=MINO_D5_STORAGE_FAULT_ROUNDS=7" in command
-        assert f"--test_env=MINO_D5_STORAGE_FAULT_SEED=9" in command
-        assert command[-1] == "--test_arg=--gtest_filter=Suite.Test"
-        assert _positive_rounds(str(MAX_ROUNDS)) == MAX_ROUNDS
-        assert _seed(str(UINT64_MAX)) == UINT64_MAX
-        assert ROUNDS_SCOPE in _command(
-            "bazel", overlay, 7, 9, 260, ROUNDS_SCOPE
-        )[-1]
-        assert _filter_selects_rounds_test(None)
-        assert _filter_selects_rounds_test(ROUNDS_SCOPE)
-        assert _filter_selects_rounds_test("D5StorageFaultTest.Sigkill*")
-        assert not _filter_selects_rounds_test("OtherSuite.OtherTest")
-        assert _git_commit(workspace) == os.environ.get("GITHUB_SHA")
-        for invalid in ("0", str(MAX_ROUNDS + 1), "not-a-number"):
-            try:
-                _positive_rounds(invalid)
-            except argparse.ArgumentTypeError:
-                pass
-            else:
-                raise AssertionError(f"invalid rounds accepted: {invalid}")
+    assert len({scenario.name for scenario in SCENARIOS}) == len(SCENARIOS)
+    assert len({scenario.test for scenario in SCENARIOS}) == len(SCENARIOS)
+    assert sum(scenario.cuts_per_round for scenario in SCENARIOS) == 34
+    scenario = SCENARIOS[0]
+    command = _command("bazel", 7, 9, 260, scenario)
+    assert TARGET in command
+    assert command[:3] == ["bazel", "--batch", "test"]
+    assert "--test_env=MINO_D5_STORAGE_FAULT_ROUNDS=7" in command
+    assert "--test_env=MINO_D5_STORAGE_FAULT_SEED=9" in command
+    assert command[-1] == f"--test_arg=--gtest_filter={scenario.test}"
+    assert _positive_rounds(str(MAX_ROUNDS)) == MAX_ROUNDS
+    assert _seed(str(UINT64_MAX)) == UINT64_MAX
+    assert _commit("A" * 40) == "a" * 40
+    match = RESULT_PATTERN.search(
+        "D5_SCENARIO_RESULT scenario=record-write rounds=7 cases=56 seed=9\n"
+    )
+    assert match is not None
+    assert int(match.group("cases"), 10) == 7 * scenario.cuts_per_round
+    for invalid in ("0", str(MAX_ROUNDS + 1), "not-a-number"):
+        try:
+            _positive_rounds(invalid)
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(f"invalid rounds accepted: {invalid}")
     print("run_d5_storage_fault_campaign.py self-test: PASS")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the D5 storage kill/ENOSPC/disk-stall campaign"
+        description="Run the complete D5 storage fork/SIGKILL scenario matrix"
     )
     parser.add_argument(
         "--workspace", type=Path, default=Path(__file__).resolve().parents[2]
@@ -401,8 +585,12 @@ def main() -> int:
     parser.add_argument("--rounds", type=_positive_rounds, default=1)
     parser.add_argument("--seed", type=_seed, default=_default_seed())
     parser.add_argument("--timeout", type=_positive_int)
-    parser.add_argument("--gtest-filter")
-    parser.add_argument("--keep-overlay", action="store_true")
+    parser.add_argument("--expected-commit", type=_commit)
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="allow dirty local evidence, marked qualification_eligible=false",
+    )
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()

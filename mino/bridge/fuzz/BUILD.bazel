@@ -1,0 +1,54 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "fuzz_harness",
+    srcs = ["fuzz_harness.cc"],
+    hdrs = ["fuzz_harness.h"],
+    deps = [
+        "//mino/bridge:reliability",
+        "//mino/bridge:wire_frame",
+        "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "corpus_support",
+    hdrs = ["corpus_support.h"],
+)
+
+cc_test(
+    name = "corpus_smoke_test",
+    size = "small",
+    srcs = ["corpus_smoke_test.cc"],
+    data = glob(["testdata/*.hex"]),
+    deps = [
+        ":corpus_support",
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)
+
+cc_binary(
+    name = "standalone_fuzz_driver",
+    srcs = ["standalone_fuzz_driver.cc"],
+    data = glob(["testdata/*.hex"]),
+    tags = ["manual"],
+    deps = [
+        ":corpus_support",
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)
+
+cc_binary(
+    name = "libfuzzer_driver",
+    srcs = ["libfuzzer_driver.cc"],
+    tags = [
+        "large",
+        "manual",
+    ],
+    deps = [
+        ":fuzz_harness",
+        "//mino/common:status",
+    ],
+)

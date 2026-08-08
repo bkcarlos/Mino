@@ -60,6 +60,16 @@ jobs:
           cp bazel-bin/tools/ci/mino_two_host_probe physical-binary/
           chmod 0755 physical-binary/mino_two_host_probe
           printf '%s\n' "${GITHUB_SHA}" > physical-binary/commit.txt
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path("physical-binary/provenance.json").write_text(json.dumps({
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+          }, sort_keys=True) + "\n", encoding="utf-8")
+          PY
           (cd physical-binary && sha256sum mino_two_host_probe > mino_two_host_probe.sha256)
 
       - name: Verify build did not mutate locked inputs
@@ -92,6 +102,16 @@ jobs:
           cp bazel-bin/tools/ci/mino_two_host_probe physical-binary/
           chmod 0755 physical-binary/mino_two_host_probe
           printf '%s\n' "${GITHUB_SHA}" > physical-binary/commit.txt
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path("physical-binary/provenance.json").write_text(json.dumps({
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+          }, sort_keys=True) + "\n", encoding="utf-8")
+          PY
           (cd physical-binary && sha256sum mino_two_host_probe > mino_two_host_probe.sha256)
 
       - name: Verify build did not mutate locked inputs
@@ -155,6 +175,11 @@ jobs:
             --timeout-seconds="${MINO_TIMEOUT_SECONDS}" \
             --manifest=two-host/server/manifest.json \
             --log=two-host/server/server.log
+          test -s two-host/server/manifest.json
+          test -s two-host/server/mino-result.json
+          test -s two-host/server/server.log
+          find two-host/server/schema-store/schemas -name '*.schema' -type f -size +0c \
+            -print -quit | grep -q .
 
       - name: Upload server evidence
         if: always()
@@ -162,7 +187,7 @@ jobs:
         with:
           name: physical-two-host-server-${{ github.run_id }}-${{ github.run_attempt }}
           path: two-host/server/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
 
   client:
@@ -216,6 +241,11 @@ jobs:
             --timeout-seconds="${MINO_TIMEOUT_SECONDS}" \
             --manifest=two-host/client/manifest.json \
             --log=two-host/client/client.log
+          test -s two-host/client/manifest.json
+          test -s two-host/client/mino-result.json
+          test -s two-host/client/client.log
+          find two-host/client/schema-store/schemas -name '*.schema' -type f -size +0c \
+            -print -quit | grep -q .
 
       - name: Upload client evidence
         if: always()
@@ -223,7 +253,7 @@ jobs:
         with:
           name: physical-two-host-client-${{ github.run_id }}-${{ github.run_attempt }}
           path: two-host/client/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
 
   evidence:
@@ -250,13 +280,60 @@ jobs:
           name: physical-two-host-client-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/client
 
+      - name: Download server build provenance
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-server-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-downloads/server
+
+      - name: Download client build provenance
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-two-host-build-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-downloads/client
+
+      - name: Verify and retain build hashes and run provenance
+        run: |
+          set -eu
+          for role in server client; do
+            test -s "build-downloads/${role}/mino_two_host_probe"
+            test -s "build-downloads/${role}/mino_two_host_probe.sha256"
+            test -s "build-downloads/${role}/commit.txt"
+            test -s "build-downloads/${role}/provenance.json"
+            grep -Fx "${GITHUB_SHA}" "build-downloads/${role}/commit.txt"
+            (cd "build-downloads/${role}" && sha256sum -c mino_two_host_probe.sha256)
+            python3 - "build-downloads/${role}/provenance.json" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert value["commit"] == os.environ["GITHUB_SHA"]
+          assert value["run_id"] == os.environ["GITHUB_RUN_ID"]
+          assert value["run_attempt"] == os.environ["GITHUB_RUN_ATTEMPT"]
+          PY
+          done
+          cmp build-downloads/server/mino_two_host_probe \
+            build-downloads/client/mino_two_host_probe
+          mkdir -p evidence/build/server evidence/build/client
+          for role in server client; do
+            cp "build-downloads/${role}/commit.txt" evidence/build/${role}/
+            cp "build-downloads/${role}/provenance.json" evidence/build/${role}/
+            cp "build-downloads/${role}/mino_two_host_probe.sha256" \
+              evidence/build/${role}/
+          done
+
       - name: Cross-check Mino data-path evidence and hashes
         run: |
           umask 077
           python3 tools/ci/finalize_two_host_manifest.py \
             --server-manifest=evidence/server/manifest.json \
             --client-manifest=evidence/client/manifest.json \
+            --server-build-root=build-downloads/server \
+            --client-build-root=build-downloads/client \
             --expected-commit="${GITHUB_SHA}" \
+            --expected-run-id="${GITHUB_RUN_ID}" \
+            --expected-run-attempt="${GITHUB_RUN_ATTEMPT}" \
             --out=evidence/final/manifest.json
 
       - name: Upload final evidence

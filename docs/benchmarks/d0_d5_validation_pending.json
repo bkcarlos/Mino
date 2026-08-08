@@ -1,0 +1,53 @@
+{
+  "schema": "mino.d0_d5_validation_benchmark.v1",
+  "artifact_status": "PENDING",
+  "clock": "std::chrono::steady_clock",
+  "provenance": {
+    "run_timestamp_utc": "PENDING",
+    "commit": "PENDING",
+    "command": "PENDING",
+    "build_config": "PENDING",
+    "compiler": "PENDING",
+    "cplusplus": null,
+    "os": "PENDING",
+    "hardware": {
+      "logical_cpu_count": null,
+      "physical_memory_bytes_detected": null,
+      "cpu_model": "PENDING",
+      "memory": "PENDING",
+      "storage_device": "PENDING",
+      "filesystem": "PENDING"
+    }
+  },
+  "configuration": {
+    "suite": "PENDING",
+    "iterations": null,
+    "storage_records": null,
+    "records_per_writer": null,
+    "payload_bytes": null,
+    "pin_count": null,
+    "temporary_directory_base": null
+  },
+  "methodology": {
+    "percentile_method": "nearest-rank",
+    "latency_unit": "ns",
+    "measured_results_are_generated_only_by_execution": true,
+    "capacity_model_is_labeled_separately": true
+  },
+  "results": {
+    "V-14": {"status": "PENDING", "reason": "benchmark not run", "metrics": null},
+    "V-15": {"status": "PENDING", "reason": "benchmark not run", "metrics": null},
+    "V-16": {"status": "PENDING", "reason": "benchmark not run", "metrics": null},
+    "V-17": {"status": "PENDING", "reason": "benchmark not run", "metrics": null},
+    "V-18": {"status": "PENDING", "reason": "benchmark not run", "metrics": null},
+    "V-27": {"status": "PENDING", "reason": "benchmark not run", "metrics": null}
+  },
+  "audits": {
+    "docs/benchmarks/d5_storage_64b.json": {
+      "observed_configuration_payload_bytes": 64,
+      "filename_payload_label_bytes": 64,
+      "conclusion": "CONSISTENT",
+      "modified": false
+    }
+  }
+}

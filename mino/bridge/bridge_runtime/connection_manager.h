@@ -17,6 +17,7 @@
 
 #include "mino/bridge/bridge_pipeline.h"
 #include "mino/common/result.h"
+#include "mino/observability/tracing.h"
 #include "mino/runtime/bus.h"
 #include "mino/transport/transport_driver.h"
 
@@ -82,6 +83,13 @@ struct BridgeConnectionManagerOptions {
 
     size_t max_egress_frames = 4096;
     size_t max_egress_bytes = 64u * 1024u * 1024u;
+
+    // Optional non-owning, non-blocking telemetry sink. Its lifetime must cover
+    // the manager. Null preserves the uninstrumented path without clock reads.
+    observability::TraceEventSink* telemetry = nullptr;
+    size_t telemetry_shard = 0;
+    uint32_t telemetry_component_instance = 0;
+    uint32_t telemetry_hop_id = 0;
     BridgePipelineOptions pipeline;
 };
 
@@ -187,6 +195,9 @@ private:
     void ScheduleRetry(uint64_t now_ns) noexcept;
     uint64_t GenerateNewEpoch() noexcept;
     uint64_t EffectiveNow(uint64_t supplied_now_ns) const noexcept;
+    void RecordTelemetry(observability::TraceStage stage, uint64_t now_ns,
+                         uint64_t duration_ns, uint32_t payload_bytes,
+                         uint32_t wire_bytes) noexcept;
     size_t FrameCharge(const EncodedOutboundFrame& frame) const noexcept;
     Status ValidateOutboundSize(
         const EncodedOutboundFrame& frame,
@@ -218,6 +229,7 @@ private:
     bool driver_started_by_manager_ = false;
     Status last_failure_ = Status::Ok();
     BridgeConnectionManagerStats stats_;
+    uint64_t telemetry_sequence_ = 0;
 
     mutable std::mutex egress_mutex_;
     std::deque<QueuedEgress> egress_queue_;

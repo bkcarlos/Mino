@@ -9,12 +9,16 @@ on:
     paths:
       - .github/workflows/formal-validation.yml
       - docs/formal/**
+      - mino/runtime/**
+      - mino/shm/channel/**
       - tools/ci/run_tla_validation.py
   pull_request:
     branches: [master, main]
     paths:
       - .github/workflows/formal-validation.yml
       - docs/formal/**
+      - mino/runtime/**
+      - mino/shm/channel/**
       - tools/ci/run_tla_validation.py
 
 permissions:
@@ -26,9 +30,9 @@ concurrency:
 
 jobs:
   tla-validation:
-    name: TLC v1.7.4 (${{ github.event_name == 'pull_request' && 'bounded PR model' || 'all models' }})
+    name: TLC v1.7.4 (all models)
     runs-on: ubuntu-22.04
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 10 || 70 }}
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 25 || 70 }}
     env:
       TLA_VERSION: 1.7.4
       TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
@@ -52,34 +56,87 @@ jobs:
             "https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
           printf '%s  %s\n' "${TLA_SHA256}" "${TLA_JAR}" | sha256sum --check --strict -
 
-      - name: Run bounded PR model
-        if: github.event_name == 'pull_request'
-        env:
-          TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
-        run: |
-          python3 tools/ci/run_tla_validation.py \
-            --jar "${TLA_JAR}" \
-            --out formal-validation \
-            --model BroadcastMembership \
-            --timeout-seconds 300 \
-            --total-timeout-seconds 360
-
       - name: Run all formal models
-        if: github.event_name != 'pull_request'
         env:
           TLA_JAR: ${{ runner.temp }}/tla2tools-v1.7.4.jar
+          MODEL_TIMEOUT: ${{ github.event_name == 'pull_request' && '300' || '1200' }}
+          TOTAL_TIMEOUT: ${{ github.event_name == 'pull_request' && '900' || '3600' }}
         run: |
           python3 tools/ci/run_tla_validation.py \
             --jar "${TLA_JAR}" \
             --out formal-validation \
-            --timeout-seconds 1200 \
-            --total-timeout-seconds 3600
+            --timeout-seconds "${MODEL_TIMEOUT}" \
+            --total-timeout-seconds "${TOTAL_TIMEOUT}" \
+            --expected-commit "${GITHUB_SHA}"
+
+      - name: Verify formal evidence integrity
+        if: always()
+        env:
+          EXPECTED_MODELS: MpscReservation,BroadcastMembership,LeaseEviction
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("formal-validation")
+          manifest_path = root / "manifest.json"
+          if not manifest_path.is_file():
+              raise SystemExit("formal evidence is missing manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected = os.environ["EXPECTED_MODELS"].split(",")
+          if manifest.get("selected_models") != expected:
+              raise SystemExit(
+                  f"formal evidence selected_models mismatch: expected {expected}, "
+                  f"got {manifest.get('selected_models')}"
+              )
+          if manifest.get("commit") != os.environ["GITHUB_SHA"].lower():
+              raise SystemExit("formal evidence commit does not match GITHUB_SHA")
+          if manifest.get("expected_commit") != os.environ["GITHUB_SHA"].lower():
+              raise SystemExit("formal evidence expected_commit does not match GITHUB_SHA")
+          if manifest.get("source_state") != "clean" or not manifest.get("qualification_eligible"):
+              raise SystemExit("formal evidence is not qualification eligible")
+          if not manifest.get("complete"):
+              raise SystemExit("formal evidence manifest is incomplete")
+          if not manifest.get("overall_success") or manifest.get("outcome") != "passed":
+              raise SystemExit("formal evidence reports a failed model")
+          if manifest.get("exit_code") != 0:
+              raise SystemExit("formal evidence exit_code is not zero")
+          entries = manifest.get("models")
+          if not isinstance(entries, list) or [entry.get("name") for entry in entries] != expected:
+              raise SystemExit("formal evidence is missing one or more model records")
+
+          root_resolved = root.resolve()
+          for entry in entries:
+              for path_key, hash_key in (
+                  ("stdout", "stdout_sha256"),
+                  ("stderr", "stderr_sha256"),
+              ):
+                  relative = entry.get(path_key)
+                  expected_hash = entry.get(hash_key)
+                  if not isinstance(relative, str) or not isinstance(expected_hash, str):
+                      raise SystemExit(
+                          f"{entry.get('name')} is missing {path_key} evidence metadata"
+                      )
+                  artifact = (root / relative).resolve()
+                  if root_resolved not in artifact.parents or not artifact.is_file():
+                      raise SystemExit(
+                          f"{entry.get('name')} evidence artifact is missing: {relative}"
+                      )
+                  actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                  if actual_hash != expected_hash:
+                      raise SystemExit(
+                          f"{entry.get('name')} evidence hash mismatch: {relative}"
+                      )
+          print("formal evidence integrity: PASS")
+          PY
 
       - name: Upload formal validation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: formal-validation-${{ github.run_id }}
-          path: formal-validation
-          if-no-files-found: warn
+          path: formal-validation/
+          if-no-files-found: error
           retention-days: 90

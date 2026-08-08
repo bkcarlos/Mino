@@ -1,2 +1,68 @@
-# Observability (metrics, logging, tracing).
-package(default_visibility = ["//visibility:private"])
+# Bounded, low-overhead metrics, tracing, clock validation, and export.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "observability",
+    srcs = [
+        "clock.cc",
+        "metrics.cc",
+        "otlp_exporter.cc",
+        "prometheus_exporter.cc",
+        "telemetry.cc",
+        "tracing.cc",
+    ],
+    hdrs = [
+        "bounded_queue.h",
+        "clock.h",
+        "exporter.h",
+        "metrics.h",
+        "otlp_exporter.h",
+        "prometheus_exporter.h",
+        "telemetry.h",
+        "tracing.h",
+    ],
+    deps = ["//mino/common:status"],
+)
+
+cc_test(
+    name = "metrics_test",
+    srcs = ["metrics_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "tracing_test",
+    srcs = ["tracing_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "clock_test",
+    srcs = ["clock_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "exporter_test",
+    srcs = ["exporter_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# V-23: compare baseline, Off, Counters, 1% Sampled, and Full telemetry cost.
+cc_binary(
+    name = "v23_telemetry_benchmark",
+    srcs = ["v23_telemetry_benchmark.cc"],
+    deps = [":observability"],
+)

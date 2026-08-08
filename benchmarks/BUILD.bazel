@@ -1,5 +1,49 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "d0_d5_golden_generated",
+    hdrs = ["//mino/schema/codegen:testdata/golden.generated.h"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+cc_binary(
+    name = "d0_d5_validation_benchmark",
+    srcs = ["d0_d5_validation_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":d0_d5_golden_generated",
+        "//mino/registry:registry",
+        "//mino/runtime:allocation_journal",
+        "//mino/runtime:runtime_types",
+        "//mino/schema:compiler",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:layout",
+        "//mino/schema:wire",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+        "//mino/storage:recorder_buffer_pool",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:segment_format",
+        "//mino/storage:segment_writer",
+        "//mino/storage:topic_writer",
+    ],
+)
+
 cc_binary(
     name = "storage_benchmark",
     srcs = ["storage_benchmark.cc"],

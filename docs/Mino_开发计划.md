@@ -12,11 +12,11 @@
 |---|---|
 | 设计文档 | 架构设计 v1、详细设计 v0.5，已完成评审修订 |
 | ADR 状态 | 0001~0014 共 14 篇，全部 ACCEPTED |
-| 代码 | D0~D5 核心实现、单元/集成测试与 CI 编排已落地；D6 性能优化与产品化继续推进 |
+| 代码 | D0~D5 核心实现、单元/集成测试、可观测性、扩展 Fuzz、验证 Benchmark 与 CI 编排已落地；D6 性能优化与产品化继续推进 |
 | 验证登记 | 27 项（V-01~V-27），P0 优先级 14 项、P1 优先级 11 项、P2 优先级 2 项 |
 | 关键不变量 | 32 项（INV-01~INV-32），贯穿测试与验收 |
 
-**结论**：D0~D5 的代码交付基本完成。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已归档，D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证和 D5 当前提交 100 轮故障 campaign 仍是待关闭门禁。
+**结论**：D0~D5 的计划内实现已落地。Region ID 分配/Attach 契约、D2 多场景恢复长压、D4 强制断链与非空 Schema 双机 probe、D5 多持久化阶段 SIGKILL、可观测性、Frame/Segment/Handle Fuzz 及 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark 均已补齐。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已有历史归档，D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证、D5 当前提交 100 轮多场景故障 campaign，以及新增 Benchmark/Fuzz 的资格环境实跑仍是待关闭门禁。
 
 ### 1.2 阶段映射
 
@@ -48,9 +48,10 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 当前发布候选的剩余门禁：
 
-1. **D2 长时间恢复验证**：对当前提交执行固定 seed 与随机 seed 的 Publisher/Subscriber Kill、暂停和 PID incarnation campaign，并保存 manifest。
-2. **D4 物理双机验证**：现有 `.github/workflows/physical-two-host.yml` 只覆盖基础 TCP 与双向可靠帧/ACK；需先扩展 probe 注入强制断链和非空 Schema Identity，再在两台不同物理主机完成验证。fork + loopback 不替代该门禁。
-3. **D5 故障恢复验证**：对当前提交执行 100 轮 SIGKILL campaign；短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停仍由常规 fault suite 覆盖。
+1. **D2 长时间恢复验证**：多场景 campaign 已覆盖 Publisher crash、Subscriber kill、慢 Subscriber、Lease 边界和 PID incarnation，并额外确定性执行 13 个持久化切点 SIGKILL 与 SIGSTOP-live/SIGCONT；class、cutpoint、interruption attempted/completed、完整日志 hash、commit/clean qualification 均 fail-closed。仍需对当前提交执行 fixed 与 run-derived seed 并保存 manifest。
+2. **D4 物理双机验证**：`.github/workflows/physical-two-host.yml` 与 v4 probe 已覆盖非空 Schema Identity/Descriptor 持久化、建立连接后的强制断链、两次自动重连、Session Epoch 变化、可靠帧重传/去重与双向 ACK；仍需在两台不同物理主机对当前提交执行并归档 final manifest。fork + loopback 不替代该门禁。
+3. **D5 故障恢复验证**：多场景 runner 已覆盖 Record、Sync、Schema Store、Recording Manifest、Checkpoint/Seal 与 orphan quarantine 的真实 SIGKILL 切点；仍需对当前提交执行每场景 100 轮并归档 manifest。短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停继续由常规 fault suite 覆盖。
+4. **扩展资格验证**：执行并归档 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark，以及 Frame/Segment/Handle ASAN/UBSAN Fuzz campaign。
 
 ---
 
@@ -108,7 +109,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 |---|---|---|---|---|
 | D1-01 | 标识类型与 ProcessIdentity | TopicId/NodeId/PublisherId 等强类型 ID（详设 5.2）、ProcessIdentity（4.3） | D0-04 | 2d |
 | D1-02 | Platform SHM 抽象 | `//mino/platform:shared_memory`：shm_open/mmap/munmap 封装、Huge Page 支持 | D0-01 | 3d |
-| D1-03 | SuperBlock + Region 生命周期 | `//mino/shm/region:region`：Create/Attach/校验/状态机（详设 6.1~6.4） | D1-02 | 5d |
+| D1-03 | SuperBlock + Region 生命周期 ✅ | `//mino/shm/region:region`：Create/Attach/校验/状态机；Region ID 使用 flock + fdatasync/fsync 的持久文件 HWM，支持旧 POSIX HWM 迁移、并发首次初始化和耗尽不回绕；name 必填、region_id 可选断言的 Attach 契约已固定（详设 6.1~6.4） | D1-02 | 5d |
 | D1-04 | Recovery Owner 协议 | Owner/Epoch/Lease CAS 接管、QUARANTINED（详设 6.5） | D1-03 | 3d |
 | D1-05 | ShmHandle + HandleResolver | `//mino/abi:shm_abi` + Resolver 全项校验（详设 7.1~7.2） | D1-03 | 3d |
 | D1-06 | 通用 MPMC 骨架 | Vyukov 有界 Ring、Control Block Init/Attach、Slot Sequence（详设 9.9） | D1-03 | 5d |
@@ -136,6 +137,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 ### 3.4 退出条件（DoD）
 
+- [x] Region ID 持久 HWM 并发首次初始化、跨进程唯一性、重建持久性、旧 HWM 迁移和 UINT32_MAX 耗尽不回绕测试已落地（INV-19，`//mino/shm/region:region_id_allocator_test`）
 - [x] 不同进程映射不同虚拟地址时 Handle 正确解析（INV-03，`//mino/shm/region:cross_process_handle_test`：子进程 MAP_FIXED 占坑强制异地址 Attach，解析/payload/stale 拒绝全验，TSAN 通过）
 - [x] MPMC 骨架跨进程守恒/回绕/满空判定测试通过（V-26，`//mino/shm/channel:mpmc_ring_xproc_test`：2P2C fork 进程 10000 条零丢失零重复（~156 次回绕）、满 kResourceExhausted/空 kWouldBlock 跨进程传播）
 - [x] Slab 分配/回收在 TSAN 下无数据竞争（`bazel test --config=tsan //...` 23/23 通过，2026-07-28 macOS arm64）
@@ -166,8 +168,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D2-10 | 静态 Subscriber API ✅ | `Subscriber<T>` + `BorrowedMessage<T>`：Poll/ACK/Cursor 推进与析构 ACK（`//mino/runtime:subscriber`，详设 11.1~11.3） | D2-02 | 3d |
 | D2-11 | ShmSharedPtr（引用 Pin） ✅ | `//mino/runtime:shm_shared_ptr`：Transfer/Pin 计数、per-object/per-process 配额、Lease Owner 崩溃清除（详设 11.2.1、ADR-0013） | D2-10 | 3d |
 | D2-12 | Delivery Receipt 框架 ✅ | `//mino/runtime:delivery_receipt`：有界 Outstanding Table、Target Snapshot、kAll/kAny/kQuorum 与逐目标状态（详设 10.5） | D2-09 | 3d |
-| D2-13 | Kill/暂停/PID 复用压力测试 ✅（持续） | Publisher 各点 Kill、Subscriber Kill、慢 Subscriber、Lease 误判边界；runner/workflow 已落地，发布候选仍需重新执行并归档 manifest | 全部 | 持续 |
-| D2-14 | TLA+ 模型验证 ✅ | `docs/formal/`：MPSC Reservation、Broadcast Membership、Lease Eviction；TLC 穷举通过并映射 INV-17/INV-18/INV-32 | D2-04, D2-06 | 5d |
+| D2-13 | Kill/暂停/PID 复用压力测试 ✅（持续） | 随机 timed campaign 覆盖五类场景，并确定性覆盖 13 个持久化切点 SIGKILL 与 SIGSTOP-live/SIGCONT；class/cutpoint/interruption 计数、守恒、无孤儿、完整日志 hash 与 commit/clean qualification fail-closed | 全部 | 持续 |
+| D2-14 | TLA+ 模型验证 ✅ | `docs/formal/`：MPSC Reservation、Broadcast Membership、Lease Eviction；PR/push 均执行三个模型，证据绑定 commit/clean qualification，TLC 穷举并映射 INV-17/INV-18/INV-32 | D2-04, D2-06 | 5d |
 
 ### 4.2 并行工作流
 
@@ -190,7 +192,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] SPSC 长时间回绕无 ABA、无重复/漏消费（INV-01，`spsc_channel_test` 10000 次回绕 + `spsc_channel_xproc_test` fork 双进程 20000 条 ~312 次回绕零丢失零重复）
 - [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
 - [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
-- [x] Publisher/Subscriber 随机 Kill ≥1 小时后恢复扫描无孤儿（`d2_recovery_stress_long_test`，seed 12345，2,959,560 次随机迭代，2026-08-01 Linux x86-64）
+- [ ] 当前发布候选执行新版 Publisher/Subscriber 多场景随机 campaign ≥1 小时，fixed 与 run-derived seed 均满足五类场景、13 个确定性 SIGKILL 切点、SIGSTOP-live、守恒、ACK/Lease/Journal 清理、allocator 容量恢复及 commit/clean qualification，并归档完整 hash manifest（旧版 `d2_recovery_stress_long_test` 历史运行不替代新版门禁）
 - [x] ASAN/UBSAN/TSAN 全部通过（2026-08-01 修复后全仓无缓存回归各 59/59；D2 新增 JournalChannelRecoveryCoordinator、Broadcast era-bound ACK 与三态 Lease 回归）
 - [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；固定 `.cfg` 与 CI 已落地；TLC v1.7.4 实跑通过：MPSC 55,672、Broadcast 1,241、Lease 106,304 个 distinct states）
 
@@ -271,8 +273,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-08 | Schema 分发与协商 ✅ | connection_schema_ref 单调映射、Descriptor 按需请求、4 MiB/1024 帧缓冲、16/s 限频与认证持久化门禁（`//mino/bridge:schema_negotiator`） | D4-07 | 3d |
 | D4-09 | 可靠传输与去重 ✅ | Sequence/ACK/Session Epoch、逐来源 HWM、重传/重连、重复抑制、Receiver restart `kDegraded`（`//mino/bridge:reliability`） | D4-07 | 5d |
 | D4-10 | 远端对象重建 ✅ | Schema/Topic 校验 → Canonical Decode → Slab/Journal → SPSC 原子发布，支持显式 N/N-1 binding（`//mino/bridge:remote_object_reconstructor`） | D4-07 | 3d |
-| D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`） | D4-03 | 3d |
-| D4-12 | 双节点集成测试 ✅（物理双机资格验证待执行） | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；`.github/workflows/physical-two-host.yml` 当前仅覆盖物理双机基础 TCP 与双向 ACK，强制重连和 Schema 协商仍需扩展 | 全部 | 持续 |
+| D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`）；`//mino/runtime/deployment:remote_bridge` 提供 TCP、Schema Registry/Store、Negotiator 与自动重连 Connection Manager 的生产组装根 | D4-03 | 3d |
+| D4-12 | 双节点集成测试 ✅（物理双机资格验证待执行） | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；物理 probe 已扩展非空 Schema/Descriptor、持久化、连接后强制断链、两次重连、Session Epoch、重传/去重和双向 ACK，manifest fail-closed | 全部 | 持续 |
 
 ### 6.2 并行工作流
 
@@ -293,7 +295,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 - [x] 同机端到端 Pub/Sub 通过
 - [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback）
-- [ ] 扩展物理双机 probe 注入强制断链与非空 Schema Identity；当前发布候选随后在两台不同物理主机完成 TCP、重连、Schema 协商与双向 ACK 验证，并归档 manifest
+- [ ] 已扩展的物理双机 v4 probe 在当前发布候选的两台不同物理主机完成 TCP、非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重与双向 ACK 验证，并归档 fail-closed final manifest
 - [x] 断链重连后按策略恢复，去重窗口正常工作（V-19）
 - [x] 错误帧被校验拒绝且不导致越界（INV-31）
 - [x] N/N-1 Schema 互通通过
@@ -325,7 +327,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D5-12 | `mino` 运维工具 ✅ | record/replay/storage inspect/verify/repair CLI（`//tools/mino:mino`，详设 17.16） | D5-10 | 5d |
 | D5-13 | 录制模式集成 ✅ | `//mino/storage:recording_policy` + `//mino/storage:recorder` + `//mino/storage:snapshot_store`：四种模式、确认/Sync/Buffer 策略、Snapshot 原子覆盖与完整 Session 编排（详设 17.4） | D5-07 | 3d |
 | D5-14 | 正式 SLA 文档 ✅ | `docs/benchmarks/D5_Storage_SLA.md`：硬件、负载、统计口径、实测目标与原始 JSON | 全部 | 3d |
-| D5-15 | Kill/ENOSPC/磁盘抖动测试 ✅（持续） | `//mino/storage:storage_fault_test` + `tools/ci/run_d5_storage_fault_campaign.py`：Kill 恢复、短写、EINTR、ENOSPC、EIO、EROFS、磁盘暂停 | 全部 | 持续 |
+| D5-15 | Kill/ENOSPC/磁盘抖动测试 ✅（持续） | `//mino/storage:storage_fault_test` + `tools/ci/run_d5_storage_fault_campaign.py`：多阶段真实 SIGKILL，child alarm + parent bounded reap + runner 进程组 watchdog；短写、EINTR、ENOSPC、EIO、EROFS、磁盘暂停；逐场景计数、证据 hash 与 commit/clean qualification fail-closed | 全部 | 持续 |
 
 ### 7.2 并行工作流
 
@@ -355,7 +357,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] Ingestion Sequence 无无法解释的永久空洞（INV-23；Gap/Tombstone + `topic_writer_test`）
 - [x] Replay 可按 Topic/时间/Sequence 过滤回放（`replay_engine_test` + Storage CLI 测试）
 - [x] **正式 SLA 文档发布**（`docs/benchmarks/D5_Storage_SLA.md`）
-- [ ] 当前发布候选完成 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、命令、日志摘要和 GitHub run provenance 的 manifest
+- [ ] 当前发布候选在 clean、commit-matched qualification 下完成新版六场景、每场景 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、逐场景计数、命令、日志 SHA-256、watchdog 结果和 GitHub run provenance 的 manifest
 
 ---
 
@@ -413,20 +415,20 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | 工作项 | 说明 | 启动阶段 |
 |---|---|---|
 | Sanitizer 矩阵 | ASAN/UBSAN/TSAN 五配置 CI | D0 |
-| Fuzz Harness | IDL/Descriptor/Frame/Payload/Segment/Handle 六类 Fuzz | D3 起持续 |
+| Fuzz Harness ✅ | IDL/Descriptor/Canonical Payload 与 Frame/Segment/Handle 六类 Fuzz；ASAN/UBSAN campaign、selector 计数和证据 hash fail-closed | D3 起持续 |
 | Litmus Test | 跨进程原子内存序验证 | D0（V-12） |
 | TLA+ 模型 | MPSC/Broadcast/Lease 形式化 | D2 |
-| 故障注入框架 | SIGKILL/SIGSTOP/网络断开/磁盘故障/时钟跳变 | D2 起持续 |
-| Benchmark 框架 | 性能回归基线、报告口径（架构 16.2） | D1 起持续 |
+| 故障注入框架 ✅ | SIGKILL/SIGSTOP/连接后网络断开/多阶段存储故障/时钟跳变；D2/D4/D5 runner 生成 commit-matched manifest | D2 起持续 |
+| Benchmark 框架 ✅ | `//benchmarks:d0_d5_validation_benchmark` 覆盖 V-14/V-15/V-16/V-17/V-18/V-27，`//mino/observability:v23_telemetry_benchmark` 覆盖 V-23；资格结果待实跑归档 | D1 起持续 |
 
 ### 9.2 可观测性
 
 | 工作项 | 说明 | 启动阶段 |
 |---|---|---|
-| Counter 框架 | Thread-local/Sharded Counter、周期合并 | D1 |
-| Histogram 框架 | 固定内存对数桶、热路径无分配 | D1 |
-| Trace Context | 采样传播、Sidecar Buffer（详设 21.5.5） | D4 |
-| 指标导出 | Prometheus/OTLP Exporter、有界 Snapshot Queue | D5 |
+| Counter 框架 ✅ | 固定容量 Sharded Counter、无全局锁热路径、周期 Snapshot（`//mino/observability:observability`） | D1 |
+| Histogram 框架 ✅ | 固定内存 base-2 对数桶、热路径无分配 | D1 |
+| Trace Context ✅ | Off/Counters/Sampled/Full 四级、稳定采样、固定容量 MPMC Sidecar、Clock Quality/跳变/负延迟处理 | D4 |
+| 指标导出 ✅ | Prometheus text、无网络依赖 OTLP encoder、有界 Snapshot Queue；Exporter 失败不阻塞业务 | D5 |
 
 ### 9.3 文档
 
@@ -443,7 +445,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 | 里程碑 | 标志 | 检查内容 |
 |---|---|---|
-| **M0：协议冻结** | D0 完成 | 13 篇 ADR 全部 ACCEPTED；工程骨架可构建 |
+| **M0：协议冻结** | D0 完成 | 14 篇 ADR 全部 ACCEPTED；工程骨架可构建 |
 | **M1：SHM 可用** | D1 完成 | Region/Handle/Slab/MPMC 骨架通过 Kill 压力测试 |
 | **M2：本地通信** | D2 完成 | SPSC/MPSC/Broadcast 语义正确；Publisher/Subscriber API 可用 |
 | **M3：类型系统** | D3 完成 | IDL 编译、代码生成、动态 Schema、Canonical Wire 全链路 |
@@ -473,6 +475,8 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4 | V-19（Bridge 去重窗口）、V-21（Admission Control） |
 | D5 | V-10（Segment Commit）、V-16（Writer 线程模型）、V-17（Sync 策略）、V-18（Buffer 容量）、V-23（Telemetry 开销） |
 | D6 | V-13（AArch64）、V-20（Trust Domain）、V-22（Rollout）、V-24（Partition 阈值）、V-25（UDP/RDMA/Fabric） |
+
+实现状态补充：V-14/V-15/V-16/V-17/V-18/V-27 的统一 benchmark 与 V-23 Telemetry benchmark 已落地；结果模板保持 `PENDING`，必须在资格环境执行并以包含 commit、命令、构建配置、环境信息和日志/JSON SHA-256 的 artifact 关闭。验证代码存在不等于验证登记已关闭。
 
 ---
 

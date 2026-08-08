@@ -86,9 +86,9 @@ jobs:
           retention-days: 90
 
   d5-fault-campaign:
-    name: D5 SIGKILL recovery campaign (100 rounds)
+    name: D5 persistence SIGKILL matrix (100 rounds)
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       CC: gcc-12
       CXX: g++-12
@@ -115,14 +115,48 @@ jobs:
           restore-keys: |
             d5-fault-${{ runner.os }}-
 
-      - name: Run D5 SIGKILL recovery campaign
+      - name: Run D5 persistence SIGKILL matrix
         run: |
           python3 tools/ci/run_d5_storage_fault_campaign.py \
             --rounds=100 \
             --seed="${D5_FAULT_SEED}" \
-            --gtest-filter=D5StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit \
+            --timeout=1200 \
+            --expected-commit="${GITHUB_SHA}" \
             --out=extended-results/d5-fault-campaign \
             --clean
+
+      - name: Verify complete D5 evidence
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("extended-results/d5-fault-campaign")
+          manifest_path = root / "campaign-manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          assert manifest["commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["expected_commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["source_state"] == "clean"
+          assert manifest["qualification_eligible"] is True
+          assert manifest["outcome"] == "passed"
+          assert manifest["exit_code"] == 0
+          assert manifest["scenario_count"] == 6
+          assert manifest["missing_or_invalid_scenarios"] == []
+          scenarios = manifest["scenarios"]
+          assert len(scenarios) == manifest["scenario_count"]
+          for scenario in scenarios:
+              assert scenario["rounds"] == 100
+              assert scenario["outcome"] == "passed"
+              assert scenario["marker_valid"] is True
+              assert scenario["reported_cases"] == scenario["expected_cases"]
+              log = root / scenario["log"]["path"]
+              assert log.is_file()
+              assert hashlib.sha256(log.read_bytes()).hexdigest() == scenario["log"]["sha256"]
+          assert manifest["reported_total_cases"] == manifest["expected_total_cases"]
+          PY
 
       - name: Upload D5 fault evidence
         if: always()
@@ -130,5 +164,5 @@ jobs:
         with:
           name: extended-d5-fault-${{ github.run_id }}-${{ github.run_attempt }}
           path: extended-results/d5-fault-campaign/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90

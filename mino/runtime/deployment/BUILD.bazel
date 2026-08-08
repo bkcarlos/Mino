@@ -1,6 +1,36 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "remote_bridge",
+    srcs = ["remote_bridge.cc"],
+    hdrs = ["remote_bridge.h"],
+    deps = [
+        "//mino/bridge:bridge_connection_manager",
+        "//mino/bridge:schema_negotiator",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/registry",
+        "//mino/schema:registry",
+        "//mino/storage:schema_store",
+        "//mino/transport:tcp_driver",
+    ],
+)
+
+cc_test(
+    name = "remote_bridge_test",
+    srcs = ["remote_bridge_test.cc"],
+    deps = [
+        ":remote_bridge",
+        "//mino/common:status",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:schema_store",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "local_bus",
     srcs = ["local_bus.cc"],
     hdrs = ["local_bus.h"],

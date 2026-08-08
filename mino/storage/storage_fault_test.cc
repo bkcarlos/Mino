@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -45,6 +46,14 @@ namespace mino::storage {
 namespace {
 
 using namespace std::chrono_literals;
+
+constexpr auto kChildWatchdog = std::chrono::seconds(30);
+constexpr auto kParentReapWatchdog = std::chrono::seconds(35);
+
+void ArmStorageChildWatchdog() noexcept {
+    ::signal(SIGALRM, SIG_DFL);
+    ::alarm(static_cast<unsigned int>(kChildWatchdog.count()));
+}
 
 constexpr std::string_view kRoundsEnvironment =
     "MINO_D5_STORAGE_FAULT_ROUNDS";
@@ -553,11 +562,47 @@ std::ptrdiff_t KillDuringRecordWrite(int fd, const std::byte* data, size_t size,
 }
 
 int WaitForChild(pid_t child) {
+    const auto deadline = std::chrono::steady_clock::now() + kParentReapWatchdog;
     int status = 0;
-    while (::waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) return -1;
+    for (;;) {
+        const pid_t result = ::waitpid(child, &status, WNOHANG);
+        if (result == child) return status;
+        if (result < 0 && errno != EINTR) return -1;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            static_cast<void>(::kill(child, SIGKILL));
+            const auto reap_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < reap_deadline) {
+                const pid_t reaped = ::waitpid(child, &status, WNOHANG);
+                if (reaped == child) break;
+                if (reaped < 0 && errno != EINTR) break;
+                std::this_thread::sleep_for(1ms);
+            }
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        std::this_thread::sleep_for(1ms);
     }
-    return status;
+}
+
+[[noreturn]] void KillCurrentProcess(int failure_exit) noexcept {
+    if (::kill(::getpid(), SIGKILL) != 0) ::_exit(failure_exit);
+    ::_exit(failure_exit + 1);
+}
+
+void ReportScenario(std::string_view scenario, uint64_t rounds,
+                    uint64_t cases, uint64_t seed) {
+    std::cout << "D5_SCENARIO_RESULT scenario=" << scenario
+              << " rounds=" << rounds << " cases=" << cases
+              << " seed=" << seed << std::endl;
+}
+
+size_t RoundOffset(uint64_t* random, size_t point_count) {
+    return static_cast<size_t>(NextRandom(random) % point_count);
+}
+
+bool ChildWasKilled(int status) {
+    return status != -1 && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
 TEST(D5StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
@@ -567,10 +612,12 @@ TEST(D5StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
     ASSERT_GT(encoded_size, 1u);
     const uint64_t rounds =
         EnvironmentUint64(kRoundsEnvironment, 1, 1000);
-    uint64_t random = EnvironmentUint64(kSeedEnvironment, 1,
-                                        std::numeric_limits<uint64_t>::max());
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
     RecordProperty("rounds", std::to_string(rounds));
-    RecordProperty("seed", std::to_string(random));
+    RecordProperty("seed", std::to_string(seed));
 
     for (uint64_t round = 0; round < rounds; ++round) {
         for (size_t target = 1; target <= kRecordCount; ++target) {
@@ -580,11 +627,13 @@ TEST(D5StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
                 SCOPED_TRACE("round=" + std::to_string(round) +
                              " target=" + std::to_string(target) +
                              " cut=" + std::to_string(cut));
+                ++cases;
                 const std::filesystem::path root = TestDirectory("sigkill");
                 const std::filesystem::path path = root / "segment.mino";
                 const pid_t child = ::fork();
                 ASSERT_GE(child, 0);
                 if (child == 0) {
+                    ArmStorageChildWatchdog();
                     KillWriteState state{
                         .target_record = target,
                         .cut_bytes = cut,
@@ -641,6 +690,410 @@ TEST(D5StorageFaultTest, SigkillAtRecordWritesRepairsToLastCompleteCommit) {
             }
         }
     }
+    ReportScenario("record-write", rounds, cases, seed);
+#else
+    GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
+#endif
+}
+
+struct KillSyncState {
+    bool after_sync = false;
+};
+
+int KillAroundDataSync(int fd, void* context) noexcept {
+    const auto* state = static_cast<KillSyncState*>(context);
+    if (!state->after_sync) KillCurrentProcess(110);
+    int result;
+    do {
+#if defined(__APPLE__)
+        result = ::fsync(fd);
+#else
+        result = ::fdatasync(fd);
+#endif
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) return result;
+    KillCurrentProcess(112);
+}
+
+TEST(D5StorageFaultTest, SigkillBeforeAndAfterRecordAndSealSync) {
+#if defined(__unix__) || defined(__APPLE__)
+    constexpr std::array<std::pair<bool, bool>, 4> cuts = {{
+        {false, false},
+        {false, true},
+        {true, false},
+        {true, true},
+    }};
+    const uint64_t rounds =
+        EnvironmentUint64(kRoundsEnvironment, 1, 1000);
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
+    RecordProperty("rounds", std::to_string(rounds));
+    RecordProperty("seed", std::to_string(seed));
+
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const size_t offset = RoundOffset(&random, cuts.size());
+        for (size_t index = 0; index < cuts.size(); ++index) {
+            const auto [seal, after_sync] = cuts[(offset + index) % cuts.size()];
+            SCOPED_TRACE("round=" + std::to_string(round) +
+                         " seal=" + std::to_string(seal) +
+                         " after_sync=" + std::to_string(after_sync));
+            ++cases;
+            const std::filesystem::path root = TestDirectory("sync_sigkill");
+            const std::filesystem::path path = root / "segment.mino";
+            const pid_t child = ::fork();
+            ASSERT_GE(child, 0);
+            if (child == 0) {
+                ArmStorageChildWatchdog();
+                KillSyncState state{.after_sync = after_sync};
+                SegmentWriterOptions options;
+                options.batch_bytes = 0;
+                options.batch_records = 1;
+                options.flush_interval_ns = 0;
+                options.sync_policy = seal ? SegmentSyncPolicy::kNone
+                                           : SegmentSyncPolicy::kPerRecord;
+                options.data_sync_hook = KillAroundDataSync;
+                options.io_hook_context = &state;
+                auto writer =
+                    SegmentWriter::Create(path, SampleHeader(), 100, options);
+                if (!writer.ok()) ::_exit(114);
+                auto appended = (*writer)->Append(SampleRecord(1), 101);
+                if (!appended.ok()) ::_exit(115);
+                if (seal) {
+                    const Status sealed = (*writer)->Seal(102);
+                    if (!sealed.ok()) ::_exit(116);
+                }
+                ::_exit(117);
+            }
+
+            const int child_status = WaitForChild(child);
+            ASSERT_TRUE(ChildWasKilled(child_status)) << child_status;
+            auto scanned = ScanSegment(path);
+            ASSERT_TRUE(scanned.ok()) << scanned.status().ToString();
+            EXPECT_TRUE(scanned->clean()) << scanned->reason_detail;
+            ASSERT_EQ(scanned->records.size(), 1u);
+            EXPECT_EQ(scanned->records[0].ingestion_sequence, 1u);
+        }
+    }
+    ReportScenario("record-sync", rounds, cases, seed);
+#else
+    GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
+#endif
+}
+
+struct KillSchemaState {
+    SchemaStoreFaultPoint target;
+};
+
+Status KillAtSchemaPoint(SchemaStoreFaultPoint point, void* context) noexcept {
+    const auto* state = static_cast<KillSchemaState*>(context);
+    if (point == state->target) KillCurrentProcess(120);
+    return Status::Ok();
+}
+
+TEST(D5StorageFaultTest, SigkillAcrossSchemaPersistencePhases) {
+#if defined(__unix__) || defined(__APPLE__)
+    constexpr std::array<SchemaStoreFaultPoint, 8> points = {
+        SchemaStoreFaultPoint::kAfterDescriptorTempWrite,
+        SchemaStoreFaultPoint::kAfterDescriptorSync,
+        SchemaStoreFaultPoint::kAfterDescriptorRename,
+        SchemaStoreFaultPoint::kAfterDescriptorDirectorySync,
+        SchemaStoreFaultPoint::kAfterManifestTempWrite,
+        SchemaStoreFaultPoint::kAfterManifestSync,
+        SchemaStoreFaultPoint::kAfterManifestRename,
+        SchemaStoreFaultPoint::kAfterManifestDirectorySync,
+    };
+    auto artifact = CompileArtifact();
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    const uint64_t rounds =
+        EnvironmentUint64(kRoundsEnvironment, 1, 1000);
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
+    RecordProperty("rounds", std::to_string(rounds));
+    RecordProperty("seed", std::to_string(seed));
+
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const size_t offset = RoundOffset(&random, points.size());
+        for (size_t index = 0; index < points.size(); ++index) {
+            const SchemaStoreFaultPoint point =
+                points[(offset + index) % points.size()];
+            SCOPED_TRACE("round=" + std::to_string(round) +
+                         " point=" +
+                         std::to_string(static_cast<int>(point)));
+            ++cases;
+            const std::filesystem::path root = TestDirectory("schema_sigkill");
+            const pid_t child = ::fork();
+            ASSERT_GE(child, 0);
+            if (child == 0) {
+                ArmStorageChildWatchdog();
+                schema::SchemaRegistry registry;
+                KillSchemaState state{.target = point};
+                SchemaStoreOptions options;
+                options.fault_hook = KillAtSchemaPoint;
+                options.fault_hook_context = &state;
+                auto store = SchemaStore::Open(root, &registry, options);
+                if (!store.ok()) ::_exit(122);
+                auto persisted =
+                    (*store)->Persist(artifact->identity, Bytes(artifact->bytes));
+                if (!persisted.ok()) ::_exit(123);
+                ::_exit(124);
+            }
+
+            const int child_status = WaitForChild(child);
+            ASSERT_TRUE(ChildWasKilled(child_status)) << child_status;
+            schema::SchemaRegistry registry;
+            auto reopened = SchemaStore::Open(root, &registry);
+            ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+            const bool manifest_renamed =
+                point == SchemaStoreFaultPoint::kAfterManifestRename ||
+                point == SchemaStoreFaultPoint::kAfterManifestDirectorySync;
+            EXPECT_EQ((*reopened)->size(), manifest_renamed ? 1u : 0u);
+            EXPECT_EQ((*reopened)->Resolve(1).ok(), manifest_renamed);
+        }
+    }
+    ReportScenario("schema", rounds, cases, seed);
+#else
+    GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
+#endif
+}
+
+struct KillManifestState {
+    ManifestFaultPoint target;
+};
+
+Status KillAtManifestPoint(ManifestFaultPoint point, void* context) noexcept {
+    const auto* state = static_cast<KillManifestState*>(context);
+    if (point == state->target) KillCurrentProcess(130);
+    return Status::Ok();
+}
+
+TEST(D5StorageFaultTest, SigkillAcrossManifestPersistencePhases) {
+#if defined(__unix__) || defined(__APPLE__)
+    constexpr std::array<ManifestFaultPoint, 4> points = {
+        ManifestFaultPoint::kAfterTempWrite,
+        ManifestFaultPoint::kAfterTempDataSync,
+        ManifestFaultPoint::kAfterRename,
+        ManifestFaultPoint::kAfterParentDirectorySync,
+    };
+    const uint64_t rounds =
+        EnvironmentUint64(kRoundsEnvironment, 1, 1000);
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
+    RecordProperty("rounds", std::to_string(rounds));
+    RecordProperty("seed", std::to_string(seed));
+
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const size_t offset = RoundOffset(&random, points.size());
+        for (size_t index = 0; index < points.size(); ++index) {
+            const ManifestFaultPoint point =
+                points[(offset + index) % points.size()];
+            SCOPED_TRACE("round=" + std::to_string(round) +
+                         " point=" +
+                         std::to_string(static_cast<int>(point)));
+            ++cases;
+            const std::filesystem::path root = TestDirectory("manifest_sigkill");
+            auto created = RecordingManifest::Create(root, RecordingMetadata());
+            ASSERT_TRUE(created.ok()) << created.status().ToString();
+            created->reset();
+            const pid_t child = ::fork();
+            ASSERT_GE(child, 0);
+            if (child == 0) {
+                ArmStorageChildWatchdog();
+                KillManifestState state{.target = point};
+                ManifestOptions options;
+                options.fault_hook = KillAtManifestPoint;
+                options.fault_hook_context = &state;
+                auto manifest = RecordingManifest::Open(root, options);
+                if (!manifest.ok()) ::_exit(132);
+                const Status updated =
+                    (*manifest)->UpdateSessionConfigVersion(2);
+                if (!updated.ok()) ::_exit(133);
+                ::_exit(134);
+            }
+
+            const int child_status = WaitForChild(child);
+            ASSERT_TRUE(ChildWasKilled(child_status)) << child_status;
+            auto reopened = RecordingManifest::Open(root);
+            ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+            const bool renamed = point == ManifestFaultPoint::kAfterRename ||
+                                 point == ManifestFaultPoint::kAfterParentDirectorySync;
+            EXPECT_EQ((*reopened)->snapshot().session.config_version,
+                      renamed ? 2u : 1u);
+        }
+    }
+    ReportScenario("manifest", rounds, cases, seed);
+#else
+    GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
+#endif
+}
+
+SegmentManifestEntry CampaignSegment(SegmentPersistentState state) {
+    return SegmentManifestEntry{
+        .segment_id = 1,
+        .state = state,
+        .first_ingestion_sequence = 1,
+        .last_ingestion_sequence = 1,
+        .created_at_ns = 100,
+        .sealed_at_ns = state == SegmentPersistentState::kSealed ? 200u : 0u,
+        .size_bytes = kEncodedSegmentHeaderSize,
+        .relative_path = "segments/00000001.mino",
+    };
+}
+
+TEST(D5StorageFaultTest, SigkillAcrossSealAndCheckpointPersistence) {
+#if defined(__unix__) || defined(__APPLE__)
+    constexpr std::array<ManifestFaultPoint, 4> points = {
+        ManifestFaultPoint::kAfterTempWrite,
+        ManifestFaultPoint::kAfterTempDataSync,
+        ManifestFaultPoint::kAfterRename,
+        ManifestFaultPoint::kAfterParentDirectorySync,
+    };
+    const uint64_t rounds =
+        EnvironmentUint64(kRoundsEnvironment, 1, 1000);
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
+    RecordProperty("rounds", std::to_string(rounds));
+    RecordProperty("seed", std::to_string(seed));
+
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const size_t offset = RoundOffset(&random, points.size());
+        for (bool checkpoint : {false, true}) {
+            for (size_t index = 0; index < points.size(); ++index) {
+                const ManifestFaultPoint point =
+                    points[(offset + index) % points.size()];
+                SCOPED_TRACE("round=" + std::to_string(round) +
+                             " checkpoint=" + std::to_string(checkpoint) +
+                             " point=" +
+                             std::to_string(static_cast<int>(point)));
+                ++cases;
+                const std::filesystem::path root =
+                    TestDirectory("checkpoint_seal_sigkill");
+                std::filesystem::create_directory(root / "segments");
+                auto created =
+                    PartitionManifest::Create(root, PartitionMetadataForTest());
+                ASSERT_TRUE(created.ok()) << created.status().ToString();
+                SegmentManifestEntry segment = CampaignSegment(
+                    checkpoint ? SegmentPersistentState::kSealed
+                               : SegmentPersistentState::kOpen);
+                ASSERT_TRUE((*created)->AddSegment(segment).ok());
+                created->reset();
+
+                const pid_t child = ::fork();
+                ASSERT_GE(child, 0);
+                if (child == 0) {
+                    ArmStorageChildWatchdog();
+                    KillManifestState state{.target = point};
+                    ManifestOptions options;
+                    options.fault_hook = KillAtManifestPoint;
+                    options.fault_hook_context = &state;
+                    auto manifest = PartitionManifest::Open(root, options);
+                    if (!manifest.ok()) ::_exit(136);
+                    Status updated = Status::Ok();
+                    if (checkpoint) {
+                        updated = (*manifest)->UpdateCheckpoint(DurableCheckpoint{
+                            .segment_id = 1,
+                            .durable_offset = kEncodedSegmentHeaderSize,
+                            .durable_sequence = 1,
+                        });
+                    } else {
+                        segment.state = SegmentPersistentState::kSealed;
+                        segment.sealed_at_ns = 200;
+                        updated = (*manifest)->UpdateSegment(segment);
+                    }
+                    if (!updated.ok()) ::_exit(137);
+                    ::_exit(138);
+                }
+
+                const int child_status = WaitForChild(child);
+                ASSERT_TRUE(ChildWasKilled(child_status)) << child_status;
+                auto reopened = PartitionManifest::Open(root);
+                ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+                const bool renamed =
+                    point == ManifestFaultPoint::kAfterRename ||
+                    point == ManifestFaultPoint::kAfterParentDirectorySync;
+                if (checkpoint) {
+                    EXPECT_EQ((*reopened)->snapshot().checkpoint.has_value(),
+                              renamed);
+                } else {
+                    ASSERT_EQ((*reopened)->snapshot().segments.size(), 1u);
+                    EXPECT_EQ((*reopened)->snapshot().segments[0].state,
+                              renamed ? SegmentPersistentState::kSealed
+                                      : SegmentPersistentState::kOpen);
+                }
+            }
+        }
+    }
+    ReportScenario("checkpoint-seal", rounds, cases, seed);
+#else
+    GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
+#endif
+}
+
+TEST(D5StorageFaultTest, SigkillAcrossOrphanQuarantinePersistence) {
+#if defined(__unix__) || defined(__APPLE__)
+    constexpr std::array<ManifestFaultPoint, 2> points = {
+        ManifestFaultPoint::kAfterOrphanRename,
+        ManifestFaultPoint::kAfterOrphanDirectorySync,
+    };
+    const uint64_t rounds =
+        EnvironmentUint64(kRoundsEnvironment, 1, 1000);
+    const uint64_t seed = EnvironmentUint64(
+        kSeedEnvironment, 1, std::numeric_limits<uint64_t>::max());
+    uint64_t random = seed;
+    uint64_t cases = 0;
+    RecordProperty("rounds", std::to_string(rounds));
+    RecordProperty("seed", std::to_string(seed));
+
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const size_t offset = RoundOffset(&random, points.size());
+        for (size_t index = 0; index < points.size(); ++index) {
+            const ManifestFaultPoint point =
+                points[(offset + index) % points.size()];
+            SCOPED_TRACE("round=" + std::to_string(round) +
+                         " point=" +
+                         std::to_string(static_cast<int>(point)));
+            ++cases;
+            const std::filesystem::path root = TestDirectory("orphan_sigkill");
+            std::filesystem::create_directory(root / "segments");
+            auto created =
+                PartitionManifest::Create(root, PartitionMetadataForTest());
+            ASSERT_TRUE(created.ok()) << created.status().ToString();
+            created->reset();
+            const std::filesystem::path candidate = "segments/orphan.mino";
+            WriteOneByte(root / candidate);
+
+            const pid_t child = ::fork();
+            ASSERT_GE(child, 0);
+            if (child == 0) {
+                ArmStorageChildWatchdog();
+                KillManifestState state{.target = point};
+                ManifestOptions options;
+                options.fault_hook = KillAtManifestPoint;
+                options.fault_hook_context = &state;
+                auto manifest = PartitionManifest::Open(root, options);
+                if (!manifest.ok()) ::_exit(140);
+                auto quarantined = (*manifest)->QuarantineOrphan(candidate);
+                if (!quarantined.ok()) ::_exit(141);
+                ::_exit(142);
+            }
+
+            const int child_status = WaitForChild(child);
+            ASSERT_TRUE(ChildWasKilled(child_status)) << child_status;
+            auto reopened = PartitionManifest::Open(root);
+            ASSERT_TRUE(reopened.ok()) << reopened.status().ToString();
+            EXPECT_FALSE(std::filesystem::exists(root / candidate));
+            EXPECT_TRUE(std::filesystem::is_regular_file(
+                root / "segments/orphan.mino.orphan"));
+        }
+    }
+    ReportScenario("orphan", rounds, cases, seed);
 #else
     GTEST_SKIP() << "fork/SIGKILL storage campaign requires a POSIX platform";
 #endif

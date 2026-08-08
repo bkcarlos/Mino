@@ -1,0 +1,163 @@
+name: D0-D5 Fuzz Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per selector/sanitizer campaign
+        required: true
+        default: "60"
+  schedule:
+    - cron: "41 3 * * 0"
+  push:
+    branches: [master, main]
+    paths:
+      - .bazelrc
+      - .github/workflows/d0-d5-fuzz-validation.yml
+      - MODULE.bazel
+      - MODULE.bazel.lock
+      - mino/abi/**
+      - mino/bridge/**
+      - mino/platform/**
+      - mino/shm/allocator/**
+      - mino/shm/region/**
+      - mino/storage/**
+      - tools/ci/run_extended_fuzz_campaign.py
+  pull_request:
+    branches: [master, main]
+    paths:
+      - .bazelrc
+      - .github/workflows/d0-d5-fuzz-validation.yml
+      - MODULE.bazel
+      - MODULE.bazel.lock
+      - mino/abi/**
+      - mino/bridge/**
+      - mino/platform/**
+      - mino/shm/allocator/**
+      - mino/shm/region/**
+      - mino/storage/**
+      - tools/ci/run_extended_fuzz_campaign.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d0-d5-fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  corpus-smoke:
+    name: Deterministic corpus smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Self-test campaign evidence tooling
+        run: python3 tools/ci/run_extended_fuzz_campaign.py --self-test
+
+      - name: Run committed deterministic corpora
+        run: |
+          bazel test --lockfile_mode=error --config=release \
+            //mino/bridge/fuzz:corpus_smoke_test \
+            //mino/storage/fuzz:corpus_smoke_test \
+            //mino/shm/region/fuzz:corpus_smoke_test \
+            --test_output=errors
+
+  fuzz:
+    name: ${{ matrix.sanitizer }} / ${{ matrix.selector }} libFuzzer
+    needs: corpus-smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - selector: frame
+            selector_id: 1
+            sanitizer: asan
+            sanitizer_id: 1
+          - selector: frame
+            selector_id: 1
+            sanitizer: ubsan
+            sanitizer_id: 2
+          - selector: segment
+            selector_id: 2
+            sanitizer: asan
+            sanitizer_id: 1
+          - selector: segment
+            selector_id: 2
+            sanitizer: ubsan
+            sanitizer_id: 2
+          - selector: handle
+            selector_id: 3
+            sanitizer: asan
+            sanitizer_id: 1
+          - selector: handle
+            selector_id: 3
+            sanitizer: ubsan
+            sanitizer_id: 2
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Select bounded duration and reproducible seed
+        env:
+          DISPATCH_SECONDS: ${{ inputs.seconds }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            seconds=60
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            seconds="${DISPATCH_SECONDS}"
+          else
+            seconds=3600
+          fi
+          seed=$(( (GITHUB_RUN_NUMBER * 100 + ${{ matrix.selector_id }} * 10 + ${{ matrix.sanitizer_id }}) % 2147483646 + 1 ))
+          echo "FUZZ_SECONDS=${seconds}" >> "${GITHUB_ENV}"
+          echo "FUZZ_SEED=${seed}" >> "${GITHUB_ENV}"
+
+      - name: Run bounded sanitizer campaign
+        run: |
+          python3 tools/ci/run_extended_fuzz_campaign.py \
+            --selector=${{ matrix.selector }} \
+            --sanitizer=${{ matrix.sanitizer }} \
+            --seconds="${FUZZ_SECONDS}" \
+            --seed="${FUZZ_SEED}" \
+            --out=fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
+
+      - name: Verify required evidence fail closed
+        if: always()
+        run: |
+          python3 tools/ci/run_extended_fuzz_campaign.py \
+            --verify \
+            --out=fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }} \
+            --expected-commit="${GITHUB_SHA}" \
+            --expected-seed="${FUZZ_SEED}" \
+            --expected-selector=${{ matrix.selector }} \
+            --expected-sanitizer=${{ matrix.sanitizer }} \
+            --expected-seconds="${FUZZ_SECONDS}"
+
+      - name: Upload manifest, corpus hashes, logs, and reproducers
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d0-d5-fuzz-${{ matrix.selector }}-${{ matrix.sanitizer }}-${{ github.run_id }}
+          path: fuzz-evidence-${{ matrix.selector }}-${{ matrix.sanitizer }}
+          if-no-files-found: error
+          retention-days: 90

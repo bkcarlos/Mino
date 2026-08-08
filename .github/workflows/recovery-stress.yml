@@ -32,12 +32,21 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - id: d1
-            name: D1 Region recovery (2h)
+          - id: d1-fixed
+            suite: d1
+            name: D1 Region recovery (2h, fixed seed)
+            seed_kind: fixed
             seed: "910009"
-          - id: d2
-            name: D2 Runtime recovery (2h)
+          - id: d2-fixed
+            suite: d2
+            name: D2 Runtime recovery (2h, fixed seed)
+            seed_kind: fixed
             seed: "920009"
+          - id: d2-run-derived
+            suite: d2
+            name: D2 Runtime recovery (2h, run-derived seed)
+            seed_kind: run-derived
+            seed: ""
 
     steps:
       - name: Checkout
@@ -63,12 +72,88 @@ jobs:
 
       - name: Run reproducible two-hour recovery stress
         env:
-          STRESS_SEED: ${{ inputs.seed || matrix.seed }}
+          STRESS_SEED: ${{ matrix.seed_kind == 'fixed' && matrix.seed || (inputs.seed || github.run_number) }}
+          STRESS_SEED_KIND: ${{ matrix.seed_kind == 'fixed' && 'fixed' || (inputs.seed && 'manual' || 'run-derived') }}
         run: |
-          python3 tools/ci/run_recovery_stress.py "${{ matrix.id }}" \
+          python3 tools/ci/run_recovery_stress.py "${{ matrix.suite }}" \
             --seconds="${RECOVERY_STRESS_SECONDS}" \
             --seed="${STRESS_SEED}" \
+            --seed-kind="${STRESS_SEED_KIND}" \
+            --expected-commit="${GITHUB_SHA}" \
             --out="recovery-stress-results/${{ matrix.id }}"
+
+      - name: Verify complete recovery stress evidence
+        if: always()
+        env:
+          RESULT_DIR: recovery-stress-results/${{ matrix.id }}
+          EXPECTED_SUITE: ${{ matrix.suite }}
+          EXPECTED_SEED_KIND: ${{ matrix.seed_kind == 'fixed' && 'fixed' || (inputs.seed && 'manual' || 'run-derived') }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RESULT_DIR"])
+          manifest_path = root / "manifest.json"
+          if not manifest_path.is_file():
+              raise SystemExit("recovery evidence is missing manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          assert manifest["commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["expected_commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["source_state"] == "clean"
+          assert manifest["qualification_eligible"] is True
+          assert manifest["suite"] == os.environ["EXPECTED_SUITE"]
+          assert manifest["seed_kind"] == os.environ["EXPECTED_SEED_KIND"]
+          assert manifest["status"] == "passed"
+          assert manifest["outcome"] == "passed"
+          assert manifest["exit_code"] == 0
+          hashes = manifest["test_log_hashes"]
+          for name in ("test.log", "test.xml", "bazel-console.log"):
+              artifact = root / name
+              assert artifact.is_file()
+              assert isinstance(hashes.get(name), str)
+              assert hashlib.sha256(artifact.read_bytes()).hexdigest() == hashes[name]
+          if manifest["suite"] == "d2":
+              expected_classes = {
+                  "publisher_crash", "subscriber_kill", "slow_subscriber",
+                  "lease_boundary", "pid_incarnation",
+              }
+              attempted = manifest["scenario_attempt_counts"]
+              completed = manifest["scenario_counts"]
+              assert set(attempted) == expected_classes
+              assert set(completed) == expected_classes
+              for name in expected_classes:
+                  assert attempted[name] == completed[name] and completed[name] > 0
+              assert manifest["scenario_count_source"] == "test.log"
+              cut_attempted = manifest["cutpoint_attempt_counts"]
+              cut_completed = manifest["cutpoint_counts"]
+              expected_cuts = {
+                  "journal-initializing-tagged", "journal-building-published",
+                  "journal-allocation-published", "journal-handle-appended",
+                  "mpsc-claim-tagged", "mpsc-owner-published",
+                  "mpsc-cursor-advanced", "mpsc-writing-published",
+                  "mpsc-ready-published", "mpsc-turn-published",
+                  "journal-reclaim-tagged", "journal-reclaim-progress",
+                  "journal-finalizing-tagged",
+              }
+              assert set(cut_attempted) == expected_cuts
+              assert set(cut_completed) == expected_cuts
+              for cut in expected_cuts:
+                  assert cut_attempted[cut].keys() == cut_completed[cut].keys()
+                  for interruption in cut_attempted[cut]:
+                      assert cut_attempted[cut][interruption] == cut_completed[cut][interruption]
+                  assert cut_completed[cut]["sigkill"] > 0
+              assert manifest["cutpoint_count_source"] == "test.log"
+              interruptions = manifest["interruption_counts"]
+              assert interruptions["sigstop_live_sigcont"] > 0
+              assert (
+                  manifest["interruption_attempt_counts"]["sigstop_live_sigcont"]
+                  == interruptions["sigstop_live_sigcont"]
+              )
+          print("recovery evidence integrity: PASS")
+          PY
 
       - name: Write recovery stress summary
         if: always()
@@ -89,6 +174,10 @@ jobs:
           else:
               manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
               hashes = manifest.get("test_log_hashes", {})
+              scenario_counts = manifest.get("scenario_counts", {})
+              scenario_summary = ", ".join(
+                  f"{name}={count}" for name, count in scenario_counts.items()
+              ) or "n/a"
               lines += [
                   "| Field | Value |",
                   "| --- | --- |",
@@ -100,6 +189,8 @@ jobs:
                   f"| Start | `{manifest.get('start_time_utc')}` |",
                   f"| End | `{manifest.get('end_time_utc')}` |",
                   f"| Exit code | `{manifest.get('exit_code')}` |",
+                  f"| Completed scenario counts | `{scenario_summary}` |",
+                  f"| Scenario count source | `{manifest.get('scenario_count_source')}` |",
                   f"| test.log SHA-256 | `{hashes.get('test.log')}` |",
                   f"| test.xml SHA-256 | `{hashes.get('test.xml')}` |",
                   "",
@@ -116,5 +207,5 @@ jobs:
         with:
           name: recovery-stress-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: recovery-stress-results/${{ matrix.id }}/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90

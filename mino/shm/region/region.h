@@ -36,11 +36,15 @@ class SharedMemoryRegion;
 
 // Options for SharedMemoryRegion::Create (design doc section 6.2).
 struct RegionCreateOptions {
-    // POSIX shm object name (e.g. "/my_region"). The region_id is assigned by
-    // the authoritative registry at Create and must NOT be specified by the
-    // caller (design doc section 6.2).
+    // POSIX shm object name (e.g. "/my_region"). Create assigns region_id from
+    // the deployment-local durable high-water mark; callers do not specify it.
+    // The HWM is committed to the configured state directory before Create can
+    // return the ID.
     std::string name;
     uint64_t size_bytes = 0;
+
+    // Reserved for API compatibility. Create currently requires a writable
+    // mapping and rejects read_only=true; use read-only Attach after creation.
     bool read_only = false;
 
     // Back the mapping with huge pages when available (degrades to normal
@@ -89,8 +93,11 @@ struct RegionV4CopyUpgradeOptions {
 };
 
 struct RegionAttachOptions {
-    std::string name;        // resolved to a region_id via the Registry
-    uint32_t region_id = 0;  // or specified explicitly (mutually exclusive)
+    // Required POSIX shm object name. Registry lookup and ID-only Attach are not
+    // implemented. A non-zero region_id is an optional identity assertion and
+    // must match the SuperBlock reached by name; zero means no ID assertion.
+    std::string name;
+    uint32_t region_id = 0;
     bool read_only = false;
 
     // Diagnostic escape hatch for quarantined Regions. It is honored only when
@@ -114,8 +121,8 @@ public:
     SharedMemoryRegion& operator=(SharedMemoryRegion&& other) noexcept;
     ~SharedMemoryRegion();
 
-    // Creates a new Region: allocates a persistent region_id, lays out and
-    // initializes the SuperBlock, and maps the Region (design doc 6.1:
+    // Creates a new Region: durably allocates a never-reused region_id, lays out
+    // and initializes the SuperBlock, and maps the Region (design doc 6.1:
     // ABSENT -> INITIALIZING -> ACTIVE).
     static Result<SharedMemoryRegion> Create(const RegionCreateOptions&);
 

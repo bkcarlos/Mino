@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mino.dev/schemas/d0_d5_validation_benchmark.v1.schema.json",
+  "title": "Mino D0-D5 validation benchmark artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "artifact_status",
+    "clock",
+    "provenance",
+    "configuration",
+    "methodology",
+    "results"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mino.d0_d5_validation_benchmark.v1"
+    },
+    "artifact_status": {
+      "enum": ["MEASURED", "FAILED", "PENDING"]
+    },
+    "clock": {
+      "const": "std::chrono::steady_clock"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["suite", "iterations", "storage_records", "records_per_writer", "payload_bytes", "pin_count"],
+      "properties": {
+        "suite": {"enum": ["all", "memory", "storage", "PENDING"]},
+        "iterations": {"type": ["integer", "null"], "minimum": 1},
+        "storage_records": {"type": ["integer", "null"], "minimum": 1},
+        "records_per_writer": {"type": ["integer", "null"], "minimum": 1},
+        "payload_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "pin_count": {"type": ["integer", "null"], "minimum": 1},
+        "temporary_directory_base": {"type": ["string", "null"]}
+      }
+    },
+    "methodology": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["percentile_method", "latency_unit"],
+      "properties": {
+        "percentile_method": {"enum": ["nearest-rank", "PENDING"]},
+        "latency_unit": {"enum": ["ns", "PENDING"]}
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["V-14", "V-15", "V-16", "V-17", "V-18", "V-27"],
+      "properties": {
+        "V-14": {"$ref": "#/$defs/result"},
+        "V-15": {"$ref": "#/$defs/result"},
+        "V-16": {"$ref": "#/$defs/result"},
+        "V-17": {"$ref": "#/$defs/result"},
+        "V-18": {"$ref": "#/$defs/result"},
+        "V-27": {"$ref": "#/$defs/result"}
+      }
+    },
+    "sink": {"type": "integer"},
+    "audits": {"type": "object", "additionalProperties": true}
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["MEASURED", "MEASURED_AND_MODELED", "FAILED", "PENDING"]}
+        "reason": {"type": "string"},
+        "metrics": {"type": ["object", "array", "null"]}
+      },
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "PENDING"}}, "required": ["status"]},
+          "then": {"required": ["reason", "metrics"], "properties": {"metrics": {"type": "null"}}}
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_timestamp_utc", "commit", "command", "build_config", "compiler", "cplusplus", "os", "hardware"],
+      "properties": {
+        "run_timestamp_utc": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "minLength": 1},
+        "command": {"type": "string", "minLength": 1},
+        "build_config": {"type": "string", "minLength": 1},
+        "compiler": {"type": "string", "minLength": 1},
+        "cplusplus": {"type": ["integer", "null"]},
+        "os": {"type": "string", "minLength": 1},
+        "hardware": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["logical_cpu_count", "physical_memory_bytes_detected", "cpu_model", "memory", "storage_device", "filesystem"],
+          "properties": {
+            "logical_cpu_count": {"type": ["integer", "null"], "minimum": 0},
+            "physical_memory_bytes_detected": {"type": ["integer", "null"], "minimum": 0},
+            "cpu_model": {"type": "string", "minLength": 1},
+            "memory": {"type": "string", "minLength": 1},
+            "storage_device": {"type": "string", "minLength": 1},
+            "filesystem": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "latency_distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["samples", "p50", "p95", "p99", "max"],
+      "properties": {
+        "samples": {"type": "integer", "minimum": 0},
+        "p50": {"type": "integer", "minimum": 0},
+        "p95": {"type": "integer", "minimum": 0},
+        "p99": {"type": "integer", "minimum": 0},
+        "max": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}
