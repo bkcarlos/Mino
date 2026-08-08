@@ -1729,13 +1729,13 @@ bool ShmPinTable::ReclaimGuardCallback(ShmHandle handle,
 }
 
 Status ShmPinTable::MaybeReclaim(ShmHandle handle) noexcept {
-    Result<SlabView> slab = allocator_->Inspect(handle);
-    if (!slab.ok()) {
-        return slab.status().code() == StatusCode::kNotFound
+    Result<ObjectState> state = allocator_->InspectState(handle);
+    if (!state.ok()) {
+        return state.status().code() == StatusCode::kNotFound
                    ? Status::Ok()
-                   : slab.status();
+                   : state.status();
     }
-    if (slab->state != ObjectState::kRetired || PinCount(handle) != 0) {
+    if (*state != ObjectState::kRetired || PinCount(handle) != 0) {
         return Status::Ok();
     }
     const Status reclaimed = allocator_->Reclaim(handle);

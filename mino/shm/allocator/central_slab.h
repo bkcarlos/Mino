@@ -266,6 +266,11 @@ public:
     // reclaim).
     Status Reclaim(ShmHandle handle);
 
+    // Returns the atomically published lifecycle state without reading
+    // generation-local header metadata. This is safe for reclaim probes that
+    // may race immediate slot reuse.
+    Result<ObjectState> InspectState(ShmHandle handle) const;
+
     // Returns a read-only view of the slot addressed by `handle`
     // (design doc 8.2). Validates region id, bounds, bitmap occupancy,
     // generation and header CRC.

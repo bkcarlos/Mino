@@ -344,11 +344,12 @@ TEST_F(ShmSharedPtrTest, PerObjectQuotaRejectsSixtyFifthPin) {
 }
 
 TEST_F(ShmSharedPtrTest, PerProcessQuotaRejectsPinBeyond4096) {
-    constexpr uint32_t kObjectCount =
+    constexpr uint32_t kMinimumObjectCount =
         ShmPinTable::kMaxPinsPerProcess / ShmPinTable::kMaxPinsPerObject;
+    constexpr uint32_t kObjectCount = kMinimumObjectCount * 2;
     std::vector<ShmHandle> handles;
-    handles.reserve(kObjectCount + 1);
-    for (uint32_t i = 0; i <= kObjectCount; ++i) {
+    handles.reserve(kObjectCount);
+    for (uint32_t i = 0; i < kObjectCount; ++i) {
         auto handle = Publish(100 + i);
         ASSERT_TRUE(handle.ok()) << handle.status().ToString();
         handles.push_back(*handle);
@@ -356,19 +357,30 @@ TEST_F(ShmSharedPtrTest, PerProcessQuotaRejectsPinBeyond4096) {
 
     std::vector<ShmPinToken> tokens;
     tokens.reserve(ShmPinTable::kMaxPinsPerProcess);
-    for (uint32_t object = 0; object < kObjectCount; ++object) {
-        for (uint32_t pin = 0; pin < ShmPinTable::kMaxPinsPerObject; ++pin) {
+    for (uint32_t round = 0;
+         round < ShmPinTable::kMaxPinsPerObject &&
+         tokens.size() < ShmPinTable::kMaxPinsPerProcess;
+         ++round) {
+        for (uint32_t object = 0;
+             object < kObjectCount &&
+             tokens.size() < ShmPinTable::kMaxPinsPerProcess;
+             ++object) {
             auto token = pins_->Pin(handles[object], Contract(), Owner(5));
-            ASSERT_TRUE(token.ok())
-                << "object " << object << " pin " << pin << ": "
-                << token.status().ToString();
+            if (!token.ok()) {
+                ASSERT_EQ(token.status().code(),
+                          StatusCode::kResourceExhausted)
+                    << "object " << object << " round " << round << ": "
+                    << token.status().ToString();
+                continue;
+            }
             tokens.push_back(std::move(*token));
         }
     }
+    ASSERT_EQ(tokens.size(), ShmPinTable::kMaxPinsPerProcess);
     EXPECT_EQ(pins_->OwnerPinCount(Owner(5)),
               ShmPinTable::kMaxPinsPerProcess);
 
-    auto denied = pins_->Pin(handles.back(), Contract(), Owner(5));
+    auto denied = pins_->Pin(handles.front(), Contract(), Owner(5));
     ASSERT_FALSE(denied.ok());
     EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
 }
@@ -953,28 +965,41 @@ TEST_F(ShmSharedPtrTest, CrashAtEveryPinAndReleaseStateLeaksNoQuota) {
     }
     object_tokens.clear();
 
-    // Refill the exact owner quota across 64 objects. This catches owner quota
-    // leaks that OwnerPinCount() alone cannot observe.
-    constexpr uint32_t kObjectCount =
+    // Refill the exact owner quota across enough objects to tolerate
+    // conservative object-quota hash collisions. This catches owner quota leaks
+    // that OwnerPinCount() alone cannot observe.
+    constexpr uint32_t kMinimumObjectCount =
         ShmPinTable::kMaxPinsPerProcess / ShmPinTable::kMaxPinsPerObject;
+    constexpr uint32_t kObjectCount = kMinimumObjectCount * 2;
     std::vector<ShmHandle> handles;
     handles.reserve(kObjectCount);
-    for (uint32_t i = 0; i < kObjectCount; ++i) {
+    handles.push_back(*handle);
+    for (uint32_t i = 1; i < kObjectCount; ++i) {
         auto owner_handle = Publish(2000 + i);
         ASSERT_TRUE(owner_handle.ok()) << owner_handle.status().ToString();
         handles.push_back(*owner_handle);
     }
     std::vector<ShmPinToken> owner_tokens;
     owner_tokens.reserve(ShmPinTable::kMaxPinsPerProcess);
-    for (const ShmHandle owner_handle : handles) {
-        for (uint32_t i = 0; i < ShmPinTable::kMaxPinsPerObject; ++i) {
+    for (uint32_t round = 0;
+         round < ShmPinTable::kMaxPinsPerObject &&
+         owner_tokens.size() < ShmPinTable::kMaxPinsPerProcess;
+         ++round) {
+        for (const ShmHandle owner_handle : handles) {
+            if (owner_tokens.size() == ShmPinTable::kMaxPinsPerProcess) break;
             auto token = pins_->Pin(owner_handle, Contract(), owner);
-            ASSERT_TRUE(token.ok())
-                << "owner quota refill " << owner_tokens.size() << ": "
-                << token.status().ToString();
+            if (!token.ok()) {
+                ASSERT_EQ(token.status().code(),
+                          StatusCode::kResourceExhausted)
+                    << "owner quota refill " << owner_tokens.size()
+                    << " round " << round << ": "
+                    << token.status().ToString();
+                continue;
+            }
             owner_tokens.push_back(std::move(*token));
         }
     }
+    ASSERT_EQ(owner_tokens.size(), ShmPinTable::kMaxPinsPerProcess);
     EXPECT_EQ(pins_->OwnerPinCount(owner),
               ShmPinTable::kMaxPinsPerProcess);
     owner_tokens.clear();
