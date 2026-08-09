@@ -10,11 +10,14 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <locale>
 #include <map>
 #include <new>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -92,6 +95,19 @@ std::string HexBits(uint64_t bits, size_t digits) {
         bits >>= 4;
     }
     return result;
+}
+
+template <typename T>
+std::optional<T> ParseFiniteFloating(std::string_view text) {
+    if (text.empty()) return std::nullopt;
+    std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
+    T value = 0;
+    input >> std::noskipws >> value;
+    if (input.fail() || !input.eof() || !std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 template <typename T>
@@ -180,17 +196,13 @@ Result<DefaultValue> ValidateDefault(const Literal& literal,
             }
             std::string_view text = literal.value;
             if (!text.empty() && text.front() == '+') text.remove_prefix(1);
-            float value = 0;
-            const auto parsed = std::from_chars(
-                text.data(), text.data() + text.size(), value,
-                std::chars_format::general);
-            if (text.empty() || parsed.ec != std::errc() ||
-                parsed.ptr != text.data() + text.size() ||
-                !std::isfinite(value)) {
+            const auto value = ParseFiniteFloating<float>(text);
+            if (!value.has_value()) {
                 return Error(literal.source, "invalid finite float default");
             }
-            return DefaultValue(DefaultValue::Kind::kFloat32,
-                                "0x" + HexBits(std::bit_cast<uint32_t>(value), 8));
+            return DefaultValue(
+                DefaultValue::Kind::kFloat32,
+                "0x" + HexBits(std::bit_cast<uint32_t>(*value), 8));
         }
         case ScalarType::kDouble: {
             if (literal.kind != LiteralKind::kInteger &&
@@ -200,17 +212,13 @@ Result<DefaultValue> ValidateDefault(const Literal& literal,
             }
             std::string_view text = literal.value;
             if (!text.empty() && text.front() == '+') text.remove_prefix(1);
-            double value = 0;
-            const auto parsed = std::from_chars(
-                text.data(), text.data() + text.size(), value,
-                std::chars_format::general);
-            if (text.empty() || parsed.ec != std::errc() ||
-                parsed.ptr != text.data() + text.size() ||
-                !std::isfinite(value)) {
+            const auto value = ParseFiniteFloating<double>(text);
+            if (!value.has_value()) {
                 return Error(literal.source, "invalid finite double default");
             }
-            return DefaultValue(DefaultValue::Kind::kFloat64,
-                                "0x" + HexBits(std::bit_cast<uint64_t>(value), 16));
+            return DefaultValue(
+                DefaultValue::Kind::kFloat64,
+                "0x" + HexBits(std::bit_cast<uint64_t>(*value), 16));
         }
         case ScalarType::kBool:
             if (literal.kind != LiteralKind::kBoolean) {

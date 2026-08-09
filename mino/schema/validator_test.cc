@@ -127,6 +127,8 @@ TEST(SemanticValidatorTest, ValidatesAnnotationsDefaultsAndBounds) {
              "message M { uint32 n = 1 [unknown = 4]; }",
              "message M { uint32 n = 1 [snapshot_key = true]; }",
              "message M { uint32 n = 1 [default = -1]; }",
+             "message M { float f = 1 [default = 1e999]; }",
+             "message M { double d = 1 [default = -1e999]; }",
              "message M { bool b = 1 [default = 1]; }",
              "message M { string s = 1 [max_bytes = 1, default = \"xx\"]; }",
              "message M { string s = 1 [max_bytes = 4, max_bytes = 5]; }",
@@ -140,6 +142,7 @@ message M {
   int32 a = 1 [default = +0007];
   float b = 2 [default = 1e-1];
   string c = 3 [max_bytes = 4, default = "x"];
+  double d = 4 [default = +0.1];
 }
 )idl");
     ASSERT_TRUE(normalized.ok()) << normalized.status().ToString();
@@ -151,6 +154,10 @@ message M {
                   .default_value()
                   ->canonical_value(),
               "0x3dcccccd");
+    EXPECT_EQ(normalized->aggregates()[0].fields()[3]
+                  .default_value()
+                  ->canonical_value(),
+              "0x3fb999999999999a");
 }
 
 TEST(SemanticValidatorTest, ParsesSchemaVersionAndEnforcesResources) {
