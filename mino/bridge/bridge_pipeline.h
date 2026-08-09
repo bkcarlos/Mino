@@ -8,8 +8,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <list>
+#include <map>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "mino/bridge/dedup_window.h"
@@ -63,6 +66,8 @@ struct BridgePipelineOptions {
     WireFrameLimits wire_limits;
     DedupWindowOptions dedup;
     RetransmitWindowOptions retransmit;
+    uint16_t lane_index = 0;
+    uint16_t lane_count = 1;
 };
 
 struct BridgePumpBudget {
@@ -77,6 +82,7 @@ struct BridgePumpResult {
     size_t completions = 0;
     size_t inbound_frames = 0;
     size_t outbound_frames = 0;
+    size_t retransmitted_frames = 0;
     size_t bytes = 0;
     bool made_progress = false;
 };
@@ -130,6 +136,32 @@ private:
         bool retry_requested = false;
     };
 
+    struct AttemptKey {
+        SourceIdentity source;
+        uint64_t sequence = 0;
+        transport::ConnectionId connection_id =
+            transport::kInvalidConnectionId;
+        transport::OperationId operation_id = transport::kInvalidOperationId;
+    };
+
+    struct AttemptKeyLess {
+        bool operator()(const AttemptKey& left,
+                        const AttemptKey& right) const noexcept;
+    };
+
+    struct SendOperationHash {
+        size_t operator()(transport::SendOperation operation) const noexcept;
+    };
+
+    using AttemptMap = std::map<AttemptKey, Attempt, AttemptKeyLess>;
+    using PendingAckQueue = std::list<AckPayload>;
+
+    struct PendingAckSource {
+        PendingAckQueue::iterator cumulative;
+        bool has_cumulative = false;
+        std::map<uint64_t, PendingAckQueue::iterator> selective;
+    };
+
     struct PendingInbound {
         WireFrame frame;
         size_t wire_bytes = 0;
@@ -140,6 +172,18 @@ private:
         SourceIdentity source;
         uint64_t sequence = 0;
         EncodedOutboundFrame outbound;
+        bool transmitted = false;
+    };
+
+    struct ReliableKey {
+        SourceIdentity source;
+        uint64_t sequence = 0;
+
+        bool operator==(const ReliableKey&) const = default;
+    };
+
+    struct ReliableKeyHash {
+        size_t operator()(const ReliableKey& key) const noexcept;
     };
 
     struct LocalSchemaBinding {
@@ -161,6 +205,8 @@ private:
     Status AdmitNegotiatedControls() noexcept;
     Status QueueSessionHello() noexcept;
     Status QueueAck(const AckPayload& ack) noexcept;
+    bool CanQueueAck(const AckPayload& ack) const noexcept;
+    void RemovePendingAck(PendingAckQueue::iterator pending) noexcept;
     Status FlushAcks(BridgePumpBudget budget,
                      BridgePumpResult* result) noexcept;
     Status FlushControls(BridgePumpBudget budget,
@@ -181,8 +227,13 @@ private:
     Status HandleHello(const WireFrame& frame, uint64_t now_ns) noexcept;
     Status EmitAck(const WireFrame& data, const DedupCheckResult& state,
                    AckDisposition disposition) noexcept;
-    Status RetireAcknowledgedAttempts(
-        const std::vector<Attempt>& before) noexcept;
+    Status AddAttempt(Attempt attempt) noexcept;
+    void RemoveAttempt(AttemptMap::iterator attempt) noexcept;
+    AttemptMap::iterator FindAttempt(const SourceIdentity& source,
+                                     uint64_t sequence,
+                                     transport::ConnectionId connection_id)
+        noexcept;
+    Status RetireAcknowledgedAttempts(const AckPayload& ack) noexcept;
     Status ResendPending(const BridgePumpBudget& budget,
                          BridgePumpResult* result) noexcept;
     Status PullOutbound(const BridgePumpBudget& budget,
@@ -193,8 +244,11 @@ private:
                     const BridgePumpBudget& budget,
                     BridgePumpResult* result,
                     bool* ownership_transferred) noexcept;
+    Status AddPendingReliable(PendingReliable pending) noexcept;
     PendingReliable* FindPendingReliable(const SourceIdentity& source,
                                          uint64_t sequence) noexcept;
+    void RemovePendingReliableAt(size_t index) noexcept;
+    void RemoveAcknowledgedReliable(const AckPayload& ack) noexcept;
     void RemoveRetiredReliable() noexcept;
 
     BridgePipelineOptions options_;
@@ -207,15 +261,24 @@ private:
     std::unique_ptr<RetransmitWindow> retransmit_;
     std::deque<std::vector<std::byte>> control_queue_;
     size_t control_bytes_ = 0;
-    std::vector<AckPayload> pending_acks_;
+    PendingAckQueue pending_acks_;
+    std::unordered_map<SourceIdentity, PendingAckSource, SourceIdentityHash>
+        pending_ack_sources_;
     std::vector<WireFrame> pending_schema_controls_;
     std::vector<PendingInbound> pending_inbound_;
     std::vector<PendingInbound> staged_ready_;
     size_t pending_inbound_bytes_ = 0;
     size_t processing_inbound_wire_bytes_ = 0;
     std::vector<PendingReliable> pending_reliable_;
+    std::unordered_map<ReliableKey, size_t, ReliableKeyHash>
+        pending_reliable_index_;
+    std::unordered_map<SourceIdentity, std::map<uint64_t, size_t>,
+                       SourceIdentityHash>
+        pending_reliable_sources_;
     std::vector<LocalSchemaBinding> local_schema_bindings_;
-    std::vector<Attempt> attempts_;
+    AttemptMap attempts_;
+    std::unordered_map<transport::SendOperation, AttemptKey, SendOperationHash>
+        attempt_operations_;
     bool hello_sent_ = false;
     bool hello_received_ = false;
     bool session_ready_ = false;

@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--advertise-address")
     parser.add_argument("--port", type=int, default=43191)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--tcp-lane-count", type=int, default=1)
     parser.add_argument("--token-env", default="MINO_TWO_HOST_TOKEN")
     parser.add_argument("--commit")
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
@@ -48,6 +49,7 @@ def main() -> int:
             advertise_address=args.advertise_address,
             port=args.port,
             timeout_seconds=args.timeout_seconds,
+            tcp_lane_count=args.tcp_lane_count,
             token=load_token(os.environ, args.token_env),
             commit=resolve_commit(args.workspace, args.commit),
             manifest_path=args.manifest,

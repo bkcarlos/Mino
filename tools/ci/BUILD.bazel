@@ -10,7 +10,11 @@ genrule(
 
 cc_binary(
     name = "mino_two_host_probe",
-    srcs = ["mino_two_host_probe.cc"],
+    srcs = [
+        "mino_two_host_probe.cc",
+        "two_host_connection_group.cc",
+        "two_host_connection_group.h",
+    ],
     deps = [
         "//mino/bridge:bridge_connection_manager",
         "//mino/bridge:schema_negotiator",

@@ -40,6 +40,7 @@ struct TcpDriverStats {
     size_t queued_send_bytes = 0;
     size_t ready_receive_bytes = 0;
     size_t ready_receive_messages = 0;
+    size_t ready_receive_storage_slots = 0;
     size_t pending_accepts = 0;
     uint64_t successful_send_syscalls = 0;
     uint64_t gathered_send_syscalls = 0;

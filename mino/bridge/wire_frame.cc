@@ -190,34 +190,62 @@ PerfTraceContext DecodeTrace(std::span<const std::byte> input,
 
 }  // namespace
 
-Result<std::vector<std::byte>> WireFrameCodec::Encode(
+Result<size_t> WireFrameCodec::EncodedSize(
     const WireFrame& frame, const WireFrameLimits& limits) noexcept {
+    return EncodedSize(frame.header, frame.payload.size(), limits);
+}
+
+Result<size_t> WireFrameCodec::EncodedSize(
+    const WireFrameHeader& header, size_t payload_size,
+    const WireFrameLimits& limits) noexcept {
     try {
-        Status validation = ValidateFlags(
-            frame.header.flags, frame.header.perf_trace.has_value(), true);
+        Status validation =
+            ValidateFlags(header.flags, header.perf_trace.has_value(), true);
         if (!validation.ok()) return validation;
-        validation = ValidateFrameType(frame.header.flags,
-                                       frame.header.frame_type, true);
+        validation = ValidateFrameType(header.flags, header.frame_type, true);
         if (!validation.ok()) return validation;
 
-        const bool is_control =
-            HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame);
-        const uint64_t wire_payload_length =
-            static_cast<uint64_t>(frame.payload.size()) +
-            (is_control ? kWireControlOpcodeLength : 0u);
-        if (wire_payload_length > limits.max_payload_length ||
-            wire_payload_length > std::numeric_limits<uint32_t>::max()) {
+        const size_t control_length =
+            HasFrameFlag(header.flags, FrameFlag::kControlFrame)
+                ? kWireControlOpcodeLength
+                : 0u;
+        if (payload_size >
+            std::numeric_limits<uint32_t>::max() - control_length) {
+            return Resource("wire payload exceeds max_payload_length");
+        }
+        const uint32_t wire_payload_length =
+            static_cast<uint32_t>(payload_size + control_length);
+        if (wire_payload_length > limits.max_payload_length) {
             return Resource("wire payload exceeds max_payload_length");
         }
 
-        const uint32_t header_length =
-            CanonicalHeaderLength(frame.header.flags);
-        const uint64_t body_length = header_length + wire_payload_length;
-        if (body_length > std::numeric_limits<uint32_t>::max()) {
+        const uint32_t header_length = CanonicalHeaderLength(header.flags);
+        if (wire_payload_length >
+            std::numeric_limits<uint32_t>::max() - header_length) {
             return Resource("encoded frame exceeds uint32 length prefix");
         }
+        return static_cast<size_t>(header_length) + wire_payload_length;
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
 
-        std::vector<std::byte> output(static_cast<size_t>(body_length));
+Result<std::vector<std::byte>> WireFrameCodec::Encode(
+    const WireFrame& frame, const WireFrameLimits& limits) noexcept {
+    try {
+        MINO_ASSIGN_OR_RETURN(const size_t body_length,
+                              EncodedSize(frame, limits));
+        const bool is_control =
+            HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame);
+        const size_t wire_payload_length =
+            frame.payload.size() +
+            (is_control ? kWireControlOpcodeLength : 0u);
+        const uint32_t header_length =
+            CanonicalHeaderLength(frame.header.flags);
+
+        std::vector<std::byte> output(body_length);
         std::span<std::byte> bytes(output);
         WriteBe32(bytes, kMagicOffset, kWireFrameMagic);
         WriteBe16(bytes, kVersionOffset, kWireProtocolVersion);

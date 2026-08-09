@@ -128,6 +128,16 @@ struct WireFrameLimits {
 
 class WireFrameCodec {
 public:
+    // Validates the same inputs as Encode and returns the exact frame-body size.
+    // Successful validation performs no allocation, payload copying, or CRC
+    // calculation. The header-only overload is useful when a caller knows a
+    // canonical payload's size without materializing its bytes.
+    static Result<size_t> EncodedSize(
+        const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
+    static Result<size_t> EncodedSize(
+        const WireFrameHeader& header, size_t payload_size,
+        const WireFrameLimits& limits = {}) noexcept;
+
     // Encodes/decodes exactly one frame body. Decode rejects extra trailing
     // bytes. The length-prefixed form is for byte-stream transports.
     static Result<std::vector<std::byte>> Encode(

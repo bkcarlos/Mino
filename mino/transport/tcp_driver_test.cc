@@ -3,6 +3,10 @@
 #include "mino/transport/tcp_driver.h"
 
 #include <arpa/inet.h>
+#if defined(__linux__)
+#include <dirent.h>
+#include <sys/epoll.h>
+#endif
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -15,14 +19,20 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "mino/bridge/wire_frame.h"
 
 namespace mino::transport {
+
+const char* TcpDriverReadinessBackendForTest() noexcept;
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -96,6 +106,86 @@ std::vector<std::byte> Prefix(std::span<const std::byte> body) {
     std::copy(body.begin(), body.end(), result.begin() + 4);
     return result;
 }
+
+std::vector<std::byte> HeartbeatBody(uint64_t timestamp_ns = 0) {
+    bridge::WireFrame heartbeat;
+    heartbeat.header.frame_type = bridge::FrameType::kHeartbeat;
+    heartbeat.header.flags = bridge::FlagValue(bridge::FrameFlag::kControlFrame);
+    heartbeat.header.timestamp_ns = timestamp_ns;
+    auto encoded = bridge::WireFrameCodec::Encode(heartbeat);
+    EXPECT_TRUE(encoded.ok()) << encoded.status().ToString();
+    return encoded.ok() ? std::move(*encoded) : std::vector<std::byte>{};
+}
+
+ssize_t SendRawNoSignal(int fd, std::span<const std::byte> bytes) {
+#if defined(MSG_NOSIGNAL)
+    return ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+#else
+#if defined(SO_NOSIGPIPE)
+    const int enabled = 1;
+    if (::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                     sizeof(enabled)) != 0) {
+        return -1;
+    }
+#endif
+    return ::send(fd, bytes.data(), bytes.size(), 0);
+#endif
+}
+
+#if defined(__linux__)
+int FindProcessEpollFd() {
+    DIR* directory = ::opendir("/proc/self/fd");
+    EXPECT_NE(directory, nullptr);
+    if (directory == nullptr) return -1;
+    int epoll_fd = -1;
+    while (const dirent* entry = ::readdir(directory)) {
+        char* end = nullptr;
+        const long candidate = std::strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || candidate < 0) continue;
+        const std::string path =
+            "/proc/self/fd/" + std::to_string(candidate);
+        std::array<char, 64> target{};
+        const ssize_t size =
+            ::readlink(path.c_str(), target.data(), target.size() - 1);
+        if (size < 0) continue;
+        target[static_cast<size_t>(size)] = '\0';
+        if (std::string(target.data()) != "anon_inode:[eventpoll]") continue;
+        EXPECT_EQ(epoll_fd, -1) << "test expected one live epoll instance";
+        epoll_fd = static_cast<int>(candidate);
+    }
+    (void)::closedir(directory);
+    return epoll_fd;
+}
+
+bool EpollHasEventMask(int epoll_fd, uint32_t mask) {
+    const std::string path = "/proc/self/fdinfo/" + std::to_string(epoll_fd);
+    FILE* file = std::fopen(path.c_str(), "r");
+    if (file == nullptr) return false;
+    std::array<char, 256> line{};
+    bool found = false;
+    while (std::fgets(line.data(), static_cast<int>(line.size()), file) !=
+           nullptr) {
+        unsigned int events = 0;
+        if (std::sscanf(line.data(), "tfd: %*d events: %x", &events) == 1 &&
+            (events & mask) != 0) {
+            found = true;
+            break;
+        }
+    }
+    (void)std::fclose(file);
+    return found;
+}
+
+bool WaitForEpollEventMask(int epoll_fd, uint32_t mask, bool expected,
+                           std::chrono::milliseconds timeout = 1000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (EpollHasEventMask(epoll_fd, mask) == expected) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return EpollHasEventMask(epoll_fd, mask) == expected;
+}
+#endif
 
 TcpDriverOptions TestOptions() {
     return TcpDriverOptions{
@@ -268,6 +358,17 @@ bool WaitForQueuedSendBytes(const TcpDriver& driver, size_t expected,
     return driver.stats().queued_send_bytes == expected;
 }
 
+TEST(TcpDriverBackendTest, SelectsPlatformReadinessBackend) {
+#if defined(__linux__)
+    EXPECT_STREQ(TcpDriverReadinessBackendForTest(), "epoll");
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+    EXPECT_STREQ(TcpDriverReadinessBackendForTest(), "kqueue");
+#else
+    EXPECT_STREQ(TcpDriverReadinessBackendForTest(), "poll");
+#endif
+}
+
 TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
     TcpDriverOptions options = TestOptions();
     EXPECT_TRUE(ValidateTcpDriverOptions(options).ok());
@@ -434,6 +535,183 @@ TEST(TcpDriverTest, ConnectionFiltersPreserveOtherMessagesAndCompletions) {
               first_send->operation);
 }
 
+TEST(TcpDriverTest, IndexedReadyQueuePreservesInterleavedGlobalOrder) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    auto second_client = pair.client->Connect({
+        .remote_endpoint = *pair.listener.local_endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_client.ok()) << second_client.status().ToString();
+    auto second_server = pair.server->Accept({
+        .listener_id = pair.listener.id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_server.ok()) << second_server.status().ToString();
+
+    const std::vector<std::byte> first_a = FrameBody(32, 201);
+    const std::vector<std::byte> first_b = FrameBody(32, 202);
+    const std::vector<std::byte> second_a = FrameBody(32, 203);
+    const std::vector<std::byte> second_b = FrameBody(32, 204);
+    const auto send_and_wait = [&](ConnectionId connection_id,
+                                   const std::vector<std::byte>& body,
+                                   size_t ready_count) {
+        auto sent = pair.client->SendUntracked({
+            .connection_id = connection_id,
+            .payload = body,
+            .traffic_class = UntrackedTrafficClass::kData,
+        });
+        EXPECT_TRUE(sent.ok()) << sent.status().ToString();
+        EXPECT_TRUE(WaitForReadyMessageCount(*pair.server, ready_count));
+    };
+    send_and_wait(pair.client_connection.id, first_a, 1);
+    send_and_wait(second_client->id, first_b, 2);
+    send_and_wait(pair.client_connection.id, second_a, 3);
+    send_and_wait(second_client->id, second_b, 4);
+
+    auto filtered = pair.server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = second_server->id,
+    });
+    ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+    ASSERT_EQ(filtered->messages.size(), 1u);
+    EXPECT_EQ(filtered->messages[0].payload, first_b);
+    EXPECT_EQ(pair.server->stats().ready_receive_messages, 3u);
+
+    auto remaining = pair.server->Poll({
+        .max_messages = 3,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+    });
+    ASSERT_TRUE(remaining.ok()) << remaining.status().ToString();
+    ASSERT_EQ(remaining->messages.size(), 3u);
+    EXPECT_EQ(remaining->messages[0].payload, first_a);
+    EXPECT_EQ(remaining->messages[1].payload, second_a);
+    EXPECT_EQ(remaining->messages[2].payload, second_b);
+    EXPECT_EQ(pair.server->stats().ready_receive_messages, 0u);
+    EXPECT_EQ(pair.server->stats().ready_receive_bytes, 0u);
+}
+
+TEST(TcpDriverTest, IndexedReadyQueuePreservesOversizedHeadAndByteCutoff) {
+    DriverPair pair = ConnectPair();
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    const std::vector<std::byte> first = FrameBody(256, 211);
+    const std::vector<std::byte> second = FrameBody(64, 212);
+    ASSERT_TRUE(pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = first,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    ASSERT_TRUE(pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = second,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    ASSERT_TRUE(WaitForReadyMessageCount(*pair.server, 2));
+
+    const TcpDriverStats before = pair.server->stats();
+    auto oversized = pair.server->Poll({
+        .max_messages = 2,
+        .max_bytes = static_cast<uint32_t>(first.size() - 1),
+        .timeout_ms = 0,
+        .connection_id = pair.server_connection.id,
+    });
+    ASSERT_FALSE(oversized.ok());
+    EXPECT_EQ(oversized.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(pair.server->stats().ready_receive_messages,
+              before.ready_receive_messages);
+    EXPECT_EQ(pair.server->stats().ready_receive_bytes,
+              before.ready_receive_bytes);
+
+    auto cutoff = pair.server->Poll({
+        .max_messages = 2,
+        .max_bytes = static_cast<uint32_t>(first.size() + second.size() - 1),
+        .timeout_ms = 0,
+        .connection_id = pair.server_connection.id,
+    });
+    ASSERT_TRUE(cutoff.ok()) << cutoff.status().ToString();
+    ASSERT_EQ(cutoff->messages.size(), 1u);
+    EXPECT_EQ(cutoff->messages[0].payload, first);
+
+    auto tail = pair.server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = pair.server_connection.id,
+    });
+    ASSERT_TRUE(tail.ok()) << tail.status().ToString();
+    ASSERT_EQ(tail->messages.size(), 1u);
+    EXPECT_EQ(tail->messages[0].payload, second);
+}
+
+TEST(TcpDriverTest, IndexedReadyQueueCompactsBoundedTombstoneStorage) {
+    TcpDriverOptions options = TestOptions();
+    options.max_ready_receive_messages = 8;
+    DriverPair pair = ConnectPair(options);
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    auto second_client = pair.client->Connect({
+        .remote_endpoint = *pair.listener.local_endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_client.ok()) << second_client.status().ToString();
+    auto second_server = pair.server->Accept({
+        .listener_id = pair.listener.id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_server.ok()) << second_server.status().ToString();
+
+    const std::vector<std::byte> pinned = FrameBody(32, 221);
+    ASSERT_TRUE(pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = pinned,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    ASSERT_TRUE(WaitForReadyMessageCount(*pair.server, 1));
+
+    for (uint64_t iteration = 0; iteration < 64; ++iteration) {
+        const std::vector<std::byte> transient =
+            FrameBody(32, 222 + iteration);
+        ASSERT_TRUE(pair.client->SendUntracked({
+            .connection_id = second_client->id,
+            .payload = transient,
+            .traffic_class = UntrackedTrafficClass::kData,
+        }).ok());
+        ASSERT_TRUE(WaitForReadyMessageCount(*pair.server, 2));
+        auto received = pair.server->Poll({
+            .max_messages = 1,
+            .max_bytes = 4096,
+            .timeout_ms = 0,
+            .connection_id = second_server->id,
+        });
+        ASSERT_TRUE(received.ok()) << received.status().ToString();
+        ASSERT_EQ(received->messages.size(), 1u);
+        EXPECT_EQ(received->messages[0].payload, transient);
+        const TcpDriverStats stats = pair.server->stats();
+        EXPECT_EQ(stats.ready_receive_messages, 1u);
+        EXPECT_LE(stats.ready_receive_storage_slots,
+                  options.max_ready_receive_messages);
+    }
+
+    auto remaining = pair.server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+    });
+    ASSERT_TRUE(remaining.ok()) << remaining.status().ToString();
+    ASSERT_EQ(remaining->messages.size(), 1u);
+    EXPECT_EQ(remaining->messages[0].payload, pinned);
+}
+
 TEST(TcpDriverTest, CloseDiscardsReadyMessagesForConnection) {
     DriverPair pair = ConnectPair();
     ASSERT_NE(pair.server, nullptr);
@@ -467,6 +745,12 @@ TEST(TcpDriverTest, CloseBeforeAckFailsTrackedOperation) {
     ASSERT_TRUE(received.ok()) << received.status().ToString();
 
     ASSERT_TRUE(pair.client->Close(pair.client_connection.id).ok());
+    auto rejected = pair.client->SendUntracked({
+        .connection_id = pair.client_connection.id,
+        .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData,
+    });
+    EXPECT_FALSE(rejected.ok());
     auto failed = pair.client->PollCompletions(
         {.max_completions = 1, .timeout_ms = 1000});
     ASSERT_TRUE(failed.ok()) << failed.status().ToString();
@@ -651,6 +935,243 @@ TEST(TcpDriverTest, GathersQueuedFramesAndPreservesAckCompletionSemantics) {
     }
 }
 
+TEST(TcpDriverTest, WakePathSendsSmallMessagesWithoutWritableInterest) {
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+
+    RawListener listener = ListenRaw();
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    const std::vector<std::byte> first = FrameBody(256, 2001);
+    const std::vector<std::byte> first_wire = Prefix(first);
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = first,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    std::vector<std::byte> received;
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received, first_wire.size()));
+    EXPECT_EQ(received, first_wire);
+    ASSERT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+
+    const uint64_t sends_after_drain =
+        driver->stats().successful_send_syscalls;
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(driver->stats().successful_send_syscalls, sends_after_drain);
+
+    const std::vector<std::byte> second = FrameBody(256, 2002);
+    const std::vector<std::byte> second_wire = Prefix(second);
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = second,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    received.clear();
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received, second_wire.size()));
+    EXPECT_EQ(received, second_wire);
+    EXPECT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+#if defined(__linux__)
+    const int epoll_fd = FindProcessEpollFd();
+    ASSERT_GE(epoll_fd, 0);
+    EXPECT_TRUE(WaitForEpollEventMask(epoll_fd, EPOLLOUT, false));
+#endif
+}
+
+TEST(TcpDriverTest, ConcurrentSendIngressPreservesPerProducerOrder) {
+    constexpr size_t kProducerCount = 8;
+    constexpr size_t kMessagesPerProducer = 64;
+
+    TcpDriverOptions options = TestOptions();
+    options.max_total_send_buffer_bytes = 4 * 1024 * 1024;
+    options.max_connection_send_buffer_bytes = 4 * 1024 * 1024;
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    options.io_poll_max_ms = 1000;
+
+    RawListener listener = ListenRaw(1024 * 1024);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    std::vector<std::vector<std::vector<std::byte>>> bodies(kProducerCount);
+    size_t expected_wire_bytes = 0;
+    for (size_t producer = 0; producer < kProducerCount; ++producer) {
+        bodies[producer].reserve(kMessagesPerProducer);
+        for (size_t index = 0; index < kMessagesPerProducer; ++index) {
+            const uint64_t sequence = producer * 1000 + index + 1;
+            bodies[producer].push_back(FrameBody(32, sequence));
+            expected_wire_bytes += bodies[producer].back().size() + 4;
+        }
+    }
+
+    std::array<std::atomic<bool>, kProducerCount> succeeded{};
+    std::vector<std::thread> producers;
+    producers.reserve(kProducerCount);
+    for (size_t producer = 0; producer < kProducerCount; ++producer) {
+        producers.emplace_back([&, producer] {
+            bool ok = true;
+            for (const std::vector<std::byte>& body : bodies[producer]) {
+                if (!driver->SendUntracked({
+                        .connection_id = connected->id,
+                        .payload = body,
+                        .traffic_class = UntrackedTrafficClass::kData,
+                    }).ok()) {
+                    ok = false;
+                    break;
+                }
+            }
+            succeeded[producer].store(ok, std::memory_order_release);
+        });
+    }
+    for (std::thread& producer : producers) producer.join();
+    for (const std::atomic<bool>& success : succeeded) {
+        ASSERT_TRUE(success.load(std::memory_order_acquire));
+    }
+
+    std::vector<std::byte> received;
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received, expected_wire_bytes, 3000ms));
+    ASSERT_EQ(received.size(), expected_wire_bytes);
+    std::array<size_t, kProducerCount> next_index{};
+    size_t offset = 0;
+    while (offset < received.size()) {
+        ASSERT_LE(offset + 4, received.size());
+        const uint32_t body_size =
+            (static_cast<uint32_t>(std::to_integer<uint8_t>(received[offset]))
+             << 24) |
+            (static_cast<uint32_t>(
+                 std::to_integer<uint8_t>(received[offset + 1]))
+             << 16) |
+            (static_cast<uint32_t>(
+                 std::to_integer<uint8_t>(received[offset + 2]))
+             << 8) |
+            static_cast<uint32_t>(
+                std::to_integer<uint8_t>(received[offset + 3]));
+        ASSERT_LE(offset + 4 + body_size, received.size());
+        auto decoded = bridge::WireFrameCodec::Decode(
+            std::span<const std::byte>(received).subspan(offset + 4, body_size));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        const uint64_t sequence = (*decoded).header.sequence_num;
+        const size_t producer = static_cast<size_t>(sequence / 1000);
+        ASSERT_LT(producer, kProducerCount);
+        EXPECT_EQ(sequence, producer * 1000 + next_index[producer] + 1);
+        ++next_index[producer];
+        offset += 4 + body_size;
+    }
+    for (size_t count : next_index) EXPECT_EQ(count, kMessagesPerProducer);
+    EXPECT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+}
+
+TEST(TcpDriverTest, WritableReadinessRecoversBlockedWriteAndDisablesAfterDrain) {
+    const std::vector<std::byte> body = FrameBody(8u * 1024u * 1024u, 2100);
+    const size_t wire_size = body.size() + 4;
+    TcpDriverOptions options = TestOptions();
+    options.max_frame_body_bytes = static_cast<uint32_t>(body.size());
+    options.max_total_send_buffer_bytes = wire_size;
+    options.max_connection_send_buffer_bytes = wire_size;
+    options.max_control_send_buffer_bytes = wire_size;
+    options.max_ready_receive_bytes = body.size();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+
+    RawListener listener = ListenRaw();
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+#if defined(__linux__)
+    const int epoll_fd = FindProcessEpollFd();
+    ASSERT_GE(epoll_fd, 0);
+    ASSERT_TRUE(WaitForEpollEventMask(epoll_fd, EPOLLOUT, true, 3000ms));
+#endif
+    ASSERT_NE(driver->stats().queued_send_bytes, 0u);
+    const uint64_t sends_while_blocked =
+        driver->stats().successful_send_syscalls;
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(driver->stats().successful_send_syscalls, sends_while_blocked);
+
+    std::vector<std::byte> received;
+    ASSERT_TRUE(ReceiveUntil(peer.get(), &received, wire_size, 10s));
+    EXPECT_EQ(received, Prefix(body));
+    ASSERT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+#if defined(__linux__)
+    ASSERT_TRUE(WaitForEpollEventMask(epoll_fd, EPOLLOUT, false));
+#endif
+    const uint64_t sends_after_drain =
+        driver->stats().successful_send_syscalls;
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(driver->stats().successful_send_syscalls, sends_after_drain);
+}
+
+TEST(TcpDriverTest, StaleEventsDoNotAffectReusedConnectionDescriptors) {
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 1000;
+    options.idle_timeout_ms = 5000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+
+    for (uint64_t iteration = 0; iteration < 24; ++iteration) {
+        ScopedFd peer = ConnectRaw(endpoint);
+        auto accepted = server->Accept(
+            {.listener_id = listener->id, .timeout_ms = 1000});
+        ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+        const std::vector<std::byte> body = FrameBody(32, 3000 + iteration);
+        const std::vector<std::byte> wire = Prefix(body);
+        ASSERT_EQ(SendRawNoSignal(peer.get(), wire),
+                  static_cast<ssize_t>(wire.size()));
+        auto received = server->Poll({
+            .max_messages = 1,
+            .max_bytes = 4096,
+            .timeout_ms = 1000,
+            .connection_id = accepted->id,
+        });
+        ASSERT_TRUE(received.ok()) << received.status().ToString();
+        ASSERT_EQ(received->messages.size(), 1u);
+        EXPECT_EQ(received->messages[0].payload, body);
+        ASSERT_TRUE(server->Close(accepted->id).ok());
+        ASSERT_TRUE(WaitForConnectionCount(*server, 0));
+    }
+}
+
 TEST(TcpDriverTest, IncrementalReaderAcceptsOneBytePrefixAndBodyFragments) {
     auto server_result = TcpDriver::Create(TestOptions());
     ASSERT_TRUE(server_result.ok());
@@ -715,6 +1236,73 @@ TEST(TcpDriverTest, CanonicalHeartbeatsKeepIdleConnectionsAliveAndStayInternal) 
         {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 20});
     ASSERT_FALSE(heartbeat_hidden.ok());
     EXPECT_EQ(heartbeat_hidden.status().code(), StatusCode::kTimeout);
+}
+
+TEST(TcpDriverTest, NoncanonicalHeartbeatIsDeliveredToBridge) {
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 1000;
+    options.idle_timeout_ms = 5000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    const std::vector<std::byte> heartbeat = HeartbeatBody(1);
+    const std::vector<std::byte> wire = Prefix(heartbeat);
+    ASSERT_EQ(SendRawNoSignal(peer.get(), wire),
+              static_cast<ssize_t>(wire.size()));
+    auto received = server->Poll(
+        {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 1000});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages[0].payload, heartbeat);
+}
+
+TEST(TcpDriverTest, MalformedBodiesReachBridgeButDoNotRefreshIdleTimeout) {
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 10;
+    options.idle_timeout_ms = 100;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    const std::vector<std::byte> malformed(
+        bridge::kWireBaseHeaderLength, std::byte{0});
+    const std::vector<std::byte> wire = Prefix(malformed);
+    size_t delivered = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 400ms;
+    while (server->stats().active_connections != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (SendRawNoSignal(peer.get(), wire) < 0) break;
+        auto received = server->Poll(
+            {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 20});
+        if (received.ok()) {
+            ASSERT_EQ(received->messages.size(), 1u);
+            EXPECT_EQ(received->messages[0].payload, malformed);
+            ++delivered;
+        } else {
+            EXPECT_TRUE(received.status().code() == StatusCode::kTimeout ||
+                        received.status().code() == StatusCode::kWouldBlock);
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_GT(delivered, 0u);
+    EXPECT_TRUE(WaitForConnectionCount(*server, 0, 500ms));
 }
 
 TEST(TcpDriverTest, SilentPeerTriggersIdleTimeout) {

@@ -7,8 +7,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "mino/bridge/control_payload.h"
@@ -87,8 +89,26 @@ public:
     const RetransmitWindowStats& stats() const noexcept { return stats_; }
 
 private:
+    struct EntryKey {
+        SourceIdentity source;
+        uint64_t sequence = 0;
+
+        bool operator==(const EntryKey&) const = default;
+    };
+
+    struct EntryKeyHash {
+        size_t operator()(const EntryKey& key) const noexcept {
+            size_t value = SourceIdentityHash{}(key.source);
+            value ^= static_cast<size_t>(key.sequence) +
+                     0x9e3779b97f4a7c15ull + (value << 6) + (value >> 2);
+            return value;
+        }
+    };
+
     explicit RetransmitWindow(RetransmitWindowOptions options) noexcept
         : options_(options) {}
+
+    void RemoveAt(size_t index, RetransmitAckResult* result = nullptr) noexcept;
 
     RetransmitWindowOptions options_;
     bool session_active_ = false;
@@ -96,6 +116,10 @@ private:
     uint64_t remote_session_epoch_ = 0;
     uint64_t session_started_ns_ = 0;
     std::vector<RetransmitEntry> entries_;
+    std::unordered_map<EntryKey, size_t, EntryKeyHash> entry_index_;
+    std::unordered_map<SourceIdentity, std::map<uint64_t, size_t>,
+                       SourceIdentityHash>
+        source_index_;
     size_t bytes_ = 0;
     RetransmitWindowStats stats_;
 };

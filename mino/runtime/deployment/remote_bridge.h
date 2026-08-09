@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "mino/bridge/bridge_runtime/connection_manager.h"
+#include "mino/bridge/bridge_runtime/connection_pool.h"
 #include "mino/bridge/schema_negotiator.h"
 #include "mino/capacity/capacity.h"
 #include "mino/common/result.h"
@@ -28,6 +29,9 @@ namespace mino::deployment {
 struct RemoteBridgeConfig {
     bridge::BridgeConnectionManagerOptions connection;
     transport::TcpDriverOptions tcp;
+    // Immutable for the lifetime of this composition. Every SourceIdentity is
+    // deterministically pinned to one lane; unavailable lanes never fall back.
+    uint16_t tcp_lane_count = 1;
     bridge::SchemaNegotiatorLimits schema_negotiation;
     std::filesystem::path schema_store_root;
 };
@@ -72,10 +76,25 @@ public:
                    registry::Reliability reliability,
                    bool allow_drop = false) noexcept;
 
-    bridge::BridgeConnectionManager& manager() noexcept { return *manager_; }
-    const bridge::BridgeConnectionManager& manager() const noexcept {
-        return *manager_;
+    bridge::BridgeConnectionManager& manager() noexcept {
+        return pool_->manager(0);
     }
+    const bridge::BridgeConnectionManager& manager() const noexcept {
+        return pool_->manager(0);
+    }
+    bridge::BridgeConnectionManager& manager(uint16_t lane_index) noexcept {
+        return pool_->manager(lane_index);
+    }
+    const bridge::BridgeConnectionManager& manager(
+        uint16_t lane_index) const noexcept {
+        return pool_->manager(lane_index);
+    }
+    bridge::BridgeConnectionPool& connection_pool() noexcept { return *pool_; }
+    const bridge::BridgeConnectionPool& connection_pool() const noexcept {
+        return *pool_;
+    }
+    uint16_t tcp_lane_count() const noexcept { return pool_->lane_count(); }
+    const transport::TcpDriver& driver() const noexcept { return *driver_; }
     schema::SchemaRegistry& schema_registry() noexcept { return *registry_; }
     const schema::SchemaRegistry& schema_registry() const noexcept {
         return *registry_;
@@ -92,9 +111,11 @@ private:
         std::unique_ptr<storage::SchemaStore> store,
         std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
         std::unique_ptr<StorePersistence> persistence,
-        std::unique_ptr<bridge::SchemaNegotiator> negotiator,
+        std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators,
         std::shared_ptr<transport::TcpDriver> driver,
-        std::unique_ptr<bridge::BridgeConnectionManager> manager) noexcept;
+        std::shared_ptr<bridge::BridgeConnectionPool> pool,
+        std::unique_ptr<bridge::BridgeListenerHub> listener_hub,
+        transport::DriverConfig driver_config) noexcept;
 
     // Declared first so the charge remains held until every composed resource
     // has been destroyed (members are destroyed in reverse declaration order).
@@ -103,9 +124,12 @@ private:
     std::unique_ptr<storage::SchemaStore> store_;
     std::shared_ptr<bridge::DescriptorAuth> descriptor_auth_;
     std::unique_ptr<StorePersistence> persistence_;
-    std::unique_ptr<bridge::SchemaNegotiator> negotiator_;
+    std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators_;
     std::shared_ptr<transport::TcpDriver> driver_;
-    std::unique_ptr<bridge::BridgeConnectionManager> manager_;
+    std::shared_ptr<bridge::BridgeConnectionPool> pool_;
+    std::unique_ptr<bridge::BridgeListenerHub> listener_hub_;
+    transport::DriverConfig driver_config_;
+    bool started_ = false;
     std::map<schema::CanonicalDigest, std::vector<std::byte>> local_artifacts_;
 };
 

@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any
 
 PROTOCOL = "mino-two-host-mino-v2"
-SCHEMA_VERSION = 4
-MINO_RESULT_SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
+MINO_RESULT_SCHEMA_VERSION = 6
 MIN_TOKEN_BYTES = 32
 MIN_PRODUCTION_TIMEOUT_SECONDS = 1800
 MAX_TIMEOUT_SECONDS = 3600
@@ -36,6 +36,94 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 HOST_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+TOPIC_ROUTE_KEYS = frozenset(
+    {
+        "topic_id",
+        "direction",
+        "messages",
+        "ordered",
+        "payload_verified",
+        "cross_topic_leakage",
+    }
+)
+NETWORK_SCALING_KEYS = frozenset(
+    {
+        "mode",
+        "topic_count",
+        "messages_per_topic",
+        "messages_sent",
+        "messages_received",
+        "application_payload_bytes",
+        "mino_frame_body_bytes",
+        "pipeline_inbound_frames",
+        "pipeline_outbound_frames",
+        "tcp_prefix_bytes",
+        "tcp_framed_bytes",
+        "elapsed_ms",
+        "accepted_acks",
+        "retransmissions",
+        "duplicate_suppressed",
+        "cross_topic_leakage",
+    }
+)
+CORRECTNESS_MESSAGES_PER_TOPIC = 64
+NETWORK_SCALING_MODES = ("fixed_total", "fixed_per_topic")
+NETWORK_SCALING_TOPIC_COUNTS = (1, 2, 4, 8, 16, 32)
+NETWORK_SCALING_FIXED_TOTAL_MESSAGES = 384
+NETWORK_SCALING_FIXED_PER_TOPIC_MESSAGES = 32
+NETWORK_SCALING_PAYLOAD_BYTES = 256
+NETWORK_SCALING_POSITIVE_INTEGER_FIELDS = (
+    "topic_count",
+    "messages_per_topic",
+    "messages_sent",
+    "messages_received",
+    "application_payload_bytes",
+    "mino_frame_body_bytes",
+    "pipeline_inbound_frames",
+    "pipeline_outbound_frames",
+    "tcp_prefix_bytes",
+    "tcp_framed_bytes",
+    "elapsed_ms",
+    "accepted_acks",
+)
+NETWORK_SCALING_NONNEGATIVE_INTEGER_FIELDS = (
+    "retransmissions",
+    "duplicate_suppressed",
+)
+LATENCY_SAMPLE_KEYS = frozenset(
+    {
+        "topic_count",
+        "messages_per_topic",
+        "sample_count",
+        "single_message_rtt_us",
+        "p50_rtt_us",
+        "p95_rtt_us",
+        "p99_rtt_us",
+        "max_rtt_us",
+    }
+)
+LATENCY_TOPIC_COUNTS = (1, 2, 4, 8, 16, 32)
+LATENCY_MESSAGES_PER_TOPIC = 64
+LANE_CONNECTION_KEYS = frozenset(
+    {
+        "lane_index",
+        "active",
+        "local_session_epoch",
+        "remote_session_epoch",
+        "connection_attempts",
+        "accepted_connections",
+        "completed_handshakes",
+        "reconnects",
+        "disconnects",
+    }
+)
+LATENCY_RTT_FIELDS = (
+    "single_message_rtt_us",
+    "p50_rtt_us",
+    "p95_rtt_us",
+    "p99_rtt_us",
+    "max_rtt_us",
 )
 REQUIRED_MINO_TRUE_FIELDS = (
     "session_discovery",
@@ -259,13 +347,250 @@ def _terminate(process: subprocess.Popen[str], log: EventLog) -> None:
         process.wait(timeout=5)
 
 
+def _require_integer(value: Any, *, description: str, minimum: int = 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        if minimum == 0:
+            qualifier = "nonnegative integer"
+        elif minimum == 1:
+            qualifier = "positive integer"
+        else:
+            qualifier = f"integer of at least {minimum}"
+        raise ProtocolError(f"{description} is not a {qualifier}")
+    return value
+
+
+def _validate_topic_routes(value: Any, *, role: str) -> dict[tuple[int, str], int]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ProtocolError("Mino result 'topic_routes' is not an array of four records")
+    expected = {
+        (1001, "sent"),
+        (1002, "sent"),
+        (2001, "received"),
+        (2002, "received"),
+    }
+    if role == "client":
+        expected = {
+            (topic_id, "received" if direction == "sent" else "sent")
+            for topic_id, direction in expected
+        }
+    indexed: dict[tuple[int, str], int] = {}
+    for index, raw_record in enumerate(value):
+        if (
+            not isinstance(raw_record, dict)
+            or frozenset(raw_record) != TOPIC_ROUTE_KEYS
+        ):
+            raise ProtocolError(
+                f"Mino topic route {index} does not contain exactly the required keys"
+            )
+        topic_id = _require_integer(
+            raw_record["topic_id"], description=f"Mino topic route {index} topic_id"
+        )
+        direction = raw_record["direction"]
+        if direction not in ("sent", "received"):
+            raise ProtocolError(f"Mino topic route {index} direction is invalid")
+        messages = _require_integer(
+            raw_record["messages"],
+            description=f"Mino topic route {index} messages",
+            minimum=CORRECTNESS_MESSAGES_PER_TOPIC,
+        )
+        if messages != CORRECTNESS_MESSAGES_PER_TOPIC:
+            raise ProtocolError(
+                f"Mino topic route {index} correctness message count is not "
+                f"{CORRECTNESS_MESSAGES_PER_TOPIC}"
+            )
+        if raw_record["ordered"] is not True:
+            raise ProtocolError(f"Mino topic route {index} is not ordered")
+        if raw_record["payload_verified"] is not True:
+            raise ProtocolError(f"Mino topic route {index} payload is not verified")
+        if raw_record["cross_topic_leakage"] is not False:
+            raise ProtocolError(f"Mino topic route {index} reports cross-topic leakage")
+        key = (topic_id, direction)
+        if key in indexed:
+            raise ProtocolError(f"Mino topic route {index} duplicates {key!r}")
+        indexed[key] = messages
+    if set(indexed) != expected:
+        raise ProtocolError(f"Mino topic routes do not match the expected {role} routes")
+    return indexed
+
+
+def _validate_network_scaling(
+    value: Any,
+) -> dict[tuple[str, int], Mapping[str, Any]]:
+    if not isinstance(value, list) or len(value) != 12:
+        raise ProtocolError(
+            "Mino result 'network_scaling' is not an array of twelve records"
+        )
+    expected = {
+        (mode, topic_count)
+        for mode in NETWORK_SCALING_MODES
+        for topic_count in NETWORK_SCALING_TOPIC_COUNTS
+    }
+    indexed: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for index, raw_record in enumerate(value):
+        if (
+            not isinstance(raw_record, dict)
+            or frozenset(raw_record) != NETWORK_SCALING_KEYS
+        ):
+            raise ProtocolError(
+                f"Mino network scaling record {index} does not contain exactly the required keys"
+            )
+        mode = raw_record["mode"]
+        if mode not in NETWORK_SCALING_MODES:
+            raise ProtocolError(f"Mino network scaling record {index} mode is invalid")
+        for field in NETWORK_SCALING_POSITIVE_INTEGER_FIELDS:
+            _require_integer(
+                raw_record[field],
+                description=f"Mino network scaling record {index} {field}",
+            )
+        for field in NETWORK_SCALING_NONNEGATIVE_INTEGER_FIELDS:
+            _require_integer(
+                raw_record[field],
+                description=f"Mino network scaling record {index} {field}",
+                minimum=0,
+            )
+        if raw_record["cross_topic_leakage"] is not False:
+            raise ProtocolError(
+                f"Mino network scaling record {index} reports cross-topic leakage"
+            )
+        expected_messages_per_topic = (
+            NETWORK_SCALING_FIXED_TOTAL_MESSAGES // raw_record["topic_count"]
+            if mode == "fixed_total"
+            else NETWORK_SCALING_FIXED_PER_TOPIC_MESSAGES
+        )
+        if raw_record["messages_per_topic"] != expected_messages_per_topic:
+            raise ProtocolError(
+                f"Mino network scaling record {index} does not match the required workload"
+            )
+        expected_messages = (
+            raw_record["topic_count"] * expected_messages_per_topic
+        )
+        if (
+            raw_record["messages_sent"] != expected_messages
+            or raw_record["messages_received"] != expected_messages
+        ):
+            raise ProtocolError(
+                f"Mino network scaling record {index} message counts are inconsistent"
+            )
+        expected_prefix_bytes = 4 * (
+            raw_record["pipeline_inbound_frames"]
+            + raw_record["pipeline_outbound_frames"]
+        )
+        if raw_record["tcp_prefix_bytes"] != expected_prefix_bytes:
+            raise ProtocolError(
+                f"Mino network scaling record {index} TCP prefix bytes are inconsistent"
+            )
+        if raw_record["tcp_framed_bytes"] != (
+            raw_record["mino_frame_body_bytes"] + raw_record["tcp_prefix_bytes"]
+        ):
+            raise ProtocolError(
+                f"Mino network scaling record {index} TCP framed bytes are inconsistent"
+            )
+        if raw_record["accepted_acks"] < raw_record["messages_sent"]:
+            raise ProtocolError(
+                f"Mino network scaling record {index} accepted ACK count is too small"
+            )
+        if raw_record["application_payload_bytes"] != (
+            raw_record["messages_sent"] * NETWORK_SCALING_PAYLOAD_BYTES
+        ):
+            raise ProtocolError(
+                f"Mino network scaling record {index} payload bytes do not match "
+                f"{NETWORK_SCALING_PAYLOAD_BYTES} bytes per message"
+            )
+        key = (mode, raw_record["topic_count"])
+        if key in indexed:
+            raise ProtocolError(
+                f"Mino network scaling record {index} duplicates {key!r}"
+            )
+        indexed[key] = raw_record
+    if set(indexed) != expected:
+        raise ProtocolError(
+            "Mino network scaling records are not the required Cartesian set"
+        )
+    fixed_total_messages = {
+        record["messages_sent"]
+        for (mode, _), record in indexed.items()
+        if mode == "fixed_total"
+    }
+    if len(fixed_total_messages) != 1:
+        raise ProtocolError("Mino fixed-total scaling workload is not constant")
+    fixed_per_topic_messages = {
+        record["messages_per_topic"]
+        for (mode, _), record in indexed.items()
+        if mode == "fixed_per_topic"
+    }
+    if len(fixed_per_topic_messages) != 1:
+        raise ProtocolError("Mino fixed-per-topic scaling workload is not constant")
+    payload_bytes_per_message = {
+        record["application_payload_bytes"] // record["messages_sent"]
+        for record in indexed.values()
+    }
+    if len(payload_bytes_per_message) != 1:
+        raise ProtocolError("Mino network scaling payload size is not constant")
+    return indexed
+
+
+def _validate_latency_samples(
+    value: Any,
+) -> dict[int, Mapping[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(LATENCY_TOPIC_COUNTS):
+        raise ProtocolError("Mino result 'latency_samples' is not an array of six records")
+    indexed: dict[int, Mapping[str, Any]] = {}
+    for index, raw_record in enumerate(value):
+        if (
+            not isinstance(raw_record, dict)
+            or frozenset(raw_record) != LATENCY_SAMPLE_KEYS
+        ):
+            raise ProtocolError(
+                f"Mino latency sample {index} does not contain exactly the required keys"
+            )
+        for field in LATENCY_SAMPLE_KEYS:
+            _require_integer(
+                raw_record[field],
+                description=f"Mino latency sample {index} {field}",
+            )
+        topic_count = raw_record["topic_count"]
+        if raw_record["messages_per_topic"] != LATENCY_MESSAGES_PER_TOPIC:
+            raise ProtocolError(
+                f"Mino latency sample {index} messages_per_topic is not "
+                f"{LATENCY_MESSAGES_PER_TOPIC}"
+            )
+        if raw_record["sample_count"] != topic_count * LATENCY_MESSAGES_PER_TOPIC:
+            raise ProtocolError(
+                f"Mino latency sample {index} sample_count is inconsistent"
+            )
+        if not (
+            raw_record["p50_rtt_us"]
+            <= raw_record["p95_rtt_us"]
+            <= raw_record["p99_rtt_us"]
+            <= raw_record["max_rtt_us"]
+        ):
+            raise ProtocolError(
+                f"Mino latency sample {index} percentile order is invalid"
+            )
+        if raw_record["single_message_rtt_us"] > raw_record["max_rtt_us"]:
+            raise ProtocolError(
+                f"Mino latency sample {index} single-message RTT exceeds max RTT"
+            )
+        if topic_count in indexed:
+            raise ProtocolError(
+                f"Mino latency sample {index} duplicates topic_count {topic_count}"
+            )
+        indexed[topic_count] = raw_record
+    if set(indexed) != set(LATENCY_TOPIC_COUNTS):
+        raise ProtocolError("Mino latency samples do not contain the required topic counts")
+    return indexed
+
+
 def _validate_mino_result(
     result: Mapping[str, Any],
     *,
     role: str,
     commit: str,
     local_identity: str,
+    tcp_lane_count: int,
 ) -> None:
+    if not isinstance(tcp_lane_count, int) or isinstance(tcp_lane_count, bool) or not 1 <= tcp_lane_count <= 8:
+        raise ProtocolError("Mino expected TCP lane count is invalid")
     expected_scalars = {
         "schema_version": MINO_RESULT_SCHEMA_VERSION,
         "protocol": PROTOCOL,
@@ -288,6 +613,34 @@ def _validate_mino_result(
     for field in REQUIRED_MINO_TRUE_FIELDS:
         if result.get(field) is not True:
             raise ProtocolError(f"Mino data-path evidence {field!r} is not true")
+    if result.get("tcp_lane_count") != tcp_lane_count:
+        raise ProtocolError("Mino result TCP lane count differs from requested config")
+    if result.get("active_lane_connections") != tcp_lane_count:
+        raise ProtocolError("Mino result did not activate every configured TCP lane")
+    if result.get("exercised_lane_count") != tcp_lane_count:
+        raise ProtocolError("Mino workload did not exercise every configured TCP lane")
+    lane_connections = result.get("lane_connections")
+    if not isinstance(lane_connections, list) or len(lane_connections) != tcp_lane_count:
+        raise ProtocolError("Mino lane connection evidence has invalid cardinality")
+    for lane_index, lane in enumerate(lane_connections):
+        if not isinstance(lane, Mapping) or frozenset(lane) != LANE_CONNECTION_KEYS:
+            raise ProtocolError("Mino lane connection evidence has invalid fields")
+        if lane.get("lane_index") != lane_index or lane.get("active") is not True:
+            raise ProtocolError("Mino lane connection is not active or canonically ordered")
+        for field in ("local_session_epoch", "remote_session_epoch", "completed_handshakes"):
+            value = lane.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ProtocolError(f"Mino lane field {field!r} is not positive")
+        for field in ("connection_attempts", "accepted_connections", "reconnects", "disconnects"):
+            value = lane.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ProtocolError(f"Mino lane field {field!r} is negative")
+        role_connections = lane["accepted_connections" if role == "server" else "connection_attempts"]
+        if role_connections <= 0:
+            raise ProtocolError("Mino lane never established its role-specific connection")
+    _validate_topic_routes(result.get("topic_routes"), role=role)
+    _validate_network_scaling(result.get("network_scaling"))
+    _validate_latency_samples(result.get("latency_samples"))
     for field in (
         "initial_local_session_epoch",
         "initial_remote_session_epoch",
@@ -352,6 +705,7 @@ def run_role(
     commit: str,
     manifest_path: Path,
     log_path: Path,
+    tcp_lane_count: int = 1,
     allow_short_timeout: bool = False,
     allow_loopback: bool = False,
     identity_override: str | None = None,
@@ -369,6 +723,8 @@ def run_role(
         advertise_address, allow_loopback=allow_loopback
     )
     port = validate_port(port)
+    if not isinstance(tcp_lane_count, int) or isinstance(tcp_lane_count, bool) or not 1 <= tcp_lane_count <= 8:
+        raise ProtocolError("TCP lane count must be an integer from 1 through 8")
     timeout_seconds = validate_timeout(timeout_seconds, allow_short=allow_short_timeout)
     local_identity = identity_override or machine_identity(token)
     if not DIGEST_RE.fullmatch(local_identity):
@@ -391,6 +747,7 @@ def run_role(
         f"--advertise-address={advertise_address}",
         f"--port={port}",
         f"--deadline-seconds={timeout_seconds}",
+        f"--tcp-lane-count={tcp_lane_count}",
         f"--commit={commit}",
         f"--machine-identity={local_identity}",
         f"--run-proof={proof}",
@@ -410,6 +767,7 @@ def run_role(
             address=address,
             advertise_address=advertise_address,
             timeout_seconds=timeout_seconds,
+            tcp_lane_count=tcp_lane_count,
         )
         process = subprocess.Popen(
             command,
@@ -437,6 +795,7 @@ def run_role(
             role=role,
             commit=commit,
             local_identity=local_identity,
+            tcp_lane_count=tcp_lane_count,
         )
         schema_directory = result_path.parent / "schema-store" / "schemas"
         persisted_paths = sorted(schema_directory.glob("*.schema"))
@@ -651,6 +1010,7 @@ def finalize_evidence(
     client_commit = client.get("commit")
     server_github = _json_object(server.get("github"))
     client_github = _json_object(client.get("github"))
+    validated_results: set[str] = set()
     for role, result, role_commit, local, peer in (
         ("server", server_mino, server_commit, server_local, server_peer),
         ("client", client_mino, client_commit, client_local, client_peer),
@@ -665,9 +1025,12 @@ def finalize_evidence(
                     role=role,
                     commit=role_commit,
                     local_identity=local_identity,
+                    tcp_lane_count=result.get("tcp_lane_count"),
                 )
             except ProtocolError as error:
                 errors.append(f"{role} nested Mino result: {error}")
+            else:
+                validated_results.add(role)
         if result.get("local_address") != local.get("advertised_address"):
             errors.append(f"{role} Mino local address differs from role manifest")
         if result.get("peer_commit") != peer.get("commit"):
@@ -677,6 +1040,8 @@ def finalize_evidence(
         if result.get("peer_address") != peer.get("advertised_address"):
             errors.append(f"{role} Mino peer address differs from role manifest")
 
+    if server_mino.get("tcp_lane_count") != client_mino.get("tcp_lane_count"):
+        errors.append("server and client TCP lane counts differ")
     if server_github.get("github_run_id") != client_github.get("github_run_id"):
         errors.append("server and client GitHub run IDs differ")
     if server_github.get("github_run_attempt") != client_github.get("github_run_attempt"):
@@ -788,6 +1153,262 @@ def finalize_evidence(
                 or initial == final_epoch
             ):
                 errors.append(f"{role} {prefix} session epoch did not change")
+
+    server_topic_routes: dict[tuple[int, str], int] = {}
+    client_topic_routes: dict[tuple[int, str], int] = {}
+    server_network_scaling: dict[tuple[str, int], Mapping[str, Any]] = {}
+    client_network_scaling: dict[tuple[str, int], Mapping[str, Any]] = {}
+    server_latency_samples: dict[int, Mapping[str, Any]] = {}
+    client_latency_samples: dict[int, Mapping[str, Any]] = {}
+    topic_route_counterparts_match = False
+    network_workload_dimensions_match = False
+    network_counterpart_messages_match = False
+    latency_workload_dimensions_match = False
+    if validated_results == {"server", "client"}:
+        server_topic_routes = _validate_topic_routes(
+            server_mino["topic_routes"], role="server"
+        )
+        client_topic_routes = _validate_topic_routes(
+            client_mino["topic_routes"], role="client"
+        )
+        topic_route_counterparts_match = all(
+            messages
+            == client_topic_routes[
+                (topic_id, "received" if direction == "sent" else "sent")
+            ]
+            for (topic_id, direction), messages in server_topic_routes.items()
+        )
+        if not topic_route_counterparts_match:
+            errors.append("server and client topic-route counterpart messages differ")
+
+        server_network_scaling = _validate_network_scaling(
+            server_mino["network_scaling"]
+        )
+        client_network_scaling = _validate_network_scaling(
+            client_mino["network_scaling"]
+        )
+        network_workload_dimensions_match = all(
+            server_network_scaling[key]["messages_per_topic"]
+            == client_network_scaling[key]["messages_per_topic"]
+            and server_network_scaling[key]["application_payload_bytes"]
+            == client_network_scaling[key]["application_payload_bytes"]
+            for key in server_network_scaling
+        )
+        if not network_workload_dimensions_match:
+            errors.append(
+                "server and client network-scaling workload dimensions differ"
+            )
+        network_counterpart_messages_match = all(
+            server_network_scaling[key]["messages_sent"]
+            == client_network_scaling[key]["messages_received"]
+            and client_network_scaling[key]["messages_sent"]
+            == server_network_scaling[key]["messages_received"]
+            for key in server_network_scaling
+        )
+        if not network_counterpart_messages_match:
+            errors.append(
+                "server and client network-scaling counterpart messages differ"
+            )
+
+        server_latency_samples = _validate_latency_samples(
+            server_mino["latency_samples"]
+        )
+        client_latency_samples = _validate_latency_samples(
+            client_mino["latency_samples"]
+        )
+        latency_workload_dimensions_match = all(
+            (
+                server_latency_samples[topic_count]["topic_count"],
+                server_latency_samples[topic_count]["messages_per_topic"],
+                server_latency_samples[topic_count]["sample_count"],
+            )
+            == (
+                client_latency_samples[topic_count]["topic_count"],
+                client_latency_samples[topic_count]["messages_per_topic"],
+                client_latency_samples[topic_count]["sample_count"],
+            )
+            for topic_count in LATENCY_TOPIC_COUNTS
+        )
+        if not latency_workload_dimensions_match:
+            errors.append("server and client latency workload dimensions differ")
+
+    def scaling_constant(
+        records: Mapping[tuple[str, int], Mapping[str, Any]],
+        mode: str,
+        field: str,
+    ) -> int | None:
+        values = {
+            record[field]
+            for (record_mode, _), record in records.items()
+            if record_mode == mode
+        }
+        return next(iter(values)) if len(values) == 1 else None
+
+    def scaling_samples(
+        records: Mapping[tuple[str, int], Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        for mode in NETWORK_SCALING_MODES:
+            for topic_count in NETWORK_SCALING_TOPIC_COUNTS:
+                record = records.get((mode, topic_count))
+                if record is None:
+                    continue
+                elapsed_ms = record["elapsed_ms"]
+                sent_payload_bytes = record["application_payload_bytes"]
+                tcp_framed_bytes = record["tcp_framed_bytes"]
+                sample = dict(record)
+                sample.update(
+                    {
+                        "payload_bytes_per_message": sent_payload_bytes
+                        // record["messages_sent"],
+                        "tcp_framed_to_sent_payload_ratio": round(
+                            tcp_framed_bytes / sent_payload_bytes, 6
+                        ),
+                        "messages_per_second": round(
+                            record["messages_sent"] * 1000 / elapsed_ms, 3
+                        ),
+                        "sent_payload_bytes_per_second": round(
+                            sent_payload_bytes * 1000 / elapsed_ms, 3
+                        ),
+                        "tcp_framed_bytes_per_second": round(
+                            tcp_framed_bytes * 1000 / elapsed_ms, 3
+                        ),
+                    }
+                )
+                samples.append(sample)
+        return samples
+
+    def latency_samples_with_increases(
+        records: Mapping[int, Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        baseline = records.get(1)
+        if baseline is None:
+            return []
+        samples: list[dict[str, Any]] = []
+        for topic_count in LATENCY_TOPIC_COUNTS:
+            record = records.get(topic_count)
+            if record is None:
+                continue
+            sample = dict(record)
+            for field in LATENCY_RTT_FIELDS:
+                metric = field.removesuffix("_us")
+                increase = record[field] - baseline[field]
+                sample[f"{metric}_increase_us"] = increase
+                sample[f"{metric}_increase_percent"] = round(
+                    increase * 100 / baseline[field], 3
+                )
+            samples.append(sample)
+        return samples
+
+    topic_routes_summary = {
+        "expected_records_per_host": 4,
+        "server_records": len(server_topic_routes),
+        "client_records": len(client_topic_routes),
+        "topic_ids": [1001, 1002, 2001, 2002],
+        "counterpart_messages_match": topic_route_counterparts_match,
+        "messages_sent": {
+            "server": sum(
+                messages
+                for (_, direction), messages in server_topic_routes.items()
+                if direction == "sent"
+            ),
+            "client": sum(
+                messages
+                for (_, direction), messages in client_topic_routes.items()
+                if direction == "sent"
+            ),
+        },
+        "messages_received": {
+            "server": sum(
+                messages
+                for (_, direction), messages in server_topic_routes.items()
+                if direction == "received"
+            ),
+            "client": sum(
+                messages
+                for (_, direction), messages in client_topic_routes.items()
+                if direction == "received"
+            ),
+        },
+    }
+    latency_summary = {
+        "semantics": {
+            "measurement": "Bridge dispatch-to-ingress echo RTT",
+            "scope": (
+                "includes probe payload construction and validation, dispatcher, "
+                "Bridge pipeline, TCP, and remote echo dispatch; excludes local Bus "
+                "subscriber scheduling"
+            ),
+            "clock": "initiator local steady clock",
+            "cross_host_clock_synchronization": False,
+            "single_message_rtt_us": "first completed echo RTT in the phase",
+            "concurrency": "at most one outstanding request per topic",
+            "distribution": "64 completed RTT samples per topic",
+            "path": [
+                "local DispatchTargets",
+                "Bridge pipeline",
+                "TCP",
+                "remote ingress",
+                "remote DispatchTargets",
+                "return pipeline",
+                "local ingress",
+            ],
+        },
+        "topic_counts": list(LATENCY_TOPIC_COUNTS),
+        "messages_per_topic": LATENCY_MESSAGES_PER_TOPIC,
+        "workload_dimensions_match": latency_workload_dimensions_match,
+        "samples": {
+            "server": latency_samples_with_increases(server_latency_samples),
+            "client": latency_samples_with_increases(client_latency_samples),
+        },
+    }
+    network_scaling_summary = {
+        "expected_records_per_host": 12,
+        "server_records": len(server_network_scaling),
+        "client_records": len(client_network_scaling),
+        "modes": list(NETWORK_SCALING_MODES),
+        "topic_counts": list(NETWORK_SCALING_TOPIC_COUNTS),
+        "workload_dimensions_match": network_workload_dimensions_match,
+        "counterpart_messages_match": network_counterpart_messages_match,
+        "byte_accounting": {
+            "mino_frame_body_bytes": (
+                "aggregate local BridgePipeline inbound and outbound frame bodies"
+            ),
+            "tcp_prefix_bytes": (
+                "four-byte TCP length prefix per observed inbound or outbound frame"
+            ),
+            "tcp_framed_bytes": "Mino frame bodies plus TCP length prefixes",
+            "excludes": [
+                "IP headers",
+                "TCP headers and retransmission overhead below TcpDriver",
+                "session discovery and health traffic outside BridgePipeline",
+                "TcpDriver heartbeat traffic",
+            ],
+            "host_totals_must_not_be_added": (
+                "the same transfer is observed once by each physical host"
+            ),
+        },
+        "fixed_total_messages": {
+            "server": scaling_constant(
+                server_network_scaling, "fixed_total", "messages_sent"
+            ),
+            "client": scaling_constant(
+                client_network_scaling, "fixed_total", "messages_sent"
+            ),
+        },
+        "fixed_per_topic_messages": {
+            "server": scaling_constant(
+                server_network_scaling, "fixed_per_topic", "messages_per_topic"
+            ),
+            "client": scaling_constant(
+                client_network_scaling, "fixed_per_topic", "messages_per_topic"
+            ),
+        },
+        "samples": {
+            "server": scaling_samples(server_network_scaling),
+            "client": scaling_samples(client_network_scaling),
+        },
+    }
 
     logs: dict[str, Any] = {}
     role_hashes: dict[str, Any] = {}
@@ -958,6 +1579,9 @@ def finalize_evidence(
             is True,
             "bidirectional_ack": server_mino.get("bidirectional_ack") is True
             and client_mino.get("bidirectional_ack") is True,
+            "topic_routes": topic_routes_summary,
+            "network_scaling": network_scaling_summary,
+            "latency": latency_summary,
         },
         "reconnect": {
             "forced_disconnect": server_mino.get("forced_disconnect") is True
@@ -1031,8 +1655,79 @@ if args['address'] == 'slow.invalid':
 role = args['role']
 peer_identity = 'b' * 64 if role == 'server' else 'a' * 64
 peer_address = '10.0.0.2:43191' if role == 'server' else '10.0.0.1:43191'
+route_directions = (
+    ((1001, 'sent'), (1002, 'sent'), (2001, 'received'), (2002, 'received'))
+    if role == 'server'
+    else ((1001, 'received'), (1002, 'received'), (2001, 'sent'), (2002, 'sent'))
+)
+topic_routes = [
+    {
+        'topic_id': topic_id,
+        'direction': direction,
+        'messages': 64,
+        'ordered': True,
+        'payload_verified': True,
+        'cross_topic_leakage': False,
+    }
+    for topic_id, direction in route_directions
+]
+network_scaling = []
+role_offset = 7 if role == 'server' else 11
+for mode in ('fixed_total', 'fixed_per_topic'):
+    for topic_count in (1, 2, 4, 8, 16, 32):
+        messages_per_topic = 384 // topic_count if mode == 'fixed_total' else 32
+        messages = topic_count * messages_per_topic
+        inbound_frames = messages + 1
+        outbound_frames = messages + 2
+        prefix_bytes = 4 * (inbound_frames + outbound_frames)
+        frame_body_bytes = messages * 24 + role_offset
+        network_scaling.append({
+            'mode': mode,
+            'topic_count': topic_count,
+            'messages_per_topic': messages_per_topic,
+            'messages_sent': messages,
+            'messages_received': messages,
+            'application_payload_bytes': messages * 256,
+            'mino_frame_body_bytes': frame_body_bytes,
+            'pipeline_inbound_frames': inbound_frames,
+            'pipeline_outbound_frames': outbound_frames,
+            'tcp_prefix_bytes': prefix_bytes,
+            'tcp_framed_bytes': frame_body_bytes + prefix_bytes,
+            'elapsed_ms': topic_count + role_offset,
+            'accepted_acks': messages + 1,
+            'retransmissions': 0,
+            'duplicate_suppressed': 0,
+            'cross_topic_leakage': False,
+        })
+latency_samples = []
+latency_offset = 100 if role == 'server' else 200
+for topic_count in (1, 2, 4, 8, 16, 32):
+    latency_samples.append({
+        'topic_count': topic_count,
+        'messages_per_topic': 64,
+        'sample_count': topic_count * 64,
+        'single_message_rtt_us': latency_offset + topic_count,
+        'p50_rtt_us': latency_offset + topic_count * 2,
+        'p95_rtt_us': latency_offset + topic_count * 3,
+        'p99_rtt_us': latency_offset + topic_count * 4,
+        'max_rtt_us': latency_offset + topic_count * 5,
+    })
+tcp_lane_count = int(args.get('tcp-lane-count', '1'))
+lane_connections = []
+for lane_index in range(tcp_lane_count):
+    lane_connections.append({
+        'lane_index': lane_index,
+        'active': True,
+        'local_session_epoch': 33 + lane_index,
+        'remote_session_epoch': 44 + lane_index,
+        'connection_attempts': 1 if role == 'client' else 0,
+        'accepted_connections': 1 if role == 'server' else 0,
+        'completed_handshakes': 1,
+        'reconnects': 2 if lane_index == 0 else 0,
+        'disconnects': 2 if lane_index == 0 else 0,
+    })
 result = {
-    'schema_version': 4,
+    'schema_version': 6,
     'protocol': 'mino-two-host-mino-v2',
     'role': role,
     'outcome': 'passed',
@@ -1065,6 +1760,13 @@ result = {
     'dedup_state_preserved': True,
     'duplicate_suppressed': True,
     'bidirectional_ack': True,
+    'tcp_lane_count': tcp_lane_count,
+    'active_lane_connections': tcp_lane_count,
+    'exercised_lane_count': tcp_lane_count,
+    'lane_connections': lane_connections,
+    'topic_routes': topic_routes,
+    'network_scaling': network_scaling,
+    'latency_samples': latency_samples,
     'local_schema_digest': ('c' * 64 if role == 'server' else 'd' * 64),
     'peer_schema_digest': ('d' * 64 if role == 'server' else 'c' * 64),
     'persisted_schema_digest': ('d' * 64 if role == 'server' else 'c' * 64),
@@ -1158,19 +1860,276 @@ print('fake mino probe completed')
             expected_commit=commit,
         ) == 0
         final = _load_json_object(final_path, "self-test final manifest")
+        assert final["schema_version"] == SCHEMA_VERSION
         assert final["outcome"] == "passed"
         assert final["binary"]["identical"]
         assert final["binary"]["bound_to_hosted_builds"]
         assert final["mino_data_path"]["server_remote_acknowledged"]
         assert final["mino_data_path"]["client_remote_acknowledged"]
+        topic_summary = final["mino_data_path"]["topic_routes"]
+        assert topic_summary["server_records"] == 4
+        assert topic_summary["client_records"] == 4
+        assert topic_summary["counterpart_messages_match"]
+        scaling_summary = final["mino_data_path"]["network_scaling"]
+        assert scaling_summary["server_records"] == 12
+        assert scaling_summary["client_records"] == 12
+        assert scaling_summary["workload_dimensions_match"]
+        assert scaling_summary["counterpart_messages_match"]
+        assert scaling_summary["fixed_total_messages"] == {
+            "server": 384,
+            "client": 384,
+        }
+        assert scaling_summary["fixed_per_topic_messages"] == {
+            "server": 32,
+            "client": 32,
+        }
+        assert len(scaling_summary["samples"]["server"]) == 12
+        assert len(scaling_summary["samples"]["client"]) == 12
+        assert scaling_summary["samples"]["server"][0][
+            "payload_bytes_per_message"
+        ] == 256
+        latency_summary = final["mino_data_path"]["latency"]
+        assert latency_summary["semantics"]["measurement"] == (
+            "Bridge dispatch-to-ingress echo RTT"
+        )
+        assert latency_summary["semantics"]["clock"] == "initiator local steady clock"
+        assert latency_summary["semantics"]["cross_host_clock_synchronization"] is False
+        assert latency_summary["topic_counts"] == [1, 2, 4, 8, 16, 32]
+        assert latency_summary["messages_per_topic"] == 64
+        assert latency_summary["workload_dimensions_match"]
+        server_latency = latency_summary["samples"]["server"]
+        client_latency = latency_summary["samples"]["client"]
+        assert [sample["topic_count"] for sample in server_latency] == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+        ]
+        assert [sample["topic_count"] for sample in client_latency] == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+        ]
+        assert server_latency[0]["single_message_rtt_us"] != client_latency[0][
+            "single_message_rtt_us"
+        ]
+        for metric in ("single_message_rtt", "p50_rtt", "p95_rtt", "p99_rtt", "max_rtt"):
+            assert server_latency[0][f"{metric}_increase_us"] == 0
+            assert server_latency[0][f"{metric}_increase_percent"] == 0
+            assert f"{metric}_increase_us" in client_latency[0]
+            assert f"{metric}_increase_percent" in client_latency[0]
+        assert server_latency[1]["single_message_rtt_increase_us"] == 1
+        assert server_latency[1]["single_message_rtt_increase_percent"] == 0.99
+        assert server_latency[1]["p99_rtt_increase_us"] == 4
+        assert server_latency[1]["p99_rtt_increase_percent"] == 3.846
         assert final["reconnect"]["automatic"]
         assert final["reconnect"]["duplicate_suppressed"]
         assert final["schema"]["request"]
         assert final["schema"]["persisted"]
 
+        valid_server_manifest = _load_json_object(
+            server_manifest, "server validation self-test manifest"
+        )
+        valid_server_result = valid_server_manifest["mino"]
+
+        def expect_invalid_result(
+            candidate: Mapping[str, Any], expected_error: str
+        ) -> None:
+            try:
+                _validate_mino_result(
+                    candidate,
+                    role="server",
+                    commit=commit,
+                    local_identity="a" * 64,
+                    tcp_lane_count=1,
+                )
+            except ProtocolError as error:
+                assert expected_error in str(error), str(error)
+            else:
+                raise AssertionError("tampered Mino result was accepted")
+
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["schema_version"] = 4
+        expect_invalid_result(invalid, "schema_version")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["topic_routes"][0]["unexpected"] = True
+        expect_invalid_result(invalid, "exactly the required keys")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["topic_routes"][0]["messages"] = True
+        expect_invalid_result(invalid, "at least 64")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["topic_routes"][0]["messages"] = 63
+        expect_invalid_result(invalid, "at least 64")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["topic_routes"][1] = dict(invalid["topic_routes"][0])
+        expect_invalid_result(invalid, "duplicates")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["topic_routes"][0]["cross_topic_leakage"] = True
+        expect_invalid_result(invalid, "cross-topic leakage")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["unexpected"] = 1
+        expect_invalid_result(invalid, "exactly the required keys")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["elapsed_ms"] = True
+        expect_invalid_result(invalid, "positive integer")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["retransmissions"] = -1
+        expect_invalid_result(invalid, "nonnegative integer")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["cross_topic_leakage"] = True
+        expect_invalid_result(invalid, "cross-topic leakage")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["tcp_prefix_bytes"] += 4
+        expect_invalid_result(invalid, "TCP prefix bytes")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["accepted_acks"] = 1
+        expect_invalid_result(invalid, "accepted ACK count")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["network_scaling"][0]["application_payload_bytes"] += 1
+        expect_invalid_result(invalid, "256 bytes per message")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid_record = invalid["network_scaling"][0]
+        invalid_record["messages_per_topic"] *= 2
+        invalid_record["messages_sent"] *= 2
+        invalid_record["messages_received"] *= 2
+        invalid_record["accepted_acks"] = invalid_record["messages_sent"]
+        expect_invalid_result(invalid, "required workload")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["unexpected"] = 1
+        expect_invalid_result(invalid, "exactly the required keys")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"].pop()
+        expect_invalid_result(invalid, "array of six records")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][1] = dict(invalid["latency_samples"][0])
+        expect_invalid_result(invalid, "duplicates topic_count")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["p50_rtt_us"] = True
+        expect_invalid_result(invalid, "positive integer")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["max_rtt_us"] = 0
+        expect_invalid_result(invalid, "positive integer")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["sample_count"] += 1
+        expect_invalid_result(invalid, "sample_count is inconsistent")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["messages_per_topic"] = 63
+        expect_invalid_result(invalid, "messages_per_topic is not 64")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["p50_rtt_us"] = (
+            invalid["latency_samples"][0]["p95_rtt_us"] + 1
+        )
+        expect_invalid_result(invalid, "percentile order is invalid")
+        invalid = json.loads(json.dumps(valid_server_result))
+        invalid["latency_samples"][0]["single_message_rtt_us"] = (
+            invalid["latency_samples"][0]["max_rtt_us"] + 1
+        )
+        expect_invalid_result(invalid, "single-message RTT exceeds max RTT")
+
         original_client_manifest = client_manifest.read_bytes()
         client_result_path = client_manifest.parent / "mino-result.json"
         original_client_result = client_result_path.read_bytes()
+
+        def persist_client_result(manifest: dict[str, Any]) -> None:
+            write_json_atomic(client_result_path, manifest["mino"])
+            manifest["mino_result_artifact"]["sha256"] = sha256_file(
+                client_result_path
+            )
+            manifest["mino_result_artifact"]["size_bytes"] = (
+                client_result_path.stat().st_size
+            )
+            write_json_atomic(client_manifest, manifest)
+
+        route_tampered = _load_json_object(
+            client_manifest, "client route-tampered self-test manifest"
+        )
+        route_tampered["mino"]["topic_routes"][0]["messages"] += 1
+        persist_client_result(route_tampered)
+        route_tampered_final = root / "route-tampered-final.json"
+        assert finalize_evidence(
+            server_manifest_path=server_manifest,
+            client_manifest_path=client_manifest,
+            server_build_root=build_roots["server"],
+            client_build_root=build_roots["client"],
+            output_path=route_tampered_final,
+            expected_commit=commit,
+        ) == 1
+        route_failure = _load_json_object(
+            route_tampered_final, "route-tampered self-test final manifest"
+        )
+        assert any(
+            "correctness message count" in error
+            for error in route_failure["errors"]
+        )
+        client_manifest.write_bytes(original_client_manifest)
+        client_result_path.write_bytes(original_client_result)
+
+        scaling_tampered = _load_json_object(
+            client_manifest, "client scaling-tampered self-test manifest"
+        )
+        for record in scaling_tampered["mino"]["network_scaling"]:
+            if record["mode"] == "fixed_per_topic":
+                record["messages_per_topic"] = 4
+                messages = record["topic_count"] * record["messages_per_topic"]
+                record["messages_sent"] = messages
+                record["messages_received"] = messages
+                record["application_payload_bytes"] = messages * 256
+                record["accepted_acks"] = messages
+        persist_client_result(scaling_tampered)
+        scaling_tampered_final = root / "scaling-tampered-final.json"
+        assert finalize_evidence(
+            server_manifest_path=server_manifest,
+            client_manifest_path=client_manifest,
+            server_build_root=build_roots["server"],
+            client_build_root=build_roots["client"],
+            output_path=scaling_tampered_final,
+            expected_commit=commit,
+        ) == 1
+        scaling_failure = _load_json_object(
+            scaling_tampered_final, "scaling-tampered self-test final manifest"
+        )
+        assert any(
+            "required workload" in error
+            for error in scaling_failure["errors"]
+        )
+        client_manifest.write_bytes(original_client_manifest)
+        client_result_path.write_bytes(original_client_result)
+
+        latency_tampered = _load_json_object(
+            client_manifest, "client latency-tampered self-test manifest"
+        )
+        latency_tampered["mino"]["latency_samples"][0][
+            "messages_per_topic"
+        ] = 63
+        persist_client_result(latency_tampered)
+        latency_tampered_final = root / "latency-tampered-final.json"
+        assert finalize_evidence(
+            server_manifest_path=server_manifest,
+            client_manifest_path=client_manifest,
+            server_build_root=build_roots["server"],
+            client_build_root=build_roots["client"],
+            output_path=latency_tampered_final,
+            expected_commit=commit,
+        ) == 1
+        latency_failure = _load_json_object(
+            latency_tampered_final, "latency-tampered self-test final manifest"
+        )
+        assert latency_failure["outcome"] == "failed"
+        assert not latency_failure["mino_data_path"]["latency"][
+            "workload_dimensions_match"
+        ]
+        assert any(
+            "latency" in error and "messages_per_topic is not 64" in error
+            for error in latency_failure["errors"]
+        )
+        client_manifest.write_bytes(original_client_manifest)
+        client_result_path.write_bytes(original_client_result)
+
         nested_tampered = _load_json_object(
             client_manifest, "client nested-result self-test manifest"
         )

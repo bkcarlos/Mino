@@ -69,8 +69,14 @@ cc_library(
 
 cc_library(
     name = "bridge_connection_manager",
-    srcs = ["bridge_runtime/connection_manager.cc"],
-    hdrs = ["bridge_runtime/connection_manager.h"],
+    srcs = [
+        "bridge_runtime/connection_manager.cc",
+        "bridge_runtime/connection_pool.cc",
+    ],
+    hdrs = [
+        "bridge_runtime/connection_manager.h",
+        "bridge_runtime/connection_pool.h",
+    ],
     deps = [
         ":bridge_pipeline",
         "//mino/common:result",
@@ -202,6 +208,16 @@ cc_test(
         "//mino/schema:compiler",
         "//mino/schema:layout",
         "//mino/schema/codegen:artifact_codec",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "crc32c_test",
+    size = "small",
+    srcs = ["crc32c_test.cc"],
+    deps = [
+        ":crc32c",
         "@googletest//:gtest_main",
     ],
 )

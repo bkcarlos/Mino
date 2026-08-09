@@ -23,6 +23,11 @@
 
 namespace mino::bridge {
 
+class BridgeConnectionPool;
+namespace detail {
+class BridgeEgressQuota;
+}  // namespace detail
+
 enum class BridgeConnectionMode : uint8_t {
     kConnect = 0,
     kListen = 1,
@@ -91,6 +96,8 @@ struct BridgeConnectionManagerOptions {
     uint32_t telemetry_component_instance = 0;
     uint32_t telemetry_hop_id = 0;
     BridgePipelineOptions pipeline;
+    uint16_t lane_index = 0;
+    uint16_t lane_count = 1;
 };
 
 struct BridgeConnectionManagerStats {
@@ -163,16 +170,20 @@ public:
     const Status& last_failure() const noexcept { return last_failure_; }
     const BridgeConnectionManagerStats& stats() const noexcept { return stats_; }
     const BridgePipeline* pipeline() const noexcept { return pipeline_.get(); }
+    uint16_t lane_index() const noexcept { return options_.lane_index; }
+    uint16_t lane_count() const noexcept { return options_.lane_count; }
 
     bool MatchesRoute(NodeId target_node,
                       const transport::RemoteTargetRoute& target) const noexcept;
 
 private:
+    friend class BridgeConnectionPool;
     friend class BridgeRuntimeDispatcher;
     friend class BridgeListenerHub;
 
     struct QueuedEgress {
         uint64_t reservation_id = 0;
+        size_t charge = 0;
         EncodedOutboundFrame frame;
         std::shared_ptr<BridgeEgressAdmission> admission;
     };
@@ -232,6 +243,7 @@ private:
     uint64_t telemetry_sequence_ = 0;
 
     mutable std::mutex egress_mutex_;
+    std::shared_ptr<detail::BridgeEgressQuota> aggregate_egress_quota_;
     std::deque<QueuedEgress> egress_queue_;
     size_t egress_bytes_ = 0;
     uint64_t next_reservation_id_ = 1;
@@ -286,6 +298,8 @@ public:
 
     Status RegisterPeer(NodeId node,
                         std::shared_ptr<BridgeConnectionManager> manager) noexcept;
+    Status RegisterPeer(NodeId node,
+                        std::shared_ptr<BridgeConnectionPool> pool) noexcept;
     Status UnregisterPeer(NodeId node) noexcept;
     Status Dispatch(const BridgeDispatchRequest& request) override;
     // Synchronous lower-level adapter used by Dispatch after unwrapping the
@@ -300,11 +314,12 @@ public:
 private:
     struct Peer {
         NodeId node;
-        std::shared_ptr<BridgeConnectionManager> manager;
+        std::shared_ptr<BridgeConnectionPool> pool;
     };
 
-    // Stable contract key. Target resource references are retained once per
-    // distinct contract; the per-publication RouteHandle is never retained.
+    // Stable contract key. Bindings remain sorted by stamp.topic_id.value.
+    // Target resource references are retained once per distinct contract; the
+    // per-publication RouteHandle is never retained.
     struct RouteBinding {
         transport::RouteStamp stamp;
         std::vector<transport::TargetRoute> targets;
@@ -359,7 +374,7 @@ struct BridgeListenerHubPumpResult {
 
 // One listener/acceptor shared by many inbound peer managers on the same driver
 // and endpoint. It consumes exactly one SessionDiscovery before dispatching the
-// connection by full expected peer identity.
+// connection by full expected peer identity and lane tuple.
 class BridgeListenerHub final {
 public:
     static Result<std::unique_ptr<BridgeListenerHub>> Create(
@@ -380,6 +395,8 @@ public:
 private:
     struct Peer {
         BridgeNodeIdentityFence identity;
+        uint16_t lane_index = 0;
+        uint16_t lane_count = 1;
         std::shared_ptr<BridgeConnectionManager> manager;
     };
     struct Pending {
@@ -400,6 +417,7 @@ private:
     bool running_ = false;
     bool driver_started_by_hub_ = false;
     std::vector<Peer> peers_;
+    size_t peer_identity_count_ = 0;
     std::vector<Pending> pending_;
     BridgeListenerHubStats stats_;
 };

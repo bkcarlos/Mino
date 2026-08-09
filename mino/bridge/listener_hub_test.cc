@@ -93,7 +93,9 @@ BridgeConnectionManagerOptions ManagerOptions(
     const transport::EndpointDescriptor& endpoint,
     BridgeNodeIdentityFence local,
     BridgeNodeIdentityFence peer,
-    bool manage_driver) {
+    bool manage_driver,
+    uint16_t lane_index = 0,
+    uint16_t lane_count = 1) {
     BridgeConnectionManagerOptions options;
     options.mode = mode;
     if (mode == BridgeConnectionMode::kConnect) {
@@ -119,6 +121,8 @@ BridgeConnectionManagerOptions ManagerOptions(
     options.pipeline.retransmit.max_entries = 32;
     options.pipeline.retransmit.max_bytes = 64 * 1024;
     options.pipeline.retransmit.max_age_ns = 30'000'000'000ull;
+    options.lane_index = lane_index;
+    options.lane_count = lane_count;
     return options;
 }
 
@@ -130,6 +134,15 @@ public:
     }
     std::vector<WireFrame> frames;
 };
+
+SourceIdentity SourceForLane(uint64_t node, uint16_t lane_index,
+                             uint16_t lane_count) {
+    for (uint64_t publisher = 1; publisher != 10'000; ++publisher) {
+        const SourceIdentity source{node, publisher, 1};
+        if (BridgeLaneFor(source, lane_count) == lane_index) return source;
+    }
+    return {};
+}
 
 WireFrame DataFrame(uint64_t node, uint64_t publisher, uint64_t sequence,
                     std::byte value) {
@@ -298,6 +311,227 @@ TEST(BridgeListenerHubTest, RoutesTwoPeersThroughOneListenerAndSharedDriver) {
     EXPECT_TRUE(hub->Shutdown().ok());
     EXPECT_EQ(server_driver->state(), transport::DriverState::kRunning);
     EXPECT_TRUE(server_driver->Shutdown().ok());
+}
+
+TEST(BridgeListenerHubTest,
+     RoutesTwoLanesOfOneIdentityThroughOneSharedListener) {
+    const transport::EndpointDescriptor endpoint = Loopback(FreePort());
+    const BridgeNodeIdentityFence server = Fence(NodeId{910}, 10);
+    const BridgeNodeIdentityFence peer = Fence(NodeId{911}, 11);
+
+    auto server_created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(server_created.ok()) << server_created.status().ToString();
+    auto server_driver =
+        std::shared_ptr<transport::TcpDriver>(std::move(*server_created));
+    ASSERT_TRUE(server_driver->Start(DriverConfig()).ok());
+    CollectingIngress inbound_lane0_ingress;
+    CollectingIngress inbound_lane1_ingress;
+    auto inbound_lane0_created = BridgeConnectionManager::Create(
+        ManagerOptions(BridgeConnectionMode::kAccepted, endpoint, server, peer,
+                       false, 0, 2),
+        server_driver, &inbound_lane0_ingress);
+    auto inbound_lane1_created = BridgeConnectionManager::Create(
+        ManagerOptions(BridgeConnectionMode::kAccepted, endpoint, server, peer,
+                       false, 1, 2),
+        server_driver, &inbound_lane1_ingress);
+    ASSERT_TRUE(inbound_lane0_created.ok())
+        << inbound_lane0_created.status().ToString();
+    ASSERT_TRUE(inbound_lane1_created.ok())
+        << inbound_lane1_created.status().ToString();
+    auto inbound_lane0 = std::shared_ptr<BridgeConnectionManager>(
+        std::move(*inbound_lane0_created));
+    auto inbound_lane1 = std::shared_ptr<BridgeConnectionManager>(
+        std::move(*inbound_lane1_created));
+    ASSERT_TRUE(inbound_lane0->Start(1).ok());
+    ASSERT_TRUE(inbound_lane1->Start(1).ok());
+
+    auto hub_created = BridgeListenerHub::Create(
+        BridgeListenerHubOptions{
+            .local_endpoint = endpoint,
+            .driver_config = DriverConfig(),
+            .manage_driver_lifecycle = false,
+            .listen_backlog = 8,
+            .max_peers = 1,
+            .max_pending_handshakes = 4,
+            .max_accepts_per_pump = 4,
+            .handshake_timeout_ns = 2'000'000'000ull,
+            .wire_limits = WireFrameLimits{
+                .max_payload_length = 4096,
+                .max_buffered_bytes = 8192,
+            },
+        },
+        server_driver);
+    ASSERT_TRUE(hub_created.ok()) << hub_created.status().ToString();
+    auto hub = std::move(*hub_created);
+    ASSERT_TRUE(hub->RegisterPeer(inbound_lane0).ok());
+    ASSERT_TRUE(hub->RegisterPeer(inbound_lane1).ok());
+    ASSERT_TRUE(hub->Start().ok());
+
+    auto connector_created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(connector_created.ok())
+        << connector_created.status().ToString();
+    auto connector_driver =
+        std::shared_ptr<transport::TcpDriver>(std::move(*connector_created));
+    ASSERT_TRUE(connector_driver->Start(DriverConfig()).ok());
+    CollectingIngress connector_lane0_ingress;
+    CollectingIngress connector_lane1_ingress;
+    auto connector_lane0_created = BridgeConnectionManager::Create(
+        ManagerOptions(BridgeConnectionMode::kConnect, endpoint, peer, server,
+                       false, 0, 2),
+        connector_driver, &connector_lane0_ingress);
+    auto connector_lane1_created = BridgeConnectionManager::Create(
+        ManagerOptions(BridgeConnectionMode::kConnect, endpoint, peer, server,
+                       false, 1, 2),
+        connector_driver, &connector_lane1_ingress);
+    ASSERT_TRUE(connector_lane0_created.ok())
+        << connector_lane0_created.status().ToString();
+    ASSERT_TRUE(connector_lane1_created.ok())
+        << connector_lane1_created.status().ToString();
+    auto connector_lane0 = std::move(*connector_lane0_created);
+    auto connector_lane1 = std::move(*connector_lane1_created);
+    ASSERT_TRUE(connector_lane0->Start(1).ok());
+    ASSERT_TRUE(connector_lane1->Start(1).ok());
+
+    uint64_t now_ns = 1;
+    const auto pump_all = [&]() -> Status {
+        now_ns += 1'000'000;
+        BridgePumpBudget budget;
+        budget.now_ns = now_ns;
+        auto connector0 = connector_lane0->Pump(budget);
+        if (!connector0.ok()) return connector0.status();
+        auto connector1 = connector_lane1->Pump(budget);
+        if (!connector1.ok()) return connector1.status();
+        auto accepted = hub->Pump(now_ns);
+        if (!accepted.ok()) return accepted.status();
+        auto inbound0 = inbound_lane0->Pump(budget);
+        if (!inbound0.ok()) return inbound0.status();
+        auto inbound1 = inbound_lane1->Pump(budget);
+        return inbound1.ok() ? Status::Ok() : inbound1.status();
+    };
+    const auto all_ready = [&] {
+        return connector_lane0->state() == BridgeConnectionState::kActive &&
+               connector_lane1->state() == BridgeConnectionState::kActive &&
+               inbound_lane0->state() == BridgeConnectionState::kActive &&
+               inbound_lane1->state() == BridgeConnectionState::kActive;
+    };
+    for (size_t i = 0; i < 4000 && !all_ready(); ++i) {
+        ASSERT_TRUE(pump_all().ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_TRUE(all_ready());
+    EXPECT_EQ(hub->stats().accepted_connections, 2u);
+    EXPECT_EQ(hub->stats().dispatched_connections, 2u);
+    EXPECT_EQ(server_driver->stats().listeners, 1u);
+
+    const SourceIdentity lane0_source = SourceForLane(peer.node_id.value, 0, 2);
+    const SourceIdentity lane1_source = SourceForLane(peer.node_id.value, 1, 2);
+    ASSERT_NE(lane0_source.node_id, 0u);
+    ASSERT_NE(lane1_source.node_id, 0u);
+    ASSERT_TRUE(QueueReliable(
+                    connector_lane0.get(),
+                    DataFrame(lane0_source.node_id,
+                              lane0_source.publisher_id, 1,
+                              std::byte{0xa0}))
+                    .ok());
+    ASSERT_TRUE(QueueReliable(
+                    connector_lane1.get(),
+                    DataFrame(lane1_source.node_id,
+                              lane1_source.publisher_id, 1,
+                              std::byte{0xa1}))
+                    .ok());
+    for (size_t i = 0;
+         i < 4000 && (inbound_lane0_ingress.frames.size() != 1 ||
+                      inbound_lane1_ingress.frames.size() != 1);
+         ++i) {
+        ASSERT_TRUE(pump_all().ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_EQ(inbound_lane0_ingress.frames.size(), 1u);
+    ASSERT_EQ(inbound_lane1_ingress.frames.size(), 1u);
+    EXPECT_EQ(inbound_lane0_ingress.frames[0].header.source_publisher_id,
+              lane0_source.publisher_id);
+    EXPECT_EQ(inbound_lane1_ingress.frames[0].header.source_publisher_id,
+              lane1_source.publisher_id);
+
+    EXPECT_TRUE(connector_lane0->Shutdown().ok());
+    EXPECT_TRUE(connector_lane1->Shutdown().ok());
+    EXPECT_TRUE(inbound_lane0->Shutdown().ok());
+    EXPECT_TRUE(inbound_lane1->Shutdown().ok());
+    EXPECT_TRUE(hub->Shutdown().ok());
+    EXPECT_TRUE(connector_driver->Shutdown().ok());
+    EXPECT_TRUE(server_driver->Shutdown().ok());
+}
+
+TEST(BridgeListenerHubTest,
+     RejectsDuplicateIncompleteMismatchedAndExcessLogicalPeers) {
+    const transport::EndpointDescriptor endpoint = Loopback(FreePort());
+    const BridgeNodeIdentityFence server = Fence(NodeId{920}, 20);
+    const BridgeNodeIdentityFence peer = Fence(NodeId{921}, 21);
+    const BridgeNodeIdentityFence other_peer = Fence(NodeId{922}, 22);
+    auto driver_created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(driver_created.ok())
+        << driver_created.status().ToString();
+    auto driver =
+        std::shared_ptr<transport::TcpDriver>(std::move(*driver_created));
+    ASSERT_TRUE(driver->Start(DriverConfig()).ok());
+    CollectingIngress ingress;
+    const auto make_manager = [&](const BridgeNodeIdentityFence& identity,
+                                  uint16_t lane_index,
+                                  uint16_t lane_count) {
+        auto created = BridgeConnectionManager::Create(
+            ManagerOptions(BridgeConnectionMode::kAccepted, endpoint, server,
+                           identity, false, lane_index, lane_count),
+            driver, &ingress);
+        EXPECT_TRUE(created.ok()) << created.status().ToString();
+        return created.ok()
+                   ? std::shared_ptr<BridgeConnectionManager>(
+                         std::move(*created))
+                   : std::shared_ptr<BridgeConnectionManager>{};
+    };
+    auto lane0 = make_manager(peer, 0, 2);
+    auto lane1 = make_manager(peer, 1, 2);
+    auto mismatched = make_manager(peer, 1, 3);
+    auto other = make_manager(other_peer, 0, 1);
+    ASSERT_NE(lane0, nullptr);
+    ASSERT_NE(lane1, nullptr);
+    ASSERT_NE(mismatched, nullptr);
+    ASSERT_NE(other, nullptr);
+
+    auto hub_created = BridgeListenerHub::Create(
+        BridgeListenerHubOptions{
+            .local_endpoint = endpoint,
+            .driver_config = DriverConfig(),
+            .manage_driver_lifecycle = false,
+            .listen_backlog = 8,
+            .max_peers = 1,
+            .max_pending_handshakes = 4,
+            .max_accepts_per_pump = 4,
+            .handshake_timeout_ns = 2'000'000'000ull,
+            .wire_limits = WireFrameLimits{
+                .max_payload_length = 4096,
+                .max_buffered_bytes = 8192,
+            },
+        },
+        driver);
+    ASSERT_TRUE(hub_created.ok()) << hub_created.status().ToString();
+    auto hub = std::move(*hub_created);
+
+    ASSERT_TRUE(hub->RegisterPeer(lane0).ok());
+    EXPECT_EQ(hub->RegisterPeer(lane0).code(), StatusCode::kAlreadyExists);
+    EXPECT_EQ(hub->RegisterPeer(mismatched).code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(hub->RegisterPeer(other).code(),
+              StatusCode::kResourceExhausted);
+    ASSERT_TRUE(hub->RegisterPeer(lane1).ok());
+    ASSERT_TRUE(hub->UnregisterPeer(peer).ok());
+    EXPECT_EQ(hub->UnregisterPeer(peer).code(), StatusCode::kNotFound);
+
+    ASSERT_TRUE(hub->RegisterPeer(lane0).ok());
+    EXPECT_EQ(hub->Start().code(), StatusCode::kInvalidArgument);
+    ASSERT_TRUE(hub->RegisterPeer(lane1).ok());
+    ASSERT_TRUE(hub->Start().ok());
+    EXPECT_TRUE(hub->Shutdown().ok());
+    EXPECT_TRUE(driver->Shutdown().ok());
 }
 
 }  // namespace

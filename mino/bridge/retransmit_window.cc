@@ -36,8 +36,12 @@ Result<std::unique_ptr<RetransmitWindow>> RetransmitWindow::Create(
             options.max_age_ns == 0) {
             return Invalid("retransmit limits must be nonzero");
         }
-        return std::unique_ptr<RetransmitWindow>(
+        auto window = std::unique_ptr<RetransmitWindow>(
             new RetransmitWindow(options));
+        window->entries_.reserve(options.max_entries);
+        window->entry_index_.reserve(options.max_entries);
+        window->source_index_.reserve(options.max_entries);
+        return window;
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
@@ -73,7 +77,8 @@ Status RetransmitWindow::Add(const SourceIdentity& source, uint64_t sequence,
         if (encoded_frame.size() > options_.max_bytes) {
             return Resource("encoded frame exceeds retransmit byte limit");
         }
-        if (Find(source, sequence) != nullptr) {
+        const EntryKey key{source, sequence};
+        if (entry_index_.contains(key)) {
             return Status::Error(StatusCode::kAlreadyExists,
                                  "retransmit entry already exists");
         }
@@ -89,7 +94,53 @@ Status RetransmitWindow::Add(const SourceIdentity& source, uint64_t sequence,
         entry.sequence = sequence;
         entry.enqueued_ns = now_ns;
         entry.frame.assign(encoded_frame.begin(), encoded_frame.end());
-        entries_.push_back(std::move(entry));
+
+        auto source_position = source_index_.end();
+        bool source_created = false;
+        bool sequence_inserted = false;
+        bool key_inserted = false;
+        try {
+            auto source_result = source_index_.try_emplace(source);
+            source_position = source_result.first;
+            source_created = source_result.second;
+            sequence_inserted =
+                source_position->second.emplace(sequence, entries_.size())
+                    .second;
+            if (!sequence_inserted) {
+                if (source_created) source_index_.erase(source_position);
+                return Status::Error(StatusCode::kAlreadyExists,
+                                     "retransmit entry already exists");
+            }
+            key_inserted =
+                entry_index_.emplace(key, entries_.size()).second;
+            if (!key_inserted) {
+                source_position->second.erase(sequence);
+                if (source_created) source_index_.erase(source_position);
+                return Status::Error(StatusCode::kAlreadyExists,
+                                     "retransmit entry already exists");
+            }
+            entries_.push_back(std::move(entry));
+        } catch (const std::bad_alloc&) {
+            if (key_inserted) entry_index_.erase(key);
+            if (sequence_inserted) {
+                source_position->second.erase(sequence);
+            }
+            if (source_created && source_position != source_index_.end() &&
+                source_position->second.empty()) {
+                source_index_.erase(source_position);
+            }
+            return Status::Error(StatusCode::kResourceExhausted);
+        } catch (const std::length_error&) {
+            if (key_inserted) entry_index_.erase(key);
+            if (sequence_inserted) {
+                source_position->second.erase(sequence);
+            }
+            if (source_created && source_position != source_index_.end() &&
+                source_position->second.empty()) {
+                source_index_.erase(source_position);
+            }
+            return Status::Error(StatusCode::kResourceExhausted);
+        }
         bytes_ += encoded_frame.size();
         return Status::Ok();
     } catch (const std::bad_alloc&) {
@@ -119,24 +170,24 @@ Result<RetransmitAckResult> RetransmitWindow::ApplyAck(
 
         RetransmitAckResult result;
         const uint64_t highest = ack.highest_contiguous_sequence.value_or(0);
-        for (size_t i = 0; i < entries_.size();) {
-            const RetransmitEntry& entry = entries_[i];
-            const bool same_source = entry.source == ack.source;
-            const bool cumulative =
-                ack.highest_contiguous_sequence.has_value() &&
-                entry.sequence <= highest;
-            const bool accepted_observed =
-                ack.disposition == AckDisposition::kAccepted &&
-                entry.sequence == ack.observed_sequence;
-            if (!same_source || (!cumulative && !accepted_observed)) {
-                ++i;
-                continue;
+        if (ack.highest_contiguous_sequence.has_value()) {
+            while (true) {
+                const auto source = source_index_.find(ack.source);
+                if (source == source_index_.end() ||
+                    source->second.empty() ||
+                    source->second.begin()->first > highest) {
+                    break;
+                }
+                RemoveAt(source->second.begin()->second, &result);
             }
-            result.removed_bytes += entry.frame.size();
-            ++result.removed_entries;
-            bytes_ -= entry.frame.size();
-            entries_.erase(entries_.begin() +
-                           static_cast<std::ptrdiff_t>(i));
+        }
+        if (ack.disposition == AckDisposition::kAccepted &&
+            ack.observed_sequence > highest) {
+            const auto observed = entry_index_.find(
+                EntryKey{ack.source, ack.observed_sequence});
+            if (observed != entry_index_.end()) {
+                RemoveAt(observed->second, &result);
+            }
         }
         if (ack.disposition == AckDisposition::kAccepted) {
             ++stats_.accepted_acks;
@@ -149,6 +200,44 @@ Result<RetransmitAckResult> RetransmitWindow::ApplyAck(
     }
 }
 
+void RetransmitWindow::RemoveAt(size_t index,
+                                RetransmitAckResult* result) noexcept {
+    const EntryKey removed_key{entries_[index].source, entries_[index].sequence};
+    const size_t removed_bytes = entries_[index].frame.size();
+    bytes_ -= removed_bytes;
+    if (result != nullptr) {
+        ++result->removed_entries;
+        result->removed_bytes += removed_bytes;
+    }
+
+    entry_index_.erase(removed_key);
+    const auto removed_source = source_index_.find(removed_key.source);
+    if (removed_source != source_index_.end()) {
+        removed_source->second.erase(removed_key.sequence);
+        if (removed_source->second.empty()) {
+            source_index_.erase(removed_source);
+        }
+    }
+
+    const size_t last = entries_.size() - 1;
+    if (index != last) {
+        entries_[index] = std::move(entries_[last]);
+        const EntryKey moved_key{entries_[index].source,
+                                 entries_[index].sequence};
+        const auto moved = entry_index_.find(moved_key);
+        if (moved != entry_index_.end()) moved->second = index;
+        const auto moved_source = source_index_.find(moved_key.source);
+        if (moved_source != source_index_.end()) {
+            const auto moved_sequence =
+                moved_source->second.find(moved_key.sequence);
+            if (moved_sequence != moved_source->second.end()) {
+                moved_sequence->second = index;
+            }
+        }
+    }
+    entries_.pop_back();
+}
+
 size_t RetransmitWindow::PurgeExpired(uint64_t now_ns) noexcept {
     size_t removed = 0;
     for (size_t i = 0; i < entries_.size();) {
@@ -157,8 +246,7 @@ size_t RetransmitWindow::PurgeExpired(uint64_t now_ns) noexcept {
             ++i;
             continue;
         }
-        bytes_ -= entries_[i].frame.size();
-        entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+        RemoveAt(i);
         ++removed;
         ++stats_.expired_entries;
     }
@@ -167,12 +255,8 @@ size_t RetransmitWindow::PurgeExpired(uint64_t now_ns) noexcept {
 
 const RetransmitEntry* RetransmitWindow::Find(
     const SourceIdentity& source, uint64_t sequence) const noexcept {
-    const auto it = std::find_if(
-        entries_.begin(), entries_.end(),
-        [&source, sequence](const RetransmitEntry& entry) {
-            return entry.source == source && entry.sequence == sequence;
-        });
-    return it == entries_.end() ? nullptr : &*it;
+    const auto found = entry_index_.find(EntryKey{source, sequence});
+    return found == entry_index_.end() ? nullptr : &entries_[found->second];
 }
 
 }  // namespace mino::bridge

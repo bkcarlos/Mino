@@ -1,6 +1,7 @@
 // Copyright 2026 The Mino Authors
 
 #include "mino/bridge/bridge_runtime/connection_manager.h"
+#include "mino/bridge/bridge_runtime/connection_pool.h"
 
 #include <gtest/gtest.h>
 
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -95,7 +97,9 @@ BridgeConnectionManagerOptions ManagerOptions(
     BridgeNodeIdentityFence local_identity,
     BridgeNodeIdentityFence expected_peer,
     bool manage_driver_lifecycle = true,
-    observability::TraceEventSink* telemetry = nullptr) {
+    observability::TraceEventSink* telemetry = nullptr,
+    uint16_t lane_index = 0,
+    uint16_t lane_count = 1) {
     BridgeConnectionManagerOptions options;
     options.mode = mode;
     if (mode == BridgeConnectionMode::kListen) {
@@ -130,7 +134,17 @@ BridgeConnectionManagerOptions ManagerOptions(
     options.pipeline.retransmit.max_age_ns = 30'000'000'000ull;
     options.pipeline.retransmit.max_entries = 32;
     options.pipeline.retransmit.max_bytes = 64 * 1024;
+    options.lane_index = lane_index;
+    options.lane_count = lane_count;
     return options;
+}
+
+SourceIdentity SourceForLane(uint16_t lane_index, uint16_t lane_count) {
+    for (uint64_t publisher_id = 1; publisher_id != 100'000; ++publisher_id) {
+        const SourceIdentity source{101, publisher_id, 103};
+        if (BridgeLaneFor(source, lane_count) == lane_index) return source;
+    }
+    return {};
 }
 
 WireFrame DataFrame(uint64_t sequence, std::byte value) {
@@ -192,7 +206,11 @@ struct ManagerPair {
     uint64_t now_ns = 1;
 };
 
-ManagerPair MakePair(bool listener_rejects_connector = false) {
+ManagerPair MakePair(bool listener_rejects_connector = false,
+                     uint16_t connector_lane_index = 0,
+                     uint16_t connector_lane_count = 1,
+                     uint16_t listener_lane_index = 0,
+                     uint16_t listener_lane_count = 1) {
     ManagerPair pair;
     const uint16_t port = FreePort();
     EXPECT_NE(port, 0);
@@ -216,12 +234,14 @@ ManagerPair MakePair(bool listener_rejects_connector = false) {
     auto connector = BridgeConnectionManager::Create(
         ManagerOptions(BridgeConnectionMode::kConnect, endpoint,
                        connector_identity, listener_identity, true,
-                       &pair.connector_telemetry),
+                       &pair.connector_telemetry, connector_lane_index,
+                       connector_lane_count),
         pair.connector_driver, &pair.connector_ingress);
     auto listener = BridgeConnectionManager::Create(
         ManagerOptions(BridgeConnectionMode::kListen, endpoint,
                        listener_identity, expected_connector, true,
-                       &pair.listener_telemetry),
+                       &pair.listener_telemetry, listener_lane_index,
+                       listener_lane_count),
         pair.listener_driver, &pair.listener_ingress);
     EXPECT_TRUE(connector.ok()) << connector.status().ToString();
     EXPECT_TRUE(listener.ok()) << listener.status().ToString();
@@ -310,6 +330,8 @@ public:
         ++calls;
         return std::vector<std::byte>{std::byte{0xaa}, std::byte{0xbb}};
     }
+
+    constexpr size_t artifact_size() const noexcept { return 2; }
 
     size_t calls = 0;
 };
@@ -444,6 +466,91 @@ Result<std::vector<std::byte>> StaleHello(uint64_t sender_epoch,
                          FlagValue(FrameFlag::kPayloadCrcPresent);
     frame.payload = std::move(payload);
     return WireFrameCodec::Encode(frame);
+}
+
+TEST(BridgeConnectionManagerTest, ValidatesLaneOptionsAndExposesTuple) {
+    auto created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto driver = std::shared_ptr<transport::TcpDriver>(std::move(*created));
+    CollectingIngress ingress;
+    const transport::EndpointDescriptor endpoint = Loopback(FreePort());
+    const BridgeNodeIdentityFence local = Fence(NodeId{111}, 1);
+    const BridgeNodeIdentityFence peer = Fence(NodeId{222}, 2);
+    const auto create = [&](uint16_t lane_index, uint16_t lane_count) {
+        return BridgeConnectionManager::Create(
+            ManagerOptions(BridgeConnectionMode::kConnect, endpoint, local,
+                           peer, false, nullptr, lane_index, lane_count),
+            driver, &ingress);
+    };
+
+    EXPECT_EQ(create(0, 0).status().code(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(create(0, kMaxBridgeLaneCount + 1).status().code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(create(2, 2).status().code(), StatusCode::kInvalidArgument);
+    auto valid = create(1, 2);
+    ASSERT_TRUE(valid.ok()) << valid.status().ToString();
+    EXPECT_EQ((*valid)->lane_index(), 1u);
+    EXPECT_EQ((*valid)->lane_count(), 2u);
+}
+
+TEST(BridgeConnectionManagerTest, RejectsDiscoveryWithWrongLaneTuple) {
+    ManagerPair pair = MakePair(false, 0, 2, 1, 2);
+    ASSERT_NE(pair.connector, nullptr);
+    ASSERT_NE(pair.listener, nullptr);
+    const Status rejected = PumpUntil(&pair, [&] {
+        return pair.connector->stats().protocol_failures != 0 ||
+               pair.listener->stats().protocol_failures != 0;
+    });
+    ASSERT_TRUE(rejected.ok()) << rejected.ToString();
+    EXPECT_NE(pair.connector->state(), BridgeConnectionState::kActive);
+    EXPECT_NE(pair.listener->state(), BridgeConnectionState::kActive);
+    EXPECT_TRUE(pair.connector->last_failure().code() ==
+                    StatusCode::kPermissionDenied ||
+                pair.listener->last_failure().code() ==
+                    StatusCode::kPermissionDenied);
+    EXPECT_TRUE(pair.connector->Shutdown().ok());
+    EXPECT_TRUE(pair.listener->Shutdown().ok());
+}
+
+TEST(BridgeConnectionManagerTest, RejectsAdoptionWithWrongLaneTuple) {
+    auto created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto driver = std::shared_ptr<transport::TcpDriver>(std::move(*created));
+    CollectingIngress ingress;
+    const transport::EndpointDescriptor endpoint = Loopback(FreePort());
+    const BridgeNodeIdentityFence local = Fence(NodeId{333}, 3);
+    const BridgeNodeIdentityFence peer = Fence(NodeId{444}, 4);
+    auto manager_created = BridgeConnectionManager::Create(
+        ManagerOptions(BridgeConnectionMode::kAccepted, endpoint, local, peer,
+                       true, nullptr, 0, 2),
+        driver, &ingress);
+    ASSERT_TRUE(manager_created.ok())
+        << manager_created.status().ToString();
+    auto manager = std::move(*manager_created);
+    ASSERT_TRUE(manager->Start(1).ok());
+
+    const Status adopted = manager->AdoptAcceptedConnection(
+        transport::ConnectionInfo{
+            .id = 123,
+            .kind = transport::TransportKind::kNetwork,
+            .is_listener = false,
+            .local_endpoint = endpoint,
+            .peer_endpoint = endpoint,
+        },
+        SessionDiscovery{
+            .session_epoch = 99,
+            .node_id = peer.node_id,
+            .process_identity = peer.process_identity,
+            .lease_epoch = peer.lease_epoch,
+            .node_config_version = peer.node_config_version,
+            .lane_index = 1,
+            .lane_count = 2,
+        },
+        2);
+    EXPECT_EQ(adopted.code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(manager->state(), BridgeConnectionState::kWaiting);
+    EXPECT_EQ(manager->connection_id(), transport::kInvalidConnectionId);
+    EXPECT_TRUE(manager->Shutdown().ok());
 }
 
 TEST(BridgeConnectionManagerTest,
@@ -759,6 +866,208 @@ TEST(BridgeRuntimeDispatcherTest,
 }
 
 TEST(BridgeRuntimeDispatcherTest,
+     SortsBindingsByTopicAndFencesOnlyMatchingRouteContracts) {
+    constexpr size_t kMaxRouteBindings = 11;
+    auto dispatcher_created =
+        BridgeRuntimeDispatcher::Create(1, {}, kMaxRouteBindings);
+    ASSERT_TRUE(dispatcher_created.ok())
+        << dispatcher_created.status().ToString();
+    auto dispatcher = *dispatcher_created;
+
+    const std::array<std::byte, 4> payload = {
+        std::byte{0x10}, std::byte{0x20}, std::byte{0x30}, std::byte{0x40}};
+    const registry::DeliveryPolicy delivery{
+        .reliability = registry::Reliability::kBestEffort,
+        .allow_drop = false,
+    };
+    const transport::TargetRoute first_target{
+        .target_node = NodeId{1},
+        .transport = transport::LocalTargetRoute{},
+    };
+    const transport::TargetRoute second_target{
+        .target_node = NodeId{2},
+        .transport = transport::LocalTargetRoute{},
+    };
+    uint64_t sequence = 1;
+    const auto dispatch = [&](uint32_t topic_value,
+                              schema::SchemaIdentity schema_identity,
+                              const transport::TargetRoute& target,
+                              uint64_t route_version_delta) {
+        BridgeDispatchRequest request{
+            .topic_id = TopicId{topic_value},
+            .schema = std::move(schema_identity),
+            .publication = LocalPublication{
+                .source = SourceIdentity{1, 2, 3},
+                .sequence_num = sequence++,
+                .timestamp_ns = 4,
+                .message_type = 5,
+            },
+            .priority = 6,
+            .canonical_payload = payload,
+            .route = {},
+        };
+        BridgeRouteContract route = RouteContract(request, delivery);
+        route.stamp.route_version += route_version_delta;
+        return dispatcher->DispatchTargets(
+            request, std::span<const transport::TargetRoute>(&target, 1),
+            route);
+    };
+
+    constexpr std::array<uint32_t, 9> kNonSortedTopics = {
+        90, 10, 70, 30, 80, 20, 60, 40, 50};
+    for (const uint32_t topic : kNonSortedTopics) {
+        const Status status = dispatch(topic, Schema(topic), first_target, 0);
+        ASSERT_TRUE(status.ok())
+            << "topic " << topic << ": " << status.ToString();
+    }
+
+    constexpr std::array<uint32_t, 3> kRevisitedTopics = {10, 50, 90};
+    for (const uint32_t topic : kRevisitedTopics) {
+        EXPECT_TRUE(dispatch(topic, Schema(topic), first_target, 0).ok())
+            << "failed to revisit topic " << topic;
+    }
+
+    EXPECT_EQ(dispatch(50, Schema(5'000), first_target, 0).code(),
+              StatusCode::kSchemaMismatch);
+    EXPECT_TRUE(dispatch(50, Schema(5'000), first_target, 1).ok());
+    EXPECT_TRUE(dispatch(50, Schema(6'000), second_target, 0).ok());
+    EXPECT_EQ(dispatch(50, Schema(6'000), first_target, 1).code(),
+              StatusCode::kSchemaMismatch);
+    EXPECT_EQ(dispatch(50, Schema(5'000), second_target, 0).code(),
+              StatusCode::kSchemaMismatch);
+
+    EXPECT_EQ(dispatch(100, Schema(100), first_target, 0).code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_EQ(dispatch(50, Schema(7'000), first_target, 2).code(),
+              StatusCode::kResourceExhausted);
+    for (const uint32_t topic : kRevisitedTopics) {
+        EXPECT_TRUE(dispatch(topic, Schema(topic), first_target, 0).ok())
+            << "full table rejected existing topic " << topic;
+    }
+}
+
+TEST(BridgeRuntimeDispatcherTest,
+     SelectsStableSourceLaneWithoutFallbackOrQueueMultiplication) {
+    auto created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto driver = std::shared_ptr<transport::TcpDriver>(std::move(*created));
+    ASSERT_TRUE(driver
+                    ->Start(transport::DriverConfig{
+                        .max_connections = 8,
+                        .max_listeners = 1,
+                        .max_queued_sends = 128,
+                    })
+                    .ok());
+    const transport::EndpointDescriptor endpoint = Loopback(FreePort());
+    const BridgeNodeIdentityFence local = Fence(NodeId{401}, 5);
+    const BridgeNodeIdentityFence peer = Fence(NodeId{402}, 6);
+    CollectingIngress ingress;
+    std::vector<std::shared_ptr<BridgeConnectionManager>> lanes;
+    for (uint16_t lane = 0; lane < 2; ++lane) {
+        BridgeConnectionManagerOptions options = ManagerOptions(
+            BridgeConnectionMode::kConnect, endpoint, local, peer, false,
+            nullptr, lane, 2);
+        options.route_driver_id = 901;
+        options.route_driver_generation = 12;
+        options.max_egress_frames = 2;
+        auto manager = BridgeConnectionManager::Create(options, driver, &ingress);
+        ASSERT_TRUE(manager.ok()) << manager.status().ToString();
+        lanes.push_back(std::shared_ptr<BridgeConnectionManager>(
+            std::move(*manager)));
+    }
+    auto pool_created = BridgeConnectionPool::Create(lanes, 2, 64 * 1024);
+    ASSERT_TRUE(pool_created.ok()) << pool_created.status().ToString();
+    auto pool = *pool_created;
+    ASSERT_TRUE(pool->Start(1).ok());
+    auto dispatcher_created = BridgeRuntimeDispatcher::Create(4);
+    ASSERT_TRUE(dispatcher_created.ok())
+        << dispatcher_created.status().ToString();
+    auto dispatcher = *dispatcher_created;
+    ASSERT_TRUE(dispatcher->RegisterPeer(peer.node_id, pool).ok());
+
+    const transport::RemoteTargetRoute remote{
+        .endpoint = endpoint,
+        .node_config_version = peer.node_config_version,
+        .process_identity = peer.process_identity,
+        .lease_epoch = peer.lease_epoch,
+        .driver_id = 901,
+        .driver_generation = 12,
+        .capabilities = driver->capabilities(),
+        .driver = driver,
+    };
+    const transport::TargetRoute target{
+        .target_node = peer.node_id,
+        .transport = remote,
+    };
+    const std::vector<std::byte> payload(16, std::byte{0x5a});
+    const registry::DeliveryPolicy reliable{
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+    };
+    for (uint16_t lane = 0; lane < 2; ++lane) {
+        const SourceIdentity source = SourceForLane(lane, 2);
+        ASSERT_NE(source.publisher_id, 0u);
+        BridgeDispatchRequest request{
+            .topic_id = TopicId{77},
+            .schema = Schema(0x7788),
+            .publication = LocalPublication{
+                .source = source,
+                .sequence_num = 1,
+                .timestamp_ns = 700,
+                .message_type = 8,
+            },
+            .priority = 3,
+            .canonical_payload = payload,
+            .route = {},
+        };
+        ASSERT_TRUE(dispatcher
+                        ->DispatchTargets(
+                            request,
+                            std::span<const transport::TargetRoute>(&target, 1),
+                            RouteContract(request, reliable))
+                        .ok());
+        EXPECT_EQ(pool->manager(lane).queued_egress_frames(), 1u);
+    }
+    EXPECT_EQ(pool->queued_egress_frames(), 2u);
+
+    const SourceIdentity lane0 = SourceForLane(0, 2);
+    BridgeDispatchRequest full{
+        .topic_id = TopicId{77},
+        .schema = Schema(0x7788),
+        .publication = LocalPublication{
+            .source = lane0,
+            .sequence_num = 2,
+            .timestamp_ns = 701,
+            .message_type = 8,
+        },
+        .priority = 3,
+        .canonical_payload = payload,
+        .route = {},
+    };
+    EXPECT_EQ(dispatcher
+                  ->DispatchTargets(
+                      full,
+                      std::span<const transport::TargetRoute>(&target, 1),
+                      RouteContract(full, reliable))
+                  .code(),
+              StatusCode::kWouldBlock);
+    EXPECT_EQ(pool->manager(0).queued_egress_frames(), 1u);
+    EXPECT_EQ(pool->manager(1).queued_egress_frames(), 1u);
+
+    ASSERT_TRUE(pool->manager(0).Shutdown().ok());
+    EXPECT_EQ(dispatcher
+                  ->DispatchTargets(
+                      full,
+                      std::span<const transport::TargetRoute>(&target, 1),
+                      RouteContract(full, reliable))
+                  .code(),
+              StatusCode::kUnavailable);
+    EXPECT_EQ(pool->manager(1).queued_egress_frames(), 1u);
+    EXPECT_TRUE(pool->Shutdown().ok());
+    EXPECT_TRUE(driver->Shutdown().ok());
+}
+
+TEST(BridgeRuntimeDispatcherTest,
      DerivesMessageTypePreflightsCapabilityAndFencesEveryRouteContract) {
     auto created = transport::TcpDriver::Create(TcpOptions());
     ASSERT_TRUE(created.ok()) << created.status().ToString();
@@ -916,10 +1225,21 @@ TEST(BridgeRuntimeDispatcherTest,
     EXPECT_EQ(descriptors->calls, 0u);
     EXPECT_EQ(manager->queued_egress_frames(), 0u);
 
+    WireFrameHeader announcement_header;
+    announcement_header.frame_type = FrameType::kSchemaAnnounce;
+    announcement_header.flags = FlagValue(FrameFlag::kControlFrame);
+    auto announcement_size = WireFrameCodec::EncodedSize(
+        announcement_header,
+        kSchemaAnnouncementFixedPayloadBytes + descriptors->artifact_size());
+    ASSERT_TRUE(announcement_size.ok())
+        << announcement_size.status().ToString();
+    ASSERT_LE(*announcement_size, std::numeric_limits<uint32_t>::max());
+
     transport::TargetRoute oversized_target = remote_target;
     auto& oversized =
         std::get<transport::RemoteTargetRoute>(oversized_target.transport);
-    oversized.capabilities.max_frame_size = 120;
+    oversized.capabilities.max_frame_size =
+        static_cast<uint32_t>(*announcement_size - 1);
     const Status too_large = dispatcher->DispatchTargets(
         request,
         std::span<const transport::TargetRoute>(&oversized_target, 1), route);
@@ -927,10 +1247,16 @@ TEST(BridgeRuntimeDispatcherTest,
     EXPECT_EQ(descriptors->calls, 1u);
     EXPECT_EQ(manager->queued_egress_frames(), 0u);
 
+    transport::TargetRoute exact_limit_target = remote_target;
+    auto& exact_limit =
+        std::get<transport::RemoteTargetRoute>(exact_limit_target.transport);
+    exact_limit.capabilities.max_frame_size =
+        static_cast<uint32_t>(*announcement_size);
     ASSERT_TRUE(dispatcher
                     ->DispatchTargets(
                         request,
-                        std::span<const transport::TargetRoute>(&remote_target, 1),
+                        std::span<const transport::TargetRoute>(
+                            &exact_limit_target, 1),
                         route)
                     .ok());
     EXPECT_EQ(descriptors->calls, 2u);

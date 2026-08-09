@@ -101,6 +101,80 @@ TEST(RetransmitWindowTest, NackRemovesCumulativePrefixAndRetainsRejectedFrame) {
     EXPECT_EQ(window->stats().nack_acks, 1u);
 }
 
+TEST(RetransmitWindowTest,
+     OutOfOrderStorageKeepsIndexesValidAcrossCumulativeSwapRemoval) {
+    auto window = MakeWindow();
+    ASSERT_NE(window, nullptr);
+    window->BeginSession(10, 20, 0);
+    const std::array<std::byte, 1> frame{std::byte{1}};
+    ASSERT_TRUE(window->Add(kSource, 30, frame, 1).ok());
+    ASSERT_TRUE(window->Add(kSource, 10, frame, 2).ok());
+    ASSERT_TRUE(window->Add(kOtherSource, 1, frame, 3).ok());
+    ASSERT_TRUE(window->Add(kSource, 20, frame, 4).ok());
+
+    auto applied = window->ApplyAck(AckPayload{
+        .sender_session_epoch = 20,
+        .receiver_session_epoch = 10,
+        .source = kSource,
+        .observed_sequence = 0,
+        .highest_contiguous_sequence = 15,
+        .disposition = AckDisposition::kAccepted,
+    });
+    ASSERT_TRUE(applied.ok()) << applied.status().ToString();
+    EXPECT_EQ(applied->removed_entries, 1u);
+    EXPECT_EQ(window->Find(kSource, 10), nullptr);
+    ASSERT_NE(window->Find(kSource, 20), nullptr);
+    ASSERT_NE(window->Find(kSource, 30), nullptr);
+    ASSERT_NE(window->Find(kOtherSource, 1), nullptr);
+    EXPECT_EQ(window->entries().size(), window->size());
+
+    applied = window->ApplyAck(AckPayload{
+        .sender_session_epoch = 20,
+        .receiver_session_epoch = 10,
+        .source = kSource,
+        .observed_sequence = 30,
+        .highest_contiguous_sequence = 20,
+        .disposition = AckDisposition::kAccepted,
+    });
+    ASSERT_TRUE(applied.ok()) << applied.status().ToString();
+    EXPECT_EQ(applied->removed_entries, 2u);
+    EXPECT_EQ(window->Find(kSource, 20), nullptr);
+    EXPECT_EQ(window->Find(kSource, 30), nullptr);
+    ASSERT_NE(window->Find(kOtherSource, 1), nullptr);
+}
+
+TEST(RetransmitWindowTest, NackAtCapacityRetiresOnlyPrefixAndFreesSlots) {
+    auto window = MakeWindow(RetransmitWindowOptions{
+        .max_entries = 3,
+        .max_bytes = 3,
+        .max_age_ns = 100,
+    });
+    ASSERT_NE(window, nullptr);
+    window->BeginSession(10, 20, 0);
+    const std::array<std::byte, 1> frame{std::byte{1}};
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+        ASSERT_TRUE(window->Add(kSource, sequence, frame, sequence).ok());
+    }
+    EXPECT_EQ(window->Add(kSource, 4, frame, 4).code(),
+              StatusCode::kResourceExhausted);
+
+    auto applied = window->ApplyAck(AckPayload{
+        .sender_session_epoch = 20,
+        .receiver_session_epoch = 10,
+        .source = kSource,
+        .observed_sequence = 3,
+        .highest_contiguous_sequence = 1,
+        .disposition = AckDisposition::kNackWithHighest,
+    });
+    ASSERT_TRUE(applied.ok()) << applied.status().ToString();
+    EXPECT_EQ(applied->removed_entries, 1u);
+    ASSERT_NE(window->Find(kSource, 2), nullptr);
+    ASSERT_NE(window->Find(kSource, 3), nullptr);
+    ASSERT_TRUE(window->Add(kSource, 4, frame, 4).ok());
+    EXPECT_EQ(window->size(), 3u);
+    EXPECT_EQ(window->bytes(), 3u);
+}
+
 TEST(RetransmitWindowTest, SessionFencingAndAgeAreBounded) {
     auto window = MakeWindow(RetransmitWindowOptions{
         .max_entries = 4,

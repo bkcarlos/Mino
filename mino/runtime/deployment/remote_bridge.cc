@@ -34,6 +34,18 @@ Status ValidateCompositionLimits(const RemoteBridgeConfig& config) {
         bridge::kWireBaseHeaderLength + kAnnouncementPayloadOverhead;
     const auto& negotiation = config.schema_negotiation;
     const auto& pipeline = config.connection.pipeline;
+    if (config.tcp_lane_count == 0 ||
+        config.tcp_lane_count > bridge::kMaxBridgeLaneCount ||
+        config.connection.lane_index != 0 ||
+        config.connection.lane_count != 1) {
+        return Invalid("remote Bridge TCP lane configuration is invalid");
+    }
+    if (config.connection.mode ==
+            bridge::BridgeConnectionMode::kAccepted ||
+        config.connection.driver_config.max_connections <
+            config.tcp_lane_count) {
+        return Invalid("remote Bridge mode or connection capacity is invalid");
+    }
     if (negotiation.max_control_frame_bytes < kAnnouncementBodyOverhead) {
         return Invalid("remote Bridge schema control frame limit is too small");
     }
@@ -59,35 +71,41 @@ Status ValidateCompositionLimits(const RemoteBridgeConfig& config) {
 
 Result<capacity::ResourceVector> EstimateRemoteBridgeResources(
     const RemoteBridgeConfig& config) noexcept {
+    MINO_RETURN_IF_ERROR(ValidateCompositionLimits(config));
     capacity::ResourceVector resources;
-    resources.bridge_connections = 1;
-    resources.threads = 1;  // TcpDriver worker.
+    resources.bridge_connections = config.tcp_lane_count;
+    resources.threads = 1;  // One shared TcpDriver worker.
 
     capacity::ResourceVector egress;
+    // Application egress and TCP driver buffers are shared by the logical peer
+    // and therefore charged once, not once per lane.
     egress.bridge_egress_bytes = config.connection.max_egress_bytes;
-    capacity::ResourceVector tcp_egress;
-    tcp_egress.bridge_egress_bytes = config.tcp.max_total_send_buffer_bytes;
     MINO_ASSIGN_OR_RETURN(resources,
                           capacity::CheckedAdd(resources, egress));
+    egress.bridge_egress_bytes = config.tcp.max_total_send_buffer_bytes;
     MINO_ASSIGN_OR_RETURN(resources,
-                          capacity::CheckedAdd(resources, tcp_egress));
-    egress = {};
+                          capacity::CheckedAdd(resources, egress));
     egress.bridge_egress_bytes = config.tcp.max_control_send_buffer_bytes;
     MINO_ASSIGN_OR_RETURN(resources,
                           capacity::CheckedAdd(resources, egress));
-    egress.bridge_egress_bytes = config.connection.pipeline.retransmit.max_bytes;
-    MINO_ASSIGN_OR_RETURN(resources,
-                          capacity::CheckedAdd(resources, egress));
 
-    capacity::ResourceVector schema_buffers;
-    schema_buffers.schema_buffer_bytes =
-        config.schema_negotiation.max_buffered_bytes;
-    MINO_ASSIGN_OR_RETURN(resources,
-                          capacity::CheckedAdd(resources, schema_buffers));
-    schema_buffers.schema_buffer_bytes =
-        config.schema_negotiation.max_descriptor_bytes;
-    MINO_ASSIGN_OR_RETURN(resources,
-                          capacity::CheckedAdd(resources, schema_buffers));
+    // Retransmit and schema state are connection-local and must be charged for
+    // every lane.
+    for (uint16_t lane = 0; lane < config.tcp_lane_count; ++lane) {
+        egress.bridge_egress_bytes =
+            config.connection.pipeline.retransmit.max_bytes;
+        MINO_ASSIGN_OR_RETURN(resources,
+                              capacity::CheckedAdd(resources, egress));
+        capacity::ResourceVector schema_buffers;
+        schema_buffers.schema_buffer_bytes =
+            config.schema_negotiation.max_buffered_bytes;
+        MINO_ASSIGN_OR_RETURN(resources,
+                              capacity::CheckedAdd(resources, schema_buffers));
+        schema_buffers.schema_buffer_bytes =
+            config.schema_negotiation.max_descriptor_bytes;
+        MINO_ASSIGN_OR_RETURN(resources,
+                              capacity::CheckedAdd(resources, schema_buffers));
+    }
 
     capacity::ResourceVector descriptors;
     descriptors.file_descriptors = config.connection.driver_config.max_connections;
@@ -161,25 +179,80 @@ Result<std::unique_ptr<RemoteBridge>> RemoteBridge::Create(
         MINO_RETURN_IF_ERROR(store->HydrateRegistry());
         auto persistence =
             std::make_unique<StorePersistence>(store.get());
-        auto negotiator = std::make_unique<bridge::SchemaNegotiator>(
-            registry.get(), descriptor_auth.get(), persistence.get(),
-            config.schema_negotiation);
         MINO_ASSIGN_OR_RETURN(auto created_driver,
                               transport::TcpDriver::Create(config.tcp));
         auto driver =
             std::shared_ptr<transport::TcpDriver>(std::move(created_driver));
-        config.connection.manage_driver_lifecycle = true;
+
+        const bridge::BridgeConnectionMode configured_mode =
+            config.connection.mode;
+        std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators;
+        std::vector<std::shared_ptr<bridge::BridgeConnectionManager>> managers;
+        negotiators.reserve(config.tcp_lane_count);
+        managers.reserve(config.tcp_lane_count);
+        for (uint16_t lane = 0; lane < config.tcp_lane_count; ++lane) {
+            auto negotiator = std::make_unique<bridge::SchemaNegotiator>(
+                registry.get(), descriptor_auth.get(), persistence.get(),
+                config.schema_negotiation);
+            bridge::BridgeConnectionManagerOptions lane_options =
+                config.connection;
+            lane_options.manage_driver_lifecycle = false;
+            lane_options.lane_index = lane;
+            lane_options.lane_count = config.tcp_lane_count;
+            if (configured_mode == bridge::BridgeConnectionMode::kListen) {
+                lane_options.mode = bridge::BridgeConnectionMode::kAccepted;
+            }
+            MINO_ASSIGN_OR_RETURN(
+                auto manager,
+                bridge::BridgeConnectionManager::Create(
+                    std::move(lane_options), driver, ingress,
+                    negotiator.get()));
+            negotiators.push_back(std::move(negotiator));
+            managers.push_back(
+                std::shared_ptr<bridge::BridgeConnectionManager>(
+                    std::move(manager)));
+        }
         MINO_ASSIGN_OR_RETURN(
-            auto manager,
-            bridge::BridgeConnectionManager::Create(
-                std::move(config.connection), driver, ingress,
-                negotiator.get()));
+            auto pool,
+            bridge::BridgeConnectionPool::Create(
+                managers, config.connection.max_egress_frames,
+                config.connection.max_egress_bytes));
+
+        std::unique_ptr<bridge::BridgeListenerHub> listener_hub;
+        if (configured_mode == bridge::BridgeConnectionMode::kListen) {
+            if (!config.connection.local_endpoint.has_value()) {
+                return Invalid("remote Bridge listener has no local endpoint");
+            }
+            MINO_ASSIGN_OR_RETURN(
+                listener_hub,
+                bridge::BridgeListenerHub::Create(
+                    bridge::BridgeListenerHubOptions{
+                        .local_endpoint = *config.connection.local_endpoint,
+                        .driver_config = config.connection.driver_config,
+                        .manage_driver_lifecycle = false,
+                        .listen_backlog = config.connection.listen_backlog,
+                        .max_peers = 1,
+                        .max_pending_handshakes = std::max<size_t>(
+                            config.tcp_lane_count,
+                            config.connection.listen_backlog),
+                        .max_accepts_per_pump = config.tcp_lane_count,
+                        .handshake_timeout_ns =
+                            config.connection.handshake_timeout_ns,
+                        .wire_limits = config.connection.pipeline.wire_limits,
+                    },
+                    driver));
+            for (const auto& manager : managers) {
+                MINO_RETURN_IF_ERROR(listener_hub->RegisterPeer(manager));
+            }
+        }
+
         MINO_ASSIGN_OR_RETURN(auto capacity_lease,
                               capacity_reservation.Commit());
         return std::unique_ptr<RemoteBridge>(new RemoteBridge(
             std::move(capacity_lease), std::move(registry), std::move(store),
             std::move(descriptor_auth), std::move(persistence),
-            std::move(negotiator), std::move(driver), std::move(manager)));
+            std::move(negotiators), std::move(driver), std::move(pool),
+            std::move(listener_hub), config.connection.driver_config));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted,
                              "remote Bridge composition allocation failed");
@@ -195,36 +268,81 @@ RemoteBridge::RemoteBridge(
     std::unique_ptr<storage::SchemaStore> store,
     std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
     std::unique_ptr<StorePersistence> persistence,
-    std::unique_ptr<bridge::SchemaNegotiator> negotiator,
+    std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators,
     std::shared_ptr<transport::TcpDriver> driver,
-    std::unique_ptr<bridge::BridgeConnectionManager> manager) noexcept
+    std::shared_ptr<bridge::BridgeConnectionPool> pool,
+    std::unique_ptr<bridge::BridgeListenerHub> listener_hub,
+    transport::DriverConfig driver_config) noexcept
     : capacity_lease_(std::move(capacity_lease)),
       registry_(std::move(registry)),
       store_(std::move(store)),
       descriptor_auth_(std::move(descriptor_auth)),
       persistence_(std::move(persistence)),
-      negotiator_(std::move(negotiator)),
+      negotiators_(std::move(negotiators)),
       driver_(std::move(driver)),
-      manager_(std::move(manager)) {}
+      pool_(std::move(pool)),
+      listener_hub_(std::move(listener_hub)),
+      driver_config_(driver_config) {}
 
 RemoteBridge::~RemoteBridge() { static_cast<void>(Shutdown()); }
 
 Status RemoteBridge::Start(uint64_t now_ns) noexcept {
-    return manager_->Start(now_ns);
+    if (started_) {
+        return Status::Error(StatusCode::kAlreadyExists,
+                             "remote Bridge is already started");
+    }
+    MINO_RETURN_IF_ERROR(driver_->Start(driver_config_));
+    const Status pool_started = pool_->Start(now_ns);
+    if (!pool_started.ok()) {
+        static_cast<void>(driver_->Shutdown());
+        return pool_started;
+    }
+    if (listener_hub_ != nullptr) {
+        const Status listener_started = listener_hub_->Start();
+        if (!listener_started.ok()) {
+            static_cast<void>(pool_->Shutdown());
+            static_cast<void>(driver_->Shutdown());
+            return listener_started;
+        }
+    }
+    started_ = true;
+    return Status::Ok();
 }
 
 Result<bridge::BridgeConnectionPumpResult> RemoteBridge::Pump(
     bridge::BridgePumpBudget budget) noexcept {
-    return manager_->Pump(budget);
+    if (!started_) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "remote Bridge is not started");
+    }
+    if (listener_hub_ != nullptr) {
+        auto accepted = listener_hub_->Pump(budget.now_ns);
+        if (!accepted.ok()) return accepted.status();
+    }
+    return pool_->Pump(budget);
 }
 
-Status RemoteBridge::Shutdown() noexcept { return manager_->Shutdown(); }
+Status RemoteBridge::Shutdown() noexcept {
+    Status first = Status::Ok();
+    if (listener_hub_ != nullptr) {
+        const Status stopped = listener_hub_->Shutdown();
+        if (!stopped.ok()) first = stopped;
+    }
+    const Status pool_stopped = pool_->Shutdown();
+    if (first.ok() && !pool_stopped.ok()) first = pool_stopped;
+    if (driver_->state() != transport::DriverState::kStopped) {
+        const Status driver_stopped = driver_->Shutdown();
+        if (first.ok() && !driver_stopped.ok()) first = driver_stopped;
+    }
+    started_ = false;
+    return first;
+}
 
 Result<std::vector<schema::SchemaHandle>>
 RemoteBridge::RegisterLocalDescriptor(
     std::span<const std::byte> descriptor_artifact) noexcept {
     try {
-        if (manager_->state() != bridge::BridgeConnectionState::kStopped) {
+        if (pool_->state() != bridge::BridgeConnectionState::kStopped) {
             return Status::Error(
                 StatusCode::kUnavailable,
                 "local descriptors must be registered before Bridge Start");
@@ -296,7 +414,7 @@ Status RemoteBridge::Enqueue(bridge::WireFrame frame,
         frame.header.msg_type = static_cast<uint32_t>(identity.short_id());
         frame.header.schema_version = identity.schema_version();
         frame.header.layout_version = identity.layout_version();
-        return manager_->Enqueue(bridge::EncodedOutboundFrame{
+        return pool_->Enqueue(bridge::EncodedOutboundFrame{
             .frame = std::move(frame),
             .reliability = reliability,
             .allow_drop = allow_drop,

@@ -84,6 +84,28 @@ std::span<const std::byte> Bytes(std::string_view value) {
     return std::as_bytes(std::span<const char>(value.data(), value.size()));
 }
 
+bridge::SourceIdentity SourceForLane(uint16_t lane_index,
+                                     uint16_t lane_count) {
+    for (uint64_t publisher_id = 1; publisher_id != 100'000; ++publisher_id) {
+        const bridge::SourceIdentity source{101, publisher_id, 7001};
+        if (bridge::BridgeLaneFor(source, lane_count) == lane_index) {
+            return source;
+        }
+    }
+    return {};
+}
+
+bridge::WireFrame FrameFor(const bridge::SourceIdentity& source,
+                           uint64_t sequence) {
+    bridge::WireFrame frame;
+    frame.header.source_node_id = source.node_id;
+    frame.header.source_publisher_id = source.publisher_id;
+    frame.header.source_publisher_epoch = source.publisher_epoch;
+    frame.header.sequence_num = sequence;
+    frame.payload = {std::byte{0x5a}};
+    return frame;
+}
+
 std::filesystem::path StoreRoot() {
     static std::atomic<uint64_t> sequence{0};
     const char* test_tmpdir = std::getenv("TEST_TMPDIR");
@@ -166,6 +188,114 @@ TEST(RemoteBridgeTest, HydratesRegistryFromDurableSchemaStore) {
     EXPECT_EQ((*created)->schema_store().size(), 1u);
     EXPECT_EQ((*created)->schema_registry().size(), 1u);
     EXPECT_TRUE((*created)->schema_registry().Find(artifact->identity).ok());
+}
+
+TEST(RemoteBridgeTest,
+     MultiLanePinsSourcesAndSharesOneLogicalEgressQuota) {
+    const std::filesystem::path root = StoreRoot();
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    auto artifact = CompileArtifact(
+        "option schema_version = \"1.0\"; package deployment; "
+        "message LaneData { uint64 value = 1; }");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+
+    RemoteBridgeConfig config = Config(root);
+    config.tcp_lane_count = 2;
+    config.connection.max_egress_frames = 2;
+    SinkIngress ingress;
+    auto auth = std::make_shared<AcceptingAuth>();
+    auto created = RemoteBridge::Create(config, &ingress, auth);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto bridge = std::move(*created);
+    ASSERT_EQ(bridge->tcp_lane_count(), 2u);
+    EXPECT_EQ(bridge->manager(0).lane_index(), 0u);
+    EXPECT_EQ(bridge->manager(1).lane_index(), 1u);
+    EXPECT_EQ(bridge->manager(0).lane_count(), 2u);
+    EXPECT_EQ(bridge->manager(1).lane_count(), 2u);
+    ASSERT_TRUE(
+        bridge->RegisterLocalDescriptor(Bytes(artifact->bytes)).ok());
+    ASSERT_TRUE(bridge->Start(1).ok());
+
+    const bridge::SourceIdentity lane0 = SourceForLane(0, 2);
+    const bridge::SourceIdentity lane1 = SourceForLane(1, 2);
+    ASSERT_NE(lane0.publisher_id, 0u);
+    ASSERT_NE(lane1.publisher_id, 0u);
+    ASSERT_TRUE(bridge
+                    ->Enqueue(FrameFor(lane0, 1), artifact->identity,
+                              registry::Reliability::kReliableOrdered)
+                    .ok());
+    ASSERT_TRUE(bridge
+                    ->Enqueue(FrameFor(lane1, 1), artifact->identity,
+                              registry::Reliability::kReliableOrdered)
+                    .ok());
+    EXPECT_EQ(bridge->manager(0).queued_egress_frames(), 1u);
+    EXPECT_EQ(bridge->manager(1).queued_egress_frames(), 1u);
+    EXPECT_EQ(bridge->connection_pool().queued_egress_frames(), 2u);
+
+    EXPECT_EQ(bridge
+                  ->Enqueue(FrameFor(lane0, 2), artifact->identity,
+                            registry::Reliability::kReliableOrdered)
+                  .code(),
+              StatusCode::kWouldBlock);
+    EXPECT_EQ(bridge->manager(0)
+                  .Enqueue(bridge::EncodedOutboundFrame{
+                      .frame = FrameFor(lane1, 2),
+                      .reliability =
+                          registry::Reliability::kReliableOrdered,
+                      .allow_drop = false,
+                      .schema_identity = artifact->identity,
+                      .descriptor_artifact = std::vector<std::byte>(
+                          Bytes(artifact->bytes).begin(),
+                          Bytes(artifact->bytes).end()),
+                  })
+                  .code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(bridge->manager(0).queued_egress_frames(), 1u);
+    EXPECT_TRUE(bridge->Shutdown().ok());
+    std::filesystem::remove_all(root, ignored);
+}
+
+TEST(RemoteBridgeTest, RejectsInvalidTcpLaneConfiguration) {
+    const std::filesystem::path root = StoreRoot();
+    SinkIngress ingress;
+    auto auth = std::make_shared<AcceptingAuth>();
+
+    RemoteBridgeConfig zero = Config(root);
+    zero.tcp_lane_count = 0;
+    EXPECT_EQ(RemoteBridge::Create(zero, &ingress, auth).status().code(),
+              StatusCode::kInvalidArgument);
+    RemoteBridgeConfig excessive = Config(root);
+    excessive.tcp_lane_count = bridge::kMaxBridgeLaneCount + 1;
+    EXPECT_EQ(RemoteBridge::Create(excessive, &ingress, auth).status().code(),
+              StatusCode::kInvalidArgument);
+    RemoteBridgeConfig conflicting = Config(root);
+    conflicting.connection.lane_count = 2;
+    EXPECT_EQ(RemoteBridge::Create(conflicting, &ingress, auth).status().code(),
+              StatusCode::kInvalidArgument);
+}
+
+TEST(RemoteBridgeTest, CapacityScalesOnlyConnectionLocalLaneState) {
+    const std::filesystem::path root = StoreRoot();
+    RemoteBridgeConfig single = Config(root);
+    RemoteBridgeConfig four = single;
+    four.tcp_lane_count = 4;
+    auto single_estimate = EstimateRemoteBridgeResources(single);
+    auto four_estimate = EstimateRemoteBridgeResources(four);
+    ASSERT_TRUE(single_estimate.ok()) << single_estimate.status().ToString();
+    ASSERT_TRUE(four_estimate.ok()) << four_estimate.status().ToString();
+    EXPECT_EQ(single_estimate->bridge_connections, 1u);
+    EXPECT_EQ(four_estimate->bridge_connections, 4u);
+    EXPECT_EQ(four_estimate->threads, single_estimate->threads);
+    EXPECT_EQ(
+        four_estimate->bridge_egress_bytes -
+            single_estimate->bridge_egress_bytes,
+        3 * single.connection.pipeline.retransmit.max_bytes);
+    EXPECT_EQ(
+        four_estimate->schema_buffer_bytes -
+            single_estimate->schema_buffer_bytes,
+        3 * (single.schema_negotiation.max_buffered_bytes +
+             single.schema_negotiation.max_descriptor_bytes));
 }
 
 TEST(RemoteBridgeTest, RejectsIncompatibleCompositionLimits) {

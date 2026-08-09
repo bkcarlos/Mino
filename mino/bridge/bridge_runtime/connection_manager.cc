@@ -8,9 +8,11 @@
 #include <limits>
 #include <new>
 #include <random>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 
+#include "mino/bridge/bridge_runtime/connection_pool.h"
 #include "mino/schema/canonical.h"
 
 namespace mino::bridge {
@@ -31,6 +33,11 @@ Status Exhausted(const char* message) {
 bool IsWouldBlock(const Status& status) noexcept {
     return status.code() == StatusCode::kWouldBlock ||
            status.code() == StatusCode::kTimeout;
+}
+
+bool ValidLane(uint16_t lane_index, uint16_t lane_count) noexcept {
+    return lane_count != 0 && lane_count <= kMaxBridgeLaneCount &&
+           lane_index < lane_count;
 }
 
 bool IsPeerProtocolFailure(const Status& status) noexcept {
@@ -104,6 +111,49 @@ WireFrame ControlFrame(FrameType type, std::vector<std::byte> payload = {}) {
     return frame;
 }
 
+Result<size_t> LargestOutboundBodySize(
+    const EncodedOutboundFrame& frame,
+    const WireFrameLimits& wire_limits) noexcept {
+    try {
+        MINO_ASSIGN_OR_RETURN(
+            size_t largest_body,
+            WireFrameCodec::EncodedSize(frame.frame, wire_limits));
+        if (!frame.schema_identity.has_value()) return largest_body;
+
+        const schema::SchemaIdentity& identity = *frame.schema_identity;
+        if (identity.short_id() !=
+            schema::DigestShortId(identity.canonical_digest())) {
+            return Status::Error(
+                StatusCode::kSchemaMismatch,
+                "schema short ID does not match canonical digest");
+        }
+        const size_t artifact_size = frame.descriptor_artifact.size();
+        if (artifact_size > std::numeric_limits<uint32_t>::max()) {
+            return Exhausted(
+                "descriptor artifact cannot be represented on wire");
+        }
+        if (artifact_size > std::numeric_limits<size_t>::max() -
+                                kSchemaAnnouncementFixedPayloadBytes) {
+            return Exhausted("schema announcement size overflows size_t");
+        }
+
+        WireFrameHeader announcement_header;
+        announcement_header.frame_type = FrameType::kSchemaAnnounce;
+        announcement_header.flags = FlagValue(FrameFlag::kControlFrame);
+        MINO_ASSIGN_OR_RETURN(
+            const size_t announcement_body,
+            WireFrameCodec::EncodedSize(
+                announcement_header,
+                kSchemaAnnouncementFixedPayloadBytes + artifact_size,
+                wire_limits));
+        return std::max(largest_body, announcement_body);
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
+
 }  // namespace
 
 Result<std::unique_ptr<BridgeConnectionManager>>
@@ -137,7 +187,8 @@ BridgeConnectionManager::Create(
             options.max_reconnect_backoff_ns <
                 options.initial_reconnect_backoff_ns ||
             options.health_probe_interval_ns == 0 ||
-            options.max_egress_frames == 0 || options.max_egress_bytes == 0) {
+            options.max_egress_frames == 0 || options.max_egress_bytes == 0 ||
+            !ValidLane(options.lane_index, options.lane_count)) {
             return Invalid("bridge connection limits are invalid");
         }
         if (options.mode == BridgeConnectionMode::kConnect &&
@@ -327,11 +378,15 @@ Status BridgeConnectionManager::AdoptAcceptedConnection(
         .lease_epoch = peer_discovery.lease_epoch,
         .node_config_version = peer_discovery.node_config_version,
     };
-    if (actual != options_.expected_peer || peer_discovery.session_epoch == 0) {
-        return Status::Error(StatusCode::kPermissionDenied,
-                             "accepted bridge peer identity fencing failed");
+    if (actual != options_.expected_peer || peer_discovery.session_epoch == 0 ||
+        peer_discovery.lane_index != options_.lane_index ||
+        peer_discovery.lane_count != options_.lane_count) {
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "accepted bridge peer identity or lane fencing failed");
     }
     MINO_RETURN_IF_ERROR(BeginConnection(std::move(connection), now_ns));
+    ++stats_.accepted_connections;
     adopted_discovery_ = peer_discovery;
     return Status::Ok();
 }
@@ -346,6 +401,8 @@ Status BridgeConnectionManager::SendDiscoveryHello() noexcept {
             .lease_epoch = options_.local_identity.lease_epoch,
             .node_config_version =
                 options_.local_identity.node_config_version,
+            .lane_index = options_.lane_index,
+            .lane_count = options_.lane_count,
         }));
     MINO_ASSIGN_OR_RETURN(
         auto encoded,
@@ -397,9 +454,12 @@ BridgeConnectionManager::PollDiscoveryHello() noexcept {
         .lease_epoch = discovery.lease_epoch,
         .node_config_version = discovery.node_config_version,
     };
-    if (actual != options_.expected_peer) {
-        return Status::Error(StatusCode::kPermissionDenied,
-                             "bridge discovery peer identity fencing failed");
+    if (actual != options_.expected_peer ||
+        discovery.lane_index != options_.lane_index ||
+        discovery.lane_count != options_.lane_count) {
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "bridge discovery peer identity or lane fencing failed");
     }
     return std::optional<SessionDiscovery>{std::move(discovery)};
 }
@@ -412,6 +472,8 @@ Status BridgeConnectionManager::CompleteHandshake(uint64_t remote_epoch,
     BridgePipelineOptions pipeline_options = options_.pipeline;
     pipeline_options.local_session_epoch = local_session_epoch_;
     pipeline_options.remote_session_epoch = remote_epoch;
+    pipeline_options.lane_index = options_.lane_index;
+    pipeline_options.lane_count = options_.lane_count;
     if (pipeline_ == nullptr) {
         MINO_ASSIGN_OR_RETURN(
             pipeline_,
@@ -695,6 +757,10 @@ Status BridgeConnectionManager::Shutdown() noexcept {
         std::lock_guard lock(egress_mutex_);
         stats_.discarded_egress_frames += egress_queue_.size();
         stats_.discarded_egress_bytes += egress_bytes_;
+        if (aggregate_egress_quota_ != nullptr) {
+            aggregate_egress_quota_->Release(egress_queue_.size(),
+                                             egress_bytes_);
+        }
         egress_queue_.clear();
         egress_bytes_ = 0;
     }
@@ -727,6 +793,18 @@ Status BridgeConnectionManager::ValidateOutboundSize(
     if (frame.frame.header.frame_type != FrameType::kData) {
         return Invalid("bridge egress only accepts data frames");
     }
+    const SourceIdentity source{
+        .node_id = frame.frame.header.source_node_id,
+        .publisher_id = frame.frame.header.source_publisher_id,
+        .publisher_epoch = frame.frame.header.source_publisher_epoch,
+    };
+    if (source.node_id == 0 || source.publisher_id == 0 ||
+        source.publisher_epoch == 0) {
+        return Invalid("bridge egress source identity is incomplete");
+    }
+    if (BridgeLaneFor(source, options_.lane_count) != options_.lane_index) {
+        return Invalid("bridge egress source belongs to another lane");
+    }
     if (frame.reliability == registry::Reliability::kReliableOrdered &&
         !driver_->capabilities().features.Has(
             transport::Capability::kRemoteAcceptedConfirmation)) {
@@ -735,23 +813,8 @@ Status BridgeConnectionManager::ValidateOutboundSize(
             "reliable bridge egress lacks remote-ACK capability");
     }
     MINO_ASSIGN_OR_RETURN(
-        auto data_body,
-        WireFrameCodec::Encode(frame.frame, options_.pipeline.wire_limits));
-    size_t largest_body = data_body.size();
-    if (frame.schema_identity.has_value()) {
-        MINO_ASSIGN_OR_RETURN(
-            auto announcement_payload,
-            SchemaControlCodec::EncodeAnnouncement(SchemaAnnouncement(
-                1, *frame.schema_identity, frame.descriptor_artifact)));
-        WireFrame announcement = ControlFrame(
-            FrameType::kSchemaAnnounce, std::move(announcement_payload));
-        announcement.header.flags = FlagValue(FrameFlag::kControlFrame);
-        MINO_ASSIGN_OR_RETURN(
-            auto control_body,
-            WireFrameCodec::Encode(announcement,
-                                   options_.pipeline.wire_limits));
-        largest_body = std::max(largest_body, control_body.size());
-    }
+        const size_t largest_body,
+        LargestOutboundBodySize(frame, options_.pipeline.wire_limits));
 
     const uint32_t route_limit = route_capabilities.max_frame_size;
     const uint32_t live_limit = driver_->capabilities().max_frame_size;
@@ -770,19 +833,30 @@ Status BridgeConnectionManager::ValidateOutboundSize(
 Result<uint64_t> BridgeConnectionManager::ReserveEgress(
     EncodedOutboundFrame frame,
     std::shared_ptr<BridgeEgressAdmission> admission) noexcept {
+    const size_t charge = FrameCharge(frame);
+    bool aggregate_reserved = false;
     try {
         MINO_RETURN_IF_ERROR(
             ValidateOutboundSize(frame, driver_->capabilities()));
-        const size_t charge = FrameCharge(frame);
+        if (aggregate_egress_quota_ != nullptr) {
+            MINO_RETURN_IF_ERROR(aggregate_egress_quota_->Reserve(1, charge));
+            aggregate_reserved = true;
+        }
         std::lock_guard lock(egress_mutex_);
         const BridgeConnectionState state =
             state_.load(std::memory_order_acquire);
         if (state == BridgeConnectionState::kStopped ||
             state == BridgeConnectionState::kShuttingDown) {
+            if (aggregate_reserved) {
+                aggregate_egress_quota_->Release(1, charge);
+            }
             return Unavailable("bridge egress is not accepting messages");
         }
         if (egress_queue_.size() >= options_.max_egress_frames ||
             charge > options_.max_egress_bytes - egress_bytes_) {
+            if (aggregate_reserved) {
+                aggregate_egress_quota_->Release(1, charge);
+            }
             return Status::Error(StatusCode::kWouldBlock,
                                  "bridge egress queue is full");
         }
@@ -790,12 +864,14 @@ Result<uint64_t> BridgeConnectionManager::ReserveEgress(
         if (reservation_id == 0) reservation_id = next_reservation_id_++;
         egress_queue_.push_back(QueuedEgress{
             .reservation_id = reservation_id,
+            .charge = charge,
             .frame = std::move(frame),
             .admission = std::move(admission),
         });
         egress_bytes_ += charge;
         return reservation_id;
     } catch (const std::bad_alloc&) {
+        if (aggregate_reserved) aggregate_egress_quota_->Release(1, charge);
         return Exhausted("bridge egress allocation failed");
     }
 }
@@ -814,7 +890,10 @@ void BridgeConnectionManager::CancelEgressReservation(
             return queued.reservation_id == reservation_id;
         });
     if (found == egress_queue_.end()) return;
-    egress_bytes_ -= FrameCharge(found->frame);
+    egress_bytes_ -= found->charge;
+    if (aggregate_egress_quota_ != nullptr) {
+        aggregate_egress_quota_->Release(1, found->charge);
+    }
     egress_queue_.erase(found);
 }
 
@@ -829,7 +908,11 @@ BridgeConnectionManager::TryPeekAndEncode() {
     }
     while (!egress_queue_.empty() && egress_queue_.front().admission != nullptr &&
            egress_queue_.front().admission->rolled_back()) {
-        egress_bytes_ -= FrameCharge(egress_queue_.front().frame);
+        egress_bytes_ -= egress_queue_.front().charge;
+        if (aggregate_egress_quota_ != nullptr) {
+            aggregate_egress_quota_->Release(1,
+                                             egress_queue_.front().charge);
+        }
         egress_queue_.pop_front();
     }
     if (egress_queue_.empty()) {
@@ -850,7 +933,10 @@ BridgeConnectionManager::TryPeekAndEncode() {
 void BridgeConnectionManager::CommitPolled() noexcept {
     std::lock_guard lock(egress_mutex_);
     if (egress_queue_.empty()) return;
-    egress_bytes_ -= FrameCharge(egress_queue_.front().frame);
+    egress_bytes_ -= egress_queue_.front().charge;
+    if (aggregate_egress_quota_ != nullptr) {
+        aggregate_egress_quota_->Release(1, egress_queue_.front().charge);
+    }
     egress_queue_.pop_front();
 }
 
@@ -911,7 +997,15 @@ BridgeRuntimeDispatcher::BridgeRuntimeDispatcher(
 
 Status BridgeRuntimeDispatcher::RegisterPeer(
     NodeId node, std::shared_ptr<BridgeConnectionManager> manager) noexcept {
-    if (node.value == 0 || manager == nullptr) {
+    auto pool = BridgeConnectionPool::WrapSingle(std::move(manager));
+    if (!pool.ok()) return pool.status();
+    return RegisterPeer(node, std::move(*pool));
+}
+
+Status BridgeRuntimeDispatcher::RegisterPeer(
+    NodeId node, std::shared_ptr<BridgeConnectionPool> pool) noexcept {
+    if (node.value == 0 || pool == nullptr || pool->lane_count() == 0 ||
+        pool->manager(0).options_.expected_peer.node_id != node) {
         return Invalid("bridge dispatcher peer is incomplete");
     }
     try {
@@ -926,7 +1020,7 @@ Status BridgeRuntimeDispatcher::RegisterPeer(
         if (peers_.size() >= max_peers_) {
             return Exhausted("bridge dispatcher peer table is full");
         }
-        peers_.push_back(Peer{.node = node, .manager = std::move(manager)});
+        peers_.push_back(Peer{.node = node, .pool = std::move(pool)});
         return Status::Ok();
     } catch (const std::bad_alloc&) {
         return Exhausted("bridge dispatcher peer allocation failed");
@@ -998,9 +1092,20 @@ Status BridgeRuntimeDispatcher::ValidateAndBindRoute(
     };
 
     std::lock_guard lock(route_bindings_mutex_);
-    const auto existing = std::find_if(route_bindings_.begin(),
-                                       route_bindings_.end(), contract_matches);
-    if (existing != route_bindings_.end()) {
+    const uint64_t topic_id = route.stamp.topic_id.value;
+    const auto topic_begin = std::lower_bound(
+        route_bindings_.begin(), route_bindings_.end(), topic_id,
+        [](const RouteBinding& binding, uint64_t value) {
+            return binding.stamp.topic_id.value < value;
+        });
+    const auto topic_end = std::upper_bound(
+        topic_begin, route_bindings_.end(), topic_id,
+        [](uint64_t value, const RouteBinding& binding) {
+            return value < binding.stamp.topic_id.value;
+        });
+    const auto existing =
+        std::find_if(topic_begin, topic_end, contract_matches);
+    if (existing != topic_end) {
         if (!registry::SchemaIdentityEqual(existing->schema, request.schema)) {
             return Status::Error(StatusCode::kSchemaMismatch,
                                  "bridge route was rebound to another schema");
@@ -1010,7 +1115,7 @@ Status BridgeRuntimeDispatcher::ValidateAndBindRoute(
     if (route_bindings_.size() >= max_route_bindings_) {
         return Exhausted("bridge route-schema binding table is full");
     }
-    route_bindings_.push_back(RouteBinding{
+    route_bindings_.insert(topic_end, RouteBinding{
         .stamp = route.stamp,
         .targets = std::vector<transport::TargetRoute>(targets.begin(),
                                                        targets.end()),
@@ -1034,12 +1139,12 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
         return Invalid("bridge dispatch request is incomplete");
     }
     struct Destination {
-        std::shared_ptr<BridgeConnectionManager> manager;
+        std::shared_ptr<BridgeConnectionPool> pool;
         transport::TransportCapabilities capabilities;
     };
     struct Reservation {
-        std::shared_ptr<BridgeConnectionManager> manager;
-        uint64_t id = 0;
+        std::shared_ptr<BridgeConnectionPool> pool;
+        BridgeEgressReservationToken token;
     };
 
     try {
@@ -1063,7 +1168,7 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
                     "reliable bridge route lacks remote-ACK capability");
             }
 
-            std::shared_ptr<BridgeConnectionManager> manager;
+            std::shared_ptr<BridgeConnectionPool> pool;
             {
                 std::lock_guard lock(peers_mutex_);
                 const auto peer = std::find_if(
@@ -1071,17 +1176,17 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
                     [&target](const Peer& candidate) {
                         return candidate.node == target.target_node;
                     });
-                if (peer != peers_.end()) manager = peer->manager;
+                if (peer != peers_.end()) pool = peer->pool;
             }
-            if (manager == nullptr) {
+            if (pool == nullptr) {
                 return Unavailable(
-                    "bridge route has no registered peer manager");
+                    "bridge route has no registered peer connection pool");
             }
-            if (!manager->MatchesRoute(target.target_node, *remote)) {
-                return Unavailable("bridge route does not match peer manager");
+            if (!pool->MatchesRoute(target.target_node, *remote)) {
+                return Unavailable("bridge route does not match peer pool");
             }
             destinations.push_back(Destination{
-                .manager = std::move(manager),
+                .pool = std::move(pool),
                 .capabilities = remote->capabilities,
             });
         }
@@ -1121,7 +1226,7 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
         };
 
         for (const Destination& destination : destinations) {
-            MINO_RETURN_IF_ERROR(destination.manager->ValidateOutboundSize(
+            MINO_RETURN_IF_ERROR(destination.pool->ValidateOutboundSize(
                 outbound, destination.capabilities));
         }
 
@@ -1129,18 +1234,17 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
         std::vector<Reservation> reservations;
         reservations.reserve(destinations.size());
         for (const Destination& destination : destinations) {
-            auto reserved = destination.manager->ReserveEgress(
-                outbound, admission);
+            auto reserved = destination.pool->ReserveEgress(outbound, admission);
             if (!reserved.ok()) {
                 admission->RollBack();
                 for (const Reservation& prior : reservations) {
-                    prior.manager->CancelEgressReservation(prior.id);
+                    prior.pool->CancelEgressReservation(prior.token);
                 }
                 return reserved.status();
             }
             reservations.push_back(Reservation{
-                .manager = destination.manager,
-                .id = *reserved,
+                .pool = destination.pool,
+                .token = *reserved,
             });
         }
         admission->Commit();
@@ -1161,6 +1265,8 @@ Result<std::unique_ptr<BridgeListenerHub>> BridgeListenerHub::Create(
     if (driver == nullptr || options.listen_backlog == 0 ||
         options.max_peers == 0 ||
         options.max_peers > transport::kMaxConnections ||
+        options.max_peers >
+            std::numeric_limits<size_t>::max() / kMaxBridgeLaneCount ||
         options.max_pending_handshakes == 0 ||
         options.max_pending_handshakes > transport::kMaxConnections ||
         options.max_accepts_per_pump == 0 ||
@@ -1206,10 +1312,17 @@ uint64_t BridgeListenerHub::EffectiveNow(
 
 Status BridgeListenerHub::RegisterPeer(
     std::shared_ptr<BridgeConnectionManager> manager) noexcept {
+    if (running_) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "bridge listener hub peer registration is deployment-time only");
+    }
     if (manager == nullptr ||
         manager->options_.mode != BridgeConnectionMode::kAccepted ||
         manager->driver_.get() != driver_.get() ||
-        !manager->options_.expected_peer.complete()) {
+        !manager->options_.expected_peer.complete() ||
+        !ValidLane(manager->options_.lane_index,
+                   manager->options_.lane_count)) {
         return Invalid("bridge listener hub peer manager is incompatible");
     }
     try {
@@ -1225,22 +1338,43 @@ Status BridgeListenerHub::RegisterPeer(
             return Invalid(
                 "bridge listener hub managers do not share local fencing");
         }
-        const auto existing = std::find_if(
+        const auto same_identity = std::find_if(
             peers_.begin(), peers_.end(),
             [&identity](const Peer& peer) {
                 return peer.identity == identity;
             });
+        if (same_identity != peers_.end() &&
+            same_identity->lane_count != manager->options_.lane_count) {
+            return Invalid(
+                "bridge listener hub peer lanes disagree on lane count");
+        }
+        const auto existing = std::find_if(
+            peers_.begin(), peers_.end(),
+            [&identity, &manager](const Peer& peer) {
+                return peer.identity == identity &&
+                       peer.lane_count == manager->options_.lane_count &&
+                       peer.lane_index == manager->options_.lane_index;
+            });
         if (existing != peers_.end()) {
             return Status::Error(StatusCode::kAlreadyExists,
-                                 "bridge listener hub peer already exists");
+                                 "bridge listener hub peer lane already exists");
         }
-        if (peers_.size() >= options_.max_peers) {
-            return Exhausted("bridge listener hub peer table is full");
+        const bool new_identity = same_identity == peers_.end();
+        if (new_identity && peer_identity_count_ >= options_.max_peers) {
+            return Exhausted("bridge listener hub logical peer table is full");
+        }
+        const size_t max_registrations =
+            options_.max_peers * kMaxBridgeLaneCount;
+        if (peers_.size() >= max_registrations) {
+            return Exhausted("bridge listener hub lane table is full");
         }
         peers_.push_back(Peer{
             .identity = identity,
+            .lane_index = manager->options_.lane_index,
+            .lane_count = manager->options_.lane_count,
             .manager = std::move(manager),
         });
+        if (new_identity) ++peer_identity_count_;
         return Status::Ok();
     } catch (const std::bad_alloc&) {
         return Exhausted("bridge listener hub peer allocation failed");
@@ -1249,16 +1383,27 @@ Status BridgeListenerHub::RegisterPeer(
 
 Status BridgeListenerHub::UnregisterPeer(
     const BridgeNodeIdentityFence& peer) noexcept {
-    const auto found = std::find_if(
+    if (running_) {
+        return Status::Error(
+            StatusCode::kUnavailable,
+            "bridge listener hub peer removal is deployment-time only");
+    }
+    const auto first = std::find_if(
         peers_.begin(), peers_.end(),
         [&peer](const Peer& candidate) {
             return candidate.identity == peer;
         });
-    if (found == peers_.end()) {
+    if (first == peers_.end()) {
         return Status::Error(StatusCode::kNotFound,
                              "bridge listener hub peer does not exist");
     }
-    peers_.erase(found);
+    peers_.erase(
+        std::remove_if(peers_.begin(), peers_.end(),
+                       [&peer](const Peer& candidate) {
+                           return candidate.identity == peer;
+                       }),
+        peers_.end());
+    --peer_identity_count_;
     return Status::Ok();
 }
 
@@ -1266,6 +1411,18 @@ Status BridgeListenerHub::Start() noexcept {
     if (running_) {
         return Status::Error(StatusCode::kAlreadyExists,
                              "bridge listener hub is already running");
+    }
+    for (const Peer& peer : peers_) {
+        if (peer.lane_count == 1) continue;
+        const size_t lane_registrations = static_cast<size_t>(std::count_if(
+            peers_.begin(), peers_.end(), [&peer](const Peer& candidate) {
+                return candidate.identity == peer.identity &&
+                       candidate.lane_count == peer.lane_count;
+            }));
+        if (lane_registrations != peer.lane_count) {
+            return Invalid(
+                "bridge listener hub peer lane set is incomplete");
+        }
     }
     if (driver_->state() == transport::DriverState::kStopped) {
         if (!options_.manage_driver_lifecycle) {
@@ -1380,8 +1537,12 @@ Result<BridgeListenerHubPumpResult> BridgeListenerHub::Pump(
             };
             const auto peer = std::find_if(
                 peers_.begin(), peers_.end(),
-                [&identity](const Peer& candidate) {
-                    return candidate.identity == identity;
+                [&identity, &pending](const Peer& candidate) {
+                    return candidate.identity == identity &&
+                           candidate.lane_index ==
+                               pending.discovery->lane_index &&
+                           candidate.lane_count ==
+                               pending.discovery->lane_count;
                 });
             if (peer == peers_.end()) {
                 Reject(index, false, &result);

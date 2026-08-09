@@ -60,11 +60,25 @@ Result<std::unique_ptr<DedupWindow>> DedupWindow::Create(
         const size_t source_bytes =
             sizeof(SourceState) + words * sizeof(uint64_t);
         if (source_bytes > options.max_bytes) {
-            return Resource("dedup byte limit cannot hold one source");
+            return Resource(
+                "dedup byte limit cannot hold one logical source state");
         }
-        return std::unique_ptr<DedupWindow>(
+        auto window = std::unique_ptr<DedupWindow>(
             new DedupWindow(options, words, source_bytes));
+        const size_t max_indexed_sources =
+            std::min(options.max_sources, options.max_bytes / source_bytes);
+        if (max_indexed_sources == std::numeric_limits<size_t>::max()) {
+            return Resource("dedup source index size overflows");
+        }
+        // The index is bounded by logical source capacity but is not charged to
+        // max_bytes. reserve() preallocates buckets, not per-source map nodes.
+        // One transient slot lets AddSource insert before eviction so allocation
+        // failure cannot change existing retained state.
+        window->source_index_.reserve(max_indexed_sources + 1);
+        return window;
     } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
 }
@@ -76,6 +90,7 @@ void DedupWindow::BeginSession(uint64_t peer_session_epoch,
     if (session_active_) ++stats_.session_switches;
     if (!preserve_state) {
         entries_.clear();
+        source_index_.clear();
         bytes_ = 0;
     }
     session_active_ = true;
@@ -85,18 +100,30 @@ void DedupWindow::BeginSession(uint64_t peer_session_epoch,
 
 DedupWindow::SourceState* DedupWindow::Find(
     const SourceIdentity& source) noexcept {
-    const auto it = std::find_if(
-        entries_.begin(), entries_.end(),
-        [&source](const SourceState& state) { return state.source == source; });
-    return it == entries_.end() ? nullptr : &*it;
+    const auto it = source_index_.find(source);
+    return it == source_index_.end() ? nullptr : &entries_[it->second];
 }
 
 const DedupWindow::SourceState* DedupWindow::Find(
     const SourceIdentity& source) const noexcept {
-    const auto it = std::find_if(
-        entries_.begin(), entries_.end(),
-        [&source](const SourceState& state) { return state.source == source; });
-    return it == entries_.end() ? nullptr : &*it;
+    const auto it = source_index_.find(source);
+    return it == source_index_.end() ? nullptr : &entries_[it->second];
+}
+
+void DedupWindow::RebuildIndex() noexcept {
+    // Erasure shifts vector positions. Retained map nodes already exist, so
+    // refreshing their indices cannot allocate or invalidate noexcept callers.
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const auto it = source_index_.find(entries_[i].source);
+        if (it != source_index_.end()) it->second = i;
+    }
+}
+
+void DedupWindow::EraseEntry(size_t index) noexcept {
+    source_index_.erase(entries_[index].source);
+    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
+    bytes_ -= source_bytes_;
+    RebuildIndex();
 }
 
 bool DedupWindow::GapSet(const SourceState& state,
@@ -194,6 +221,20 @@ Status DedupWindow::AddSource(const SourceIdentity& source, uint64_t highest,
         state.last_activity_ns = now_ns;
         state.gap_words.assign(bitmap_words_, 0);
         entries_.push_back(std::move(state));
+        try {
+            const bool inserted =
+                source_index_.emplace(source, entries_.size() - 1).second;
+            if (!inserted) {
+                entries_.pop_back();
+                return Invalid("dedup source already exists");
+            }
+        } catch (const std::bad_alloc&) {
+            entries_.pop_back();
+            return Status::Error(StatusCode::kResourceExhausted);
+        } catch (const std::length_error&) {
+            entries_.pop_back();
+            return Status::Error(StatusCode::kResourceExhausted);
+        }
         EvictToLimits();
         bytes_ += source_bytes_;
         return Status::Ok();
@@ -343,8 +384,7 @@ size_t DedupWindow::PurgeExpired(uint64_t now_ns) noexcept {
             ++i;
             continue;
         }
-        entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
-        bytes_ -= source_bytes_;
+        EraseEntry(i);
         ++removed;
         ++stats_.age_evictions;
     }
@@ -367,9 +407,7 @@ void DedupWindow::EvictToLimits() noexcept {
                 oldest = i;
             }
         }
-        entries_.erase(entries_.begin() +
-                       static_cast<std::ptrdiff_t>(oldest));
-        bytes_ -= source_bytes_;
+        EraseEntry(oldest);
         ++stats_.source_evictions;
     }
 }

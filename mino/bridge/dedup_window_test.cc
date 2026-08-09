@@ -13,6 +13,8 @@ namespace {
 
 constexpr SourceIdentity kSource{1, 2, 3};
 constexpr SourceIdentity kOtherSource{4, 5, 6};
+constexpr SourceIdentity kThirdSource{7, 8, 9};
+constexpr SourceIdentity kFourthSource{10, 11, 12};
 
 std::unique_ptr<DedupWindow> MakeWindow(DedupWindowOptions options = {}) {
     auto result = DedupWindow::Create(options);
@@ -135,6 +137,7 @@ TEST(DedupWindowTest, SessionEpochFencesStaleChecksAndCommits) {
     ASSERT_TRUE(window->CommitAccepted(1, kSource, 1, 0).ok());
     window->BeginSession(2, 1);
     EXPECT_EQ(window->source_count(), 0u);
+    EXPECT_FALSE(window->HasSource(kSource));
 
     auto stale = window->Check(1, kSource, 1, 2);
     ASSERT_TRUE(stale.ok());
@@ -167,6 +170,116 @@ TEST(DedupWindowTest, PreservesStateAcrossReconnectAndSnapshotsInStableOrder) {
     EXPECT_EQ((*snapshot)[0].highest_contiguous_sequence, 7u);
     EXPECT_EQ((*snapshot)[1].source, kOtherSource);
     EXPECT_EQ((*snapshot)[1].highest_contiguous_sequence, 4u);
+}
+
+TEST(DedupWindowTest, RebuildsIndexAfterExpiryErasesShiftedEntries) {
+    auto window = MakeWindow(DedupWindowOptions{
+        .max_sources = 4,
+        .max_bytes = 4096,
+        .max_sequence_distance = 64,
+        .max_source_age_ns = 10,
+    });
+    ASSERT_NE(window, nullptr);
+    window->BeginSession(1, 0);
+
+    ASSERT_TRUE(window->SeedAccepted(1, kSource, 11, 0).ok());
+    const size_t source_bytes = window->bytes();
+    ASSERT_TRUE(window->SeedAccepted(1, kOtherSource, 22, 0).ok());
+    ASSERT_TRUE(window->SeedAccepted(1, kThirdSource, 33, 0).ok());
+    ASSERT_TRUE(window->SeedAccepted(1, kFourthSource, 44, 0).ok());
+    EXPECT_EQ(window->bytes(), 4 * source_bytes);
+
+    ASSERT_TRUE(window->Check(1, kOtherSource, 22, 5).ok());
+    ASSERT_TRUE(window->Check(1, kFourthSource, 44, 5).ok());
+    EXPECT_EQ(window->PurgeExpired(11), 2u);
+    EXPECT_EQ(window->bytes(), 2 * source_bytes);
+
+    EXPECT_FALSE(window->HasSource(kSource));
+    EXPECT_TRUE(window->HasSource(kOtherSource));
+    EXPECT_FALSE(window->HasSource(kThirdSource));
+    EXPECT_TRUE(window->HasSource(kFourthSource));
+
+    auto other = window->Check(1, kOtherSource, 22, 11);
+    ASSERT_TRUE(other.ok());
+    EXPECT_EQ(other->decision, DedupDecision::kDuplicateAccepted);
+    EXPECT_EQ(other->highest_contiguous_sequence, 22);
+    auto fourth = window->Check(1, kFourthSource, 44, 11);
+    ASSERT_TRUE(fourth.ok());
+    EXPECT_EQ(fourth->decision, DedupDecision::kDuplicateAccepted);
+    EXPECT_EQ(fourth->highest_contiguous_sequence, 44);
+}
+
+TEST(DedupWindowTest, RebuildsIndexAfterDeterministicEvictions) {
+    auto window = MakeWindow(DedupWindowOptions{
+        .max_sources = 2,
+        .max_bytes = 4096,
+        .max_sequence_distance = 64,
+        .max_source_age_ns = 100,
+    });
+    ASSERT_NE(window, nullptr);
+    window->BeginSession(1, 0);
+
+    ASSERT_TRUE(window->SeedAccepted(1, kSource, 10, 0).ok());
+    const size_t source_bytes = window->bytes();
+    ASSERT_TRUE(window->SeedAccepted(1, kOtherSource, 20, 1).ok());
+    ASSERT_TRUE(window->Check(1, kSource, 10, 2).ok());
+
+    ASSERT_TRUE(window->SeedAccepted(1, kThirdSource, 30, 3).ok());
+    EXPECT_TRUE(window->HasSource(kSource));
+    EXPECT_FALSE(window->HasSource(kOtherSource));
+    EXPECT_TRUE(window->HasSource(kThirdSource));
+
+    // Equal activity times retain vector-order tie-breaking: kSource is older.
+    ASSERT_TRUE(window->Check(1, kSource, 10, 3).ok());
+    ASSERT_TRUE(window->SeedAccepted(1, kOtherSource, 40, 4).ok());
+    EXPECT_FALSE(window->HasSource(kSource));
+    EXPECT_TRUE(window->HasSource(kThirdSource));
+    EXPECT_TRUE(window->HasSource(kOtherSource));
+    EXPECT_EQ(window->bytes(), 2 * source_bytes);
+    EXPECT_EQ(window->stats().source_evictions, 2u);
+
+    auto third = window->Check(1, kThirdSource, 30, 4);
+    ASSERT_TRUE(third.ok());
+    EXPECT_EQ(third->decision, DedupDecision::kDuplicateAccepted);
+    EXPECT_EQ(third->highest_contiguous_sequence, 30);
+    auto other = window->Check(1, kOtherSource, 40, 4);
+    ASSERT_TRUE(other.ok());
+    EXPECT_EQ(other->decision, DedupDecision::kDuplicateAccepted);
+    EXPECT_EQ(other->highest_contiguous_sequence, 40);
+}
+
+TEST(DedupWindowTest, LogicalByteLimitEvictsWithoutSourceCountPressure) {
+    auto measuring = MakeWindow(DedupWindowOptions{
+        .max_sources = 4,
+        .max_bytes = 4096,
+        .max_sequence_distance = 64,
+        .max_source_age_ns = 100,
+    });
+    ASSERT_NE(measuring, nullptr);
+    measuring->BeginSession(1, 0);
+    ASSERT_TRUE(measuring->SeedAccepted(1, kSource, 10, 0).ok());
+    const size_t logical_source_bytes = measuring->bytes();
+    ASSERT_NE(logical_source_bytes, 0u);
+
+    auto bounded = MakeWindow(DedupWindowOptions{
+        .max_sources = 4,
+        .max_bytes = logical_source_bytes,
+        .max_sequence_distance = 64,
+        .max_source_age_ns = 100,
+    });
+    ASSERT_NE(bounded, nullptr);
+    bounded->BeginSession(1, 0);
+    ASSERT_TRUE(bounded->SeedAccepted(1, kSource, 10, 0).ok());
+    ASSERT_TRUE(bounded->SeedAccepted(1, kOtherSource, 20, 1).ok());
+    EXPECT_EQ(bounded->source_count(), 1u);
+    EXPECT_EQ(bounded->bytes(), logical_source_bytes);
+    EXPECT_FALSE(bounded->HasSource(kSource));
+    EXPECT_TRUE(bounded->HasSource(kOtherSource));
+    EXPECT_EQ(bounded->stats().source_evictions, 1u);
+
+    bounded->BeginSession(2, 2);
+    EXPECT_EQ(bounded->source_count(), 0u);
+    EXPECT_EQ(bounded->bytes(), 0u);
 }
 
 TEST(DedupWindowTest, EnforcesSourceByteAndAgeBounds) {

@@ -22,7 +22,8 @@ inline constexpr uint16_t kControlPayloadVersion = 1;
 inline constexpr size_t kAckPayloadWireSize = 64;
 inline constexpr size_t kSessionHelloHeaderWireSize = 24;
 inline constexpr size_t kSessionHelloEntryWireSize = 32;
-inline constexpr uint16_t kSessionDiscoveryPayloadVersion = 1;
+inline constexpr uint16_t kSessionDiscoveryLegacyPayloadVersion = 1;
+inline constexpr uint16_t kSessionDiscoveryCurrentPayloadVersion = 2;
 inline constexpr size_t kSessionDiscoveryPayloadWireSize = 72;
 
 enum class AckDisposition : uint8_t {
@@ -75,6 +76,8 @@ struct SessionDiscovery {
     ProcessIdentity process_identity;
     uint64_t lease_epoch = 0;
     uint64_t node_config_version = 0;
+    uint16_t lane_index = 0;
+    uint16_t lane_count = 1;
 
     bool operator==(const SessionDiscovery&) const = default;
 };

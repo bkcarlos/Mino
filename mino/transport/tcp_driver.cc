@@ -8,6 +8,15 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#if defined(__linux__)
+#define MINO_TCP_USE_EPOLL 1
+#include <sys/epoll.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+#define MINO_TCP_USE_KQUEUE 1
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -16,6 +25,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cassert>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -24,6 +34,7 @@
 #include <optional>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -40,6 +51,31 @@ using TimePoint = Clock::time_point;
 constexpr size_t kTcpPrefixBytes = 4;
 constexpr size_t kIoBudgetBytes = 256u * 1024u;
 constexpr size_t kMaxGatheredWriteBuffers = 64;
+
+#if defined(MINO_TCP_USE_KQUEUE)
+using KqueueUserData =
+    decltype(static_cast<struct kevent*>(nullptr)->udata);
+using KqueueFilter = decltype(static_cast<struct kevent*>(nullptr)->filter);
+using KqueueFlags = decltype(static_cast<struct kevent*>(nullptr)->flags);
+
+template <typename UserData>
+UserData EncodeKqueueToken(uint64_t token) noexcept {
+    if constexpr (std::is_pointer_v<UserData>) {
+        return reinterpret_cast<UserData>(static_cast<uintptr_t>(token));
+    } else {
+        return static_cast<UserData>(token);
+    }
+}
+
+template <typename UserData>
+uint64_t DecodeKqueueToken(UserData data) noexcept {
+    if constexpr (std::is_pointer_v<UserData>) {
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
+    } else {
+        return static_cast<uint64_t>(data);
+    }
+}
+#endif
 
 Status Invalid(const char* message) {
     return Status::Error(StatusCode::kInvalidArgument, message);
@@ -78,6 +114,12 @@ void StoreBe32(uint32_t value, std::span<std::byte> output) noexcept {
     output[1] = static_cast<std::byte>(value >> 16);
     output[2] = static_cast<std::byte>(value >> 8);
     output[3] = static_cast<std::byte>(value);
+}
+
+uint16_t LoadBe16(std::span<const std::byte> input) noexcept {
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(std::to_integer<uint8_t>(input[0])) << 8) |
+        static_cast<uint16_t>(std::to_integer<uint8_t>(input[1])));
 }
 
 uint32_t LoadBe32(std::span<const std::byte> input) noexcept {
@@ -252,7 +294,76 @@ Result<std::vector<std::byte>> BuildHeartbeatWire(
     return PrefixFrame(body);
 }
 
+bool IsKnownControlOpcode(uint32_t opcode) noexcept {
+    switch (static_cast<bridge::FrameType>(opcode)) {
+        case bridge::FrameType::kSchemaAnnounce:
+        case bridge::FrameType::kSchemaRequest:
+        case bridge::FrameType::kAck:
+        case bridge::FrameType::kHeartbeat:
+        case bridge::FrameType::kSessionHello:
+        case bridge::FrameType::kSessionDiscovery:
+            return true;
+        case bridge::FrameType::kData:
+            return false;
+    }
+    return false;
+}
+
+// This deliberately omits CRC and payload validation. It is only used to decide
+// whether a non-heartbeat frame may refresh the transport idle timer; Bridge
+// remains the sole full WireFrame decoder for every body delivered upstream.
+bool IsMinimallyStructuredWireFrame(
+    std::span<const std::byte> body) noexcept {
+    constexpr size_t kVersionOffset = 4;
+    constexpr size_t kFlagsOffset = 6;
+    constexpr size_t kHeaderLengthOffset = 8;
+    constexpr size_t kPayloadLengthOffset = 72;
+    if (body.size() < bridge::kWireBaseHeaderLength ||
+        LoadBe32(body.first<4>()) != bridge::kWireFrameMagic ||
+        LoadBe16(body.subspan<kVersionOffset, 2>()) !=
+            bridge::kWireProtocolVersion) {
+        return false;
+    }
+
+    const uint16_t flags = LoadBe16(body.subspan<kFlagsOffset, 2>());
+    if ((flags & ~bridge::kKnownFrameFlags) != 0 ||
+        bridge::HasFrameFlag(flags, bridge::FrameFlag::kAeadPresent)) {
+        return false;
+    }
+    uint32_t canonical_header_length = bridge::kWireBaseHeaderLength;
+    if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kPayloadCrcPresent)) {
+        canonical_header_length += bridge::kWirePayloadCrcLength;
+    }
+    if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kPerfTraceSampled)) {
+        canonical_header_length += bridge::kWirePerfTraceContextLength;
+    }
+    const uint32_t header_length =
+        LoadBe32(body.subspan<kHeaderLengthOffset, 4>());
+    const uint32_t payload_length =
+        LoadBe32(body.subspan<kPayloadLengthOffset, 4>());
+    if (header_length != canonical_header_length ||
+        static_cast<uint64_t>(header_length) + payload_length != body.size()) {
+        return false;
+    }
+
+    const bool is_control =
+        bridge::HasFrameFlag(flags, bridge::FrameFlag::kControlFrame);
+    if (!is_control) return true;
+    return payload_length >= bridge::kWireControlOpcodeLength &&
+           IsKnownControlOpcode(LoadBe32(body.subspan(header_length, 4)));
+}
+
 }  // namespace
+
+const char* TcpDriverReadinessBackendForTest() noexcept {
+#if defined(MINO_TCP_USE_EPOLL)
+    return "epoll";
+#elif defined(MINO_TCP_USE_KQUEUE)
+    return "kqueue";
+#else
+    return "poll";
+#endif
+}
 
 Status ValidateTcpDriverOptions(const TcpDriverOptions& options) {
     if (options.max_frame_body_bytes < bridge::kWireBaseHeaderLength ||
@@ -321,6 +432,7 @@ public:
 
         config_ = config;
         stop_requested_.store(false, std::memory_order_release);
+        wake_pending_.store(false, std::memory_order_release);
         worker_failed_ = false;
         wake_read_fd_ = read_end.release();
         wake_write_fd_ = write_end.release();
@@ -338,6 +450,11 @@ public:
 
     void RequestStop() noexcept {
         stop_requested_.store(true, std::memory_order_release);
+        {
+            // Synchronize with the predicate-to-wait transition in blocking
+            // Poll/Accept calls so the stop notification cannot be lost.
+            std::lock_guard lock(mutex_);
+        }
         Wake();
         receive_cv_.notify_all();
         completion_cv_.notify_all();
@@ -362,12 +479,18 @@ public:
         connections_.clear();
         listeners_.clear();
         accepted_.clear();
+        ready_messages_by_connection_.clear();
         ready_messages_.clear();
+        ready_receive_messages_ = 0;
         completions_.clear();
         recently_closed_.clear();
-        total_data_send_bytes_ = 0;
-        total_control_send_bytes_ = 0;
-        total_control_send_messages_ = 0;
+        {
+            std::lock_guard send_lock(send_ingress_mutex_);
+            send_admission_.clear();
+            total_data_send_bytes_ = 0;
+            total_control_send_bytes_ = 0;
+            total_control_send_messages_ = 0;
+        }
         ready_receive_bytes_ = 0;
         reserved_receive_bytes_ = 0;
         reserved_receive_messages_ = 0;
@@ -407,11 +530,49 @@ public:
             if (request.timeout_ms == 0) {
                 return WouldBlock("TCP connect is in progress");
             }
+#if defined(MINO_TCP_USE_EPOLL)
+            UniqueFd connect_epoll(::epoll_create1(EPOLL_CLOEXEC));
+            if (connect_epoll.get() < 0) {
+                return Unavailable("failed to create TCP connect epoll");
+            }
+            epoll_event interest{};
+            interest.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+            interest.data.fd = socket_fd.get();
+            if (::epoll_ctl(connect_epoll.get(), EPOLL_CTL_ADD, socket_fd.get(),
+                            &interest) != 0) {
+                return Unavailable("failed to register TCP connect socket");
+            }
+#elif defined(MINO_TCP_USE_KQUEUE)
+            UniqueFd connect_kqueue(::kqueue());
+            if (connect_kqueue.get() < 0) {
+                return Unavailable("failed to create TCP connect kqueue");
+            }
+            const int descriptor_flags =
+                ::fcntl(connect_kqueue.get(), F_GETFD, 0);
+            if (descriptor_flags < 0 ||
+                ::fcntl(connect_kqueue.get(), F_SETFD,
+                        descriptor_flags | FD_CLOEXEC) != 0) {
+                return Internal("failed to make TCP connect kqueue close-on-exec");
+            }
+            struct kevent interest;
+            EV_SET(&interest, static_cast<uintptr_t>(socket_fd.get()),
+                   EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0,
+                   EncodeKqueueToken<KqueueUserData>(0));
+            int registered;
+            do {
+                registered = ::kevent(connect_kqueue.get(), &interest, 1,
+                                      nullptr, 0, nullptr);
+            } while (registered != 0 && errno == EINTR);
+            if (registered != 0) {
+                return Unavailable("failed to register TCP connect socket");
+            }
+#else
             pollfd descriptor{
                 .fd = socket_fd.get(),
                 .events = POLLOUT,
                 .revents = 0,
             };
+#endif
             const TimePoint deadline =
                 Clock::now() + std::chrono::milliseconds(request.timeout_ms);
             for (;;) {
@@ -427,13 +588,40 @@ public:
                     1, std::min<uint32_t>(
                            options_.io_poll_max_ms,
                            static_cast<uint32_t>(remaining.count())));
+#if defined(MINO_TCP_USE_EPOLL)
+                epoll_event completion{};
+                const int ready = ::epoll_wait(connect_epoll.get(), &completion,
+                                               1, static_cast<int>(poll_ms));
+                if (ready > 0) break;
+                if (ready < 0 && errno != EINTR) {
+                    return Unavailable("TCP connect epoll wait failed");
+                }
+#elif defined(MINO_TCP_USE_KQUEUE)
+                const timespec timeout{
+                    .tv_sec = static_cast<time_t>(poll_ms / 1000u),
+                    .tv_nsec = static_cast<long>(poll_ms % 1000u) * 1'000'000L,
+                };
+                struct kevent completion;
+                const int ready = ::kevent(connect_kqueue.get(), nullptr, 0,
+                                           &completion, 1, &timeout);
+                if (ready > 0) {
+                    if ((completion.flags & EV_ERROR) != 0) {
+                        return Unavailable("TCP connect kqueue event failed");
+                    }
+                    break;
+                }
+                if (ready < 0 && errno != EINTR) {
+                    return Unavailable("TCP connect kqueue wait failed");
+                }
+#else
                 descriptor.revents = 0;
-                const int polled =
+                const int ready =
                     ::poll(&descriptor, 1, static_cast<int>(poll_ms));
-                if (polled > 0) break;
-                if (polled < 0 && errno != EINTR) {
+                if (ready > 0) break;
+                if (ready < 0 && errno != EINTR) {
                     return Unavailable("TCP connect poll failed");
                 }
+#endif
             }
             int socket_error = 0;
             socklen_t error_size = sizeof(socket_error);
@@ -474,9 +662,19 @@ public:
         connection.fd = socket_fd.release();
         connection.last_valid_receive = now;
         connection.last_transmit = now;
-        connections_.emplace(id, std::move(connection));
+        auto [inserted, was_inserted] =
+            connections_.emplace(id, std::move(connection));
+        (void)was_inserted;
+        try {
+            std::lock_guard send_lock(send_ingress_mutex_);
+            send_admission_.emplace(id, SendAdmission{});
+        } catch (...) {
+            if (inserted->second.fd >= 0) (void)::close(inserted->second.fd);
+            connections_.erase(inserted);
+            throw;
+        }
         Wake();
-        return connections_.at(id).info;
+        return inserted->second.info;
     }
 
     Result<ConnectionInfo> Listen(const ListenRequest& request) {
@@ -572,29 +770,34 @@ public:
                             SendOperation operation) {
         std::vector<std::byte> wire = PrefixFrame(request.payload);
         const size_t wire_size = wire.size();
-        std::lock_guard lock(mutex_);
-        const auto found = connections_.find(request.connection_id);
-        if (found == connections_.end()) {
-            return Status::Error(StatusCode::kNotFound,
-                                 "TCP connection does not exist");
+        {
+            std::lock_guard lock(send_ingress_mutex_);
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                return Unavailable("TCP driver is stopping");
+            }
+            const auto found = send_admission_.find(request.connection_id);
+            if (found == send_admission_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "TCP connection does not exist");
+            }
+            SendAdmission& admission = found->second;
+            if (!admission.accepting) {
+                return Unavailable("TCP connection is closing");
+            }
+            if (wire_size > options_.max_total_send_buffer_bytes -
+                                total_data_send_bytes_ ||
+                wire_size > options_.max_connection_send_buffer_bytes -
+                                admission.queued_data_bytes) {
+                return WouldBlock("TCP data send byte queue is full");
+            }
+            admission.data_writes.push_back(PendingWrite{
+                .bytes = std::move(wire),
+                .offset = 0,
+                .operation = operation,
+            });
+            admission.queued_data_bytes += wire_size;
+            total_data_send_bytes_ += wire_size;
         }
-        Connection& connection = found->second;
-        if (connection.closing) {
-            return Unavailable("TCP connection is closing");
-        }
-        if (wire_size > options_.max_total_send_buffer_bytes -
-                            total_data_send_bytes_ ||
-            wire_size > options_.max_connection_send_buffer_bytes -
-                            connection.queued_data_send_bytes) {
-            return WouldBlock("TCP data send byte queue is full");
-        }
-        connection.data_writes.push_back(PendingWrite{
-            .bytes = std::move(wire),
-            .offset = 0,
-            .operation = operation,
-        });
-        connection.queued_data_send_bytes += wire_size;
-        total_data_send_bytes_ += wire_size;
         Wake();
         return SendResult{
             .operation = operation,
@@ -605,46 +808,52 @@ public:
     Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
         std::vector<std::byte> wire = PrefixFrame(request.payload);
         const size_t wire_size = wire.size();
-        std::lock_guard lock(mutex_);
-        const auto found = connections_.find(request.connection_id);
-        if (found == connections_.end()) {
-            return Status::Error(StatusCode::kNotFound,
-                                 "TCP connection does not exist");
-        }
-        Connection& connection = found->second;
-        if (connection.closing) {
-            return Unavailable("TCP connection is closing");
-        }
-        if (request.traffic_class ==
-            UntrackedTrafficClass::kProtocolControl) {
-            if (wire_size > options_.max_control_send_buffer_bytes -
-                                total_control_send_bytes_ ||
-                total_control_send_messages_ >=
-                    options_.max_control_send_messages) {
-                return WouldBlock("TCP control send queue is full");
+        {
+            std::lock_guard lock(send_ingress_mutex_);
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                return Unavailable("TCP driver is stopping");
             }
-            connection.control_writes.push_back(PendingWrite{
-                .bytes = std::move(wire),
-                .offset = 0,
-                .operation = {},
-            });
-            connection.queued_control_send_bytes += wire_size;
-            total_control_send_bytes_ += wire_size;
-            ++total_control_send_messages_;
-        } else {
-            if (wire_size > options_.max_total_send_buffer_bytes -
-                                total_data_send_bytes_ ||
-                wire_size > options_.max_connection_send_buffer_bytes -
-                                connection.queued_data_send_bytes) {
+            const auto found = send_admission_.find(request.connection_id);
+            if (found == send_admission_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "TCP connection does not exist");
+            }
+            SendAdmission& admission = found->second;
+            if (!admission.accepting) {
+                return Unavailable("TCP connection is closing");
+            }
+            const bool is_control =
+                request.traffic_class ==
+                UntrackedTrafficClass::kProtocolControl;
+            if (is_control) {
+                if (wire_size > options_.max_control_send_buffer_bytes -
+                                    total_control_send_bytes_ ||
+                    total_control_send_messages_ >=
+                        options_.max_control_send_messages) {
+                    return WouldBlock("TCP control send queue is full");
+                }
+            } else if (wire_size > options_.max_total_send_buffer_bytes -
+                                       total_data_send_bytes_ ||
+                       wire_size > options_.max_connection_send_buffer_bytes -
+                                       admission.queued_data_bytes) {
                 return WouldBlock("TCP data send byte queue is full");
             }
-            connection.data_writes.push_back(PendingWrite{
+            std::deque<PendingWrite>& writes =
+                is_control ? admission.control_writes : admission.data_writes;
+            writes.push_back(PendingWrite{
                 .bytes = std::move(wire),
                 .offset = 0,
                 .operation = {},
             });
-            connection.queued_data_send_bytes += wire_size;
-            total_data_send_bytes_ += wire_size;
+            if (is_control) {
+                admission.queued_control_bytes += wire_size;
+                ++admission.queued_control_messages;
+                total_control_send_bytes_ += wire_size;
+                ++total_control_send_messages_;
+            } else {
+                admission.queued_data_bytes += wire_size;
+                total_data_send_bytes_ += wire_size;
+            }
         }
         Wake();
         return request.payload.size();
@@ -675,48 +884,52 @@ public:
 
     Result<ReceiveResult> PollMessages(const ReceiveRequest& request) {
         std::unique_lock lock(mutex_);
-        const auto matches_filter = [&request](const ReceivedMessage& message) {
-            return request.connection_id == kInvalidConnectionId ||
-                   message.connection_id == request.connection_id;
+        const auto find_ready = [this, &request] {
+            return FirstReadyMessageLocked(request.connection_id);
         };
-        const auto find_ready = [this, &matches_filter] {
-            return std::find_if(ready_messages_.begin(), ready_messages_.end(),
-                                matches_filter);
-        };
-        if (find_ready() == ready_messages_.end()) {
+        if (find_ready() == nullptr) {
             if (request.timeout_ms == 0) {
                 return WouldBlock("TCP receive queue is empty");
             }
+            FilteredReceiveWaitRegistration registration(
+                &filtered_receive_waiters_,
+                request.connection_id != kInvalidConnectionId);
             const bool ready = receive_cv_.wait_for(
                 lock, std::chrono::milliseconds(request.timeout_ms),
                 [this, &find_ready] {
-                    return find_ready() != ready_messages_.end() ||
+                    return find_ready() != nullptr ||
                            stop_requested_.load(std::memory_order_acquire) ||
                            worker_failed_;
                 });
             if (!ready) return Timeout("TCP receive timed out");
-            if (find_ready() == ready_messages_.end()) {
+            if (find_ready() == nullptr) {
                 return Unavailable("TCP receive worker stopped");
             }
         }
-        if (find_ready()->payload.size() > request.max_bytes) {
+        if (find_ready()->message->payload.size() > request.max_bytes) {
+            NotifyReadyWaitersLocked();
             return Exhausted("next TCP frame exceeds receive byte budget");
         }
 
         ReceiveResult result;
-        result.messages.reserve(
-            std::min<size_t>(request.max_messages, ready_messages_.size()));
+        try {
+            result.messages.reserve(
+                std::min<size_t>(request.max_messages,
+                                 ready_receive_messages_));
+        } catch (...) {
+            if (ready_receive_messages_ != 0) NotifyReadyWaitersLocked();
+            throw;
+        }
         size_t bytes = 0;
         while (result.messages.size() < request.max_messages) {
-            const auto message = find_ready();
-            if (message == ready_messages_.end()) break;
-            const size_t frame_size = message->payload.size();
+            ReadyMessageEntry* const message = find_ready();
+            if (message == nullptr) break;
+            const size_t frame_size = message->message->payload.size();
             if (frame_size > request.max_bytes - bytes) break;
             bytes += frame_size;
-            ready_receive_bytes_ -= frame_size;
-            result.messages.push_back(std::move(*message));
-            ready_messages_.erase(message);
+            ConsumeReadyMessageLocked(message, &result);
         }
+        if (ready_receive_messages_ != 0) NotifyReadyWaitersLocked();
         Wake();
         return result;
     }
@@ -773,6 +986,13 @@ public:
         const auto connection = connections_.find(id);
         if (connection != connections_.end()) {
             connection->second.closing = true;
+            {
+                std::lock_guard send_lock(send_ingress_mutex_);
+                const auto admission = send_admission_.find(id);
+                if (admission != send_admission_.end()) {
+                    admission->second.accepting = false;
+                }
+            }
             RemoveReadyMessagesLocked(id);
             Wake();
             return Status::Ok();
@@ -784,13 +1004,15 @@ public:
 
     TcpDriverStats Stats() const noexcept {
         std::lock_guard lock(mutex_);
+        std::lock_guard send_lock(send_ingress_mutex_);
         return TcpDriverStats{
             .active_connections = connections_.size(),
             .listeners = listeners_.size(),
             .queued_send_bytes =
                 total_data_send_bytes_ + total_control_send_bytes_,
             .ready_receive_bytes = ready_receive_bytes_,
-            .ready_receive_messages = ready_messages_.size(),
+            .ready_receive_messages = ready_receive_messages_,
+            .ready_receive_storage_slots = ready_messages_.size(),
             .pending_accepts = accepted_.size(),
             .successful_send_syscalls = successful_send_syscalls_,
             .gathered_send_syscalls = gathered_send_syscalls_,
@@ -800,10 +1022,41 @@ public:
     }
 
 private:
+    struct ReadyMessageEntry {
+        std::optional<ReceivedMessage> message;
+    };
+
+
+    struct FilteredReceiveWaitRegistration {
+        FilteredReceiveWaitRegistration(size_t* waiters, bool filtered) noexcept
+            : waiters(filtered ? waiters : nullptr) {
+            if (this->waiters != nullptr) ++*this->waiters;
+        }
+        ~FilteredReceiveWaitRegistration() {
+            if (waiters != nullptr) --*waiters;
+        }
+
+        FilteredReceiveWaitRegistration(
+            const FilteredReceiveWaitRegistration&) = delete;
+        FilteredReceiveWaitRegistration& operator=(
+            const FilteredReceiveWaitRegistration&) = delete;
+
+        size_t* waiters;
+    };
+
     struct PendingWrite {
         std::vector<std::byte> bytes;
         size_t offset = 0;
         SendOperation operation;
+    };
+
+    struct SendAdmission {
+        bool accepting = true;
+        std::deque<PendingWrite> control_writes;
+        std::deque<PendingWrite> data_writes;
+        size_t queued_data_bytes = 0;
+        size_t queued_control_bytes = 0;
+        size_t queued_control_messages = 0;
     };
 
     struct Connection {
@@ -820,10 +1073,19 @@ private:
         std::deque<PendingWrite> control_writes;
         std::deque<PendingWrite> data_writes;
         std::vector<SendOperation> awaiting_ack;
-        size_t queued_control_send_bytes = 0;
-        size_t queued_data_send_bytes = 0;
         bool heartbeat_pending = false;
         size_t heartbeat_offset = 0;
+        bool write_blocked = false;
+#if defined(MINO_TCP_USE_EPOLL)
+        uint64_t event_token = 0;
+        uint32_t registered_events = 0;
+#elif defined(MINO_TCP_USE_KQUEUE)
+        uint64_t event_token = 0;
+        bool read_registered = false;
+        bool read_enabled = false;
+        bool write_registered = false;
+        bool write_enabled = false;
+#endif
         TimePoint last_valid_receive{};
         TimePoint last_transmit{};
     };
@@ -832,6 +1094,14 @@ private:
         ConnectionInfo info;
         int fd = -1;
         bool closing = false;
+#if defined(MINO_TCP_USE_EPOLL)
+        uint64_t event_token = 0;
+        uint32_t registered_events = 0;
+#elif defined(MINO_TCP_USE_KQUEUE)
+        uint64_t event_token = 0;
+        bool read_registered = false;
+        bool read_enabled = false;
+#endif
     };
 
     struct AcceptedConnection {
@@ -846,6 +1116,13 @@ private:
         ConnectionId id = kInvalidConnectionId;
         int fd = -1;
     };
+
+    static bool HasPendingWriteLocked(
+        const Connection& connection) noexcept {
+        return !connection.control_writes.empty() ||
+               !connection.data_writes.empty() ||
+               connection.heartbeat_pending;
+    }
 
     Result<ConnectionId> NextIdLocked() {
         if (connections_.size() + listeners_.size() >=
@@ -863,16 +1140,64 @@ private:
         }
     }
 
-    void Wake() const noexcept {
-        if (wake_write_fd_ < 0) return;
+    void Wake() noexcept {
+        if (wake_write_fd_ < 0 ||
+            wake_pending_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         const std::byte byte{1};
-        const ssize_t ignored = ::write(wake_write_fd_, &byte, 1);
-        (void)ignored;
+        ssize_t written;
+        do {
+            written = ::write(wake_write_fd_, &byte, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            wake_pending_.store(false, std::memory_order_release);
+        }
     }
 
-    void DrainWakePipe() noexcept {
+    void ConsumeWake() noexcept {
         std::array<std::byte, 128> bytes{};
         while (::read(wake_read_fd_, bytes.data(), bytes.size()) > 0) {
+        }
+        // Clear before the next maintenance pass. A producer that raced with the
+        // drain either left work visible to that pass or will write a fresh byte.
+        wake_pending_.store(false, std::memory_order_release);
+    }
+
+    bool DrainSendIngressLocked() noexcept {
+        std::lock_guard send_lock(send_ingress_mutex_);
+        bool staged_immediate_write = false;
+        for (auto& [id, admission] : send_admission_) {
+            const auto connection = connections_.find(id);
+            if (connection == connections_.end()) continue;
+            if (connection->second.control_writes.empty() &&
+                !admission.control_writes.empty()) {
+                connection->second.control_writes.swap(
+                    admission.control_writes);
+                staged_immediate_write |= !connection->second.write_blocked;
+            }
+            if (connection->second.data_writes.empty() &&
+                !admission.data_writes.empty()) {
+                connection->second.data_writes.swap(admission.data_writes);
+                staged_immediate_write |= !connection->second.write_blocked;
+            }
+        }
+        return staged_immediate_write;
+    }
+
+    void ReleaseSendAdmissionLocked(ConnectionId id, bool is_control,
+                                    size_t bytes, size_t messages) noexcept {
+        std::lock_guard send_lock(send_ingress_mutex_);
+        const auto found = send_admission_.find(id);
+        if (found == send_admission_.end()) return;
+        if (is_control) {
+            found->second.queued_control_bytes -= bytes;
+            found->second.queued_control_messages -= messages;
+            total_control_send_bytes_ -= bytes;
+            total_control_send_messages_ -= messages;
+        } else {
+            found->second.queued_data_bytes -= bytes;
+            total_data_send_bytes_ -= bytes;
         }
     }
 
@@ -883,93 +1208,629 @@ private:
         wake_write_fd_ = -1;
     }
 
-    void WorkerLoop() noexcept {
-        try {
-            while (!stop_requested_.load(std::memory_order_acquire)) {
-                std::vector<pollfd> descriptors;
-                std::vector<PollToken> tokens;
+    // Newly queued writes optimistically run in software. EAGAIN is the only
+    // transition to kernel-managed writable readiness; budget exhaustion stays
+    // software-ready so short queues avoid writable-interest churn.
+    bool DrainUnblockedWritesLocked() {
+        std::vector<std::pair<ConnectionId, Status>> failures;
+        bool has_immediate_writes = false;
+        for (auto& [id, connection] : connections_) {
+            if (connection.closing || connection.write_blocked ||
+                !HasPendingWriteLocked(connection)) {
+                continue;
+            }
+            const Status status = WriteConnectionLocked(connection);
+            if (!status.ok()) {
+                failures.emplace_back(id, status);
+                continue;
+            }
+            has_immediate_writes |=
+                HasPendingWriteLocked(connection) && !connection.write_blocked;
+        }
+        for (const auto& [id, status] : failures) {
+            CloseConnectionLocked(id, status);
+        }
+        return has_immediate_writes;
+    }
+
+#if defined(MINO_TCP_USE_EPOLL)
+    uint64_t NextEventTokenLocked() noexcept {
+        for (;;) {
+            const uint64_t token = next_event_token_++;
+            if (next_event_token_ == 0) next_event_token_ = 1;
+            if (token != 0 && !event_tokens_.contains(token)) return token;
+        }
+    }
+
+    Status SetEpollInterestLocked(const PollToken& poll_token, uint32_t events,
+                                  uint64_t* event_token,
+                                  uint32_t* registered_events) {
+        if (events == 0) {
+            RemoveEpollRegistrationLocked(poll_token.fd, event_token,
+                                          registered_events);
+            return Status::Ok();
+        }
+        if (*event_token != 0 && *registered_events == events) {
+            return Status::Ok();
+        }
+
+        epoll_event event{};
+        event.events = events;
+        if (*event_token == 0) {
+            const uint64_t token = NextEventTokenLocked();
+            event.data.u64 = token;
+            event_tokens_.emplace(token, poll_token);
+            int result;
+            do {
+                result = ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, poll_token.fd,
+                                     &event);
+            } while (result != 0 && errno == EINTR);
+            if (result != 0) {
+                event_tokens_.erase(token);
+                return Internal("failed to register TCP descriptor with epoll");
+            }
+            *event_token = token;
+            *registered_events = events;
+            return Status::Ok();
+        }
+
+        event.data.u64 = *event_token;
+        int result;
+        do {
+            result = ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, poll_token.fd,
+                                 &event);
+        } while (result != 0 && errno == EINTR);
+        if (result != 0) {
+            return Internal("failed to update TCP descriptor in epoll");
+        }
+        *registered_events = events;
+        return Status::Ok();
+    }
+
+    void RemoveEpollRegistrationLocked(int fd, uint64_t* event_token,
+                                       uint32_t* registered_events) noexcept {
+        if (*event_token == 0) return;
+        event_tokens_.erase(*event_token);
+        if (epoll_fd_ >= 0 && fd >= 0) {
+            int result;
+            do {
+                result = ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            } while (result != 0 && errno == EINTR);
+        }
+        *event_token = 0;
+        *registered_events = 0;
+    }
+
+    Status SyncEpollInterestsLocked() {
+        MINO_RETURN_IF_ERROR(SetEpollInterestLocked(
+            PollToken{.kind = PollKind::kWake,
+                      .id = kInvalidConnectionId,
+                      .fd = wake_read_fd_},
+            EPOLLIN, &wake_event_token_, &wake_registered_events_));
+
+        const bool can_accept =
+            accepted_.size() < options_.max_pending_accepts &&
+            connections_.size() < config_.max_connections;
+        for (auto& [id, listener] : listeners_) {
+            const uint32_t events =
+                !listener.closing && can_accept
+                    ? static_cast<uint32_t>(EPOLLIN)
+                    : 0u;
+            MINO_RETURN_IF_ERROR(SetEpollInterestLocked(
+                PollToken{.kind = PollKind::kListener,
+                          .id = id,
+                          .fd = listener.fd},
+                events, &listener.event_token, &listener.registered_events));
+        }
+        for (auto& [id, connection] : connections_) {
+            uint32_t events = EPOLLRDHUP;
+            if (CanReadLocked(connection)) events |= EPOLLIN;
+            if (connection.write_blocked &&
+                HasPendingWriteLocked(connection)) {
+                events |= EPOLLOUT;
+            }
+            MINO_RETURN_IF_ERROR(SetEpollInterestLocked(
+                PollToken{.kind = PollKind::kConnection,
+                          .id = id,
+                          .fd = connection.fd},
+                events, &connection.event_token,
+                &connection.registered_events));
+        }
+        return Status::Ok();
+    }
+
+    void ResetEpollStateLocked() noexcept {
+        epoll_fd_ = -1;
+        event_tokens_.clear();
+        wake_event_token_ = 0;
+        wake_registered_events_ = 0;
+        for (auto& [id, listener] : listeners_) {
+            (void)id;
+            listener.event_token = 0;
+            listener.registered_events = 0;
+        }
+        for (auto& [id, connection] : connections_) {
+            (void)id;
+            connection.event_token = 0;
+            connection.registered_events = 0;
+        }
+    }
+
+    void WorkerLoopEpoll() {
+        UniqueFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
+        if (epoll_fd.get() < 0) {
+            FailWorker();
+            return;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            epoll_fd_ = epoll_fd.get();
+        }
+
+        std::array<epoll_event, 256> events{};
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            Status sync_status;
+            bool has_immediate_writes = false;
+            {
+                std::lock_guard lock(mutex_);
+                const TimePoint now = Clock::now();
+                has_immediate_writes = DrainSendIngressLocked();
+                ProcessClosuresAndTimersLocked(now);
+                for (auto& [id, connection] : connections_) {
+                    (void)id;
+                    PrepareReceiveReservationLocked(connection);
+                    PrepareHeartbeatLocked(connection, now);
+                }
+                has_immediate_writes |= DrainUnblockedWritesLocked();
+                has_immediate_writes |= DrainSendIngressLocked();
+                sync_status = SyncEpollInterestsLocked();
+            }
+            if (!sync_status.ok()) {
                 {
                     std::lock_guard lock(mutex_);
-                    ProcessClosuresAndTimersLocked(Clock::now());
-                    descriptors.reserve(1 + listeners_.size() +
-                                        connections_.size());
-                    tokens.reserve(descriptors.capacity());
-                    descriptors.push_back(
-                        pollfd{.fd = wake_read_fd_,
-                               .events = POLLIN,
-                               .revents = 0});
-                    tokens.push_back(PollToken{
-                        .kind = PollKind::kWake,
-                        .id = kInvalidConnectionId,
-                        .fd = wake_read_fd_,
-                    });
-                    const bool can_accept =
-                        accepted_.size() < options_.max_pending_accepts &&
-                        connections_.size() < config_.max_connections;
-                    for (const auto& [id, listener] : listeners_) {
-                        if (!listener.closing && can_accept) {
-                            descriptors.push_back(pollfd{
-                                .fd = listener.fd,
-                                .events = POLLIN,
-                                .revents = 0,
-                            });
-                            tokens.push_back(PollToken{
-                                .kind = PollKind::kListener,
-                                .id = id,
-                                .fd = listener.fd,
-                            });
-                        }
-                    }
-                    for (auto& [id, connection] : connections_) {
-                        PrepareReceiveReservationLocked(connection);
-                        PrepareHeartbeatLocked(connection, Clock::now());
-                        short events = 0;
-                        if (CanReadLocked(connection)) events |= POLLIN;
-                        if (!connection.control_writes.empty() ||
-                            !connection.data_writes.empty() ||
-                            connection.heartbeat_pending) {
-                            events |= POLLOUT;
-                        }
-                        descriptors.push_back(pollfd{
-                            .fd = connection.fd,
-                            .events = events,
-                            .revents = 0,
-                        });
-                        tokens.push_back(PollToken{
-                            .kind = PollKind::kConnection,
-                            .id = id,
-                            .fd = connection.fd,
-                        });
-                    }
+                    ResetEpollStateLocked();
+                }
+                FailWorker();
+                return;
+            }
+
+            const int timeout_ms =
+                has_immediate_writes
+                    ? 0
+                    : static_cast<int>(options_.io_poll_max_ms);
+            const int ready = ::epoll_wait(
+                epoll_fd.get(), events.data(), static_cast<int>(events.size()),
+                timeout_ms);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                {
+                    std::lock_guard lock(mutex_);
+                    ResetEpollStateLocked();
+                }
+                FailWorker();
+                return;
+            }
+            for (int index = 0; index < ready; ++index) {
+                std::lock_guard lock(mutex_);
+                const auto found = event_tokens_.find(events[index].data.u64);
+                if (found == event_tokens_.end()) continue;
+                const PollToken token = found->second;
+                if (token.kind == PollKind::kWake) {
+                    ConsumeWake();
+                    continue;
                 }
 
-                int polled = ::poll(descriptors.data(), descriptors.size(),
-                                    static_cast<int>(options_.io_poll_max_ms));
-                if (polled < 0) {
-                    if (errno == EINTR) continue;
-                    FailWorker();
-                    return;
+                short poll_events = 0;
+                if ((events[index].events & EPOLLIN) != 0) {
+                    poll_events |= POLLIN;
                 }
-                if (polled == 0) continue;
-                for (size_t i = 0; i < descriptors.size(); ++i) {
-                    if (descriptors[i].revents == 0) continue;
-                    const PollToken token = tokens[i];
-                    if (token.kind == PollKind::kWake) {
-                        DrainWakePipe();
-                        continue;
-                    }
-                    std::lock_guard lock(mutex_);
-                    if (token.kind == PollKind::kListener) {
-                        ProcessListenerEventLocked(token, descriptors[i].revents);
-                    } else {
-                        ProcessConnectionEventLocked(token,
-                                                     descriptors[i].revents);
-                    }
+                if ((events[index].events & EPOLLOUT) != 0) {
+                    poll_events |= POLLOUT;
+                }
+                if ((events[index].events & EPOLLERR) != 0) {
+                    poll_events |= POLLERR;
+                }
+                if ((events[index].events & (EPOLLHUP | EPOLLRDHUP)) != 0) {
+                    poll_events |= POLLHUP;
+                }
+                if (token.kind == PollKind::kListener) {
+                    ProcessListenerEventLocked(token, poll_events);
+                } else {
+                    ProcessConnectionEventLocked(token, poll_events);
                 }
             }
+        }
+        std::lock_guard lock(mutex_);
+        ResetEpollStateLocked();
+    }
+#elif defined(MINO_TCP_USE_KQUEUE)
+    static_assert(sizeof(uintptr_t) >= sizeof(uint64_t));
+    static_assert(sizeof(KqueueUserData) >= sizeof(uint64_t));
+
+    uint64_t NextEventTokenLocked() noexcept {
+        for (;;) {
+            const uint64_t token = next_event_token_++;
+            if (next_event_token_ == 0) next_event_token_ = 1;
+            if (token != 0 && !event_tokens_.contains(token)) return token;
+        }
+    }
+
+    Status ChangeKqueueFilterLocked(int fd, KqueueFilter filter,
+                                    KqueueFlags flags, uint64_t event_token) {
+        struct kevent change;
+        EV_SET(&change, static_cast<uintptr_t>(fd), filter, flags, 0, 0,
+               EncodeKqueueToken<KqueueUserData>(event_token));
+        int result;
+        do {
+            result = ::kevent(kqueue_fd_, &change, 1, nullptr, 0, nullptr);
+        } while (result != 0 && errno == EINTR);
+        if (result != 0) {
+            return Internal("failed to update TCP descriptor in kqueue");
+        }
+        return Status::Ok();
+    }
+
+    Status EnsureKqueueTokenLocked(const PollToken& poll_token,
+                                   uint64_t* event_token) {
+        if (*event_token != 0) return Status::Ok();
+        const uint64_t token = NextEventTokenLocked();
+        event_tokens_.emplace(token, poll_token);
+        *event_token = token;
+        return Status::Ok();
+    }
+
+    Status SetKqueueFilterLocked(int fd, KqueueFilter filter, bool enabled,
+                                 uint64_t event_token, bool* registered,
+                                 bool* was_enabled) {
+        if (!*registered) {
+            const KqueueFlags flags = static_cast<KqueueFlags>(
+                EV_ADD | (enabled ? EV_ENABLE : EV_DISABLE));
+            MINO_RETURN_IF_ERROR(
+                ChangeKqueueFilterLocked(fd, filter, flags, event_token));
+            *registered = true;
+            *was_enabled = enabled;
+            return Status::Ok();
+        }
+        if (*was_enabled == enabled) return Status::Ok();
+        const KqueueFlags flags = static_cast<KqueueFlags>(
+            enabled ? EV_ENABLE : EV_DISABLE);
+        MINO_RETURN_IF_ERROR(
+            ChangeKqueueFilterLocked(fd, filter, flags, event_token));
+        *was_enabled = enabled;
+        return Status::Ok();
+    }
+
+    void DeleteKqueueFilterLocked(int fd, KqueueFilter filter,
+                                  bool* registered,
+                                  bool* enabled) noexcept {
+        if (!*registered) return;
+        if (kqueue_fd_ >= 0 && fd >= 0) {
+            struct kevent change;
+            EV_SET(&change, static_cast<uintptr_t>(fd), filter, EV_DELETE, 0, 0,
+                   EncodeKqueueToken<KqueueUserData>(0));
+            int result;
+            do {
+                result = ::kevent(kqueue_fd_, &change, 1, nullptr, 0, nullptr);
+            } while (result != 0 && errno == EINTR);
+            (void)result;
+        }
+        *registered = false;
+        *enabled = false;
+    }
+
+    void RemoveKqueueListenerLocked(Listener& listener) noexcept {
+        if (listener.event_token == 0) return;
+        event_tokens_.erase(listener.event_token);
+        DeleteKqueueFilterLocked(listener.fd, EVFILT_READ,
+                                 &listener.read_registered,
+                                 &listener.read_enabled);
+        listener.event_token = 0;
+    }
+
+    void RemoveKqueueConnectionLocked(Connection& connection) noexcept {
+        if (connection.event_token == 0) return;
+        event_tokens_.erase(connection.event_token);
+        DeleteKqueueFilterLocked(connection.fd, EVFILT_READ,
+                                 &connection.read_registered,
+                                 &connection.read_enabled);
+        DeleteKqueueFilterLocked(connection.fd, EVFILT_WRITE,
+                                 &connection.write_registered,
+                                 &connection.write_enabled);
+        connection.event_token = 0;
+    }
+
+    Status SyncKqueueInterestsLocked() {
+        const PollToken wake_token{.kind = PollKind::kWake,
+                                   .id = kInvalidConnectionId,
+                                   .fd = wake_read_fd_};
+        MINO_RETURN_IF_ERROR(
+            EnsureKqueueTokenLocked(wake_token, &wake_event_token_));
+        MINO_RETURN_IF_ERROR(SetKqueueFilterLocked(
+            wake_read_fd_, EVFILT_READ, true, wake_event_token_,
+            &wake_read_registered_, &wake_read_enabled_));
+
+        const bool can_accept =
+            accepted_.size() < options_.max_pending_accepts &&
+            connections_.size() < config_.max_connections;
+        for (auto& [id, listener] : listeners_) {
+            const PollToken token{.kind = PollKind::kListener,
+                                  .id = id,
+                                  .fd = listener.fd};
+            MINO_RETURN_IF_ERROR(
+                EnsureKqueueTokenLocked(token, &listener.event_token));
+            MINO_RETURN_IF_ERROR(SetKqueueFilterLocked(
+                listener.fd, EVFILT_READ, !listener.closing && can_accept,
+                listener.event_token, &listener.read_registered,
+                &listener.read_enabled));
+        }
+        for (auto& [id, connection] : connections_) {
+            const PollToken token{.kind = PollKind::kConnection,
+                                  .id = id,
+                                  .fd = connection.fd};
+            MINO_RETURN_IF_ERROR(
+                EnsureKqueueTokenLocked(token, &connection.event_token));
+            MINO_RETURN_IF_ERROR(SetKqueueFilterLocked(
+                connection.fd, EVFILT_READ, CanReadLocked(connection),
+                connection.event_token, &connection.read_registered,
+                &connection.read_enabled));
+            const bool needs_write = connection.write_blocked &&
+                                     HasPendingWriteLocked(connection);
+            MINO_RETURN_IF_ERROR(SetKqueueFilterLocked(
+                connection.fd, EVFILT_WRITE, needs_write,
+                connection.event_token, &connection.write_registered,
+                &connection.write_enabled));
+        }
+        return Status::Ok();
+    }
+
+    void ResetKqueueStateLocked() noexcept {
+        kqueue_fd_ = -1;
+        event_tokens_.clear();
+        wake_event_token_ = 0;
+        wake_read_registered_ = false;
+        wake_read_enabled_ = false;
+        for (auto& [id, listener] : listeners_) {
+            (void)id;
+            listener.event_token = 0;
+            listener.read_registered = false;
+            listener.read_enabled = false;
+        }
+        for (auto& [id, connection] : connections_) {
+            (void)id;
+            connection.event_token = 0;
+            connection.read_registered = false;
+            connection.read_enabled = false;
+            connection.write_registered = false;
+            connection.write_enabled = false;
+        }
+    }
+
+    void WorkerLoopKqueue() {
+        UniqueFd kqueue_fd(::kqueue());
+        if (kqueue_fd.get() < 0) {
+            FailWorker();
+            return;
+        }
+        const int descriptor_flags = ::fcntl(kqueue_fd.get(), F_GETFD, 0);
+        if (descriptor_flags < 0 ||
+            ::fcntl(kqueue_fd.get(), F_SETFD,
+                    descriptor_flags | FD_CLOEXEC) != 0) {
+            FailWorker();
+            return;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            kqueue_fd_ = kqueue_fd.get();
+        }
+
+        std::array<struct kevent, 256> events{};
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            Status sync_status;
+            bool has_immediate_writes = false;
+            {
+                std::lock_guard lock(mutex_);
+                const TimePoint now = Clock::now();
+                has_immediate_writes = DrainSendIngressLocked();
+                ProcessClosuresAndTimersLocked(now);
+                for (auto& [id, connection] : connections_) {
+                    (void)id;
+                    PrepareReceiveReservationLocked(connection);
+                    PrepareHeartbeatLocked(connection, now);
+                }
+                has_immediate_writes |= DrainUnblockedWritesLocked();
+                has_immediate_writes |= DrainSendIngressLocked();
+                sync_status = SyncKqueueInterestsLocked();
+            }
+            if (!sync_status.ok()) {
+                {
+                    std::lock_guard lock(mutex_);
+                    ResetKqueueStateLocked();
+                }
+                FailWorker();
+                return;
+            }
+
+            const uint32_t timeout_ms =
+                has_immediate_writes ? 0u : options_.io_poll_max_ms;
+            const timespec timeout{
+                .tv_sec = static_cast<time_t>(timeout_ms / 1000u),
+                .tv_nsec =
+                    static_cast<long>(timeout_ms % 1000u) * 1'000'000L,
+            };
+            const int ready = ::kevent(
+                kqueue_fd.get(), nullptr, 0, events.data(),
+                static_cast<int>(events.size()), &timeout);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                {
+                    std::lock_guard lock(mutex_);
+                    ResetKqueueStateLocked();
+                }
+                FailWorker();
+                return;
+            }
+
+            bool wake_failed = false;
+            for (int index = 0; index < ready; ++index) {
+                std::lock_guard lock(mutex_);
+                const uint64_t event_token =
+                    DecodeKqueueToken(events[index].udata);
+                const auto found = event_tokens_.find(event_token);
+                if (found == event_tokens_.end()) continue;
+                const PollToken token = found->second;
+                if (static_cast<uintptr_t>(token.fd) != events[index].ident) {
+                    continue;
+                }
+                if (token.kind == PollKind::kWake) {
+                    if ((events[index].flags & (EV_ERROR | EV_EOF)) != 0) {
+                        wake_failed = true;
+                        break;
+                    }
+                    ConsumeWake();
+                    continue;
+                }
+
+                short poll_events = 0;
+                if (events[index].filter == EVFILT_READ) {
+                    poll_events |= POLLIN;
+                } else if (events[index].filter == EVFILT_WRITE) {
+                    poll_events |= POLLOUT;
+                }
+                if ((events[index].flags & EV_ERROR) != 0) {
+                    poll_events |= POLLERR;
+                }
+                if ((events[index].flags & EV_EOF) != 0) {
+                    poll_events |= POLLHUP;
+                }
+                if (token.kind == PollKind::kListener) {
+                    ProcessListenerEventLocked(token, poll_events);
+                } else {
+                    ProcessConnectionEventLocked(token, poll_events);
+                }
+            }
+            if (wake_failed) {
+                {
+                    std::lock_guard lock(mutex_);
+                    ResetKqueueStateLocked();
+                }
+                FailWorker();
+                return;
+            }
+        }
+        std::lock_guard lock(mutex_);
+        ResetKqueueStateLocked();
+    }
+#else
+    void WorkerLoopPoll() {
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            std::vector<pollfd> descriptors;
+            std::vector<PollToken> tokens;
+            {
+                std::lock_guard lock(mutex_);
+                (void)DrainSendIngressLocked();
+                ProcessClosuresAndTimersLocked(Clock::now());
+                descriptors.reserve(1 + listeners_.size() + connections_.size());
+                tokens.reserve(descriptors.capacity());
+                descriptors.push_back(pollfd{.fd = wake_read_fd_,
+                                             .events = POLLIN,
+                                             .revents = 0});
+                tokens.push_back(PollToken{.kind = PollKind::kWake,
+                                           .id = kInvalidConnectionId,
+                                           .fd = wake_read_fd_});
+                const bool can_accept =
+                    accepted_.size() < options_.max_pending_accepts &&
+                    connections_.size() < config_.max_connections;
+                for (const auto& [id, listener] : listeners_) {
+                    if (!listener.closing && can_accept) {
+                        descriptors.push_back(pollfd{.fd = listener.fd,
+                                                     .events = POLLIN,
+                                                     .revents = 0});
+                        tokens.push_back(PollToken{.kind = PollKind::kListener,
+                                                   .id = id,
+                                                   .fd = listener.fd});
+                    }
+                }
+                for (auto& [id, connection] : connections_) {
+                    PrepareReceiveReservationLocked(connection);
+                    PrepareHeartbeatLocked(connection, Clock::now());
+                    short poll_events = 0;
+                    if (CanReadLocked(connection)) poll_events |= POLLIN;
+                    if (!connection.control_writes.empty() ||
+                        !connection.data_writes.empty() ||
+                        connection.heartbeat_pending) {
+                        poll_events |= POLLOUT;
+                    }
+                    descriptors.push_back(pollfd{.fd = connection.fd,
+                                                 .events = poll_events,
+                                                 .revents = 0});
+                    tokens.push_back(PollToken{.kind = PollKind::kConnection,
+                                               .id = id,
+                                               .fd = connection.fd});
+                }
+            }
+
+            const int ready = ::poll(descriptors.data(), descriptors.size(),
+                                     static_cast<int>(options_.io_poll_max_ms));
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                FailWorker();
+                return;
+            }
+            if (ready == 0) continue;
+            for (size_t index = 0; index < descriptors.size(); ++index) {
+                if (descriptors[index].revents == 0) continue;
+                const PollToken token = tokens[index];
+                if (token.kind == PollKind::kWake) {
+                    ConsumeWake();
+                    continue;
+                }
+                std::lock_guard lock(mutex_);
+                if (token.kind == PollKind::kListener) {
+                    ProcessListenerEventLocked(token,
+                                               descriptors[index].revents);
+                } else {
+                    ProcessConnectionEventLocked(token,
+                                                 descriptors[index].revents);
+                }
+            }
+        }
+    }
+#endif
+
+    void WorkerLoop() noexcept {
+        try {
+#if defined(MINO_TCP_USE_EPOLL)
+            WorkerLoopEpoll();
+#elif defined(MINO_TCP_USE_KQUEUE)
+            WorkerLoopKqueue();
+#else
+            WorkerLoopPoll();
+#endif
         } catch (const std::bad_alloc&) {
+#if defined(MINO_TCP_USE_EPOLL)
+            {
+                std::lock_guard lock(mutex_);
+                ResetEpollStateLocked();
+            }
+#elif defined(MINO_TCP_USE_KQUEUE)
+            {
+                std::lock_guard lock(mutex_);
+                ResetKqueueStateLocked();
+            }
+#endif
             FailWorker();
         } catch (...) {
+#if defined(MINO_TCP_USE_EPOLL)
+            {
+                std::lock_guard lock(mutex_);
+                ResetEpollStateLocked();
+            }
+#elif defined(MINO_TCP_USE_KQUEUE)
+            {
+                std::lock_guard lock(mutex_);
+                ResetKqueueStateLocked();
+            }
+#endif
             FailWorker();
         }
     }
@@ -1020,28 +1881,139 @@ private:
     void CloseListenerLocked(ConnectionId id) {
         const auto found = listeners_.find(id);
         if (found == listeners_.end()) return;
+#if defined(MINO_TCP_USE_EPOLL)
+        RemoveEpollRegistrationLocked(found->second.fd,
+                                      &found->second.event_token,
+                                      &found->second.registered_events);
+#elif defined(MINO_TCP_USE_KQUEUE)
+        RemoveKqueueListenerLocked(found->second);
+#endif
         if (found->second.fd >= 0) (void)::close(found->second.fd);
         listeners_.erase(found);
         RememberClosedLocked(id);
         accept_cv_.notify_all();
     }
 
-    void RemoveReadyMessagesLocked(ConnectionId id) {
-        for (auto message = ready_messages_.begin();
-             message != ready_messages_.end();) {
-            if (message->connection_id != id) {
-                ++message;
-                continue;
-            }
-            ready_receive_bytes_ -= message->payload.size();
-            message = ready_messages_.erase(message);
+    void TrimConsumedReadyMessagesLocked() noexcept {
+        while (!ready_messages_.empty() &&
+               !ready_messages_.front().message.has_value()) {
+            ready_messages_.pop_front();
         }
+    }
+
+    ReadyMessageEntry* FirstReadyMessageLocked(ConnectionId id) noexcept {
+        if (id == kInvalidConnectionId) {
+            TrimConsumedReadyMessagesLocked();
+            return ready_messages_.empty() ? nullptr : &ready_messages_.front();
+        }
+        const auto found = ready_messages_by_connection_.find(id);
+        return found == ready_messages_by_connection_.end()
+                   ? nullptr
+                   : found->second.front();
+    }
+
+    void NotifyReadyWaitersLocked() noexcept {
+        if (filtered_receive_waiters_ == 0) {
+            receive_cv_.notify_one();
+        } else {
+            // A single CV cannot target a connection. Wake all whenever a
+            // filtered waiter exists so a notification cannot select a waiter
+            // whose predicate rejects this connection and strand the message.
+            receive_cv_.notify_all();
+        }
+    }
+
+    void CompactReadyMessagesLocked() {
+        std::deque<ReadyMessageEntry> compacted;
+        std::unordered_map<ConnectionId, std::deque<ReadyMessageEntry*>>
+            compacted_index;
+        compacted_index.reserve(ready_messages_by_connection_.size());
+        size_t compacted_messages = 0;
+        for (const ReadyMessageEntry& entry : ready_messages_) {
+            if (!entry.message.has_value()) continue;
+            compacted.push_back(ReadyMessageEntry{.message = *entry.message});
+            ReadyMessageEntry* const ready = &compacted.back();
+            compacted_index[ready->message->connection_id].push_back(ready);
+            ++compacted_messages;
+        }
+        assert(compacted_messages == ready_receive_messages_);
+        ready_messages_.swap(compacted);
+        ready_messages_by_connection_.swap(compacted_index);
+    }
+
+    void EnqueueReadyMessageLocked(ReceivedMessage message) {
+        if (ready_messages_.size() >=
+                options_.max_ready_receive_messages &&
+            ready_messages_.size() != ready_receive_messages_) {
+            CompactReadyMessagesLocked();
+        }
+        const ConnectionId id = message.connection_id;
+        const size_t frame_size = message.payload.size();
+        ready_messages_.push_back(
+            ReadyMessageEntry{.message = std::move(message)});
+        ReadyMessageEntry* const ready = &ready_messages_.back();
+        auto bucket = ready_messages_by_connection_.end();
+        try {
+            bucket = ready_messages_by_connection_.try_emplace(id).first;
+            bucket->second.push_back(ready);
+        } catch (...) {
+            if (bucket != ready_messages_by_connection_.end() &&
+                bucket->second.empty()) {
+                ready_messages_by_connection_.erase(bucket);
+            }
+            ready_messages_.pop_back();
+            throw;
+        }
+        ready_receive_bytes_ += frame_size;
+        ++ready_receive_messages_;
+        NotifyReadyWaitersLocked();
+    }
+
+    void ConsumeReadyMessageLocked(ReadyMessageEntry* message,
+                                   ReceiveResult* result) {
+        assert(message != nullptr);
+        assert(message->message.has_value());
+        const ConnectionId id = message->message->connection_id;
+        const size_t frame_size = message->message->payload.size();
+        const auto bucket = ready_messages_by_connection_.find(id);
+        assert(bucket != ready_messages_by_connection_.end());
+        assert(!bucket->second.empty());
+        assert(bucket->second.front() == message);
+        result->messages.push_back(std::move(*message->message));
+        bucket->second.pop_front();
+        if (bucket->second.empty()) {
+            ready_messages_by_connection_.erase(bucket);
+        }
+        message->message.reset();
+        ready_receive_bytes_ -= frame_size;
+        --ready_receive_messages_;
+        TrimConsumedReadyMessagesLocked();
+    }
+
+    void RemoveReadyMessagesLocked(ConnectionId id) {
+        const auto bucket = ready_messages_by_connection_.find(id);
+        if (bucket == ready_messages_by_connection_.end()) return;
+        for (ReadyMessageEntry* const ready : bucket->second) {
+            assert(ready != nullptr);
+            assert(ready->message.has_value());
+            ready_receive_bytes_ -= ready->message->payload.size();
+            --ready_receive_messages_;
+            ready->message.reset();
+        }
+        ready_messages_by_connection_.erase(bucket);
+        TrimConsumedReadyMessagesLocked();
     }
 
     void CloseConnectionLocked(ConnectionId id, const Status& failure) {
         const auto found = connections_.find(id);
         if (found == connections_.end()) return;
         Connection& connection = found->second;
+#if defined(MINO_TCP_USE_EPOLL)
+        RemoveEpollRegistrationLocked(connection.fd, &connection.event_token,
+                                      &connection.registered_events);
+#elif defined(MINO_TCP_USE_KQUEUE)
+        RemoveKqueueConnectionLocked(connection);
+#endif
         if (connection.fd >= 0) (void)::close(connection.fd);
         RemoveReadyMessagesLocked(id);
         if (connection.reserved_body_bytes != 0) {
@@ -1063,9 +2035,28 @@ private:
                 .status = failure,
             });
         }
-        total_data_send_bytes_ -= connection.queued_data_send_bytes;
-        total_control_send_bytes_ -= connection.queued_control_send_bytes;
-        total_control_send_messages_ -= connection.control_writes.size();
+        {
+            std::lock_guard send_lock(send_ingress_mutex_);
+            const auto admission = send_admission_.find(id);
+            if (admission != send_admission_.end()) {
+                admission->second.accepting = false;
+                for (const PendingWrite& write :
+                     admission->second.data_writes) {
+                    if (write.operation.id == kInvalidOperationId) continue;
+                    completions_.push_back(DeliveryCompletion{
+                        .operation = write.operation,
+                        .reached_stage = DeliveryStage::kLocalPublished,
+                        .status = failure,
+                    });
+                }
+                total_data_send_bytes_ -= admission->second.queued_data_bytes;
+                total_control_send_bytes_ -=
+                    admission->second.queued_control_bytes;
+                total_control_send_messages_ -=
+                    admission->second.queued_control_messages;
+                send_admission_.erase(admission);
+            }
+        }
 
         accepted_.erase(
             std::remove_if(accepted_.begin(), accepted_.end(),
@@ -1107,7 +2098,7 @@ private:
             return false;
         }
         if (connection.reserved_body_bytes != 0) return true;
-        return ready_messages_.size() + reserved_receive_messages_ <
+        return ready_receive_messages_ + reserved_receive_messages_ <
                    options_.max_ready_receive_messages &&
                ready_receive_bytes_ + reserved_receive_bytes_ <
                    options_.max_ready_receive_bytes;
@@ -1119,7 +2110,7 @@ private:
             return;
         }
         const size_t body_size = connection.expected_body_size;
-        if (ready_messages_.size() + reserved_receive_messages_ >=
+        if (ready_receive_messages_ + reserved_receive_messages_ >=
                 options_.max_ready_receive_messages ||
             ready_receive_bytes_ + reserved_receive_bytes_ >
                 options_.max_ready_receive_bytes ||
@@ -1186,7 +2177,19 @@ private:
             connection.last_valid_receive = now;
             connection.last_transmit = now;
             const ConnectionInfo info = connection.info;
-            connections_.emplace(id, std::move(connection));
+            auto [inserted, was_inserted] =
+                connections_.emplace(id, std::move(connection));
+            (void)was_inserted;
+            try {
+                std::lock_guard send_lock(send_ingress_mutex_);
+                send_admission_.emplace(id, SendAdmission{});
+            } catch (...) {
+                if (inserted->second.fd >= 0) {
+                    (void)::close(inserted->second.fd);
+                }
+                connections_.erase(inserted);
+                throw;
+            }
             accepted_.push_back(AcceptedConnection{
                 .listener_id = token.id,
                 .info = info,
@@ -1216,6 +2219,7 @@ private:
         found = connections_.find(token.id);
         if (found == connections_.end()) return;
         if ((events & POLLOUT) != 0) {
+            found->second.write_blocked = false;
             const Status write_status = WriteConnectionLocked(found->second);
             if (!write_status.ok()) {
                 CloseConnectionLocked(token.id, write_status);
@@ -1295,39 +2299,34 @@ private:
             budget -= static_cast<size_t>(received);
             if (connection.body_size < connection.expected_body_size) continue;
 
-            bridge::WireFrameLimits limits;
-            limits.max_payload_length = options_.max_frame_body_bytes;
-            limits.max_buffered_bytes =
-                static_cast<size_t>(options_.max_frame_body_bytes) +
-                kTcpPrefixBytes;
-            auto decoded = bridge::WireFrameCodec::Decode(connection.body,
-                                                           limits);
-            if (!decoded.ok()) {
-                return Corruption("TCP stream contains an invalid Wire Frame");
+            const bool is_canonical_heartbeat =
+                connection.body.size() + kTcpPrefixBytes ==
+                    heartbeat_wire_.size() &&
+                std::equal(connection.body.begin(), connection.body.end(),
+                           heartbeat_wire_.begin() + kTcpPrefixBytes);
+            if (is_canonical_heartbeat ||
+                IsMinimallyStructuredWireFrame(connection.body)) {
+                connection.last_valid_receive = Clock::now();
             }
-            connection.last_valid_receive = Clock::now();
-            const size_t complete_size = connection.expected_body_size;
             reserved_receive_bytes_ -= connection.reserved_body_bytes;
             --reserved_receive_messages_;
             connection.reserved_body_bytes = 0;
 
-            if (decoded->header.frame_type != bridge::FrameType::kHeartbeat) {
-                ready_receive_bytes_ += complete_size;
-                ready_messages_.push_back(ReceivedMessage{
+            if (is_canonical_heartbeat) {
+                connection.body.clear();
+            } else {
+                EnqueueReadyMessageLocked(ReceivedMessage{
                     .connection_id = connection.info.id,
                     .from = *connection.info.peer_endpoint,
                     .payload = std::move(connection.body),
                 });
-                receive_cv_.notify_all();
-            } else {
-                connection.body.clear();
             }
             connection.prefix.fill(std::byte{0});
             connection.prefix_size = 0;
             connection.expected_body_size = 0;
             connection.body_size = 0;
             connection.partial_frame_started.reset();
-            if (ready_messages_.size() >=
+            if (ready_receive_messages_ >=
                     options_.max_ready_receive_messages ||
                 ready_receive_bytes_ + reserved_receive_bytes_ >=
                     options_.max_ready_receive_bytes) {
@@ -1354,6 +2353,7 @@ private:
                 if (sent < 0) {
                     if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        connection.write_blocked = true;
                         return Status::Ok();
                     }
                     return Unavailable("TCP heartbeat send failed");
@@ -1418,6 +2418,7 @@ private:
                 } while (sent < 0 && errno == EINTR);
                 if (sent < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        connection.write_blocked = true;
                         return Status::Ok();
                     }
                     return Unavailable("TCP gathered send failed");
@@ -1435,6 +2436,8 @@ private:
                 connection.last_transmit = Clock::now();
 
                 size_t consumed = sent_bytes;
+                size_t released_bytes = 0;
+                size_t released_messages = 0;
                 while (consumed != 0) {
                     PendingWrite& write = writes->front();
                     const size_t remaining = write.bytes.size() - write.offset;
@@ -1444,20 +2447,20 @@ private:
                     if (write.offset != write.bytes.size()) break;
 
                     const size_t wire_size = write.bytes.size();
-                    if (is_control) {
-                        connection.queued_control_send_bytes -= wire_size;
-                        total_control_send_bytes_ -= wire_size;
-                        --total_control_send_messages_;
-                    } else {
-                        if (write.operation.id != kInvalidOperationId) {
-                            connection.awaiting_ack.push_back(write.operation);
-                        }
-                        connection.queued_data_send_bytes -= wire_size;
-                        total_data_send_bytes_ -= wire_size;
+                    if (!is_control &&
+                        write.operation.id != kInvalidOperationId) {
+                        connection.awaiting_ack.push_back(write.operation);
                     }
+                    released_bytes += wire_size;
+                    ++released_messages;
                     writes->pop_front();
                     // TCP local write is not remote acceptance. The protocol ACK
                     // confirms tracked operations after each full frame is sent.
+                }
+                if (released_bytes != 0) {
+                    ReleaseSendAdmissionLocked(connection.info.id, is_control,
+                                               released_bytes,
+                                               released_messages);
                 }
                 continue;
             }
@@ -1469,6 +2472,7 @@ private:
             if (sent < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    connection.write_blocked = true;
                     return Status::Ok();
                 }
                 return Unavailable("TCP heartbeat send failed");
@@ -1486,6 +2490,9 @@ private:
                 connection.heartbeat_offset = 0;
             }
         }
+        if (!HasPendingWriteLocked(connection)) {
+            connection.write_blocked = false;
+        }
         return Status::Ok();
     }
 
@@ -1495,19 +2502,40 @@ private:
     DriverConfig config_{};
 
     mutable std::mutex mutex_;
+    mutable std::mutex send_ingress_mutex_;
     std::condition_variable receive_cv_;
     std::condition_variable completion_cv_;
     std::condition_variable accept_cv_;
     std::thread worker_;
     std::atomic<bool> stop_requested_{true};
+    std::atomic<bool> wake_pending_{false};
     bool worker_failed_ = false;
     int wake_read_fd_ = -1;
     int wake_write_fd_ = -1;
+#if defined(MINO_TCP_USE_EPOLL)
+    int epoll_fd_ = -1;
+    uint64_t next_event_token_ = 1;
+    uint64_t wake_event_token_ = 0;
+    uint32_t wake_registered_events_ = 0;
+    std::unordered_map<uint64_t, PollToken> event_tokens_;
+#elif defined(MINO_TCP_USE_KQUEUE)
+    int kqueue_fd_ = -1;
+    uint64_t next_event_token_ = 1;
+    uint64_t wake_event_token_ = 0;
+    bool wake_read_registered_ = false;
+    bool wake_read_enabled_ = false;
+    std::unordered_map<uint64_t, PollToken> event_tokens_;
+#endif
     ConnectionId next_id_ = 1;
     std::unordered_map<ConnectionId, Connection> connections_;
+    std::unordered_map<ConnectionId, SendAdmission> send_admission_;
     std::unordered_map<ConnectionId, Listener> listeners_;
     std::deque<AcceptedConnection> accepted_;
-    std::deque<ReceivedMessage> ready_messages_;
+    std::deque<ReadyMessageEntry> ready_messages_;
+    std::unordered_map<ConnectionId, std::deque<ReadyMessageEntry*>>
+        ready_messages_by_connection_;
+    size_t ready_receive_messages_ = 0;
+    size_t filtered_receive_waiters_ = 0;
     std::deque<DeliveryCompletion> completions_;
     std::unordered_set<ConnectionId> recently_closed_;
     size_t total_data_send_bytes_ = 0;

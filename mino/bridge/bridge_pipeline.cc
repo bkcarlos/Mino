@@ -50,6 +50,16 @@ bool ValidSource(const SourceIdentity& source) noexcept {
            source.publisher_epoch != 0;
 }
 
+bool ValidLane(uint16_t lane_index, uint16_t lane_count) noexcept {
+    return lane_count != 0 && lane_count <= kMaxBridgeLaneCount &&
+           lane_index < lane_count;
+}
+
+bool SourceBelongsToLane(const SourceIdentity& source, uint16_t lane_index,
+                         uint16_t lane_count) noexcept {
+    return BridgeLaneFor(source, lane_count) == lane_index;
+}
+
 size_t RetainedFrameBytes(const WireFrame& frame) noexcept {
     size_t bytes = kWireBaseHeaderLength + frame.payload.size();
     if (frame.header.perf_trace.has_value()) {
@@ -73,6 +83,42 @@ WireFrame ControlFrame(FrameType type, std::vector<std::byte> payload) {
 
 }  // namespace
 
+bool BridgePipeline::AttemptKeyLess::operator()(
+    const AttemptKey& left, const AttemptKey& right) const noexcept {
+    if (left.source.node_id != right.source.node_id) {
+        return left.source.node_id < right.source.node_id;
+    }
+    if (left.source.publisher_id != right.source.publisher_id) {
+        return left.source.publisher_id < right.source.publisher_id;
+    }
+    if (left.source.publisher_epoch != right.source.publisher_epoch) {
+        return left.source.publisher_epoch < right.source.publisher_epoch;
+    }
+    if (left.sequence != right.sequence) {
+        return left.sequence < right.sequence;
+    }
+    if (left.connection_id != right.connection_id) {
+        return left.connection_id < right.connection_id;
+    }
+    return left.operation_id < right.operation_id;
+}
+
+size_t BridgePipeline::SendOperationHash::operator()(
+    transport::SendOperation operation) const noexcept {
+    size_t value = static_cast<size_t>(operation.connection_id);
+    value ^= static_cast<size_t>(operation.id) + 0x9e3779b97f4a7c15ull +
+             (value << 6) + (value >> 2);
+    return value;
+}
+
+size_t BridgePipeline::ReliableKeyHash::operator()(
+    const ReliableKey& key) const noexcept {
+    size_t value = SourceIdentityHash{}(key.source);
+    value ^= static_cast<size_t>(key.sequence) + 0x9e3779b97f4a7c15ull +
+             (value << 6) + (value >> 2);
+    return value;
+}
+
 Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
     BridgePipelineOptions options,
     std::shared_ptr<transport::TransportDriver> driver,
@@ -86,7 +132,8 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
             ingress == nullptr || options.max_control_frames == 0 ||
             options.max_control_bytes < kSessionHelloHeaderWireSize ||
             options.max_pending_inbound_frames == 0 ||
-            options.max_pending_inbound_bytes == 0) {
+            options.max_pending_inbound_bytes == 0 ||
+            !ValidLane(options.lane_index, options.lane_count)) {
             return Invalid("bridge pipeline dependencies or limits are invalid");
         }
         MINO_ASSIGN_OR_RETURN(auto dedup,
@@ -99,13 +146,18 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
         auto pipeline = std::unique_ptr<BridgePipeline>(new BridgePipeline(
             options, std::move(driver), connection_id, egress, ingress,
             schema_negotiator, std::move(dedup), std::move(retransmit)));
-        pipeline->attempts_.reserve(options.retransmit.max_entries);
+        pipeline->attempt_operations_.reserve(
+            options.retransmit.max_entries);
         pipeline->pending_reliable_.reserve(options.retransmit.max_entries);
+        pipeline->pending_reliable_index_.reserve(
+            options.retransmit.max_entries);
+        pipeline->pending_reliable_sources_.reserve(
+            options.retransmit.max_entries);
         pipeline->pending_inbound_.reserve(
             options.max_pending_inbound_frames);
         pipeline->staged_ready_.reserve(
             options.max_pending_inbound_frames);
-        pipeline->pending_acks_.reserve(options.max_control_frames);
+        pipeline->pending_ack_sources_.reserve(options.max_control_frames);
         pipeline->pending_schema_controls_.reserve(
             options.max_control_frames);
         pipeline->local_schema_bindings_.reserve(
@@ -216,6 +268,11 @@ Status BridgePipeline::QueueSessionHello() noexcept {
         std::vector<SessionHelloSource> sources;
         sources.reserve(snapshot.size());
         for (const DedupResumeEntry& entry : snapshot) {
+            if (!SourceBelongsToLane(entry.source, options_.lane_index,
+                                     options_.lane_count)) {
+                return Corruption(
+                    "bridge dedup snapshot contains a source from another lane");
+            }
             sources.push_back(SessionHelloSource{
                 .source = entry.source,
                 .last_accepted_sequence =
@@ -245,7 +302,8 @@ Status BridgePipeline::RebindConnection(
     uint64_t now_ns) noexcept {
     try {
         if (connection_id == transport::kInvalidConnectionId ||
-            local_session_epoch == 0 || remote_session_epoch == 0) {
+            local_session_epoch == 0 || remote_session_epoch == 0 ||
+            !ValidLane(options_.lane_index, options_.lane_count)) {
             return Invalid("bridge reconnect identity is incomplete");
         }
 
@@ -263,6 +321,7 @@ Status BridgePipeline::RebindConnection(
         control_queue_.clear();
         control_bytes_ = 0;
         pending_acks_.clear();
+        pending_ack_sources_.clear();
         pending_schema_controls_.clear();
         pending_inbound_.clear();
         staged_ready_.clear();
@@ -286,31 +345,150 @@ Status BridgePipeline::RebindConnection(
     }
 }
 
+bool BridgePipeline::CanQueueAck(const AckPayload& ack) const noexcept {
+    if (pending_acks_.size() < options_.max_control_frames) return true;
+    if (ack.disposition != AckDisposition::kAccepted) return false;
+
+    const auto source = pending_ack_sources_.find(ack.source);
+    if (source == pending_ack_sources_.end()) return false;
+    if (source->second.has_cumulative) {
+        const uint64_t queued_highest =
+            source->second.cumulative->highest_contiguous_sequence.value_or(0);
+        if (ack.observed_sequence <= queued_highest) return true;
+        if (ack.highest_contiguous_sequence.has_value() &&
+            ack.observed_sequence <= *ack.highest_contiguous_sequence) {
+            return true;
+        }
+    }
+    if (source->second.selective.contains(ack.observed_sequence)) return true;
+    if (ack.highest_contiguous_sequence.has_value() &&
+        ack.observed_sequence <= *ack.highest_contiguous_sequence) {
+        const auto covered = source->second.selective.begin();
+        return covered != source->second.selective.end() &&
+               covered->first <= *ack.highest_contiguous_sequence;
+    }
+    return false;
+}
+
 Status BridgePipeline::QueueAck(const AckPayload& ack) noexcept {
     try {
-        const auto existing = std::find_if(
-            pending_acks_.begin(), pending_acks_.end(),
-            [&ack](const AckPayload& pending) {
-                return pending.source == ack.source &&
-                       pending.observed_sequence == ack.observed_sequence &&
-                       pending.sender_session_epoch ==
-                           ack.sender_session_epoch &&
-                       pending.receiver_session_epoch ==
-                           ack.receiver_session_epoch;
-            });
-        if (existing != pending_acks_.end()) {
-            *existing = ack;
+        if (ack.disposition != AckDisposition::kAccepted) {
+            if (pending_acks_.size() >= options_.max_control_frames) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "bridge pending ACK queue is full");
+            }
+            pending_acks_.push_back(ack);
+            return Status::Ok();
+        }
+
+        auto source_result = pending_ack_sources_.try_emplace(ack.source);
+        auto source = source_result.first;
+        const auto erase_empty_source = [&]() {
+            if (!source->second.has_cumulative &&
+                source->second.selective.empty()) {
+                pending_ack_sources_.erase(source);
+            }
+        };
+        const bool cumulative =
+            ack.highest_contiguous_sequence.has_value() &&
+            ack.observed_sequence <= *ack.highest_contiguous_sequence;
+        if (cumulative) {
+            const uint64_t highest = *ack.highest_contiguous_sequence;
+            if (source->second.has_cumulative) {
+                const uint64_t queued_highest = source->second.cumulative
+                                                    ->highest_contiguous_sequence
+                                                    .value_or(0);
+                if (highest <= queued_highest) return Status::Ok();
+                *source->second.cumulative = ack;
+            } else {
+                auto reusable = source->second.selective.begin();
+                if (reusable != source->second.selective.end() &&
+                    reusable->first <= highest) {
+                    source->second.cumulative = reusable->second;
+                    source->second.has_cumulative = true;
+                    *reusable->second = ack;
+                    source->second.selective.erase(reusable);
+                } else {
+                    if (pending_acks_.size() >=
+                        options_.max_control_frames) {
+                        erase_empty_source();
+                        return Status::Error(
+                            StatusCode::kWouldBlock,
+                            "bridge pending ACK queue is full");
+                    }
+                    try {
+                        pending_acks_.push_back(ack);
+                    } catch (const std::bad_alloc&) {
+                        erase_empty_source();
+                        return AllocationFailure();
+                    }
+                    source->second.cumulative = std::prev(pending_acks_.end());
+                    source->second.has_cumulative = true;
+                }
+            }
+            auto covered = source->second.selective.begin();
+            while (covered != source->second.selective.end() &&
+                   covered->first <= highest) {
+                pending_acks_.erase(covered->second);
+                covered = source->second.selective.erase(covered);
+            }
+            return Status::Ok();
+        }
+
+        if (source->second.has_cumulative) {
+            const uint64_t queued_highest =
+                source->second.cumulative->highest_contiguous_sequence
+                    .value_or(0);
+            if (ack.observed_sequence <= queued_highest) return Status::Ok();
+        }
+        const auto existing =
+            source->second.selective.find(ack.observed_sequence);
+        if (existing != source->second.selective.end()) {
+            *existing->second = ack;
             return Status::Ok();
         }
         if (pending_acks_.size() >= options_.max_control_frames) {
+            erase_empty_source();
             return Status::Error(StatusCode::kWouldBlock,
                                  "bridge pending ACK queue is full");
         }
         pending_acks_.push_back(ack);
+        const auto pending = std::prev(pending_acks_.end());
+        try {
+            source->second.selective.emplace(ack.observed_sequence, pending);
+        } catch (const std::bad_alloc&) {
+            pending_acks_.erase(pending);
+            erase_empty_source();
+            return AllocationFailure();
+        }
         return Status::Ok();
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }
+}
+
+void BridgePipeline::RemovePendingAck(
+    PendingAckQueue::iterator pending) noexcept {
+    if (pending->disposition == AckDisposition::kAccepted) {
+        const auto source = pending_ack_sources_.find(pending->source);
+        if (source != pending_ack_sources_.end()) {
+            if (source->second.has_cumulative &&
+                source->second.cumulative == pending) {
+                source->second.has_cumulative = false;
+            }
+            const auto selective =
+                source->second.selective.find(pending->observed_sequence);
+            if (selective != source->second.selective.end() &&
+                selective->second == pending) {
+                source->second.selective.erase(selective);
+            }
+            if (!source->second.has_cumulative &&
+                source->second.selective.empty()) {
+                pending_ack_sources_.erase(source);
+            }
+        }
+    }
+    pending_acks_.erase(pending);
 }
 
 Status BridgePipeline::FlushAcks(BridgePumpBudget budget,
@@ -336,7 +514,7 @@ Status BridgePipeline::FlushAcks(BridgePumpBudget budget,
         result->bytes += body.size();
         ++result->outbound_frames;
         result->made_progress = true;
-        pending_acks_.erase(pending_acks_.begin());
+        RemovePendingAck(pending_acks_.begin());
     }
     return Status::Ok();
 }
@@ -375,7 +553,8 @@ Status BridgePipeline::DrainCompletions(const BridgePumpBudget& budget,
         std::vector<transport::ConnectionId> connection_ids;
         connection_ids.reserve(attempts_.size() + 1);
         connection_ids.push_back(connection_id_);
-        for (const Attempt& attempt : attempts_) {
+        for (const auto& [key, attempt] : attempts_) {
+            (void)key;
             if (std::find(connection_ids.begin(), connection_ids.end(),
                           attempt.operation.connection_id) ==
                 connection_ids.end()) {
@@ -401,19 +580,22 @@ Status BridgePipeline::DrainCompletions(const BridgePumpBudget& budget,
             }
             for (const transport::DeliveryCompletion& completion :
                  completed->completions) {
-                const auto attempt = std::find_if(
-                    attempts_.begin(), attempts_.end(),
-                    [&completion](const Attempt& candidate) {
-                        return candidate.operation == completion.operation;
-                    });
-                if (attempt != attempts_.end()) {
-                    if (!completion.status.ok() &&
-                        completion.operation.connection_id == connection_id_) {
-                        current_failure = completion.status;
-                        resend_pending_ = true;
-                        session_ready_ = false;
+                const auto indexed =
+                    attempt_operations_.find(completion.operation);
+                if (indexed != attempt_operations_.end()) {
+                    const auto attempt = attempts_.find(indexed->second);
+                    if (attempt != attempts_.end()) {
+                        if (!completion.status.ok() &&
+                            completion.operation.connection_id ==
+                                connection_id_) {
+                            current_failure = completion.status;
+                            resend_pending_ = true;
+                            session_ready_ = false;
+                        }
+                        RemoveAttempt(attempt);
+                    } else {
+                        attempt_operations_.erase(indexed);
                     }
-                    attempts_.erase(attempt);
                 }
             }
             const uint32_t count =
@@ -582,6 +764,14 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
         return HandleAck(frame);
     }
     if (frame.header.frame_type == FrameType::kData) {
+        const SourceIdentity source = SourceFrom(frame.header);
+        if (!ValidSource(source)) {
+            return Corruption("bridge data source identity is incomplete");
+        }
+        if (!SourceBelongsToLane(source, options_.lane_index,
+                                 options_.lane_count)) {
+            return Corruption("bridge data source belongs to another lane");
+        }
         if (schema_negotiator_ == nullptr) {
             return HandleData(frame, now_ns);
         }
@@ -644,6 +834,10 @@ Status BridgePipeline::HandleData(const WireFrame& frame,
     if (!ValidSource(source)) {
         return Corruption("bridge data source identity is incomplete");
     }
+    if (!SourceBelongsToLane(source, options_.lane_index,
+                             options_.lane_count)) {
+        return Corruption("bridge data source belongs to another lane");
+    }
     auto checked = dedup_->Check(options_.remote_session_epoch, source,
                                  frame.header.sequence_num, now_ns);
     if (!checked.ok()) return checked.status();
@@ -663,14 +857,21 @@ Status BridgePipeline::HandleData(const WireFrame& frame,
         return EmitAck(frame, *checked, AckDisposition::kNackWithHighest);
     }
 
-    const bool ack_already_pending = std::any_of(
-        pending_acks_.begin(), pending_acks_.end(),
-        [&source, &frame](const AckPayload& pending) {
-            return pending.source == source &&
-                   pending.observed_sequence == frame.header.sequence_num;
-        });
-    if (!ack_already_pending &&
-        pending_acks_.size() >= options_.max_control_frames) {
+    uint64_t prospective_highest =
+        checked->highest_contiguous_sequence.value_or(0);
+    if (degraded_baseline ||
+        (prospective_highest != std::numeric_limits<uint64_t>::max() &&
+         frame.header.sequence_num == prospective_highest + 1)) {
+        prospective_highest = frame.header.sequence_num;
+    }
+    if (!CanQueueAck(AckPayload{
+            .sender_session_epoch = options_.local_session_epoch,
+            .receiver_session_epoch = options_.remote_session_epoch,
+            .source = source,
+            .observed_sequence = frame.header.sequence_num,
+            .highest_contiguous_sequence = prospective_highest,
+            .disposition = AckDisposition::kAccepted,
+        })) {
         return Status::Error(StatusCode::kWouldBlock,
                              "bridge pending ACK queue is full");
     }
@@ -708,27 +909,104 @@ Status BridgePipeline::EmitAck(const WireFrame& data,
     return QueueAck(ack);
 }
 
-Status BridgePipeline::RetireAcknowledgedAttempts(
-    const std::vector<Attempt>& before) noexcept {
-    for (const Attempt& attempt : before) {
-        if (retransmit_->Find(attempt.source, attempt.sequence) != nullptr) {
-            continue;
+Status BridgePipeline::AddAttempt(Attempt attempt) noexcept {
+    try {
+        const AttemptKey key{
+            .source = attempt.source,
+            .sequence = attempt.sequence,
+            .connection_id = attempt.operation.connection_id,
+            .operation_id = attempt.operation.id,
+        };
+        auto inserted = attempts_.emplace(key, std::move(attempt));
+        if (!inserted.second) {
+            return Status::Error(StatusCode::kAlreadyExists,
+                                 "bridge send attempt already exists");
         }
+        try {
+            if (!attempt_operations_
+                     .emplace(inserted.first->second.operation, key)
+                     .second) {
+                attempts_.erase(inserted.first);
+                return Status::Error(StatusCode::kAlreadyExists,
+                                     "bridge send operation already exists");
+            }
+        } catch (const std::bad_alloc&) {
+            attempts_.erase(inserted.first);
+            return AllocationFailure();
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+void BridgePipeline::RemoveAttempt(AttemptMap::iterator attempt) noexcept {
+    attempt_operations_.erase(attempt->second.operation);
+    attempts_.erase(attempt);
+}
+
+BridgePipeline::AttemptMap::iterator BridgePipeline::FindAttempt(
+    const SourceIdentity& source, uint64_t sequence,
+    transport::ConnectionId connection_id) noexcept {
+    auto attempt = attempts_.lower_bound(AttemptKey{
+        .source = source,
+        .sequence = sequence,
+        .connection_id = transport::kInvalidConnectionId,
+        .operation_id = transport::kInvalidOperationId,
+    });
+    while (attempt != attempts_.end() && attempt->first.source == source &&
+           attempt->first.sequence == sequence) {
+        if (attempt->first.connection_id == connection_id) return attempt;
+        ++attempt;
+    }
+    return attempts_.end();
+}
+
+Status BridgePipeline::RetireAcknowledgedAttempts(
+    const AckPayload& ack) noexcept {
+    const auto retire = [this](AttemptMap::iterator attempt) -> Status {
         const Status confirmed =
-            driver_->ConfirmRemoteAccepted(attempt.operation);
+            driver_->ConfirmRemoteAccepted(attempt->second.operation);
         if (!confirmed.ok() && confirmed.code() != StatusCode::kNotFound) {
             return confirmed;
         }
         if (!confirmed.ok() &&
-            attempt.operation.connection_id != connection_id_) {
-            continue;
+            attempt->second.operation.connection_id != connection_id_) {
+            return Status::Ok();
         }
-        attempts_.erase(
-            std::remove_if(attempts_.begin(), attempts_.end(),
-                           [&attempt](const Attempt& current) {
-                               return current.operation == attempt.operation;
-                           }),
-            attempts_.end());
+        RemoveAttempt(attempt);
+        return Status::Ok();
+    };
+
+    const uint64_t highest = ack.highest_contiguous_sequence.value_or(0);
+    if (ack.highest_contiguous_sequence.has_value()) {
+        auto attempt = attempts_.lower_bound(AttemptKey{
+            .source = ack.source,
+            .sequence = 0,
+            .connection_id = transport::kInvalidConnectionId,
+            .operation_id = transport::kInvalidOperationId,
+        });
+        while (attempt != attempts_.end() &&
+               attempt->first.source == ack.source &&
+               attempt->first.sequence <= highest) {
+            const auto current = attempt++;
+            MINO_RETURN_IF_ERROR(retire(current));
+        }
+    }
+    if (ack.disposition == AckDisposition::kAccepted &&
+        ack.observed_sequence > highest) {
+        auto attempt = attempts_.lower_bound(AttemptKey{
+            .source = ack.source,
+            .sequence = ack.observed_sequence,
+            .connection_id = transport::kInvalidConnectionId,
+            .operation_id = transport::kInvalidOperationId,
+        });
+        while (attempt != attempts_.end() &&
+               attempt->first.source == ack.source &&
+               attempt->first.sequence == ack.observed_sequence) {
+            const auto current = attempt++;
+            MINO_RETURN_IF_ERROR(retire(current));
+        }
     }
     return Status::Ok();
 }
@@ -737,25 +1015,38 @@ Status BridgePipeline::HandleAck(const WireFrame& frame) noexcept {
     try {
         auto ack = ControlPayloadCodec::DecodeAck(frame.payload);
         if (!ack.ok()) return ack.status();
-        const std::vector<Attempt> before = attempts_;
+        if (!SourceBelongsToLane(ack->source, options_.lane_index,
+                                 options_.lane_count)) {
+            return Corruption("bridge ACK source belongs to another lane");
+        }
         auto applied = retransmit_->ApplyAck(*ack);
         if (!applied.ok()) return applied.status();
+        RemoveAcknowledgedReliable(*ack);
         if (ack->disposition == AckDisposition::kNackWithHighest) {
             const uint64_t highest =
                 ack->highest_contiguous_sequence.value_or(0);
-            for (Attempt& attempt : attempts_) {
-                if (attempt.operation.connection_id == connection_id_ &&
-                    attempt.source == ack->source &&
-                    attempt.sequence > highest &&
-                    retransmit_->Find(attempt.source, attempt.sequence) !=
+            auto attempt = attempts_.lower_bound(AttemptKey{
+                .source = ack->source,
+                .sequence = highest == std::numeric_limits<uint64_t>::max()
+                                ? highest
+                                : highest + 1,
+                .connection_id = transport::kInvalidConnectionId,
+                .operation_id = transport::kInvalidOperationId,
+            });
+            while (attempt != attempts_.end() &&
+                   attempt->first.source == ack->source) {
+                Attempt& pending = attempt->second;
+                if (pending.operation.connection_id == connection_id_ &&
+                    pending.sequence > highest &&
+                    retransmit_->Find(pending.source, pending.sequence) !=
                         nullptr) {
-                    attempt.retry_requested = true;
+                    pending.retry_requested = true;
                     resend_pending_ = true;
                 }
+                ++attempt;
             }
         }
-        MINO_RETURN_IF_ERROR(RetireAcknowledgedAttempts(before));
-        RemoveRetiredReliable();
+        MINO_RETURN_IF_ERROR(RetireAcknowledgedAttempts(*ack));
         return Status::Ok();
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -771,12 +1062,18 @@ Status BridgePipeline::HandleHello(const WireFrame& frame,
             hello->receiver_session_epoch != options_.local_session_epoch) {
             return Corruption("session hello epoch fencing failed");
         }
+        for (const SessionHelloSource& source : hello->sources) {
+            if (!SourceBelongsToLane(source.source, options_.lane_index,
+                                     options_.lane_count)) {
+                return Corruption(
+                    "session hello source belongs to another lane");
+            }
+        }
 
         peer_dedup_state_lost_ = hello->dedup_state_lost;
-        const std::vector<Attempt> before = attempts_;
         if (!hello->dedup_state_lost) {
             for (const SessionHelloSource& source : hello->sources) {
-                auto applied = retransmit_->ApplyAck(AckPayload{
+                const AckPayload resume_ack{
                     .sender_session_epoch = options_.remote_session_epoch,
                     .receiver_session_epoch = options_.local_session_epoch,
                     .source = source.source,
@@ -784,11 +1081,14 @@ Status BridgePipeline::HandleHello(const WireFrame& frame,
                     .highest_contiguous_sequence =
                         source.last_accepted_sequence,
                     .disposition = AckDisposition::kAccepted,
-                });
+                };
+                auto applied = retransmit_->ApplyAck(resume_ack);
                 if (!applied.ok()) return applied.status();
+                RemoveAcknowledgedReliable(resume_ack);
+                MINO_RETURN_IF_ERROR(
+                    RetireAcknowledgedAttempts(resume_ack));
             }
         }
-        MINO_RETURN_IF_ERROR(RetireAcknowledgedAttempts(before));
         RemoveRetiredReliable();
         resend_pending_ = retransmit_->size() != 0;
         hello_received_ = true;
@@ -799,25 +1099,139 @@ Status BridgePipeline::HandleHello(const WireFrame& frame,
     }
 }
 
+Status BridgePipeline::AddPendingReliable(
+    PendingReliable pending) noexcept {
+    try {
+        const ReliableKey key{pending.source, pending.sequence};
+        if (pending_reliable_index_.contains(key)) {
+            return Status::Error(StatusCode::kAlreadyExists,
+                                 "bridge pending reliable frame already exists");
+        }
+        pending_reliable_.push_back(std::move(pending));
+        const size_t index = pending_reliable_.size() - 1;
+        auto source = pending_reliable_sources_.end();
+        bool source_created = false;
+        bool sequence_inserted = false;
+        bool key_inserted = false;
+        try {
+            auto source_result = pending_reliable_sources_.try_emplace(
+                pending_reliable_[index].source);
+            source = source_result.first;
+            source_created = source_result.second;
+            sequence_inserted =
+                source->second
+                    .emplace(pending_reliable_[index].sequence, index)
+                    .second;
+            key_inserted = pending_reliable_index_.emplace(key, index).second;
+            if (!sequence_inserted || !key_inserted) {
+                if (key_inserted) pending_reliable_index_.erase(key);
+                if (sequence_inserted) {
+                    source->second.erase(pending_reliable_[index].sequence);
+                }
+                if (source_created && source->second.empty()) {
+                    pending_reliable_sources_.erase(source);
+                }
+                pending_reliable_.pop_back();
+                return Status::Error(
+                    StatusCode::kAlreadyExists,
+                    "bridge pending reliable frame already exists");
+            }
+        } catch (const std::bad_alloc&) {
+            if (key_inserted) pending_reliable_index_.erase(key);
+            if (sequence_inserted) {
+                source->second.erase(pending_reliable_[index].sequence);
+            }
+            if (source_created &&
+                source != pending_reliable_sources_.end() &&
+                source->second.empty()) {
+                pending_reliable_sources_.erase(source);
+            }
+            pending_reliable_.pop_back();
+            return AllocationFailure();
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
 BridgePipeline::PendingReliable* BridgePipeline::FindPendingReliable(
     const SourceIdentity& source, uint64_t sequence) noexcept {
-    const auto found = std::find_if(
-        pending_reliable_.begin(), pending_reliable_.end(),
-        [&source, sequence](const PendingReliable& pending) {
-            return pending.source == source && pending.sequence == sequence;
-        });
-    return found == pending_reliable_.end() ? nullptr : &*found;
+    const auto found =
+        pending_reliable_index_.find(ReliableKey{source, sequence});
+    return found == pending_reliable_index_.end()
+               ? nullptr
+               : &pending_reliable_[found->second];
+}
+
+void BridgePipeline::RemovePendingReliableAt(size_t index) noexcept {
+    const ReliableKey removed{pending_reliable_[index].source,
+                              pending_reliable_[index].sequence};
+    pending_reliable_index_.erase(removed);
+    const auto source = pending_reliable_sources_.find(removed.source);
+    if (source != pending_reliable_sources_.end()) {
+        source->second.erase(removed.sequence);
+        if (source->second.empty()) pending_reliable_sources_.erase(source);
+    }
+
+    const size_t last = pending_reliable_.size() - 1;
+    if (index != last) {
+        pending_reliable_[index] = std::move(pending_reliable_[last]);
+        const ReliableKey moved{pending_reliable_[index].source,
+                                pending_reliable_[index].sequence};
+        const auto moved_index = pending_reliable_index_.find(moved);
+        if (moved_index != pending_reliable_index_.end()) {
+            moved_index->second = index;
+        }
+        const auto moved_source =
+            pending_reliable_sources_.find(moved.source);
+        if (moved_source != pending_reliable_sources_.end()) {
+            const auto moved_sequence =
+                moved_source->second.find(moved.sequence);
+            if (moved_sequence != moved_source->second.end()) {
+                moved_sequence->second = index;
+            }
+        }
+    }
+    pending_reliable_.pop_back();
+}
+
+void BridgePipeline::RemoveAcknowledgedReliable(
+    const AckPayload& ack) noexcept {
+    const uint64_t highest = ack.highest_contiguous_sequence.value_or(0);
+    if (ack.highest_contiguous_sequence.has_value()) {
+        while (true) {
+            const auto source = pending_reliable_sources_.find(ack.source);
+            if (source == pending_reliable_sources_.end() ||
+                source->second.empty() ||
+                source->second.begin()->first > highest) {
+                break;
+            }
+            const uint64_t sequence = source->second.begin()->first;
+            if (retransmit_->Find(ack.source, sequence) != nullptr) break;
+            RemovePendingReliableAt(source->second.begin()->second);
+        }
+    }
+    if (ack.disposition == AckDisposition::kAccepted &&
+        ack.observed_sequence > highest) {
+        const auto found = pending_reliable_index_.find(
+            ReliableKey{ack.source, ack.observed_sequence});
+        if (found != pending_reliable_index_.end() &&
+            retransmit_->Find(ack.source, ack.observed_sequence) == nullptr) {
+            RemovePendingReliableAt(found->second);
+        }
+    }
 }
 
 void BridgePipeline::RemoveRetiredReliable() noexcept {
-    pending_reliable_.erase(
-        std::remove_if(
-            pending_reliable_.begin(), pending_reliable_.end(),
-            [this](const PendingReliable& pending) {
-                return retransmit_->Find(pending.source, pending.sequence) ==
-                       nullptr;
-            }),
-        pending_reliable_.end());
+    for (size_t i = 0; i < pending_reliable_.size();) {
+        const PendingReliable& pending = pending_reliable_[i];
+        if (retransmit_->Find(pending.source, pending.sequence) != nullptr) {
+            ++i;
+            continue;
+        }
+        RemovePendingReliableAt(i);
+    }
 }
 
 Status BridgePipeline::PrepareSchema(EncodedOutboundFrame* outbound,
@@ -861,15 +1275,10 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
                                      BridgePumpResult* result) noexcept {
     if (!session_ready_ || !resend_pending_) return Status::Ok();
     for (const RetransmitEntry& entry : retransmit_->entries()) {
-        const auto existing_attempt = std::find_if(
-            attempts_.begin(), attempts_.end(),
-            [this, &entry](const Attempt& attempt) {
-                return attempt.operation.connection_id == connection_id_ &&
-                       attempt.source == entry.source &&
-                       attempt.sequence == entry.sequence;
-            });
+        const auto existing_attempt =
+            FindAttempt(entry.source, entry.sequence, connection_id_);
         if (existing_attempt != attempts_.end() &&
-            !existing_attempt->retry_requested) {
+            !existing_attempt->second.retry_requested) {
             continue;
         }
 
@@ -877,6 +1286,8 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
         std::vector<std::byte> rebound_body;
         PendingReliable* pending =
             FindPendingReliable(entry.source, entry.sequence);
+        const bool retransmission =
+            pending != nullptr && pending->transmitted;
         if (schema_negotiator_ != nullptr) {
             if (pending == nullptr) {
                 return Corruption(
@@ -910,7 +1321,7 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
                 return IsWouldBlock(sent.status()) ? Status::Ok()
                                                    : sent.status();
             }
-            existing_attempt->retry_requested = false;
+            existing_attempt->second.retry_requested = false;
         } else {
             auto sent = driver_->Send(transport::SendRequest{
                 .connection_id = connection_id_,
@@ -921,15 +1332,17 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
                 return IsWouldBlock(sent.status()) ? Status::Ok()
                                                    : sent.status();
             }
-            attempts_.push_back(Attempt{
+            MINO_RETURN_IF_ERROR(AddAttempt(Attempt{
                 .source = entry.source,
                 .sequence = entry.sequence,
                 .operation = sent->operation,
                 .retry_requested = false,
-            });
+            }));
         }
+        if (pending != nullptr) pending->transmitted = true;
         result->bytes += body.size();
         ++result->outbound_frames;
+        if (retransmission) ++result->retransmitted_frames;
         result->made_progress = true;
     }
     resend_pending_ = false;
@@ -971,6 +1384,10 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
     if (!ValidSource(source)) {
         return Invalid("egress source identity is incomplete");
     }
+    if (!SourceBelongsToLane(source, options_.lane_index,
+                             options_.lane_count)) {
+        return Invalid("egress source belongs to another bridge lane");
+    }
     bool schema_control_pending = false;
     MINO_RETURN_IF_ERROR(
         PrepareSchema(&outbound, &schema_control_pending));
@@ -1009,13 +1426,26 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
             return Status::Error(StatusCode::kWouldBlock,
                                  "retransmit window is full");
         }
-        MINO_RETURN_IF_ERROR(retransmit_->Add(
-            source, outbound.frame.header.sequence_num, body, now_ns));
-        pending_reliable_.push_back(PendingReliable{
+        const uint64_t sequence = outbound.frame.header.sequence_num;
+        MINO_RETURN_IF_ERROR(AddPendingReliable(PendingReliable{
             .source = source,
-            .sequence = outbound.frame.header.sequence_num,
+            .sequence = sequence,
             .outbound = std::move(outbound),
-        });
+        }));
+        const Status admitted =
+            retransmit_->Add(source, sequence, body, now_ns);
+        if (!admitted.ok()) {
+            const auto pending =
+                pending_reliable_index_.find(ReliableKey{source, sequence});
+            if (pending != pending_reliable_index_.end()) {
+                RemovePendingReliableAt(pending->second);
+            }
+            return admitted;
+        }
+        PendingReliable* pending = FindPendingReliable(source, sequence);
+        if (pending == nullptr) {
+            return Corruption("admitted reliable frame lost its logical index");
+        }
         *ownership_transferred = true;
         auto sent = driver_->Send(transport::SendRequest{
             .connection_id = connection_id_,
@@ -1024,14 +1454,19 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
         });
         if (!sent.ok()) {
             resend_pending_ = true;
-            return IsWouldBlock(sent.status()) ? Status::Ok() : sent.status();
+            // The frame is retained in the retransmit window, but later
+            // sequences must not overtake it when the driver queue is full.
+            // Propagate backpressure so PullOutbound stops this round and the
+            // next Pump retries retained frames first.
+            return sent.status();
         }
-        attempts_.push_back(Attempt{
+        pending->transmitted = true;
+        MINO_RETURN_IF_ERROR(AddAttempt(Attempt{
             .source = source,
-            .sequence = pending_reliable_.back().sequence,
+            .sequence = sequence,
             .operation = sent->operation,
             .retry_requested = false,
-        });
+        }));
     } else {
         auto sent = driver_->SendUntracked(transport::UntrackedSendRequest{
             .connection_id = connection_id_,
@@ -1077,11 +1512,12 @@ Result<BridgePumpResult> BridgePipeline::Pump(
         MINO_RETURN_IF_ERROR(FlushControls(budget, &result));
         MINO_RETURN_IF_ERROR(FlushAcks(budget, &result));
         const size_t expired = retransmit_->PurgeExpired(budget.now_ns);
-        RemoveRetiredReliable();
+        if (expired != 0) RemoveRetiredReliable();
         dedup_->PurgeExpired(budget.now_ns);
         if (expired != 0) {
             const Status closed = driver_->Close(connection_id_);
             attempts_.clear();
+            attempt_operations_.clear();
             session_ready_ = false;
             if (!closed.ok() && closed.code() != StatusCode::kNotFound) {
                 return closed;

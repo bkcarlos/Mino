@@ -103,6 +103,12 @@ bool ValidDiscoveryIdentity(const SessionDiscovery& discovery) noexcept {
            discovery.lease_epoch != 0 && discovery.node_config_version != 0;
 }
 
+bool ValidDiscoveryLane(const SessionDiscovery& discovery) noexcept {
+    return discovery.lane_count != 0 &&
+           discovery.lane_count <= kMaxBridgeLaneCount &&
+           discovery.lane_index < discovery.lane_count;
+}
+
 bool HasDuplicateSources(const std::vector<SessionHelloSource>& sources) {
     for (size_t i = 0; i < sources.size(); ++i) {
         for (size_t j = i + 1; j < sources.size(); ++j) {
@@ -301,10 +307,20 @@ Result<std::vector<std::byte>> ControlPayloadCodec::EncodeSessionDiscovery(
         if (!ValidDiscoveryIdentity(discovery)) {
             return Invalid("session discovery identity is incomplete");
         }
+        if (!ValidDiscoveryLane(discovery)) {
+            return Invalid("session discovery lane is invalid");
+        }
         std::vector<std::byte> output(kSessionDiscoveryPayloadWireSize);
-        WriteBe16(output, 0, kSessionDiscoveryPayloadVersion);
-        WriteBe16(output, 2, 0);
-        WriteBe32(output, 4, 0);
+        if (discovery.lane_count == 1) {
+            WriteBe16(output, 0, kSessionDiscoveryLegacyPayloadVersion);
+            WriteBe16(output, 2, 0);
+            WriteBe32(output, 4, 0);
+        } else {
+            WriteBe16(output, 0, kSessionDiscoveryCurrentPayloadVersion);
+            WriteBe16(output, 2, 0);
+            WriteBe16(output, 4, discovery.lane_index);
+            WriteBe16(output, 6, discovery.lane_count);
+        }
         WriteBe64(output, 8, discovery.session_epoch);
         WriteBe64(output, 16, discovery.node_id.value);
         WriteBe64(output, 24, discovery.process_identity.node_id);
@@ -326,13 +342,27 @@ Result<SessionDiscovery> ControlPayloadCodec::DecodeSessionDiscovery(
     if (payload.size() != kSessionDiscoveryPayloadWireSize) {
         return Corruption("session discovery payload has noncanonical length");
     }
-    if (ReadBe16(payload, 0) != kSessionDiscoveryPayloadVersion) {
+    const uint16_t version = ReadBe16(payload, 0);
+    SessionDiscovery discovery;
+    if (version == kSessionDiscoveryLegacyPayloadVersion) {
+        if (ReadBe16(payload, 2) != 0 || ReadBe32(payload, 4) != 0) {
+            return Corruption(
+                "legacy session discovery payload has nonzero reserved bits");
+        }
+    } else if (version == kSessionDiscoveryCurrentPayloadVersion) {
+        if (ReadBe16(payload, 2) != 0) {
+            return Corruption(
+                "session discovery payload has nonzero reserved flags");
+        }
+        discovery.lane_index = ReadBe16(payload, 4);
+        discovery.lane_count = ReadBe16(payload, 6);
+        if (discovery.lane_count < 2 ||
+            !ValidDiscoveryLane(discovery)) {
+            return Corruption("session discovery lane is invalid");
+        }
+    } else {
         return Corruption("session discovery payload version is unsupported");
     }
-    if (ReadBe16(payload, 2) != 0 || ReadBe32(payload, 4) != 0) {
-        return Corruption("session discovery payload has nonzero reserved bits");
-    }
-    SessionDiscovery discovery;
     discovery.session_epoch = ReadBe64(payload, 8);
     discovery.node_id = NodeId{ReadBe64(payload, 16)};
     discovery.process_identity = ProcessIdentity{

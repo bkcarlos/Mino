@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -89,6 +90,24 @@ void ExpectDecodeFailure(std::span<const std::byte> body,
         << decoded.status().ToString();
 }
 
+void ExpectEncodedSizeMatchesEncode(const WireFrame& frame,
+                                    const WireFrameLimits& limits = {}) {
+    const auto encoded_size = WireFrameCodec::EncodedSize(frame, limits);
+    const auto encoded = WireFrameCodec::Encode(frame, limits);
+    ASSERT_EQ(encoded_size.ok(), encoded.ok());
+    if (encoded_size.ok()) {
+        EXPECT_EQ(*encoded_size, encoded->size());
+        const auto header_only_size = WireFrameCodec::EncodedSize(
+            frame.header, frame.payload.size(), limits);
+        ASSERT_TRUE(header_only_size.ok())
+            << header_only_size.status().ToString();
+        EXPECT_EQ(*header_only_size, *encoded_size);
+        return;
+    }
+    EXPECT_EQ(encoded_size.status().code(), encoded.status().code());
+    EXPECT_EQ(encoded_size.status().message(), encoded.status().message());
+}
+
 TEST(Crc32cTest, MatchesStandardCheckVector) {
     const std::array<std::byte, 9> input = {
         std::byte{'1'}, std::byte{'2'}, std::byte{'3'},
@@ -96,6 +115,91 @@ TEST(Crc32cTest, MatchesStandardCheckVector) {
         std::byte{'7'}, std::byte{'8'}, std::byte{'9'},
     };
     EXPECT_EQ(Crc32c(input), 0xe3069283u);
+}
+
+TEST(WireFrameCodecTest, EncodedSizeEqualsEncodeForEveryCanonicalShape) {
+    const std::array<FrameType, 7> types = {
+        FrameType::kData,          FrameType::kSchemaAnnounce,
+        FrameType::kSchemaRequest, FrameType::kAck,
+        FrameType::kHeartbeat,     FrameType::kSessionHello,
+        FrameType::kSessionDiscovery,
+    };
+    for (FrameType type : types) {
+        for (uint32_t combination = 0; combination < 4; ++combination) {
+            WireFrame frame = GoldenFrame();
+            frame.header.frame_type = type;
+            if (type != FrameType::kData) {
+                frame.header.flags |= FlagValue(FrameFlag::kControlFrame);
+            }
+            if ((combination & 1u) != 0) {
+                frame.header.flags |=
+                    FlagValue(FrameFlag::kPayloadCrcPresent);
+            }
+            if ((combination & 2u) != 0) {
+                frame.header.flags |= FlagValue(FrameFlag::kPerfTraceSampled);
+                frame.header.perf_trace = PerfTraceContext{};
+            }
+            ExpectEncodedSizeMatchesEncode(frame);
+        }
+    }
+}
+
+TEST(WireFrameCodecTest, EncodedSizeAndEncodeRejectIdenticalInvalidInputs) {
+    WireFrame frame = GoldenFrame();
+    frame.header.flags = 0x8000u;
+    ExpectEncodedSizeMatchesEncode(frame);
+
+    frame = GoldenFrame();
+    frame.header.frame_type = FrameType::kHeartbeat;
+    ExpectEncodedSizeMatchesEncode(frame);
+
+    frame = GoldenFrame();
+    frame.header.flags = FlagValue(FrameFlag::kPerfTraceSampled);
+    ExpectEncodedSizeMatchesEncode(frame);
+
+    frame = GoldenFrame();
+    frame.header.flags = FlagValue(FrameFlag::kAeadPresent);
+    ExpectEncodedSizeMatchesEncode(frame);
+
+    frame = GoldenFrame();
+    frame.header.frame_type = static_cast<FrameType>(0xffffu);
+    ExpectEncodedSizeMatchesEncode(frame);
+
+    WireFrameLimits limits;
+    limits.max_payload_length = static_cast<uint32_t>(frame.payload.size() - 1);
+    frame = GoldenFrame();
+    ExpectEncodedSizeMatchesEncode(frame, limits);
+
+    frame.header.frame_type = FrameType::kHeartbeat;
+    frame.header.flags = FlagValue(FrameFlag::kControlFrame);
+    frame.payload.clear();
+    limits.max_payload_length = kWireControlOpcodeLength - 1;
+    ExpectEncodedSizeMatchesEncode(frame, limits);
+}
+
+TEST(WireFrameCodecTest, HeaderOnlyEncodedSizeRejectsLengthOverflow) {
+    WireFrameHeader data_header;
+    auto body_overflow = WireFrameCodec::EncodedSize(
+        data_header, std::numeric_limits<uint32_t>::max(),
+        WireFrameLimits{.max_payload_length =
+                            std::numeric_limits<uint32_t>::max()});
+    ASSERT_FALSE(body_overflow.ok());
+    EXPECT_EQ(body_overflow.status().code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(body_overflow.status().message(),
+              "encoded frame exceeds uint32 length prefix");
+
+    WireFrameHeader control_header;
+    control_header.frame_type = FrameType::kHeartbeat;
+    control_header.flags = FlagValue(FrameFlag::kControlFrame);
+    auto payload_overflow = WireFrameCodec::EncodedSize(
+        control_header, std::numeric_limits<uint32_t>::max(),
+        WireFrameLimits{.max_payload_length =
+                            std::numeric_limits<uint32_t>::max()});
+    ASSERT_FALSE(payload_overflow.ok());
+    EXPECT_EQ(payload_overflow.status().code(),
+              StatusCode::kResourceExhausted);
+    EXPECT_EQ(payload_overflow.status().message(),
+              "wire payload exceeds max_payload_length");
 }
 
 TEST(WireFrameCodecTest, GoldenVectorIsExact80ByteV1Header) {

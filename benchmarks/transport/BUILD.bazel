@@ -1,0 +1,35 @@
+package(default_visibility = ["//visibility:public"])
+
+# Direct ZeroMQ comparison only. This target intentionally does not depend on
+# TransportDriver or any Mino Bridge implementation.
+cc_binary(
+    name = "zmq_latency_benchmark",
+    srcs = ["zmq_latency_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    deps = [
+        "//mino/bridge:reliability",
+        "@libzmq//:libzmq",
+    ],
+)
+
+cc_binary(
+    name = "layer_comparison_benchmark",
+    srcs = ["layer_comparison_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    deps = [
+        "//mino/bridge:wire_frame",
+        "//mino/common:status",
+        "//mino/transport:tcp_driver",
+        "@libzmq//:libzmq",
+    ],
+)

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "mino/bridge/source_identity.h"
@@ -18,6 +19,9 @@ namespace mino::bridge {
 
 struct DedupWindowOptions {
     size_t max_sources = 1024;
+    // Bounds logical retained per-source state, including each source's gap
+    // bitmap. It excludes container spare capacity, the lookup index, allocator
+    // metadata, and transient allocation while replacing an entry.
     size_t max_bytes = 1024u * 1024u;
     uint64_t max_sequence_distance = 4096;
     uint64_t max_source_age_ns = 60ull * 1000ull * 1000ull * 1000ull;
@@ -101,6 +105,7 @@ public:
     bool session_active() const noexcept { return session_active_; }
     uint64_t peer_session_epoch() const noexcept { return peer_session_epoch_; }
     size_t source_count() const noexcept { return entries_.size(); }
+    // Logical retained source-state bytes charged against max_bytes.
     size_t bytes() const noexcept { return bytes_; }
     const DedupWindowStats& stats() const noexcept { return stats_; }
 
@@ -117,6 +122,8 @@ private:
 
     SourceState* Find(const SourceIdentity& source) noexcept;
     const SourceState* Find(const SourceIdentity& source) const noexcept;
+    void EraseEntry(size_t index) noexcept;
+    void RebuildIndex() noexcept;
     DedupCheckResult Classify(const SourceState& state,
                               uint64_t sequence) const noexcept;
     Status AddSource(const SourceIdentity& source, uint64_t highest,
@@ -133,6 +140,7 @@ private:
     uint64_t peer_session_epoch_ = 0;
     uint64_t session_started_ns_ = 0;
     std::vector<SourceState> entries_;
+    std::unordered_map<SourceIdentity, size_t, SourceIdentityHash> source_index_;
     size_t bytes_ = 0;
     DedupWindowStats stats_;
 };

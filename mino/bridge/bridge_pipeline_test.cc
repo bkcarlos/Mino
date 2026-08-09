@@ -90,6 +90,20 @@ public:
     std::vector<WireFrame> frames;
 };
 
+SourceIdentity SourceForLane(uint16_t lane_index, uint16_t lane_count) {
+    for (uint64_t publisher_id = 1; publisher_id != 10'000; ++publisher_id) {
+        const SourceIdentity source{11, publisher_id, 33};
+        if (BridgeLaneFor(source, lane_count) == lane_index) return source;
+    }
+    return {};
+}
+
+void SetSource(WireFrame* frame, const SourceIdentity& source) {
+    frame->header.source_node_id = source.node_id;
+    frame->header.source_publisher_id = source.publisher_id;
+    frame->header.source_publisher_epoch = source.publisher_epoch;
+}
+
 WireFrame DataFrame(uint64_t sequence, std::byte value = std::byte{0x42}) {
     WireFrame frame;
     frame.header.frame_type = FrameType::kData;
@@ -127,7 +141,10 @@ ConnectedPipelines MakePipelines(
     size_t retransmit_max_entries =
         RetransmitWindowOptions{}.max_entries,
     SchemaNegotiator* a_negotiator = nullptr,
-    SchemaNegotiator* b_negotiator = nullptr) {
+    SchemaNegotiator* b_negotiator = nullptr,
+    uint16_t lane_index = 0,
+    uint16_t lane_count = 1,
+    size_t max_control_frames = BridgePipelineOptions{}.max_control_frames) {
     ConnectedPipelines result;
     transport::TcpDriverOptions tcp_options;
     tcp_options.max_frame_body_bytes = 4096;
@@ -183,6 +200,9 @@ ConnectedPipelines MakePipelines(
     a_options.wire_limits.max_buffered_bytes = 8192;
     a_options.retransmit.max_age_ns = retransmit_max_age_ns;
     a_options.retransmit.max_entries = retransmit_max_entries;
+    a_options.max_control_frames = max_control_frames;
+    a_options.lane_index = lane_index;
+    a_options.lane_count = lane_count;
     BridgePipelineOptions b_options = a_options;
     b_options.local_session_epoch = 202;
     b_options.remote_session_epoch = 101;
@@ -223,9 +243,22 @@ Status Reconnect(ConnectedPipelines* pair, uint64_t a_epoch,
                                      b_dedup_state_lost, now_ns);
 }
 
+Status SendFrame(const std::shared_ptr<transport::TcpDriver>& driver,
+                 transport::ConnectionId connection_id,
+                 const WireFrame& frame) {
+    MINO_ASSIGN_OR_RETURN(auto encoded, WireFrameCodec::Encode(frame));
+    auto sent = driver->SendUntracked(transport::UntrackedSendRequest{
+        .connection_id = connection_id,
+        .payload = encoded,
+        .traffic_class = transport::UntrackedTrafficClass::kProtocolControl,
+    });
+    return sent.ok() ? Status::Ok() : sent.status();
+}
+
 Status PumpUntil(ConnectedPipelines* pair,
                  const std::function<bool()>& done,
-                 size_t iterations = 1000) {
+                 size_t iterations = 1000,
+                 uint64_t* retransmitted_frames = nullptr) {
     for (size_t i = 0; i < iterations; ++i) {
         BridgePumpBudget budget;
         budget.now_ns = i * 1'000'000;
@@ -233,10 +266,242 @@ Status PumpUntil(ConnectedPipelines* pair,
         if (!a.ok()) return a.status();
         auto b = pair->b->Pump(budget);
         if (!b.ok()) return b.status();
+        if (retransmitted_frames != nullptr) {
+            *retransmitted_frames += a->retransmitted_frames;
+            *retransmitted_frames += b->retransmitted_frames;
+        }
         if (done()) return Status::Ok();
         std::this_thread::sleep_for(1ms);
     }
     return Status::Error(StatusCode::kTimeout);
+}
+
+TEST(BridgePipelineTest, RejectsInvalidLaneOptions) {
+    ConnectedPipelines pair = MakePipelines();
+    ASSERT_NE(pair.a_driver, nullptr);
+
+    BridgePipelineOptions options;
+    options.local_session_epoch = 301;
+    options.remote_session_epoch = 302;
+    options.wire_limits.max_payload_length = 4096;
+    options.wire_limits.max_buffered_bytes = 8192;
+    const auto create = [&](uint16_t lane_index, uint16_t lane_count) {
+        BridgePipelineOptions candidate = options;
+        candidate.lane_index = lane_index;
+        candidate.lane_count = lane_count;
+        return BridgePipeline::Create(
+            candidate, pair.a_driver, pair.a_connection.id, nullptr,
+            &pair.a_ingress);
+    };
+
+    EXPECT_EQ(create(0, 0).status().code(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(create(0, kMaxBridgeLaneCount + 1).status().code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(create(2, 2).status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(BridgePipelineTest,
+     FencesOutboundSourcesAndAcceptsMatchingLaneDataAndAck) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 2);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    const SourceIdentity matching = SourceForLane(0, 2);
+    const SourceIdentity other = SourceForLane(1, 2);
+    ASSERT_NE(matching.node_id, 0u);
+    ASSERT_NE(other.node_id, 0u);
+
+    WireFrame wrong_reliable = DataFrame(1);
+    SetSource(&wrong_reliable, other);
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = wrong_reliable,
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    auto reliable_rejected = pair.a->Pump(BridgePumpBudget{.now_ns = 1});
+    ASSERT_FALSE(reliable_rejected.ok());
+    EXPECT_EQ(reliable_rejected.status().code(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(pair.a->retransmit_entries(), 0u);
+    EXPECT_EQ(pair.a_egress.frames.size(), 1u);
+    pair.a_egress.CommitPolled();
+
+    WireFrame wrong_best_effort = DataFrame(2);
+    SetSource(&wrong_best_effort, other);
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = wrong_best_effort,
+        .reliability = registry::Reliability::kBestEffort,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    auto best_effort_rejected = pair.a->Pump(BridgePumpBudget{.now_ns = 2});
+    ASSERT_FALSE(best_effort_rejected.ok());
+    EXPECT_EQ(best_effort_rejected.status().code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(pair.a_egress.frames.size(), 1u);
+    pair.a_egress.CommitPolled();
+
+    WireFrame accepted = DataFrame(3);
+    SetSource(&accepted, matching);
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = accepted,
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    const Status delivered = PumpUntil(&pair, [&] {
+        return pair.a_egress.frames.empty() &&
+               pair.b_ingress.frames.size() == 1 &&
+               pair.a->retransmit_entries() == 0;
+    });
+    ASSERT_TRUE(delivered.ok()) << delivered.ToString();
+    const SourceIdentity received{
+        pair.b_ingress.frames[0].header.source_node_id,
+        pair.b_ingress.frames[0].header.source_publisher_id,
+        pair.b_ingress.frames[0].header.source_publisher_epoch,
+    };
+    EXPECT_EQ(received, matching);
+}
+
+TEST(BridgePipelineTest, RejectsInboundDataFromAnotherLaneBeforePublish) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 2);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    WireFrame wrong = DataFrame(1);
+    SetSource(&wrong, SourceForLane(1, 2));
+    ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id, wrong).ok());
+
+    Status rejected = Status::Ok();
+    for (size_t i = 0; i < 200; ++i) {
+        auto pumped = pair.b->Pump(BridgePumpBudget{
+            .now_ns = 1'000'000'000ull + i * 1'000'000,
+        });
+        if (!pumped.ok()) {
+            rejected = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(rejected.code(), StatusCode::kCorruption);
+    EXPECT_TRUE(pair.b_ingress.frames.empty());
+}
+
+TEST(BridgePipelineTest, RejectsAckSourceFromAnotherLaneBeforeRetirement) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 2);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    WireFrame data = DataFrame(7);
+    SetSource(&data, SourceForLane(0, 2));
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = data,
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    ASSERT_TRUE(pair.a->Pump(BridgePumpBudget{.now_ns = 1}).ok());
+    ASSERT_EQ(pair.a->retransmit_entries(), 1u);
+
+    auto ack_payload = ControlPayloadCodec::EncodeAck(AckPayload{
+        .sender_session_epoch = 202,
+        .receiver_session_epoch = 101,
+        .source = SourceForLane(1, 2),
+        .observed_sequence = 7,
+        .highest_contiguous_sequence = 7,
+        .disposition = AckDisposition::kAccepted,
+    });
+    ASSERT_TRUE(ack_payload.ok()) << ack_payload.status().ToString();
+    WireFrame ack;
+    ack.header.frame_type = FrameType::kAck;
+    ack.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                       FlagValue(FrameFlag::kPayloadCrcPresent);
+    ack.payload = std::move(*ack_payload);
+    ASSERT_TRUE(SendFrame(pair.b_driver, pair.b_connection.id, ack).ok());
+
+    Status rejected = Status::Ok();
+    for (size_t i = 0; i < 200; ++i) {
+        auto pumped = pair.a->Pump(BridgePumpBudget{
+            .now_ns = 2'000'000'000ull + i * 1'000'000,
+        });
+        if (!pumped.ok()) {
+            rejected = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(rejected.code(), StatusCode::kCorruption);
+    EXPECT_EQ(pair.a->retransmit_entries(), 1u);
+}
+
+TEST(BridgePipelineTest, FencesEveryHelloSourceByLane) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 2);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    const auto send_hello = [&](const SourceIdentity& source) -> Status {
+        MINO_ASSIGN_OR_RETURN(
+            auto payload,
+            ControlPayloadCodec::EncodeSessionHello(SessionHello{
+                .sender_session_epoch = 101,
+                .receiver_session_epoch = 202,
+                .dedup_state_lost = false,
+                .sources = {{
+                    .source = source,
+                    .last_accepted_sequence = 1,
+                }},
+            }));
+        WireFrame hello;
+        hello.header.frame_type = FrameType::kSessionHello;
+        hello.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                             FlagValue(FrameFlag::kPayloadCrcPresent);
+        hello.payload = std::move(payload);
+        return SendFrame(pair.a_driver, pair.a_connection.id, hello);
+    };
+
+    ASSERT_TRUE(send_hello(SourceForLane(0, 2)).ok());
+    for (size_t i = 0; i < 100; ++i) {
+        auto pumped = pair.b->Pump(BridgePumpBudget{
+            .now_ns = 3'000'000'000ull + i * 1'000'000,
+        });
+        ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_TRUE(pair.b->session_ready());
+
+    ASSERT_TRUE(send_hello(SourceForLane(1, 2)).ok());
+    Status rejected = Status::Ok();
+    for (size_t i = 0; i < 200; ++i) {
+        auto pumped = pair.b->Pump(BridgePumpBudget{
+            .now_ns = 4'000'000'000ull + i * 1'000'000,
+        });
+        if (!pumped.ok()) {
+            rejected = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(rejected.code(), StatusCode::kCorruption);
 }
 
 TEST(BridgePipelineTest, ReliableTcpPublishesThenAcknowledgesAndRetiresWindow) {
@@ -251,17 +516,182 @@ TEST(BridgePipelineTest, ReliableTcpPublishesThenAcknowledgesAndRetiresWindow) {
         .descriptor_artifact = {},
     });
 
+    uint64_t retransmitted_frames = 0;
     const Status pumped = PumpUntil(
-        &pair, [&] {
+        &pair,
+        [&] {
             return pair.b_ingress.frames.size() == 1 &&
                    pair.a->retransmit_entries() == 0;
-        });
+        },
+        1000, &retransmitted_frames);
     ASSERT_TRUE(pumped.ok()) << pumped.ToString();
     EXPECT_TRUE(pair.a->session_ready());
     EXPECT_TRUE(pair.b->session_ready());
     ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
     EXPECT_EQ(pair.b_ingress.frames[0].payload,
               std::vector<std::byte>(32, std::byte{0x42}));
+    EXPECT_EQ(retransmitted_frames, 0u);
+}
+
+TEST(BridgePipelineTest,
+     ContinuousAcceptedAcksCoalesceAtControlCapacityAndRetireCumulatively) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1, 1);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = DataFrame(sequence),
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false,
+            .schema_identity = std::nullopt,
+            .descriptor_artifact = {},
+        });
+    }
+
+    ASSERT_TRUE(pair.a->Pump(BridgePumpBudget{.now_ns = 1'000'000'000ull})
+                    .ok());
+    ASSERT_TRUE(pair.a_egress.frames.empty());
+    ASSERT_EQ(pair.a->retransmit_entries(), 3u);
+    std::this_thread::sleep_for(20ms);
+
+    BridgePumpBudget receive;
+    receive.max_outbound_frames = 1;
+    receive.now_ns = 1'100'000'000ull;
+    auto received = pair.b->Pump(receive);
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(pair.b_ingress.frames.size(), 3u);
+    EXPECT_EQ(received->outbound_frames, 1u);
+
+    for (size_t i = 0; i < 500 && pair.a->retransmit_entries() != 0; ++i) {
+        auto pumped = pair.a->Pump(BridgePumpBudget{
+            .now_ns = 1'200'000'000ull + i * 1'000'000,
+        });
+        ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(pair.a->retransmit_entries(), 0u);
+}
+
+TEST(BridgePipelineTest, OutOfOrderAcceptedAcksCoalesceOnlyAfterGapCloses) {
+    ConnectedPipelines pair = MakePipelines();
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    for (uint64_t sequence : {2u, 1u}) {
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = DataFrame(sequence),
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false,
+            .schema_identity = std::nullopt,
+            .descriptor_artifact = {},
+        });
+    }
+
+    ASSERT_TRUE(pair.a->Pump(BridgePumpBudget{.now_ns = 2'000'000'000ull})
+                    .ok());
+    ASSERT_EQ(pair.a->retransmit_entries(), 2u);
+    std::this_thread::sleep_for(20ms);
+    BridgePumpBudget receive;
+    receive.max_outbound_frames = 1;
+    receive.now_ns = 2'100'000'000ull;
+    auto received = pair.b->Pump(receive);
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(pair.b_ingress.frames.size(), 2u);
+    EXPECT_EQ(received->outbound_frames, 1u);
+
+    for (size_t i = 0; i < 500 && pair.a->retransmit_entries() != 0; ++i) {
+        auto pumped = pair.a->Pump(BridgePumpBudget{
+            .now_ns = 2'200'000'000ull + i * 1'000'000,
+        });
+        ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(pair.a->retransmit_entries(), 0u);
+}
+
+TEST(BridgePipelineTest, NackRemainsIndependentFromPendingCumulativeAck) {
+    ConnectedPipelines pair = MakePipelines();
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    for (uint64_t sequence : {1u, 5000u}) {
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = DataFrame(sequence),
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false,
+            .schema_identity = std::nullopt,
+            .descriptor_artifact = {},
+        });
+    }
+
+    ASSERT_TRUE(pair.a->Pump(BridgePumpBudget{.now_ns = 3'000'000'000ull})
+                    .ok());
+    ASSERT_EQ(pair.a->retransmit_entries(), 2u);
+    std::this_thread::sleep_for(20ms);
+    BridgePumpBudget receive;
+    receive.max_outbound_frames = 2;
+    receive.now_ns = 3'100'000'000ull;
+    auto received = pair.b->Pump(receive);
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
+    EXPECT_EQ(received->outbound_frames, 2u);
+
+    for (size_t i = 0; i < 500 && pair.a->retransmit_entries() == 2; ++i) {
+        auto pumped = pair.a->Pump(BridgePumpBudget{
+            .now_ns = 3'200'000'000ull + i * 1'000'000,
+        });
+        ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(pair.a->retransmit_entries(), 1u);
+}
+
+TEST(BridgePipelineTest, ReconnectHelloCumulativelyRetiresCoalescedBatch) {
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1, 1);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = DataFrame(sequence),
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false,
+            .schema_identity = std::nullopt,
+            .descriptor_artifact = {},
+        });
+    }
+    ASSERT_TRUE(pair.a->Pump(BridgePumpBudget{.now_ns = 4'000'000'000ull})
+                    .ok());
+    ASSERT_EQ(pair.a->retransmit_entries(), 3u);
+    std::this_thread::sleep_for(20ms);
+    auto received = pair.b->Pump(BridgePumpBudget{
+        .max_outbound_frames = 1,
+        .now_ns = 4'100'000'000ull,
+    });
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(pair.b_ingress.frames.size(), 3u);
+    ASSERT_EQ(pair.a->retransmit_entries(), 3u);
+
+    ASSERT_TRUE(Reconnect(&pair, 303, 404, false, 4'200'000'000ull).ok());
+    const Status resumed = PumpUntil(&pair, [&] {
+        return pair.a->session_ready() && pair.b->session_ready() &&
+               pair.a->retransmit_entries() == 0;
+    });
+    ASSERT_TRUE(resumed.ok()) << resumed.ToString();
+    EXPECT_EQ(pair.b_ingress.frames.size(), 3u);
 }
 
 TEST(BridgePipelineTest, DuplicateFrameIsAckedWithoutDuplicatePublication) {
@@ -412,10 +842,14 @@ message Other { uint32 value = 1; }
     ASSERT_TRUE(occupied_announcement.ok());
     EXPECT_EQ(occupied_announcement->connection_schema_ref, 1u);
 
-    const Status resumed = PumpUntil(&pair, [&] {
-        return pair.b_ingress.frames.size() == 1 &&
-               pair.a->retransmit_entries() == 0;
-    });
+    uint64_t retransmitted_frames = 0;
+    const Status resumed = PumpUntil(
+        &pair,
+        [&] {
+            return pair.b_ingress.frames.size() == 1 &&
+                   pair.a->retransmit_entries() == 0;
+        },
+        1000, &retransmitted_frames);
     ASSERT_TRUE(resumed.ok())
         << resumed.ToString()
         << " a_ready=" << pair.a->session_ready()
@@ -427,6 +861,7 @@ message Other { uint32 value = 1; }
         << " b_remote_ref=" << b_negotiator.remote_ref_high_watermark();
     ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
     EXPECT_EQ(pair.b_ingress.frames[0].header.connection_schema_ref, 2u);
+    EXPECT_EQ(retransmitted_frames, 1u);
 }
 
 TEST(BridgePipelineTest, SchemaAnnouncementTransactionallyReleasesBufferedBatch) {
@@ -731,7 +1166,7 @@ TEST(BridgePipelineTest, RetransmitExpiryClosesSessionAndReportsTimeout) {
     EXPECT_FALSE(pair.a->session_ready());
 }
 
-TEST(BridgePipelineTest, CorruptWireFrameClosesTransportWithoutPublication) {
+TEST(BridgePipelineTest, CorruptWireFrameFailsWithoutPublication) {
     ConnectedPipelines pair = MakePipelines();
     ASSERT_NE(pair.a, nullptr);
     ASSERT_NE(pair.b, nullptr);
@@ -748,17 +1183,17 @@ TEST(BridgePipelineTest, CorruptWireFrameClosesTransportWithoutPublication) {
                     })
                     .ok());
 
-    for (size_t i = 0;
-         i < 500 && pair.b_driver->stats().active_connections != 0; ++i) {
+    Status failure = Status::Ok();
+    for (size_t i = 0; i < 500 && failure.ok(); ++i) {
         BridgePumpBudget budget;
         budget.now_ns = 2'000'000'000ull + i * 1'000'000;
         auto a_pumped = pair.a->Pump(budget);
         ASSERT_TRUE(a_pumped.ok()) << a_pumped.status().ToString();
         auto b_pumped = pair.b->Pump(budget);
-        ASSERT_TRUE(b_pumped.ok()) << b_pumped.status().ToString();
+        if (!b_pumped.ok()) failure = b_pumped.status();
         std::this_thread::sleep_for(1ms);
     }
-    EXPECT_EQ(pair.b_driver->stats().active_connections, 0u);
+    EXPECT_EQ(failure.code(), StatusCode::kCorruption);
     EXPECT_TRUE(pair.b_ingress.frames.empty());
 }
 
