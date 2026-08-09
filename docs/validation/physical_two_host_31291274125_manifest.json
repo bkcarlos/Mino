@@ -1,0 +1,173 @@
+{
+  "addresses": {
+    "client_advertised": "192.168.31.66:43191",
+    "client_configured_server": "192.168.31.54:43191",
+    "server_advertised": "192.168.31.54:43191"
+  },
+  "binary": {
+    "bound_to_hosted_builds": true,
+    "client_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24",
+    "hosted_builds": {
+      "client": {
+        "binary_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24",
+        "binary_size_bytes": 1697176,
+        "commit": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+        "hash_record": {
+          "sha256": "513283ac33504e0725d60881f7cc726d891b9714b09992d0d7af458b3fa785b2",
+          "size_bytes": 86
+        },
+        "provenance": {
+          "commit": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+          "run_attempt": "1",
+          "run_id": "31291274125",
+          "workflow": "Physical Two-Host Mino Validation"
+        },
+        "provenance_artifact": {
+          "sha256": "74d05185fe8b8c922c7f5cbd2edf075953e86212a02ffb6fbb077d7c3f6d25ed",
+          "size_bytes": 149
+        }
+      },
+      "server": {
+        "binary_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24",
+        "binary_size_bytes": 1697176,
+        "commit": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+        "hash_record": {
+          "sha256": "513283ac33504e0725d60881f7cc726d891b9714b09992d0d7af458b3fa785b2",
+          "size_bytes": 86
+        },
+        "provenance": {
+          "commit": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+          "run_attempt": "1",
+          "run_id": "31291274125",
+          "workflow": "Physical Two-Host Mino Validation"
+        },
+        "provenance_artifact": {
+          "sha256": "74d05185fe8b8c922c7f5cbd2edf075953e86212a02ffb6fbb077d7c3f6d25ed",
+          "size_bytes": 149
+        }
+      }
+    },
+    "hosted_client_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24",
+    "hosted_server_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24",
+    "identical": true,
+    "server_sha256": "339161649fb1d90e731fdc1cd46d3507f6f686a6b072d23b9222446e57c32e24"
+  },
+  "commits": {
+    "client": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+    "server": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6"
+  },
+  "errors": [],
+  "generated_at": "2026-08-09T02:57:14.580Z",
+  "github": {
+    "github_actions": "true",
+    "github_repository": "bkcarlos/Mino",
+    "github_run_attempt": "1",
+    "github_run_id": "31291274125",
+    "github_sha": "b02eabf4dbb2a3c1d4689a5475d1ecac33995ae6",
+    "github_workflow": "Physical Two-Host Mino Validation"
+  },
+  "host_identities": {
+    "client": "9642221d7fa5777fb3a52332a673ab006428d5cbad4dd41ff5e4a887c4c0ec90",
+    "derivation": "HMAC-SHA256(run-token, machine-id); raw values are not recorded",
+    "distinct": true,
+    "server": "1ab39e3418277fbd2e2d15ecdef8c591d7670fd2d7de2c76b0be7ee05ffe9c90"
+  },
+  "logs": {
+    "client": {
+      "path": "evidence/client/client.log",
+      "sha256": "cfc20cb51ce60f2bb51a048f0c33f78bb972c964932bdf9e0442a40fcd637427",
+      "size_bytes": 403
+    },
+    "server": {
+      "path": "evidence/server/server.log",
+      "sha256": "977f5d4e92130ac9c8e25bdcc0c85e02a7af5afade4ed7f6bd2c667abff91ce3",
+      "size_bytes": 397
+    }
+  },
+  "mino_data_path": {
+    "bidirectional_ack": true,
+    "client_remote_acknowledged": true,
+    "connection": "BridgeConnectionManager",
+    "pipeline": "BridgePipeline",
+    "reliability": "ReliableOrdered",
+    "server_remote_acknowledged": true,
+    "session_discovery": true,
+    "transport": "TcpDriver"
+  },
+  "mino_results": {
+    "client": {
+      "path": "evidence/client/mino-result.json",
+      "sha256": "5baaaf85ffd7169aac48a5cb4546b2b1d07753daa0aee57e416b6ae41c4c0472",
+      "size_bytes": 2068
+    },
+    "server": {
+      "path": "evidence/server/mino-result.json",
+      "sha256": "f6b564071f8bd0ea400582a8fef2b26c5c0b3784230fb30716d061fa4f76c69e",
+      "size_bytes": 2068
+    }
+  },
+  "outcome": "passed",
+  "persisted_schema_artifacts": {
+    "client": [
+      {
+        "bytes_verified": true,
+        "canonical_digest": "44821b288ec6f911fae323c55f41f1f7bd3316a101533a37cc2f3529b7481a6e",
+        "identity_verified": true,
+        "path": "evidence/client/schema-store/schemas/44821b288ec6f911fae323c55f41f1f7bd3316a101533a37cc2f3529b7481a6e.schema",
+        "sha256": "10e4d729a50d9b2dbd4b4414aa989e5edb18f60f33f7fb50a5d268677c9966db",
+        "size_bytes": 431
+      }
+    ],
+    "server": [
+      {
+        "bytes_verified": true,
+        "canonical_digest": "83b13c135460cfe3272696020df20e3a34b431a54589f40059063fc9b71eebc5",
+        "identity_verified": true,
+        "path": "evidence/server/schema-store/schemas/83b13c135460cfe3272696020df20e3a34b431a54589f40059063fc9b71eebc5.schema",
+        "sha256": "e01c0640d8000aeafd2bc403d246a7269dcc4e6a92a53cecee4cca92d519a6a4",
+        "size_bytes": 431
+      }
+    ]
+  },
+  "protocol": "mino-two-host-mino-v2",
+  "reconnect": {
+    "automatic": true,
+    "duplicate_suppressed": true,
+    "forced_disconnect": true,
+    "pending_reliable_recovered": true,
+    "pending_reliable_retransmitted": true,
+    "reliable_replay_pending_observed": true,
+    "resume_mode": "pending-retransmit-then-explicit-dedup-replay",
+    "session_epoch_changed": true
+  },
+  "role_manifests": {
+    "client": {
+      "sha256": "8e0aea3e11ea6d78db88e95cb55e56f6bce507a8275920d040988500fb6f79a6",
+      "size_bytes": 4091
+    },
+    "server": {
+      "sha256": "35867cdd066f6d2673ad7205f88497994d76d961a89e7b61a7d432f837991adb",
+      "size_bytes": 4085
+    }
+  },
+  "run": {
+    "client_attempt": "1",
+    "client_id": "31291274125",
+    "expected_attempt": "1",
+    "expected_id": "31291274125",
+    "server_attempt": "1",
+    "server_id": "31291274125"
+  },
+  "schema": {
+    "announcement": true,
+    "artifact_nonempty": true,
+    "client_digest": "83b13c135460cfe3272696020df20e3a34b431a54589f40059063fc9b71eebc5",
+    "identity_nonempty": true,
+    "persisted": true,
+    "persisted_bytes_verified": true,
+    "persisted_identity_verified": true,
+    "request": true,
+    "server_digest": "44821b288ec6f911fae323c55f41f1f7bd3316a101533a37cc2f3529b7481a6e"
+  },
+  "schema_version": 4
+}

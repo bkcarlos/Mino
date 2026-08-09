@@ -16,7 +16,7 @@
 | 验证登记 | 27 项（V-01~V-27），P0 优先级 14 项、P1 优先级 11 项、P2 优先级 2 项 |
 | 关键不变量 | 32 项（INV-01~INV-32），贯穿测试与验收 |
 
-**结论**：D0~D5 的计划内实现已落地。Region ID 分配/Attach 契约、D2 多场景恢复长压、D4 强制断链与非空 Schema 双机 probe、D5 多持久化阶段 SIGKILL、可观测性、Frame/Segment/Handle Fuzz 及 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark 均已补齐。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已有历史归档，D2 当前提交长时间恢复压力测试、D4 真实双物理主机验证、D5 当前提交 100 轮多场景故障 campaign，以及新增 Benchmark/Fuzz 的资格环境实跑仍是待关闭门禁。
+**结论**：D0~D5 的计划内实现已落地。Region ID 分配/Attach 契约、D2 多场景恢复长压、D4 强制断链与非空 Schema 双机 probe、D5 多持久化阶段 SIGKILL、可观测性、Frame/Segment/Handle Fuzz 及 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark 均已补齐。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已有历史归档，D4 当前提交真实物理双机验证已关闭，D2 当前提交长时间恢复压力测试、D5 当前提交 100 轮多场景故障 campaign，以及新增 Benchmark 的资格环境实跑仍是待关闭门禁。
 
 ### 1.2 阶段映射
 
@@ -49,7 +49,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 当前发布候选的剩余门禁：
 
 1. **D2 长时间恢复验证**：多场景 campaign 已覆盖 Publisher crash、Subscriber kill、慢 Subscriber、Lease 边界和 PID incarnation，并额外确定性执行 13 个持久化切点 SIGKILL 与 SIGSTOP-live/SIGCONT；class、cutpoint、interruption attempted/completed、完整日志 hash、commit/clean qualification 均 fail-closed。仍需对当前提交执行 fixed 与 run-derived seed 并保存 manifest。
-2. **D4 物理双机验证**：`.github/workflows/physical-two-host.yml` 与 v4 probe 已覆盖非空 Schema Identity/Descriptor 持久化、建立连接后的强制断链、两次自动重连、Session Epoch 变化、可靠帧重传/去重与双向 ACK；仍需在两台不同物理主机对当前提交执行并归档 final manifest。fork + loopback 不替代该门禁。
+2. **D4 物理双机验证（已关闭）**：commit `b02eabf` 在 `192.168.31.54` 与 `192.168.31.66` 两台不同物理主机完成 v4 probe；[GitHub run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 的两份独立 hermetic build 字节一致，非空 Schema/Descriptor 持久化、连接后强制断链、两次自动重连、Session Epoch 变化、可靠帧重传/去重与双向 ACK 全部通过，fail-closed final manifest 归档于 `docs/validation/physical_two_host_31291274125_manifest.json`。
 3. **D5 故障恢复验证**：多场景 runner 已覆盖 Record、Sync、Schema Store、Recording Manifest、Checkpoint/Seal 与 orphan quarantine 的真实 SIGKILL 切点；仍需对当前提交执行每场景 100 轮并归档 manifest。短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停继续由常规 fault suite 覆盖。
 4. **扩展资格验证**：执行并归档 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark，以及 Frame/Segment/Handle ASAN/UBSAN Fuzz campaign。
 
@@ -274,7 +274,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-09 | 可靠传输与去重 ✅ | Sequence/ACK/Session Epoch、逐来源 HWM、重传/重连、重复抑制、Receiver restart `kDegraded`（`//mino/bridge:reliability`） | D4-07 | 5d |
 | D4-10 | 远端对象重建 ✅ | Schema/Topic 校验 → Canonical Decode → Slab/Journal → SPSC 原子发布，支持显式 N/N-1 binding（`//mino/bridge:remote_object_reconstructor`） | D4-07 | 3d |
 | D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`）；`//mino/runtime/deployment:remote_bridge` 提供 TCP、Schema Registry/Store、Negotiator 与自动重连 Connection Manager 的生产组装根 | D4-03 | 3d |
-| D4-12 | 双节点集成测试 ✅（物理双机资格验证待执行） | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；物理 probe 已扩展非空 Schema/Descriptor、持久化、连接后强制断链、两次重连、Session Epoch、重传/去重和双向 ACK，manifest fail-closed | 全部 | 持续 |
+| D4-12 | 双节点集成测试与物理双机资格验证 ✅ | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；commit `b02eabf` 已在两台不同物理主机完成非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重和双向 ACK，[run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 与 final manifest 均为 fail-closed passed | 全部 | 持续 |
 
 ### 6.2 并行工作流
 
@@ -295,7 +295,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 - [x] 同机端到端 Pub/Sub 通过
 - [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback）
-- [ ] 已扩展的物理双机 v4 probe 在当前发布候选的两台不同物理主机完成 TCP、非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重与双向 ACK 验证，并归档 fail-closed final manifest
+- [x] 已扩展的物理双机 v4 probe 在 commit `b02eabf` 的两台不同物理主机（server `192.168.31.54`、client `192.168.31.66`）完成 TCP、非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重与双向 ACK 验证；[GitHub run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 全绿，fail-closed final manifest 已归档为 `docs/validation/physical_two_host_31291274125_manifest.json`
 - [x] 断链重连后按策略恢复，去重窗口正常工作（V-19）
 - [x] 错误帧被校验拒绝且不导致越界（INV-31）
 - [x] N/N-1 Schema 互通通过
