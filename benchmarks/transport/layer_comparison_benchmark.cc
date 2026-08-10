@@ -42,7 +42,8 @@ constexpr std::array<std::byte, 8> kMagic = {
 };
 constexpr size_t kBenchmarkHeaderBytes = 40;
 constexpr size_t kMinimumTcpBodyBytes = mino::bridge::kWireBaseHeaderLength;
-constexpr std::array<uint32_t, 6> kTopicCounts = {1, 2, 4, 8, 16, 32};
+constexpr std::array<uint32_t, 6> kDefaultTopicCounts = {1, 2, 4, 8, 16, 32};
+constexpr uint32_t kMaxTopicCount = 4096;
 constexpr uint32_t kWireMessageType = 0x42454e32u;
 constexpr uint32_t kWireSchemaRef = 0x10203040u;
 constexpr uint64_t kWireNode = 0x1112131415161718ull;
@@ -182,7 +183,8 @@ bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
         (options->layer != "l1" && options->layer != "l2") ||
         (options->role != "server" && options->role != "client") ||
         (options->mode != "all" && options->mode != "serial" &&
-         options->mode != "per_topic_concurrent")) {
+         options->mode != "per_topic_concurrent" &&
+         options->mode != "one_way")) {
         *error = "required values: --backend=mino|zmq --layer=l1|l2 "
                  "--role=server|client";
         return false;
@@ -194,15 +196,17 @@ bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
                             options->lane_count + 1 ||
         options->messages_per_topic == 0 ||
         options->warmup_messages_per_topic > options->messages_per_topic ||
-        (options->topic_count != 0 &&
-         std::find(kTopicCounts.begin(), kTopicCounts.end(),
-                   options->topic_count) == kTopicCounts.end()) ||
+        options->topic_count > kMaxTopicCount ||
         options->outstanding == 0 || options->outstanding > 1024 ||
         options->payload_bytes < kBenchmarkHeaderBytes ||
         options->payload_bytes > 16u * 1024u * 1024u ||
         options->deadline_seconds == 0 || options->deadline_seconds > 3600 ||
         options->output.empty()) {
         *error = "benchmark option is outside the supported range";
+        return false;
+    }
+    if (options->mode == "one_way" && options->topic_count == 0) {
+        *error = "one_way mode requires an explicit nonzero topic-count";
         return false;
     }
     if (options->layer == "l1" &&
@@ -697,7 +701,7 @@ private:
         const int heartbeat_interval = 1000;
         const int heartbeat_timeout = 10'000;
         const int timeout_ms = 100;
-        for (const auto [option, value] : {
+        for (const auto& [option, value] : {
                  std::pair{ZMQ_LINGER, linger_ms},
                  std::pair{ZMQ_IMMEDIATE, immediate},
                  std::pair{ZMQ_SNDHWM, hwm},
@@ -984,6 +988,165 @@ bool RunTraffic(const Options& options, Transport* transport,
     return true;
 }
 
+bool RunOneWayTraffic(const Options& options, Transport* transport,
+                      uint32_t phase, uint32_t topic_count,
+                      uint32_t messages_per_topic, uint32_t completion_kind,
+                      bool record_result, uint64_t deadline_ns, Record* record,
+                      std::string* error) {
+    const uint64_t total =
+        static_cast<uint64_t>(topic_count) * messages_per_topic;
+    const uint64_t started_ns = NowNs();
+    for (uint32_t sequence = 1; sequence <= messages_per_topic; ++sequence) {
+        for (uint32_t topic = 0; topic < topic_count; ++topic) {
+            if (!SendMessage(options, transport,
+                             LaneFor(topic, options.lane_count),
+                             Message{.kind = kData,
+                                     .phase = phase,
+                                     .topic = topic,
+                                     .sequence = sequence},
+                             deadline_ns, nullptr, error)) {
+                return false;
+            }
+        }
+    }
+    if (!SyncLanes(options, transport, completion_kind, phase, deadline_ns,
+                   error)) {
+        return false;
+    }
+    if (!record_result) return true;
+    const uint64_t elapsed_ns = NowNs() - started_ns;
+    *record = Record{
+        .mode = "one_way",
+        .topic_count = topic_count,
+        .sample_count = total,
+        .elapsed_us = ToMicroseconds(elapsed_ns),
+        .messages_per_second =
+            elapsed_ns == 0
+                ? 0.0
+                : static_cast<double>(total) * 1'000'000'000.0 /
+                      static_cast<double>(elapsed_ns),
+    };
+    return true;
+}
+
+enum class OneWayStage : uint8_t { kIdle, kWarmup, kMeasured, kComplete };
+
+struct OneWayServerState {
+    uint32_t phase = 0;
+    OneWayStage stage = OneWayStage::kIdle;
+    std::vector<uint32_t> next_sequence;
+    std::vector<bool> phase_started;
+    std::vector<bool> warmup_done;
+    std::vector<bool> phase_done;
+};
+
+bool ValidateOneWayMessage(const Options& options, const Envelope& envelope,
+                           const Message& message, OneWayServerState* state,
+                           std::string* error) {
+    const auto valid_barrier = [&] {
+        return message.topic == envelope.lane &&
+               message.sequence == message.topic;
+    };
+    const auto reset_phase = [&] {
+        state->phase = message.phase;
+        state->stage = OneWayStage::kWarmup;
+        state->next_sequence.assign(options.topic_count, 1);
+        state->phase_started.assign(options.lane_count, false);
+        state->warmup_done.assign(options.lane_count, false);
+        state->phase_done.assign(options.lane_count, false);
+    };
+    const auto all_lanes = [](const std::vector<bool>& lanes) {
+        return std::all_of(lanes.begin(), lanes.end(), [](bool seen) {
+            return seen;
+        });
+    };
+    const auto validate_lane_complete = [&](uint32_t expected_next) {
+        for (uint32_t topic = envelope.lane; topic < options.topic_count;
+             topic += options.lane_count) {
+            if (state->next_sequence[topic] != expected_next) return false;
+        }
+        return true;
+    };
+
+    if (message.kind == kPhaseStart) {
+        if (!valid_barrier()) {
+            *error = "one-way phase-start barrier is invalid";
+            return false;
+        }
+        if (message.phase != state->phase) {
+            if (state->stage != OneWayStage::kIdle &&
+                state->stage != OneWayStage::kComplete) {
+                *error = "one-way phase started before the prior phase completed";
+                return false;
+            }
+            reset_phase();
+        }
+        if (state->stage != OneWayStage::kWarmup ||
+            state->phase_started[envelope.lane]) {
+            *error = "one-way phase-start barrier is duplicated or out of order";
+            return false;
+        }
+        state->phase_started[envelope.lane] = true;
+        return true;
+    }
+
+    if (message.kind == kData) {
+        if ((state->stage != OneWayStage::kWarmup &&
+             state->stage != OneWayStage::kMeasured) ||
+            message.phase != state->phase ||
+            !all_lanes(state->phase_started) ||
+            message.topic >= options.topic_count || message.sequence == 0 ||
+            message.sequence != state->next_sequence[message.topic]) {
+            *error = "one-way DATA sequence or phase is invalid";
+            return false;
+        }
+        const uint32_t limit =
+            state->stage == OneWayStage::kWarmup
+                ? options.warmup_messages_per_topic
+                : options.messages_per_topic;
+        if (message.sequence > limit) {
+            *error = "one-way DATA exceeds the configured phase count";
+            return false;
+        }
+        ++state->next_sequence[message.topic];
+        return true;
+    }
+
+    if (message.kind == kWarmupDone) {
+        if (!valid_barrier() || message.phase != state->phase ||
+            state->stage != OneWayStage::kWarmup ||
+            state->warmup_done[envelope.lane] ||
+            !validate_lane_complete(
+                options.warmup_messages_per_topic + 1)) {
+            *error = "one-way warmup completion is invalid or premature";
+            return false;
+        }
+        state->warmup_done[envelope.lane] = true;
+        if (all_lanes(state->warmup_done)) {
+            state->next_sequence.assign(options.topic_count, 1);
+            state->stage = OneWayStage::kMeasured;
+        }
+        return true;
+    }
+
+    if (message.kind == kPhaseDone) {
+        if (!valid_barrier() || message.phase != state->phase ||
+            state->stage != OneWayStage::kMeasured ||
+            state->phase_done[envelope.lane] ||
+            !validate_lane_complete(options.messages_per_topic + 1)) {
+            *error = "one-way measured completion is invalid or premature";
+            return false;
+        }
+        state->phase_done[envelope.lane] = true;
+        if (all_lanes(state->phase_done)) {
+            state->stage = OneWayStage::kComplete;
+        }
+        return true;
+    }
+
+    return true;
+}
+
 std::string JsonEscape(std::string_view value) {
     std::string escaped;
     escaped.reserve(value.size());
@@ -1019,14 +1182,20 @@ std::string JsonEscape(std::string_view value) {
 }
 
 std::string Scope(const Options& options) {
+    const std::string_view direction =
+        options.mode == "one_way" ? "one-way delivery" : "echo";
     if (options.layer == "l1") {
         return options.backend == "mino"
-                   ? "production TcpDriver raw length-framed body echo"
-                   : "native ZeroMQ DEALER/ROUTER single-body echo";
+                   ? "production TcpDriver raw length-framed body " +
+                         std::string(direction)
+                   : "native ZeroMQ DEALER/ROUTER single-body " +
+                         std::string(direction);
     }
     return options.backend == "mino"
-               ? "production WireFrameCodec body over production TcpDriver"
-               : "production WireFrameCodec body over native ZeroMQ DEALER/ROUTER";
+               ? "production WireFrameCodec body over production TcpDriver " +
+                     std::string(direction)
+               : "production WireFrameCodec body over native ZeroMQ DEALER/ROUTER " +
+                     std::string(direction);
 }
 
 size_t EncodedBodyBytes(const Options& options) {
@@ -1038,7 +1207,7 @@ size_t EncodedBodyBytes(const Options& options) {
 
 bool WriteResult(const Options& options, std::string_view outcome,
                  std::string_view error, const std::vector<Record>& records,
-                 uint64_t messages_echoed) {
+                 uint64_t messages_received, uint64_t messages_echoed = 0) {
     std::ofstream output(options.output, std::ios::trunc);
     if (!output) return false;
     output << std::fixed << std::setprecision(3)
@@ -1061,6 +1230,7 @@ bool WriteResult(const Options& options, std::string_view outcome,
            << "  \"warmup_messages_per_topic\": "
            << options.warmup_messages_per_topic << ",\n"
            << "  \"outstanding\": " << options.outstanding << ",\n"
+           << "  \"messages_received\": " << messages_received << ",\n"
            << "  \"messages_echoed\": " << messages_echoed << ",\n"
            << "  \"records\": [\n";
     for (size_t index = 0; index < records.size(); ++index) {
@@ -1098,31 +1268,48 @@ int RunClient(const Options& options) {
         std::cerr << error << '\n';
         return 1;
     }
-    records.reserve(kTopicCounts.size() * 2);
+    records.reserve(kDefaultTopicCounts.size() * 2);
     uint32_t phase = 1;
-    for (std::string_view mode : {std::string_view("serial"),
-                                  std::string_view("per_topic_concurrent")}) {
-        if (options.mode != "all" && options.mode != mode) continue;
-        for (uint32_t topic_count : kTopicCounts) {
-            if (options.topic_count != 0 &&
-                options.topic_count != topic_count) {
-                continue;
-            }
+    if (options.mode == "one_way") {
+        if (!SyncLanes(options, transport.get(), kPhaseStart, phase,
+                       deadline_ns, &error)) {
+            WriteResult(options, "failed", error, records, 0);
+            std::cerr << error << '\n';
+            return 1;
+        }
+        Record ignored;
+        if (!RunOneWayTraffic(
+                options, transport.get(), phase, options.topic_count,
+                options.warmup_messages_per_topic, kWarmupDone, false,
+                deadline_ns, &ignored, &error)) {
+            WriteResult(options, "failed", error, records, 0);
+            std::cerr << error << '\n';
+            return 1;
+        }
+        Record record;
+        if (!RunOneWayTraffic(options, transport.get(), phase,
+                              options.topic_count,
+                              options.messages_per_topic, kPhaseDone, true,
+                              deadline_ns, &record, &error)) {
+            WriteResult(options, "failed", error, records, 0);
+            std::cerr << error << '\n';
+            return 1;
+        }
+        records.push_back(std::move(record));
+    } else {
+        const auto run_echo_phase = [&](std::string_view mode,
+                                        uint32_t topic_count) {
             if (!SyncLanes(options, transport.get(), kPhaseStart, phase,
                            deadline_ns, &error)) {
-                WriteResult(options, "failed", error, records, 0);
-                std::cerr << error << '\n';
-                return 1;
+                return false;
             }
             Record ignored;
             if (!RunTraffic(options, transport.get(), mode, phase, topic_count,
-                            options.warmup_messages_per_topic, false, deadline_ns,
-                            &ignored, &error) ||
+                            options.warmup_messages_per_topic, false,
+                            deadline_ns, &ignored, &error) ||
                 !SyncLanes(options, transport.get(), kWarmupDone, phase,
                            deadline_ns, &error)) {
-                WriteResult(options, "failed", error, records, 0);
-                std::cerr << error << '\n';
-                return 1;
+                return false;
             }
             Record record;
             if (!RunTraffic(options, transport.get(), mode, phase, topic_count,
@@ -1130,12 +1317,31 @@ int RunClient(const Options& options) {
                             &record, &error) ||
                 !SyncLanes(options, transport.get(), kPhaseDone, phase,
                            deadline_ns, &error)) {
-                WriteResult(options, "failed", error, records, 0);
-                std::cerr << error << '\n';
-                return 1;
+                return false;
             }
             records.push_back(std::move(record));
             ++phase;
+            return true;
+        };
+        for (std::string_view mode : {
+                 std::string_view("serial"),
+                 std::string_view("per_topic_concurrent")}) {
+            if (options.mode != "all" && options.mode != mode) continue;
+            if (options.topic_count != 0) {
+                if (!run_echo_phase(mode, options.topic_count)) {
+                    WriteResult(options, "failed", error, records, 0);
+                    std::cerr << error << '\n';
+                    return 1;
+                }
+                continue;
+            }
+            for (uint32_t topic_count : kDefaultTopicCounts) {
+                if (!run_echo_phase(mode, topic_count)) {
+                    WriteResult(options, "failed", error, records, 0);
+                    std::cerr << error << '\n';
+                    return 1;
+                }
+            }
         }
     }
     if (!SyncLanes(options, transport.get(), kStop, 0, deadline_ns, &error) ||
@@ -1155,11 +1361,14 @@ int RunClient(const Options& options) {
 
 int RunServer(const Options& options) {
     std::string error;
+    uint64_t messages_received = 0;
     uint64_t messages_echoed = 0;
+    OneWayServerState one_way_state;
     const uint64_t deadline_ns = DeadlineNs(options);
     std::unique_ptr<Transport> transport = MakeTransport(options);
     if (!transport->Initialize(deadline_ns, &error)) {
-        WriteResult(options, "failed", error, {}, messages_echoed);
+        WriteResult(options, "failed", error, {}, messages_received,
+                    messages_echoed);
         std::cerr << error << '\n';
         return 1;
     }
@@ -1177,7 +1386,9 @@ int RunServer(const Options& options) {
             break;
         }
         if (message.kind == kFinalAck) {
-            if (message.topic >= options.lane_count ||
+            if ((options.mode == "one_way" &&
+                 one_way_state.stage != OneWayStage::kComplete) ||
+                message.topic >= options.lane_count ||
                 message.sequence != message.topic ||
                 final_acks[message.topic]) {
                 error = "server received an invalid final acknowledgement";
@@ -1187,14 +1398,25 @@ int RunServer(const Options& options) {
             ++final_ack_count;
             continue;
         }
-        if (message.kind == kData) ++messages_echoed;
+        bool should_echo = true;
+        if (options.mode == "one_way") {
+            if (!ValidateOneWayMessage(options, envelope, message,
+                                       &one_way_state, &error)) {
+                break;
+            }
+            should_echo = message.kind != kData;
+        }
+        if (message.kind == kData) ++messages_received;
         // DecodeBody above performs full deterministic validation (and L2 CRC)
-        // before the exact encoded body is echoed without reconstruction.
-        if (!transport->Echo(envelope, deadline_ns, &error)) break;
+        // before echo or one-way sequence validation.
+        if (should_echo) {
+            if (!transport->Echo(envelope, deadline_ns, &error)) break;
+            if (message.kind == kData) ++messages_echoed;
+        }
     }
     const bool passed = error.empty() && final_ack_count == options.lane_count;
     if (!WriteResult(options, passed ? "passed" : "failed", error, {},
-                     messages_echoed)) {
+                     messages_received, messages_echoed)) {
         std::cerr << "cannot write benchmark result to " << options.output
                   << '\n';
         return 1;
