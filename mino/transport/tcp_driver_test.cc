@@ -1238,6 +1238,58 @@ TEST(TcpDriverTest, CanonicalHeartbeatsKeepIdleConnectionsAliveAndStayInternal) 
     EXPECT_EQ(heartbeat_hidden.status().code(), StatusCode::kTimeout);
 }
 
+TEST(TcpDriverTest, CapacityPausedReadAheadDoesNotPartialTimeout) {
+    TcpDriverOptions options = TestOptions();
+    options.max_ready_receive_messages = 1;
+    options.partial_frame_timeout_ms = 50;
+    options.heartbeat_interval_ms = 1000;
+    options.idle_timeout_ms = 5000;
+    options.io_poll_max_ms = 1000;
+
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    const std::vector<std::byte> first = FrameBody(64, 4101);
+    const std::vector<std::byte> second = FrameBody(64, 4102);
+    std::vector<std::byte> combined = Prefix(first);
+    const std::vector<std::byte> second_wire = Prefix(second);
+    combined.insert(combined.end(), second_wire.begin(), second_wire.end());
+    ASSERT_EQ(SendRawNoSignal(peer.get(), combined),
+              static_cast<ssize_t>(combined.size()));
+    ASSERT_TRUE(WaitForReadyMessageCount(*server, 1));
+    std::this_thread::sleep_for(100ms);
+
+    auto first_received = server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = accepted->id,
+    });
+    ASSERT_TRUE(first_received.ok()) << first_received.status().ToString();
+    ASSERT_EQ(first_received->messages.size(), 1u);
+    EXPECT_EQ(first_received->messages[0].payload, first);
+
+    auto second_received = server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 500,
+        .connection_id = accepted->id,
+    });
+    ASSERT_TRUE(second_received.ok()) << second_received.status().ToString();
+    ASSERT_EQ(second_received->messages.size(), 1u);
+    EXPECT_EQ(second_received->messages[0].payload, second);
+    EXPECT_EQ(server->stats().active_connections, 1u);
+}
+
 TEST(TcpDriverTest, NoncanonicalHeartbeatIsDeliveredToBridge) {
     TcpDriverOptions options = TestOptions();
     options.heartbeat_interval_ms = 1000;

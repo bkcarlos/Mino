@@ -49,6 +49,7 @@ using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 
 constexpr size_t kTcpPrefixBytes = 4;
+constexpr size_t kTcpReadChunkBytes = 64u * 1024u;
 constexpr size_t kIoBudgetBytes = 256u * 1024u;
 constexpr size_t kMaxGatheredWriteBuffers = 64;
 
@@ -433,7 +434,8 @@ public:
         config_ = config;
         stop_requested_.store(false, std::memory_order_release);
         wake_pending_.store(false, std::memory_order_release);
-        worker_failed_ = false;
+        receive_capacity_blocked_.store(false, std::memory_order_release);
+        worker_failed_.store(false, std::memory_order_release);
         wake_read_fd_ = read_end.release();
         wake_write_fd_ = write_end.release();
         health_->store(HealthState::kHealthy, std::memory_order_release);
@@ -451,9 +453,12 @@ public:
     void RequestStop() noexcept {
         stop_requested_.store(true, std::memory_order_release);
         {
-            // Synchronize with the predicate-to-wait transition in blocking
-            // Poll/Accept calls so the stop notification cannot be lost.
+            // Synchronize with each predicate-to-wait transition so the stop
+            // notifications cannot be lost.
             std::lock_guard lock(mutex_);
+        }
+        {
+            std::lock_guard receive_lock(receive_mutex_);
         }
         Wake();
         receive_cv_.notify_all();
@@ -479,11 +484,17 @@ public:
         connections_.clear();
         listeners_.clear();
         accepted_.clear();
-        ready_messages_by_connection_.clear();
-        ready_messages_.clear();
-        ready_receive_messages_ = 0;
         completions_.clear();
         recently_closed_.clear();
+        {
+            std::lock_guard receive_lock(receive_mutex_);
+            ready_messages_by_connection_.clear();
+            ready_messages_.clear();
+            ready_receive_messages_ = 0;
+            ready_receive_bytes_ = 0;
+            reserved_receive_bytes_ = 0;
+            reserved_receive_messages_ = 0;
+        }
         {
             std::lock_guard send_lock(send_ingress_mutex_);
             send_admission_.clear();
@@ -491,9 +502,6 @@ public:
             total_control_send_bytes_ = 0;
             total_control_send_messages_ = 0;
         }
-        ready_receive_bytes_ = 0;
-        reserved_receive_bytes_ = 0;
-        reserved_receive_messages_ = 0;
         CloseWakePipeLocked();
         health_->store(HealthState::kUnavailable, std::memory_order_release);
         return Status::Ok();
@@ -883,7 +891,7 @@ public:
     }
 
     Result<ReceiveResult> PollMessages(const ReceiveRequest& request) {
-        std::unique_lock lock(mutex_);
+        std::unique_lock lock(receive_mutex_);
         const auto find_ready = [this, &request] {
             return FirstReadyMessageLocked(request.connection_id);
         };
@@ -899,7 +907,7 @@ public:
                 [this, &find_ready] {
                     return find_ready() != nullptr ||
                            stop_requested_.load(std::memory_order_acquire) ||
-                           worker_failed_;
+                           worker_failed_.load(std::memory_order_acquire);
                 });
             if (!ready) return Timeout("TCP receive timed out");
             if (find_ready() == nullptr) {
@@ -930,7 +938,12 @@ public:
             ConsumeReadyMessageLocked(message, &result);
         }
         if (ready_receive_messages_ != 0) NotifyReadyWaitersLocked();
-        Wake();
+        const bool should_wake_worker =
+            !result.messages.empty() &&
+            receive_capacity_blocked_.exchange(false,
+                                               std::memory_order_acq_rel);
+        lock.unlock();
+        if (should_wake_worker) Wake();
         return result;
     }
 
@@ -956,7 +969,7 @@ public:
                 [this, &find_ready] {
                     return find_ready() != completions_.end() ||
                            stop_requested_.load(std::memory_order_acquire) ||
-                           worker_failed_;
+                           worker_failed_.load(std::memory_order_acquire);
                 });
             if (!ready) return Timeout("TCP completion poll timed out");
             if (find_ready() == completions_.end()) {
@@ -993,7 +1006,10 @@ public:
                     admission->second.accepting = false;
                 }
             }
-            RemoveReadyMessagesLocked(id);
+            {
+                std::lock_guard receive_lock(receive_mutex_);
+                RemoveReadyMessagesLocked(id);
+            }
             Wake();
             return Status::Ok();
         }
@@ -1005,6 +1021,7 @@ public:
     TcpDriverStats Stats() const noexcept {
         std::lock_guard lock(mutex_);
         std::lock_guard send_lock(send_ingress_mutex_);
+        std::lock_guard receive_lock(receive_mutex_);
         return TcpDriverStats{
             .active_connections = connections_.size(),
             .listeners = listeners_.size(),
@@ -1063,12 +1080,11 @@ private:
         ConnectionInfo info;
         int fd = -1;
         bool closing = false;
-        std::array<std::byte, kTcpPrefixBytes> prefix{};
-        size_t prefix_size = 0;
+        std::vector<std::byte> receive_buffer;
+        size_t receive_offset = 0;
         uint32_t expected_body_size = 0;
-        std::vector<std::byte> body;
-        size_t body_size = 0;
         size_t reserved_body_bytes = 0;
+        bool receive_paused_for_capacity = false;
         std::optional<TimePoint> partial_frame_started;
         std::deque<PendingWrite> control_writes;
         std::deque<PendingWrite> data_writes;
@@ -1206,6 +1222,22 @@ private:
         if (wake_write_fd_ >= 0) (void)::close(wake_write_fd_);
         wake_read_fd_ = -1;
         wake_write_fd_ = -1;
+    }
+
+    void DrainBufferedReceivesLocked() {
+        std::vector<std::pair<ConnectionId, Status>> failures;
+        for (auto& [id, connection] : connections_) {
+            if (connection.closing ||
+                connection.receive_offset == connection.receive_buffer.size()) {
+                continue;
+            }
+            const Status status =
+                ProcessConnectionReceiveBufferLocked(connection);
+            if (!status.ok()) failures.emplace_back(id, status);
+        }
+        for (const auto& [id, status] : failures) {
+            CloseConnectionLocked(id, status);
+        }
     }
 
     // Newly queued writes optimistically run in software. EAGAIN is the only
@@ -1381,8 +1413,13 @@ private:
                     PrepareReceiveReservationLocked(connection);
                     PrepareHeartbeatLocked(connection, now);
                 }
+                DrainBufferedReceivesLocked();
                 has_immediate_writes |= DrainUnblockedWritesLocked();
-                has_immediate_writes |= DrainSendIngressLocked();
+                // Echoes may arrive while the first write pass is running. Send
+                // newly staged work now instead of adding an epoll_wait(0) turn.
+                if (DrainSendIngressLocked()) {
+                    has_immediate_writes |= DrainUnblockedWritesLocked();
+                }
                 sync_status = SyncEpollInterestsLocked();
             }
             if (!sync_status.ok()) {
@@ -1637,8 +1674,13 @@ private:
                     PrepareReceiveReservationLocked(connection);
                     PrepareHeartbeatLocked(connection, now);
                 }
+                DrainBufferedReceivesLocked();
                 has_immediate_writes |= DrainUnblockedWritesLocked();
-                has_immediate_writes |= DrainSendIngressLocked();
+                // Echoes may arrive while the first write pass is running. Send
+                // newly staged work now instead of adding a kevent timeout turn.
+                if (DrainSendIngressLocked()) {
+                    has_immediate_writes |= DrainUnblockedWritesLocked();
+                }
                 sync_status = SyncKqueueInterestsLocked();
             }
             if (!sync_status.ok()) {
@@ -1729,6 +1771,7 @@ private:
                 std::lock_guard lock(mutex_);
                 (void)DrainSendIngressLocked();
                 ProcessClosuresAndTimersLocked(Clock::now());
+                DrainBufferedReceivesLocked();
                 descriptors.reserve(1 + listeners_.size() + connections_.size());
                 tokens.reserve(descriptors.capacity());
                 descriptors.push_back(pollfd{.fd = wake_read_fd_,
@@ -1838,9 +1881,12 @@ private:
     void FailWorker() noexcept {
         health_->store(HealthState::kUnavailable, std::memory_order_release);
         stop_requested_.store(true, std::memory_order_release);
+        worker_failed_.store(true, std::memory_order_release);
         {
             std::lock_guard lock(mutex_);
-            worker_failed_ = true;
+        }
+        {
+            std::lock_guard receive_lock(receive_mutex_);
         }
         receive_cv_.notify_all();
         completion_cv_.notify_all();
@@ -1866,7 +1912,8 @@ private:
             } else if (now - connection.last_valid_receive >= idle_timeout) {
                 close_connections.emplace_back(
                     id, Unavailable("TCP connection idle timeout"));
-            } else if (connection.partial_frame_started.has_value() &&
+            } else if (!connection.receive_paused_for_capacity &&
+                       connection.partial_frame_started.has_value() &&
                        now - *connection.partial_frame_started >=
                            partial_timeout) {
                 close_connections.emplace_back(
@@ -2015,10 +2062,13 @@ private:
         RemoveKqueueConnectionLocked(connection);
 #endif
         if (connection.fd >= 0) (void)::close(connection.fd);
-        RemoveReadyMessagesLocked(id);
-        if (connection.reserved_body_bytes != 0) {
-            reserved_receive_bytes_ -= connection.reserved_body_bytes;
-            --reserved_receive_messages_;
+        {
+            std::lock_guard receive_lock(receive_mutex_);
+            RemoveReadyMessagesLocked(id);
+            if (connection.reserved_body_bytes != 0) {
+                reserved_receive_bytes_ -= connection.reserved_body_bytes;
+                --reserved_receive_messages_;
+            }
         }
         for (const PendingWrite& write : connection.data_writes) {
             if (write.operation.id == kInvalidOperationId) continue;
@@ -2091,17 +2141,22 @@ private:
         }
     }
 
-    bool CanReadLocked(const Connection& connection) const noexcept {
+    bool CanReadLocked(Connection& connection) noexcept {
         if (connection.closing) return false;
-        if (connection.expected_body_size != 0 &&
-            connection.reserved_body_bytes == 0) {
-            return false;
-        }
         if (connection.reserved_body_bytes != 0) return true;
-        return ready_receive_messages_ + reserved_receive_messages_ <
-                   options_.max_ready_receive_messages &&
-               ready_receive_bytes_ + reserved_receive_bytes_ <
-                   options_.max_ready_receive_bytes;
+        std::lock_guard receive_lock(receive_mutex_);
+        const bool can_read =
+            connection.expected_body_size == 0 &&
+            ready_receive_messages_ + reserved_receive_messages_ <
+                options_.max_ready_receive_messages &&
+            ready_receive_bytes_ + reserved_receive_bytes_ <
+                options_.max_ready_receive_bytes;
+        connection.receive_paused_for_capacity = !can_read;
+        if (!can_read) {
+            connection.partial_frame_started.reset();
+            receive_capacity_blocked_.store(true, std::memory_order_release);
+        }
+        return can_read;
     }
 
     void PrepareReceiveReservationLocked(Connection& connection) {
@@ -2110,17 +2165,23 @@ private:
             return;
         }
         const size_t body_size = connection.expected_body_size;
+        std::lock_guard receive_lock(receive_mutex_);
         if (ready_receive_messages_ + reserved_receive_messages_ >=
                 options_.max_ready_receive_messages ||
             ready_receive_bytes_ + reserved_receive_bytes_ >
                 options_.max_ready_receive_bytes ||
             body_size > options_.max_ready_receive_bytes -
                             ready_receive_bytes_ - reserved_receive_bytes_) {
+            connection.receive_paused_for_capacity = true;
+            connection.partial_frame_started.reset();
+            receive_capacity_blocked_.store(true, std::memory_order_release);
             return;
         }
-        connection.body.resize(body_size);
-        connection.body_size = 0;
         connection.reserved_body_bytes = body_size;
+        connection.receive_paused_for_capacity = false;
+        if (!connection.partial_frame_started.has_value()) {
+            connection.partial_frame_started = Clock::now();
+        }
         reserved_receive_bytes_ += body_size;
         ++reserved_receive_messages_;
     }
@@ -2233,36 +2294,38 @@ private:
         }
     }
 
-    Status ReadConnectionLocked(Connection& connection) {
-        size_t budget = kIoBudgetBytes;
-        while (budget != 0) {
-            if (connection.prefix_size < kTcpPrefixBytes) {
-                const size_t remaining = kTcpPrefixBytes - connection.prefix_size;
-                const size_t amount = std::min(remaining, budget);
-                const ssize_t received = ::recv(
-                    connection.fd,
-                    connection.prefix.data() + connection.prefix_size, amount, 0);
-                if (received == 0) {
-                    return connection.prefix_size == 0 &&
-                                   connection.expected_body_size == 0
-                               ? Unavailable("TCP peer closed connection")
-                               : Corruption("TCP stream ended inside frame prefix");
-                }
-                if (received < 0) {
-                    if (errno == EINTR) continue;
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        return Status::Ok();
-                    }
-                    return Unavailable("TCP receive failed");
-                }
-                if (!connection.partial_frame_started.has_value()) {
-                    connection.partial_frame_started = Clock::now();
-                }
-                connection.prefix_size += static_cast<size_t>(received);
-                budget -= static_cast<size_t>(received);
-                if (connection.prefix_size < kTcpPrefixBytes) continue;
+    void ClearConnectionReceiveBufferLocked(Connection& connection) {
+        connection.receive_buffer.clear();
+        connection.receive_offset = 0;
+        if (connection.receive_buffer.capacity() > kTcpReadChunkBytes) {
+            std::vector<std::byte>().swap(connection.receive_buffer);
+        }
+    }
 
-                connection.expected_body_size = LoadBe32(connection.prefix);
+    void CompactConnectionReceiveBufferLocked(Connection& connection) {
+        if (connection.receive_offset == 0) return;
+        if (connection.receive_offset == connection.receive_buffer.size()) {
+            ClearConnectionReceiveBufferLocked(connection);
+        } else {
+            connection.receive_buffer.erase(
+                connection.receive_buffer.begin(),
+                connection.receive_buffer.begin() +
+                    static_cast<ptrdiff_t>(connection.receive_offset));
+        }
+        connection.receive_offset = 0;
+    }
+
+    Status ProcessConnectionReceiveBufferLocked(Connection& connection) {
+        for (;;) {
+            size_t available =
+                connection.receive_buffer.size() - connection.receive_offset;
+            if (connection.expected_body_size == 0) {
+                if (available < kTcpPrefixBytes) return Status::Ok();
+                const auto prefix = std::span<const std::byte>(
+                    connection.receive_buffer.data() + connection.receive_offset,
+                    kTcpPrefixBytes);
+                connection.expected_body_size = LoadBe32(prefix);
+                connection.receive_offset += kTcpPrefixBytes;
                 if (connection.expected_body_size <
                         bridge::kWireBaseHeaderLength ||
                     connection.expected_body_size >
@@ -2270,66 +2333,120 @@ private:
                     return Corruption("TCP frame length prefix is out of bounds");
                 }
                 PrepareReceiveReservationLocked(connection);
-                if (connection.reserved_body_bytes == 0) {
-                    return Status::Ok();
-                }
-            }
-
-            if (connection.reserved_body_bytes == 0) {
+                if (connection.reserved_body_bytes == 0) return Status::Ok();
+            } else if (connection.reserved_body_bytes == 0) {
                 PrepareReceiveReservationLocked(connection);
                 if (connection.reserved_body_bytes == 0) return Status::Ok();
             }
-            const size_t remaining =
-                connection.expected_body_size - connection.body_size;
-            const size_t amount = std::min(remaining, budget);
-            const ssize_t received = ::recv(
-                connection.fd, connection.body.data() + connection.body_size,
-                amount, 0);
+
+            available =
+                connection.receive_buffer.size() - connection.receive_offset;
+            if (available < connection.expected_body_size) return Status::Ok();
+            const auto body = std::span<const std::byte>(
+                connection.receive_buffer.data() + connection.receive_offset,
+                connection.expected_body_size);
+            const bool is_canonical_heartbeat =
+                body.size() + kTcpPrefixBytes == heartbeat_wire_.size() &&
+                std::equal(body.begin(), body.end(),
+                           heartbeat_wire_.begin() + kTcpPrefixBytes);
+            if (is_canonical_heartbeat ||
+                IsMinimallyStructuredWireFrame(body)) {
+                connection.last_valid_receive = Clock::now();
+            }
+
+            std::vector<std::byte> payload;
+            if (!is_canonical_heartbeat) {
+                payload.assign(body.begin(), body.end());
+            }
+            connection.receive_offset += connection.expected_body_size;
+            {
+                std::lock_guard receive_lock(receive_mutex_);
+                reserved_receive_bytes_ -= connection.reserved_body_bytes;
+                --reserved_receive_messages_;
+                connection.reserved_body_bytes = 0;
+                if (!is_canonical_heartbeat) {
+                    EnqueueReadyMessageLocked(ReceivedMessage{
+                        .connection_id = connection.info.id,
+                        .from = *connection.info.peer_endpoint,
+                        .payload = std::move(payload),
+                    });
+                }
+                if (ready_receive_messages_ >=
+                        options_.max_ready_receive_messages ||
+                    ready_receive_bytes_ + reserved_receive_bytes_ >=
+                        options_.max_ready_receive_bytes) {
+                    connection.receive_paused_for_capacity = true;
+                    connection.partial_frame_started.reset();
+                    receive_capacity_blocked_.store(true,
+                                                    std::memory_order_release);
+                    connection.expected_body_size = 0;
+                    if (connection.receive_offset ==
+                        connection.receive_buffer.size()) {
+                        ClearConnectionReceiveBufferLocked(connection);
+                    }
+                    return Status::Ok();
+                }
+                connection.receive_paused_for_capacity = false;
+            }
+
+            connection.expected_body_size = 0;
+            if (connection.receive_offset == connection.receive_buffer.size()) {
+                ClearConnectionReceiveBufferLocked(connection);
+                connection.partial_frame_started.reset();
+                return Status::Ok();
+            }
+            connection.partial_frame_started = Clock::now();
+        }
+    }
+
+    Status ReadConnectionLocked(Connection& connection) {
+        MINO_RETURN_IF_ERROR(ProcessConnectionReceiveBufferLocked(connection));
+        if (connection.receive_paused_for_capacity ||
+            (connection.expected_body_size != 0 &&
+             connection.reserved_body_bytes == 0)) {
+            return Status::Ok();
+        }
+        size_t budget = kIoBudgetBytes;
+        std::array<std::byte, kTcpReadChunkBytes> chunk{};
+        while (budget != 0) {
+            CompactConnectionReceiveBufferLocked(connection);
+            const size_t max_buffered =
+                static_cast<size_t>(options_.max_frame_body_bytes) +
+                kTcpPrefixBytes;
+            if (connection.receive_buffer.size() >= max_buffered) {
+                return Corruption("TCP receive buffer exceeded frame bound");
+            }
+            const size_t amount =
+                std::min({chunk.size(), budget,
+                          max_buffered - connection.receive_buffer.size()});
+            ssize_t received;
+            do {
+                received = ::recv(connection.fd, chunk.data(), amount, 0);
+            } while (received < 0 && errno == EINTR);
             if (received == 0) {
-                return Corruption("TCP stream ended inside frame body");
+                return connection.receive_buffer.empty() &&
+                               connection.expected_body_size == 0
+                           ? Unavailable("TCP peer closed connection")
+                           : Corruption("TCP stream ended inside frame");
             }
             if (received < 0) {
-                if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     return Status::Ok();
                 }
                 return Unavailable("TCP receive failed");
             }
-            connection.body_size += static_cast<size_t>(received);
+            if (!connection.partial_frame_started.has_value()) {
+                connection.partial_frame_started = Clock::now();
+            }
+            connection.receive_buffer.insert(
+                connection.receive_buffer.end(), chunk.begin(),
+                chunk.begin() + received);
             budget -= static_cast<size_t>(received);
-            if (connection.body_size < connection.expected_body_size) continue;
-
-            const bool is_canonical_heartbeat =
-                connection.body.size() + kTcpPrefixBytes ==
-                    heartbeat_wire_.size() &&
-                std::equal(connection.body.begin(), connection.body.end(),
-                           heartbeat_wire_.begin() + kTcpPrefixBytes);
-            if (is_canonical_heartbeat ||
-                IsMinimallyStructuredWireFrame(connection.body)) {
-                connection.last_valid_receive = Clock::now();
-            }
-            reserved_receive_bytes_ -= connection.reserved_body_bytes;
-            --reserved_receive_messages_;
-            connection.reserved_body_bytes = 0;
-
-            if (is_canonical_heartbeat) {
-                connection.body.clear();
-            } else {
-                EnqueueReadyMessageLocked(ReceivedMessage{
-                    .connection_id = connection.info.id,
-                    .from = *connection.info.peer_endpoint,
-                    .payload = std::move(connection.body),
-                });
-            }
-            connection.prefix.fill(std::byte{0});
-            connection.prefix_size = 0;
-            connection.expected_body_size = 0;
-            connection.body_size = 0;
-            connection.partial_frame_started.reset();
-            if (ready_receive_messages_ >=
-                    options_.max_ready_receive_messages ||
-                ready_receive_bytes_ + reserved_receive_bytes_ >=
-                    options_.max_ready_receive_bytes) {
+            MINO_RETURN_IF_ERROR(
+                ProcessConnectionReceiveBufferLocked(connection));
+            if (connection.receive_paused_for_capacity ||
+                (connection.expected_body_size != 0 &&
+                 connection.reserved_body_bytes == 0)) {
                 return Status::Ok();
             }
         }
@@ -2503,13 +2620,15 @@ private:
 
     mutable std::mutex mutex_;
     mutable std::mutex send_ingress_mutex_;
+    mutable std::mutex receive_mutex_;
     std::condition_variable receive_cv_;
     std::condition_variable completion_cv_;
     std::condition_variable accept_cv_;
     std::thread worker_;
     std::atomic<bool> stop_requested_{true};
     std::atomic<bool> wake_pending_{false};
-    bool worker_failed_ = false;
+    std::atomic<bool> receive_capacity_blocked_{false};
+    std::atomic<bool> worker_failed_{false};
     int wake_read_fd_ = -1;
     int wake_write_fd_ = -1;
 #if defined(MINO_TCP_USE_EPOLL)

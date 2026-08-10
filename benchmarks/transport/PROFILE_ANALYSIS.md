@@ -27,42 +27,46 @@ five-run medians on the same host were:
 | L2 | 224 us | 78 us | 142.3k msg/s | 399.3k msg/s | ZeroMQ is 2.81x faster by throughput |
 
 After P1 added indexed receive delivery, adaptive waiter notification, bounded
-tombstone storage, and shutdown-wait synchronization, the current clean five-run
-medians are:
+tombstone storage, and shutdown-wait synchronization, five-run medians were:
 
-| Layer | Mino p50 RTT | ZeroMQ p50 RTT | Mino throughput | ZeroMQ throughput | Current gap |
+| Layer | Mino p50 RTT | ZeroMQ p50 RTT | Mino throughput | ZeroMQ throughput | Gap after P1 |
 |---|---:|---:|---:|---:|---:|
-| L1 | 174 us | 70 us | 181.4k msg/s | 454.9k msg/s | ZeroMQ is 2.51x faster by throughput |
-| L2 | 223 us | 78 us | 139.5k msg/s | 407.5k msg/s | ZeroMQ is 2.92x faster by throughput |
+| L1 | 174 us | 70 us | 181.4k msg/s | 454.9k msg/s | ZeroMQ was 2.51x faster |
+| L2 | 223 us | 78 us | 139.5k msg/s | 407.5k msg/s | ZeroMQ was 2.92x faster |
 
-Relative to the original Mino baseline, current L1 p50 improved by 23.3% and
-throughput by 29.1%; L2 p50 improved by 12.2% and throughput by 12.1%. P1's
-unfiltered benchmark throughput is close to P0 (L1 +2.0%, L2 -2.0%, within the
-observed run variance), while it removes linear filtered polling and further
-reduces synchronization syscalls. A final three-run serial check was 25 us p50
-for both L1 and L2, so the concurrent changes did not materially regress the
-single-message path.
+P2 then separated ready-queue polling from the socket/lifecycle mutex, made
+receive-capacity wakeups transition-only, and replaced prefix/body-sized reads
+with a 64 KiB stream reader that parses multiple frames per syscall. A final
+follow-up also sends work captured by the worker's second ingress drain
+immediately instead of deferring it through a zero-time readiness turn. The
+final interleaved five-run medians are:
 
-A separate three-run scaling sweep with 3,000 messages per topic shows where the
-current crossover occurs:
+| Layer | Mino p50 RTT | ZeroMQ p50 RTT | Mino p95 RTT | ZeroMQ p95 RTT | Mino p99 RTT | ZeroMQ p99 RTT | Mino throughput | ZeroMQ throughput | Mino/ZMQ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| L1 | 54 us | 71 us | 67 us | 77 us | 75 us | 94 us | 578.6k msg/s | 449.4k msg/s | 128.7% |
+| L2 | 57 us | 78 us | 80 us | 101 us | 98 us | 111 us | 534.8k msg/s | 404.7k msg/s | 132.1% |
 
-| Topics | Mino L1 msg/s | ZMQ L1 msg/s | ZMQ/Mino | Mino L2 msg/s | ZMQ L2 msg/s | ZMQ/Mino |
+Relative to the original Mino baseline, final L1 p50 improved by 76.2% and
+throughput by 311.8%; L2 p50 improved by 77.6% and throughput by 329.9%.
+Mino now exceeds ZeroMQ in throughput and p50/p95/p99 under the focused fair
+workload. A final serial check measured 29 us for both L1 and L2 p50, versus
+32 us L1 and 31 us L2 for ZeroMQ.
+
+A separate final three-run scaling sweep with 3,000 messages per topic shows
+Mino meeting or exceeding ZeroMQ across the tested range:
+
+| Topics | Mino L1 msg/s | ZMQ L1 msg/s | Mino/ZMQ | Mino L2 msg/s | ZMQ L2 msg/s | Mino/ZMQ |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 40.8k | 33.7k | 0.83x | 40.7k | 32.3k | 0.79x |
-| 2 | 80.4k | 63.8k | 0.79x | 83.0k | 57.8k | 0.70x |
-| 4 | 107.7k | 125.3k | 1.16x | 112.4k | 111.6k | 0.99x |
-| 8 | 123.6k | 216.3k | 1.75x | 135.7k | 173.8k | 1.28x |
-| 16 | 179.2k | 332.5k | 1.86x | 143.7k | 314.2k | 2.19x |
-| 32 | 174.1k | 455.3k | 2.62x | 141.5k | 394.9k | 2.79x |
+| 1 | 35.7k | 33.5k | 106.6% | 34.2k | 32.4k | 105.6% |
+| 2 | 83.2k | 62.0k | 134.2% | 71.0k | 59.7k | 118.9% |
+| 4 | 127.2k | 118.5k | 107.3% | 122.9k | 109.6k | 112.1% |
+| 8 | 250.7k | 216.7k | 115.7% | 211.0k | 191.6k | 110.1% |
+| 16 | 400.5k | 318.8k | 125.6% | 334.0k | 309.4k | 107.9% |
+| 32 | 586.4k | 450.5k | 130.2% | 512.6k | 401.8k | 127.6% |
 
-In serial mode, Mino's p50 was 24 us for L1 and 24-29 us for L2, versus roughly
-29-31 us and 30 us for ZeroMQ. The gap starts to grow rapidly at four or more
-concurrent topics.
-
-Adding the shared production `WireFrameCodec` and CRC32C workload changes Mino's
-32-topic result by about +12% RTT and -11% throughput. It does not explain the
-approximately 3x transport scaling gap. The dominant difference is Mino's
-shared-lock and wake-up architecture.
+The shared production `WireFrameCodec` and CRC32C workload is no longer the
+scaling limiter: final L2 throughput exceeds ZeroMQ across the measured scaling
+curve.
 
 ## Focused profiling workload
 
@@ -129,9 +133,21 @@ After P1, the identical focused trace changed again:
 | `sendmsg` | 117,179 | 103,212 | 94,072 | 8.9% | 19.7% |
 | `recvfrom` | 435,318 | 450,651 | 436,129 | 3.2% | -0.2% |
 
-The remaining approximately 597 thousand `futex` calls and unchanged receive
-syscall count show that the shared receive/I/O mutex and worker-wide maintenance
-scans remain the dominant architectural targets.
+P2's stream-reader trace, collected before the immediate second write pass, shows
+the effect of separating the receive lock and buffering the TCP byte stream:
+
+| Syscall | Before optimization | Stream reader P2 | Total reduction |
+|---|---:|---:|---:|
+| `futex` | 1,238,643 | 547,978 | 55.8% |
+| `write` | 352,031 | 8,102 | 97.7% |
+| `read` | 255,226 | 16,206 | 93.7% |
+| `epoll_wait` | 140,364 | 11,158 | 92.1% |
+| `sendmsg` | 117,179 | 13,126 | 88.8% |
+| `recvfrom` | 435,318 | 187,035 | 57.0% |
+
+This trace is still instrumentation-perturbed, but its syscall shape matches the
+throughput result: sends, wakeups, epoll turns, and TCP receives are batched
+rather than occurring near once or multiple times per frame.
 
 ### ZeroMQ client
 
@@ -247,41 +263,37 @@ holds `mutex_` while it:
 4. scans all connections again in `DrainUnblockedWritesLocked()`;
 5. scans listeners and all connections again in `SyncEpollInterestsLocked()`.
 
-After `epoll_wait`, each ready event independently reacquires the same global
-mutex at `mino/transport/tcp_driver.cc:1412`. Socket reads no longer serialize
-with application send admission, but they still serialize with every
-`PollMessages()` call and all worker maintenance.
+After `epoll_wait`, each ready event independently reacquires the I/O/lifecycle
+mutex. Socket reads still serialize with worker maintenance, but
+`PollMessages()` no longer uses that mutex and cannot block socket progress.
 
 ### Receive path
 
-`mino/transport/tcp_driver.cc:2234` still receives the four-byte prefix and body
-while holding the driver-wide mutex. Complete messages are published through the
-indexed ready queue at `mino/transport/tcp_driver.cc:1942`.
+`mino/transport/tcp_driver.cc:2392` reads up to 64 KiB of TCP stream data per
+syscall and `mino/transport/tcp_driver.cc:2308` parses as many complete framed
+bodies as are available. Large transient receive-buffer capacity is released
+after a frame drains, and read-ahead paused for application capacity is excluded
+from the network partial-frame timeout.
 
-`mino/transport/tcp_driver.cc:883` now performs average O(1) lookup for both
-unfiltered and connection-filtered polling. The global deque preserves arrival
-order, while a per-connection pointer index preserves filtered FIFO. Filtered
-consumption marks an interior entry consumed; unfiltered consumption trims the
-consumed prefix. Before physical storage reaches the configured message bound,
-`mino/transport/tcp_driver.cc:1924` transactionally compacts tombstones and
-rebuilds the index, so storage remains bounded.
+`mino/transport/tcp_driver.cc:891` owns only `receive_mutex_`, so queue polling no
+longer contends with socket I/O, timers, writes, or readiness maintenance. The
+indexed global/per-connection FIFO, adaptive waiter notification, bounded
+tombstone compaction, and oversized-head semantics remain unchanged.
 
-`mino/transport/tcp_driver.cc:1913` uses `notify_one()` when all blocked waiters
-are unfiltered and falls back to `notify_all()` when a filtered waiter exists.
-Oversized, partial-batch, and allocation-failure exits pass a notification baton
-when messages remain. `RequestStop()` also synchronizes with the predicate-to-wait
-transition so shutdown notifications cannot be lost.
+Receive capacity uses a conservative one-way blocked latch: worker paths only set
+it, and a consumer clears it when releasing capacity. A per-connection pause bit
+prevents one blocked lane from throttling already-reserved reads on another lane.
 
 ```mermaid
 flowchart TD
-    A[epoll event] --> B[Acquire driver-wide mutex]
-    B --> C[recv prefix and body]
-    C --> D[Append global deque and connection index]
-    D --> E[Adaptive waiter notification]
-    E --> F[Poll acquires driver-wide mutex]
-    F --> G[O1 global or filtered lookup]
-    G --> H[Consume and update both indexes]
-    H --> I[Coalesced capacity wake]
+    A[epoll event] --> B[Acquire I/O mutex]
+    B --> C[Read up to 64 KiB TCP stream]
+    C --> D[Parse multiple framed bodies]
+    D --> E[Publish under receive mutex]
+    E --> F[Adaptive waiter notification]
+    F --> G[Poll acquires only receive mutex]
+    G --> H[O1 global or filtered lookup]
+    H --> I[Wake worker only after real capacity block]
 ```
 
 ## Root-cause ranking and optimization plan
@@ -334,17 +346,25 @@ Expected impact: removes the approximately 0.9-1.0 million
 `SyncEpollInterestsLocked()` calls and multi-million interest/reservation checks.
 This matters even though most checks do not result in `epoll_ctl`.
 
-### P2: batch I/O and remove framing copies
+### P2: split receive ownership and buffer stream I/O — complete
 
-1. Add a batch send path so one producer hand-off carries multiple frames.
-2. Keep the four-byte prefix in reserved headroom, an owned segmented buffer, or
-   an `iovec`/`sendmsg` pair instead of allocating and copying in `PrefixFrame()`.
-3. Read multiple complete frames per readiness event into reusable storage, and
-   reduce avoidable prefix/body/EAGAIN syscall sequences.
+Implemented:
 
-Expected impact: reduces allocator/memory-bandwidth cost and syscalls after the
-synchronization bottleneck is removed. It should not be implemented first
-because serial results show that this cost alone is not the 3x gap.
+1. Dedicated `receive_mutex_`; Poll no longer acquires the socket/lifecycle lock.
+2. Transition-only receive-capacity wakeups with a conservative blocked latch.
+3. Per-connection 64 KiB chunked TCP stream reader and multi-frame userspace
+   parser, replacing separate prefix/body receive syscalls.
+4. Capacity-paused read-ahead does not expire as a network partial frame.
+5. Large transient receive-buffer capacity is released after drain.
+6. Epoll, kqueue, and poll maintenance all resume buffered frames after capacity
+   is released.
+7. Epoll and kqueue immediately execute a bounded second write pass when the
+   post-write ingress drain captures newly queued echoes, avoiding an otherwise
+   mandatory zero-time readiness turn before those messages reach the socket.
+
+This stage closed the throughput and tail-latency gaps. Potential future work is
+focused on removing the remaining body copy and replacing worker full scans for
+very large connection counts rather than the two-lane benchmark.
 
 ### P3: preserve already-effective codec work
 
