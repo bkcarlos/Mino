@@ -28,6 +28,7 @@ NodeMetadata BuildMetadata(const NodeRegistration& request, uint64_t now_ns,
         .node_id = request.node_id,
         .process_identity = request.process_identity,
         .endpoints = request.endpoints,
+        .security_domain_id = request.security_domain_id,
         .trust_domain = request.trust_domain,
         .health = request.health,
         .lease_state = NodeLeaseState::kActive,
@@ -80,6 +81,7 @@ bool NodeRegistry::SameConfiguration(
     return current.node_id == request.node_id &&
            current.process_identity == request.process_identity &&
            current.endpoints == request.endpoints &&
+           current.security_domain_id == request.security_domain_id &&
            current.trust_domain == request.trust_domain &&
            current.health == request.health &&
            current.lease_epoch == request.lease_epoch &&
@@ -291,9 +293,12 @@ Status NodeRegistry::Update(const NodeRegistration& replacement,
                                  "node config CAS version mismatch");
         }
         if (entry.metadata.process_identity != replacement.process_identity ||
-            entry.metadata.lease_epoch != replacement.lease_epoch) {
-            return Status::Error(StatusCode::kUnsupported,
-                                 "node identity and lease epoch are immutable");
+            entry.metadata.lease_epoch != replacement.lease_epoch ||
+            entry.metadata.security_domain_id !=
+                replacement.security_domain_id) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "node identity, security domain, and lease epoch are immutable");
         }
         entry.metadata = std::move(candidate);
         ++entry.generation;

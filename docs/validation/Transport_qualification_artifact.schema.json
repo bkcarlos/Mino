@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mino.invalid/schemas/transport-qualification-v2.json",
+  "title": "Mino physical transport qualification role and final artifacts",
+  "type": "object",
+  "required": [
+    "schema",
+    "artifact_type",
+    "qualification",
+    "qualification_id",
+    "run",
+    "source",
+    "outcome",
+    "qualification_eligible",
+    "artifacts_complete",
+    "errors"
+  ],
+  "properties": {
+    "schema": {"const": "mino.transport.qualification.v2"},
+    "artifact_type": {"enum": ["role", "final"]},
+    "qualification": {"enum": ["rdma", "fabric"]},
+    "qualification_id": {"enum": ["D6-06", "D6-07"]},
+    "run": {"$ref": "#/$defs/run"},
+    "source": {"$ref": "#/$defs/source"},
+    "outcome": {"enum": ["passed", "failed"]},
+    "qualification_eligible": {"type": "boolean"},
+    "artifacts_complete": {"type": "boolean"},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "artifact": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "run": {
+      "type": "object",
+      "required": ["id", "attempt", "session_nonce"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "attempt": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "session_nonce": {
+          "oneOf": [
+            {"type": "string", "minLength": 16, "maxLength": 256, "pattern": "^\\S+$"},
+            {"const": ""}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["expected_commit", "commit", "state"],
+      "properties": {
+        "expected_commit": {"$ref": "#/$defs/commit"},
+        "commit": {"$ref": "#/$defs/commit"},
+        "state": {"enum": ["clean", "dirty", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "endpointIdentity": {
+      "type": "object",
+      "required": ["endpoint", "node_id", "security_domain"],
+      "properties": {
+        "endpoint": {"type": "string", "minLength": 1},
+        "node_id": {"type": "integer", "minimum": 1},
+        "security_domain": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "identity": {
+      "type": "object",
+      "required": ["local", "peer", "hostname"],
+      "properties": {
+        "local": {"$ref": "#/$defs/endpointIdentity"},
+        "peer": {"$ref": "#/$defs/endpointIdentity"},
+        "hostname": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "plugin",
+        "plugin_sha256",
+        "approved_plugin_sha256",
+        "abi_version",
+        "class",
+        "class_validation",
+        "provenance"
+      ],
+      "properties": {
+        "plugin": {"type": "string", "pattern": "^/"},
+        "plugin_sha256": {"$ref": "#/$defs/sha256"},
+        "approved_plugin_sha256": {"$ref": "#/$defs/sha256"},
+        "abi_version": {"const": 1},
+        "class": {"const": "device"},
+        "class_validation": {"const": "production-loader-enforced"},
+        "provenance": {"type": "string", "minLength": 1}
+      }
+    },
+    "metricRow": {
+      "type": "object",
+      "required": [
+        "transport",
+        "copy_mode",
+        "payload_bytes",
+        "iterations",
+        "p50_rtt_ns",
+        "p99_rtt_ns",
+        "elapsed_ns",
+        "process_cpu_ns",
+        "payload_bytes_per_second",
+        "provider_provenance"
+      ],
+      "properties": {
+        "transport": {"enum": ["tcp", "udp", "rdma", "fabric"]},
+        "copy_mode": {"enum": ["driver-staging", "registered-zero-copy"]},
+        "payload_bytes": {"type": "integer", "minimum": 1},
+        "iterations": {"type": "integer", "minimum": 1},
+        "p50_rtt_ns": {"type": "integer", "minimum": 1},
+        "p99_rtt_ns": {"type": "integer", "minimum": 1},
+        "elapsed_ns": {"type": "integer", "minimum": 1},
+        "process_cpu_ns": {"type": "integer", "minimum": 1},
+        "payload_bytes_per_second": {"type": "integer", "minimum": 1},
+        "provider_provenance": {"type": "string", "minLength": 1}
+      }
+    },
+    "slaCheck": {
+      "type": "object",
+      "required": ["case", "payload_bytes", "metric", "observed", "policy", "threshold", "passed"],
+      "properties": {
+        "case": {"type": "string", "minLength": 1},
+        "payload_bytes": {"type": "integer", "minimum": 1},
+        "metric": {"enum": ["p50_rtt_ns", "p99_rtt_ns", "process_cpu_ns", "payload_bytes_per_second", "elapsed_ns", "copy_mode"]},
+        "policy": {"type": "string", "minLength": 1},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": ["case", "elapsed_ns", "log", "result", "rows"],
+      "properties": {
+        "case": {"type": "string", "minLength": 1},
+        "elapsed_ns": {"type": "integer", "minimum": 1},
+        "log": {"$ref": "#/$defs/artifact"},
+        "result": {"oneOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
+        "rows": {"type": "array", "items": {"$ref": "#/$defs/metricRow"}}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"qualification": {"const": "rdma"}}},
+      "then": {"properties": {"qualification_id": {"const": "D6-06"}}},
+      "else": {"properties": {"qualification_id": {"const": "D6-07"}}}
+    },
+    {
+      "if": {"properties": {"artifact_type": {"const": "role"}}},
+      "then": {
+        "required": ["role", "identity", "host", "matrix", "sla", "artifacts"],
+        "properties": {
+          "role": {"enum": ["server", "client"]},
+          "identity": {"$ref": "#/$defs/identity"},
+          "benchmark": {
+            "type": "object",
+            "required": ["name", "sha256"],
+            "properties": {"name": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+          },
+          "provider": {"type": "object"},
+          "matrix": {
+            "type": "object",
+            "required": ["payloads", "iterations", "kinds", "expected_cases", "cases"],
+            "properties": {
+              "payloads": {
+                "type": "array",
+                "prefixItems": [{"const": 128}, {"const": 1024}, {"const": 65536}, {"const": 1048576}],
+                "items": false,
+                "minItems": 4,
+                "maxItems": 4
+              },
+              "iterations": {"type": "integer", "minimum": 1000},
+              "kinds": {"type": "array", "uniqueItems": true, "items": {"enum": ["ipcf", "ntb", "cxl"]}},
+              "expected_cases": {"type": "array", "minItems": 4, "uniqueItems": true, "items": {"type": "string"}},
+              "cases": {"type": "array", "items": {"$ref": "#/$defs/case"}}
+            }
+          },
+          "sla": {
+            "type": "object",
+            "required": ["policy", "policy_sha256", "checks", "passed"],
+            "properties": {
+              "policy": {"type": "object"},
+              "policy_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"const": ""}]},
+              "checks": {"type": "array", "items": {"$ref": "#/$defs/slaCheck"}},
+              "passed": {"type": "boolean"}
+            }
+          },
+          "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+          "qualification_eligible": {"const": false}
+        }
+      },
+      "else": {
+        "required": ["expected_kinds", "role_artifacts", "results", "sla", "identities", "benchmark", "provider", "physical"],
+        "properties": {
+          "expected_kinds": {"type": "array", "uniqueItems": true, "items": {"enum": ["ipcf", "ntb", "cxl"]}},
+          "role_artifacts": {
+            "type": "object",
+            "properties": {"server": {"$ref": "#/$defs/artifact"}, "client": {"$ref": "#/$defs/artifact"}}
+          },
+          "results": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["kind", "outcome", "sla_passed"],
+              "properties": {
+                "kind": {"enum": ["rdma", "ipcf", "ntb", "cxl"]},
+                "outcome": {"enum": ["passed", "failed"]},
+                "sla_passed": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifact_type": {"const": "role"},
+          "outcome": {"const": "passed"}
+        },
+        "required": ["artifact_type", "outcome"]
+      },
+      "then": {
+        "required": ["benchmark", "provider", "physical"],
+        "properties": {
+          "provider": {"$ref": "#/$defs/provider"},
+          "matrix": {"properties": {"cases": {"minItems": 4}}},
+          "artifacts": {"minItems": 4},
+          "sla": {"properties": {"policy_sha256": {"$ref": "#/$defs/sha256"}, "passed": {"const": true}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"qualification_eligible": {"const": true}}},
+      "then": {
+        "properties": {
+          "artifact_type": {"const": "final"},
+          "outcome": {"const": "passed"},
+          "artifacts_complete": {"const": true},
+          "errors": {"maxItems": 0},
+          "source": {"properties": {"state": {"const": "clean"}}},
+          "run": {"properties": {"session_nonce": {"type": "string", "minLength": 16}}},
+          "role_artifacts": {"required": ["server", "client"]}
+        }
+      }
+    }
+  ]
+}

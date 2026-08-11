@@ -1,0 +1,121 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "abi_atomic_smoke_test",
+    srcs = ["abi_atomic_smoke_test.cc"],
+    deps = [
+        "//mino/abi:shm_abi",
+        "//mino/shm/channel:index_slot",
+        "//mino/shm/region:superblock",
+    ],
+)
+
+test_suite(
+    name = "atomic_litmus_tests",
+    tests = [
+        "//tests/litmus:atomic_abi_test",
+    ],
+)
+
+test_suite(
+    name = "abi_tests",
+    tests = [
+        ":abi_atomic_smoke_test",
+        "//mino/shm/channel:index_slot_test",
+    ],
+)
+
+test_suite(
+    name = "region_tests",
+    tests = [
+        "//mino/shm/region:channel_directory_test",
+        "//mino/shm/region:cross_process_handle_test",
+        "//mino/shm/region:handle_resolver_test",
+        "//mino/shm/region:recovery_directory_test",
+        "//mino/shm/region:recovery_test",
+        "//mino/shm/region:region_id_allocator_test",
+        "//mino/shm/region:region_recovery_kill_stress_test",
+        "//mino/shm/region:region_test",
+        "//mino/shm/region:service_liveness_test",
+    ],
+)
+
+test_suite(
+    name = "mpmc_tests",
+    tests = [
+        "//mino/shm/channel:mpmc_ring_test",
+        "//mino/shm/channel:mpmc_ring_xproc_test",
+    ],
+)
+
+test_suite(
+    name = "channel_tests",
+    tests = [
+        "//mino/shm/channel:broadcast_channel_test",
+        "//mino/shm/channel:broadcast_channel_xproc_test",
+        "//mino/shm/channel:mpsc_channel_test",
+        "//mino/shm/channel:mpsc_channel_xproc_test",
+        "//mino/shm/channel:spsc_channel_test",
+        "//mino/shm/channel:spsc_channel_xproc_test",
+    ],
+)
+
+test_suite(
+    name = "bridge_tests",
+    tests = [
+        "//mino/bridge:bridge_pipeline_test",
+        "//mino/bridge:bridge_two_node_test",
+        "//mino/bridge:connection_manager_test",
+        "//mino/bridge:control_payload_test",
+        "//mino/bridge:crc32c_test",
+        "//mino/bridge:dedup_window_test",
+        "//mino/bridge:listener_hub_test",
+        "//mino/bridge:remote_object_reconstructor_test",
+        "//mino/bridge:retransmit_window_test",
+        "//mino/bridge:schema_negotiator_test",
+        "//mino/bridge:wire_frame_test",
+    ],
+)
+
+test_suite(
+    name = "storage_tests",
+    tests = [
+        "//mino/storage:recorder_buffer_pool_test",
+        "//mino/storage:recorder_service_test",
+        "//mino/storage:recorder_subscriber_test",
+        "//mino/storage:recorder_test",
+        "//mino/storage:recording_manifest_test",
+        "//mino/storage:recording_policy_test",
+        "//mino/storage:recording_topology_test",
+        "//mino/storage:replay_engine_test",
+        "//mino/storage:retention_test",
+        "//mino/storage:schema_store_test",
+        "//mino/storage:segment_format_test",
+        "//mino/storage:segment_recovery_test",
+        "//mino/storage:segment_writer_test",
+        "//mino/storage:session_recovery_coordinator_test",
+        "//mino/storage:snapshot_store_test",
+        "//mino/storage:storage_fault_test",
+        "//mino/storage:topic_writer_test",
+    ],
+)
+
+test_suite(
+    name = "qualification_tests",
+    tests = [
+        ":abi_tests",
+        ":atomic_litmus_tests",
+        ":bridge_tests",
+        ":channel_tests",
+        ":mpmc_tests",
+        ":region_tests",
+        ":storage_tests",
+    ],
+)
+
+py_test(
+    name = "runner_contract_test",
+    srcs = ["runner_contract_test.py"],
+    data = ["//tools/ci:aarch64_validation_lib"],
+    python_version = "PY3",
+)

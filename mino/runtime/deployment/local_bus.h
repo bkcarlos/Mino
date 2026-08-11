@@ -14,6 +14,7 @@
 
 #include "mino/common/result.h"
 #include "mino/runtime/bus.h"
+#include "mino/security/security_domain.h"
 #include "mino/schema/descriptor.h"
 
 namespace mino::deployment {
@@ -28,10 +29,42 @@ struct LocalTopicConfig {
     uint32_t channel_capacity = 256;
     uint32_t max_subscribers = 16;
     size_t max_payload_bytes = 1024u * 1024u;
+    // Zero inherits LocalBusConfig::region_id. Rolling-upgrade composition may
+    // preinstall target topics in a distinct Region generation.
+    uint32_t region_id = 0;
+    // False keeps the Registry topic Creating and the local publisher seam
+    // fenced until ProductionUpgradeControlPlane::Cutover.
+    bool activate = true;
+};
+
+struct LocalBusOperationalStats {
+    uint64_t queue_depth = 0;
+    uint64_t queue_capacity = 0;
+    uint64_t queue_full_events = 0;
+    uint64_t queue_dropped = 0;
+    uint64_t lease_expirations = 0;
+    uint64_t oldest_heartbeat_age_ns = 0;
+};
+
+struct LocalBusUpgradeTopicStats {
+    TopicId topic_id;
+    uint32_t region_id = 0;
+    bool publisher_creation_fenced = false;
+    uint64_t local_publishers = 0;
+    uint64_t local_readers = 0;
+    uint64_t outstanding_receipts = 0;
+    uint64_t outstanding_borrows = 0;
+    uint64_t queue_depth = 0;
+    uint64_t last_published_sequence = 0;
+    uint64_t last_consumed_sequence = 0;
+    uint64_t observed_samples = 0;
+    uint64_t duplicate_count = 0;
+    uint64_t unexplained_loss_count = 0;
 };
 
 struct LocalBusConfig {
     NodeId node_id{};
+    SecurityDomainId security_domain_id{1};
     uint64_t lease_epoch = 1;
     uint64_t lease_duration_ns = 60ull * 1'000'000'000ull;
     uint32_t region_id = 1;
@@ -57,6 +90,21 @@ public:
 
     Bus& bus() noexcept;
     const Bus& bus() const noexcept;
+
+    // Cold-path aggregate. No topic or node identity is exposed to monitoring.
+    LocalBusOperationalStats OperationalStats(uint64_t now_ns) const noexcept;
+    uint64_t SweepExpiredSubscribers(uint64_t now_ns) noexcept;
+
+    // Cold production-upgrade seams. They are backed by the installed real
+    // BroadcastChannel and endpoint lifecycle state; no caller supplies proof
+    // booleans. BindRoutingCatalog makes every subsequently opened endpoint and
+    // TransportSwitcher refresh read the CRC-validated durable catalog.
+    Status BindRoutingCatalog(std::filesystem::path catalog_path);
+    Result<LocalBusUpgradeTopicStats> UpgradeTopicStats(TopicId topic_id) const;
+    Status FenceUpgradePublisher(TopicId topic_id);
+    Status UnfenceUpgradePublisher(TopicId topic_id);
+    Status RefreshUpgradeRoute(TopicId topic_id);
+    registry::Coordinator& coordinator() noexcept;
 
 private:
     class Impl;

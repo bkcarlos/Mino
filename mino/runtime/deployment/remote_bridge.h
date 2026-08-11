@@ -5,6 +5,7 @@
 #ifndef MINO_RUNTIME_DEPLOYMENT_REMOTE_BRIDGE_H_
 #define MINO_RUNTIME_DEPLOYMENT_REMOTE_BRIDGE_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "mino/bridge/bridge_runtime/connection_manager.h"
@@ -19,12 +21,19 @@
 #include "mino/bridge/schema_negotiator.h"
 #include "mino/capacity/capacity.h"
 #include "mino/common/result.h"
+#include "mino/registry/coordinator.h"
 #include "mino/registry/metadata.h"
 #include "mino/schema/registry.h"
 #include "mino/storage/schema_store.h"
+#include "mino/transport/fabric_driver.h"
+#include "mino/transport/rdma_driver.h"
 #include "mino/transport/tcp_driver.h"
 
 namespace mino::deployment {
+
+namespace testing {
+class RemoteBridgeTestFactory;
+}
 
 struct RemoteBridgeConfig {
     bridge::BridgeConnectionManagerOptions connection;
@@ -34,6 +43,49 @@ struct RemoteBridgeConfig {
     uint16_t tcp_lane_count = 1;
     bridge::SchemaNegotiatorLimits schema_negotiation;
     std::filesystem::path schema_store_root;
+
+};
+
+class CoordinatorTopicAuthorizerClock {
+public:
+    virtual ~CoordinatorTopicAuthorizerClock() = default;
+    virtual uint64_t NowNs() const noexcept = 0;
+};
+
+// Live Coordinator-backed inbound ACL. Both publish and bridge grants are
+// required for the authenticated source node; missing/retired Topics deny.
+class CoordinatorTopicAuthorizer final : public bridge::BridgeTopicAuthorizer {
+public:
+    explicit CoordinatorTopicAuthorizer(
+        std::shared_ptr<const registry::Coordinator> coordinator);
+    CoordinatorTopicAuthorizer(
+        std::shared_ptr<const registry::Coordinator> coordinator,
+        std::shared_ptr<const CoordinatorTopicAuthorizerClock> clock) noexcept;
+
+    Status AuthorizeInbound(
+        const security::AuthenticatedPeer& peer,
+        TopicId topic_id) const noexcept override;
+    uint64_t denied_total() const noexcept {
+        return denied_total_.load(std::memory_order_relaxed);
+    }
+
+private:
+    Status Deny(Status status) const noexcept;
+    std::shared_ptr<const registry::Coordinator> coordinator_;
+    std::shared_ptr<const CoordinatorTopicAuthorizerClock> clock_;
+    mutable std::atomic<uint64_t> denied_total_{0};
+};
+
+struct RemoteBridgeOperationalStats {
+    uint64_t configured_connections = 0;
+    uint64_t connected_connections = 0;
+    uint64_t connections = 0;
+    uint64_t disconnects = 0;
+    uint64_t reconnects = 0;
+    uint64_t reconnect_failures = 0;
+    uint64_t protocol_failures = 0;
+    uint64_t queued_egress_bytes = 0;
+    uint64_t acl_denials = 0;
 };
 
 Result<capacity::ResourceVector> EstimateRemoteBridgeResources(
@@ -49,6 +101,30 @@ public:
     static Result<std::unique_ptr<RemoteBridge>> Create(
         RemoteBridgeConfig config, bridge::BridgeIngressPort* ingress,
         std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+        std::shared_ptr<const registry::Coordinator> coordinator,
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {},
+        std::optional<capacity::ResourceVector> capacity_charge =
+            std::nullopt) noexcept;
+
+    // Explicit production RDMA composition. Unlike the lower-level driver test
+    // seam, this rejects mock providers and cannot downgrade peer identity or
+    // Coordinator-backed Topic ACL authorization.
+    static Result<std::unique_ptr<RemoteBridge>> CreateRdma(
+        RemoteBridgeConfig config, transport::RdmaDriverOptions rdma,
+        bridge::BridgeIngressPort* ingress,
+        std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+        std::shared_ptr<const registry::Coordinator> coordinator,
+        std::shared_ptr<capacity::CapacityController> capacity_controller = {},
+        std::optional<capacity::ResourceVector> capacity_charge =
+            std::nullopt) noexcept;
+
+    // Production shared Fabric composition. Mock providers, same-domain peers,
+    // incomplete attestation bindings, and missing Coordinator ACL all fail closed.
+    static Result<std::unique_ptr<RemoteBridge>> CreateFabric(
+        RemoteBridgeConfig config, transport::FabricDriverOptions fabric,
+        bridge::BridgeIngressPort* ingress,
+        std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+        std::shared_ptr<const registry::Coordinator> coordinator,
         std::shared_ptr<capacity::CapacityController> capacity_controller = {},
         std::optional<capacity::ResourceVector> capacity_charge =
             std::nullopt) noexcept;
@@ -94,16 +170,36 @@ public:
         return *pool_;
     }
     uint16_t tcp_lane_count() const noexcept { return pool_->lane_count(); }
-    const transport::TcpDriver& driver() const noexcept { return *driver_; }
+    const transport::TransportDriver& driver() const noexcept { return *driver_; }
+    const transport::TcpDriver* tcp_driver() const noexcept {
+        return dynamic_cast<const transport::TcpDriver*>(driver_.get());
+    }
+    const transport::RdmaDriver* rdma_driver() const noexcept {
+        return dynamic_cast<const transport::RdmaDriver*>(driver_.get());
+    }
+    const transport::FabricWindowDriver* fabric_driver() const noexcept {
+        return dynamic_cast<const transport::FabricWindowDriver*>(driver_.get());
+    }
     schema::SchemaRegistry& schema_registry() noexcept { return *registry_; }
     const schema::SchemaRegistry& schema_registry() const noexcept {
         return *registry_;
     }
     storage::SchemaStore& schema_store() noexcept { return *store_; }
     const storage::SchemaStore& schema_store() const noexcept { return *store_; }
+    RemoteBridgeOperationalStats OperationalStats() const noexcept;
 
 private:
+    friend class testing::RemoteBridgeTestFactory;
     class StorePersistence;
+    static Result<std::unique_ptr<RemoteBridge>> CreateImpl(
+        RemoteBridgeConfig config, bridge::BridgeIngressPort* ingress,
+        std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
+        std::shared_ptr<capacity::CapacityController> capacity_controller,
+        std::optional<capacity::ResourceVector> capacity_charge,
+        bool allow_plaintext_for_testing,
+        std::optional<transport::RdmaDriverOptions> rdma = std::nullopt,
+        std::optional<transport::FabricDriverOptions> fabric =
+            std::nullopt) noexcept;
 
     RemoteBridge(
         capacity::CapacityLease capacity_lease,
@@ -112,9 +208,10 @@ private:
         std::shared_ptr<bridge::DescriptorAuth> descriptor_auth,
         std::unique_ptr<StorePersistence> persistence,
         std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators,
-        std::shared_ptr<transport::TcpDriver> driver,
+        std::shared_ptr<transport::TransportDriver> driver,
         std::shared_ptr<bridge::BridgeConnectionPool> pool,
         std::unique_ptr<bridge::BridgeListenerHub> listener_hub,
+        std::shared_ptr<const CoordinatorTopicAuthorizer> topic_authorizer,
         transport::DriverConfig driver_config) noexcept;
 
     // Declared first so the charge remains held until every composed resource
@@ -125,10 +222,17 @@ private:
     std::shared_ptr<bridge::DescriptorAuth> descriptor_auth_;
     std::unique_ptr<StorePersistence> persistence_;
     std::vector<std::unique_ptr<bridge::SchemaNegotiator>> negotiators_;
-    std::shared_ptr<transport::TcpDriver> driver_;
+    std::shared_ptr<transport::TransportDriver> driver_;
     std::shared_ptr<bridge::BridgeConnectionPool> pool_;
     std::unique_ptr<bridge::BridgeListenerHub> listener_hub_;
+    std::shared_ptr<const CoordinatorTopicAuthorizer> topic_authorizer_;
     transport::DriverConfig driver_config_;
+    std::atomic<uint64_t> connected_connections_{0};
+    std::atomic<uint64_t> connections_{0};
+    std::atomic<uint64_t> disconnects_{0};
+    std::atomic<uint64_t> reconnects_{0};
+    std::atomic<uint64_t> reconnect_failures_{0};
+    std::atomic<uint64_t> protocol_failures_{0};
     bool started_ = false;
     std::map<schema::CanonicalDigest, std::vector<std::byte>> local_artifacts_;
 };

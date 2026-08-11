@@ -50,6 +50,7 @@ cc_library(
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/platform:numa",
     ],
 )
 
@@ -65,6 +66,9 @@ cc_library(
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/platform:memory_registration",
+        "//mino/platform:numa",
+        "//mino/platform:shared_memory",
     ],
 )
 

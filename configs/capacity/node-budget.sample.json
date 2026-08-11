@@ -1,0 +1,72 @@
+{
+  "schema": "mino.capacity.node-budget.v1",
+  "node_name": "mino-production-edge-1001",
+  "hardware": {
+    "profile": "sample-nonqualification",
+    "architecture": "any",
+    "minimum_cpu_count": 1,
+    "minimum_memory_bytes": 1048576
+  },
+  "limits": {
+    "shm_bytes": 134217728,
+    "region_bytes": 67108864,
+    "slab_bytes": 50331648,
+    "topics": 16,
+    "partitions": 64,
+    "publishers": 64,
+    "subscribers": 256,
+    "bridge_lanes": 32,
+    "bridge_egress_bytes_per_second": 67108864,
+    "recorder_buffer_bytes": 67108864,
+    "recorder_disk_bytes_per_second": 67108864,
+    "monitoring_bytes": 8388608,
+    "file_descriptors": 4096,
+    "threads": 128
+  },
+  "emergency": {
+    "shm_bytes": 16777216,
+    "region_bytes": 8388608,
+    "slab_bytes": 8388608,
+    "topics": 2,
+    "partitions": 4,
+    "publishers": 8,
+    "subscribers": 32,
+    "bridge_lanes": 4,
+    "bridge_egress_bytes_per_second": 8388608,
+    "recorder_buffer_bytes": 8388608,
+    "recorder_disk_bytes_per_second": 8388608,
+    "monitoring_bytes": 1048576,
+    "file_descriptors": 256,
+    "threads": 16
+  },
+  "slab_classes": [
+    {
+      "class": 4,
+      "slot_bytes": 1024,
+      "limit_bytes": 16777216,
+      "emergency_bytes": 4194304
+    },
+    {
+      "class": 6,
+      "slot_bytes": 4096,
+      "limit_bytes": 33554432,
+      "emergency_bytes": 4194304
+    }
+  ],
+  "costs": {
+    "topic_overhead_bytes": 65536,
+    "partition_region_overhead_bytes": 4096,
+    "publisher_bytes": 32768,
+    "subscriber_bytes": 32768,
+    "bridge_lane_buffer_bytes": 262144,
+    "monitoring_base_bytes": 65536,
+    "base_file_descriptors": 32,
+    "base_threads": 8,
+    "publisher_file_descriptors": 1,
+    "subscriber_file_descriptors": 1,
+    "bridge_lane_file_descriptors": 2,
+    "recorder_partition_file_descriptors": 1,
+    "bridge_lane_threads": 1,
+    "recorder_topic_threads": 2
+  }
+}

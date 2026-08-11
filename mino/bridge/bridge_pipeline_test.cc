@@ -90,6 +90,23 @@ public:
     std::vector<WireFrame> frames;
 };
 
+class RecordingTopicAuthorizer final : public BridgeTopicAuthorizer {
+public:
+    Status AuthorizeInbound(
+        const security::AuthenticatedPeer& peer,
+        TopicId topic_id) const noexcept override {
+        ++calls;
+        last_source = peer.node_id;
+        last_topic = topic_id;
+        return status;
+    }
+
+    mutable size_t calls = 0;
+    mutable NodeId last_source;
+    mutable TopicId last_topic;
+    Status status = Status::Ok();
+};
+
 SourceIdentity SourceForLane(uint16_t lane_index, uint16_t lane_count) {
     for (uint64_t publisher_id = 1; publisher_id != 10'000; ++publisher_id) {
         const SourceIdentity source{11, publisher_id, 33};
@@ -144,7 +161,9 @@ ConnectedPipelines MakePipelines(
     SchemaNegotiator* b_negotiator = nullptr,
     uint16_t lane_index = 0,
     uint16_t lane_count = 1,
-    size_t max_control_frames = BridgePipelineOptions{}.max_control_frames) {
+    size_t max_control_frames = BridgePipelineOptions{}.max_control_frames,
+    const BridgeTopicAuthorizer* b_authorizer = nullptr,
+    NodeId b_authenticated_peer = {}) {
     ConnectedPipelines result;
     transport::TcpDriverOptions tcp_options;
     tcp_options.max_frame_body_bytes = 4096;
@@ -206,6 +225,14 @@ ConnectedPipelines MakePipelines(
     BridgePipelineOptions b_options = a_options;
     b_options.local_session_epoch = 202;
     b_options.remote_session_epoch = 101;
+    b_options.topic_authorizer = b_authorizer;
+    if (b_authenticated_peer.value != 0) {
+        b_options.authenticated_peer = security::AuthenticatedPeer{
+            .node_id = b_authenticated_peer,
+            .security_domain = SecurityDomainId{1},
+            .credential_generation = 1,
+        };
+    }
     auto a_pipeline = BridgePipeline::Create(
         a_options, result.a_driver, result.a_connection.id, &result.a_egress,
         &result.a_ingress, a_negotiator);
@@ -274,6 +301,72 @@ Status PumpUntil(ConnectedPipelines* pair,
         std::this_thread::sleep_for(1ms);
     }
     return Status::Error(StatusCode::kTimeout);
+}
+
+TEST(BridgePipelineTest,
+     TopicAclDeniesBeforePendingRetentionDedupAndIngressAllocation) {
+    RecordingTopicAuthorizer authorizer;
+    authorizer.status = Status::Error(StatusCode::kPermissionDenied,
+                                      "test Topic ACL denied");
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, &authorizer, NodeId{11});
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+
+    ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id,
+                          DataFrame(1)).ok());
+    Status denied = Status::Ok();
+    for (size_t attempt = 0; attempt < 1000; ++attempt) {
+        auto pumped = pair.b->Pump(BridgePumpBudget{.now_ns = attempt + 1});
+        if (!pumped.ok()) {
+            denied = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(denied.code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(authorizer.calls, 1u);
+    EXPECT_EQ(authorizer.last_source, NodeId{11});
+    EXPECT_EQ(authorizer.last_topic, TopicId{1});
+    EXPECT_TRUE(pair.b_ingress.frames.empty());
+    EXPECT_EQ(pair.b->pending_inbound_frames(), 0u);
+    EXPECT_EQ(pair.b->dedup_stats().accepted_checks, 0u);
+}
+
+TEST(BridgePipelineTest,
+     AuthenticatedSourceMismatchIsRejectedBeforeTopicAclAndDedup) {
+    RecordingTopicAuthorizer authorizer;
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, &authorizer, NodeId{11});
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+
+    WireFrame forged = DataFrame(1);
+    forged.header.source_node_id = 99;
+    ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id, forged).ok());
+    Status denied = Status::Ok();
+    for (size_t attempt = 0; attempt < 1000; ++attempt) {
+        auto pumped = pair.b->Pump(BridgePumpBudget{.now_ns = attempt + 1});
+        if (!pumped.ok()) {
+            denied = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(denied.code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(authorizer.calls, 0u);
+    EXPECT_TRUE(pair.b_ingress.frames.empty());
+    EXPECT_EQ(pair.b->dedup_stats().accepted_checks, 0u);
 }
 
 TEST(BridgePipelineTest, RejectsInvalidLaneOptions) {

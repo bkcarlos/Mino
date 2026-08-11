@@ -1,0 +1,22 @@
+#!/bin/sh
+# Copyright 2026 The Mino Authors
+# Host/systemd wrapper for the mino-deploy preflight and signal-forwarding CLI.
+set -eu
+
+deploy_bin=${MINO_DEPLOY_BIN:-/usr/local/bin/mino-deploy}
+config=${MINO_NODE_CONFIG:-/etc/mino/node.toml}
+
+if [ "${1:-}" = "--dry-run" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+        echo "mino-node-start: node command is required" >&2
+        exit 2
+    fi
+    exec "$deploy_bin" start --config "$config" --dry-run -- "$@"
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "mino-node-start: node command is required" >&2
+    exit 2
+fi
+exec "$deploy_bin" start --config "$config" -- "$@"

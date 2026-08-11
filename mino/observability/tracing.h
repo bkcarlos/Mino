@@ -35,6 +35,12 @@ PerfTraceContext MakeTraceContext(const SampleKey& key, uint32_t sample_flags,
                                   uint32_t clock_domain_id,
                                   uint64_t origin_wall_time_ns,
                                   uint64_t origin_monotonic_ns) noexcept;
+PerfTraceContext MakeTraceContext(const SampleKey& key,
+                                  const TraceDecision& decision,
+                                  uint32_t sample_flags,
+                                  uint32_t clock_domain_id,
+                                  uint64_t origin_wall_time_ns,
+                                  uint64_t origin_monotonic_ns) noexcept;
 
 enum class TraceStage : uint16_t {
     kAllocateBegin,
@@ -182,13 +188,37 @@ public:
             !PolicyShouldTrace(policy, key)) {
             return false;
         }
-        if (policy.mode == PerfTelemetryMode::kSampledLatency &&
-            policy.slow_threshold_ns != 0 &&
-            event.duration_ns < policy.slow_threshold_ns &&
+        const uint64_t hash = StableSampleHash(key);
+        const TraceDecision decision{
+            .sample_hash = hash,
+            .trace_id_low =
+                StableSampleMix(hash ^ 0xd1b54a32d192ed03ULL),
+            .policy_epoch = 0,
+            .slow_threshold_ns = policy.slow_threshold_ns,
+            .max_events_per_second = policy.max_events_per_second,
+            .mode = policy.mode,
+        };
+        return TryRecordSampledEvent(decision, event, shard, now_ns);
+    }
+
+    // Fast path after TelemetryControl::ShouldTrace has already produced one
+    // coherent per-message decision. It intentionally does not reload policy or
+    // hash the key again; a message keeps the epoch selected at publication.
+    bool TryRecordSampledEvent(const TraceDecision& decision,
+                               const TraceEvent& event, size_t shard,
+                               uint64_t now_ns) noexcept {
+        if (decision.mode == PerfTelemetryMode::kSampledLatency &&
+            decision.slow_threshold_ns != 0 &&
+            event.duration_ns < decision.slow_threshold_ns &&
             (event.flags & kPerfTraceSlow) == 0) {
             return false;
         }
-        if (!limiter_.TryAcquire(policy.max_events_per_second, now_ns, shard)) {
+        if (decision.mode != PerfTelemetryMode::kSampledLatency &&
+            decision.mode != PerfTelemetryMode::kFullDebug) {
+            return false;
+        }
+        if (!limiter_.TryAcquire(decision.max_events_per_second, now_ns,
+                                 shard)) {
             sidecar_.RecordDrop();
             return false;
         }

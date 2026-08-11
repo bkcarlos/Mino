@@ -1,0 +1,42 @@
+{
+  "schema": "mino.storage_partition_qualification_sla.v1",
+  "qualification_id": "D6-09",
+  "validation": "V-24",
+  "benchmark_schema": "mino.storage_partition_benchmark.v1",
+  "artifact_schema": "mino.storage_partition_qualification.v1",
+  "required_partition_counts": [1, 2, 4, 8, 16],
+  "required_build_config": "bazel --lockfile_mode=error --config=gcc12 --config=release",
+  "workload": {
+    "records_per_scenario": 20000,
+    "payload_bytes": 1024,
+    "target_ingress_records_per_second": 1000000
+  },
+  "target": {
+    "hardware_label": "i9-9900KS; Samsung 980 PRO NVMe; ext4; Linux x86-64",
+    "system": "Linux",
+    "machines": ["x86_64", "amd64"],
+    "cpu_model_regex": "Intel\\(R\\) Core\\(TM\\) i9-9900KS",
+    "cpu_governor": "powersave",
+    "storage_model_regex": "Samsung SSD 980 PRO",
+    "storage_transport": "nvme",
+    "rotational": false,
+    "filesystem": "ext4",
+    "required_mount_options": ["rw"],
+    "forbidden_mount_options": ["nobarrier", "data=writeback"]
+  },
+  "validation_limits": {
+    "maximum_partition_throughput_imbalance_ratio": 2.0,
+    "maximum_record_latency_p99_ns": 10000000
+  },
+  "sla": {
+    "minimum_single_writer_threshold_records_per_second": 15360,
+    "minimum_scaling_efficiency": {
+      "1": 1.0,
+      "2": 0.45,
+      "4": 0.25,
+      "8": 0.12,
+      "16": 0.06
+    },
+    "aggregation": "minimum_across_all_processes_and_rounds"
+  }
+}

@@ -1,0 +1,52 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "upgrade",
+    srcs = [
+        "manifest.cc",
+        "orchestrator.cc",
+        "production_control_plane.cc",
+        "routing_catalog.cc",
+        "upgrade.cc",
+    ],
+    hdrs = [
+        "manifest.h",
+        "orchestrator.h",
+        "production_control_plane.h",
+        "routing_catalog.h",
+        "upgrade.h",
+    ],
+    deps = [
+        "//mino/bridge:crc32c",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/registry",
+        "//mino/schema:descriptor",
+        "//mino/shm/region",
+        "//mino/security:security_domain",
+    ],
+)
+
+cc_test(
+    name = "upgrade_test",
+    srcs = ["upgrade_test.cc"],
+    deps = [
+        ":upgrade",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "rolling_upgrade_integration_test",
+    srcs = ["rolling_upgrade_integration_test.cc"],
+    deps = [
+        ":upgrade",
+        "//mino/common:status",
+        "//mino/platform:shared_memory",
+        "//mino/runtime/deployment:local_bus",
+        "//mino/runtime/deployment:upgrade_adapter",
+        "@googletest//:gtest_main",
+    ],
+)

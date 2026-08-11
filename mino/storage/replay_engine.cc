@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -128,12 +129,35 @@ bool Contains(const std::set<uint64_t>& values, uint64_t value) noexcept {
     return values.empty() || values.contains(value);
 }
 
-ReplayOrderKey OrderKey(const RecordHeader& header) noexcept {
+uint64_t PartitionGeneration(const std::filesystem::path& segment_path) noexcept {
+    const std::filesystem::path partition_root =
+        segment_path.filename() == "snapshot.mino"
+            ? segment_path.parent_path()
+            : segment_path.parent_path().parent_path();
+    const std::filesystem::path partitions = partition_root.parent_path();
+    if (partitions.filename() != "partitions") return 0;
+    const std::filesystem::path owner = partitions.parent_path();
+    if (owner.parent_path().filename() != "generations") return 1;
+    const std::string text = owner.filename().string();
+    uint64_t generation = 0;
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), generation);
+    return error == std::errc{} && end == text.data() + text.size() &&
+                   generation != 0
+               ? generation
+               : 0;
+}
+
+ReplayOrderKey OrderKey(const RecordHeader& header,
+                        uint64_t partition_generation,
+                        uint64_t writer_id) noexcept {
     return ReplayOrderKey{
         .ingestion_timestamp_ns = header.ingestion_timestamp_ns,
         .topic_id = header.topic_id,
+        .partition_generation = partition_generation,
         .partition_id = header.partition_id,
         .ingestion_sequence = header.ingestion_sequence,
+        .writer_id = writer_id,
         .node_id = header.node_id,
         .publisher_id = header.publisher_id,
         .publisher_epoch = header.publisher_epoch,
@@ -234,11 +258,13 @@ Result<SchemaRefSnapshot> ManifestReplaySchemaResolver::Resolve(
 bool ReplayOrderLess::operator()(const ReplayOrderKey& left,
                                  const ReplayOrderKey& right) const noexcept {
     return std::tie(left.ingestion_timestamp_ns, left.topic_id,
-                    left.partition_id, left.ingestion_sequence, left.node_id,
+                    left.partition_generation, left.partition_id,
+                    left.ingestion_sequence, left.writer_id, left.node_id,
                     left.publisher_id, left.publisher_epoch,
                     left.source_sequence, left.observed_timestamp_ns) <
            std::tie(right.ingestion_timestamp_ns, right.topic_id,
-                    right.partition_id, right.ingestion_sequence, right.node_id,
+                    right.partition_generation, right.partition_id,
+                    right.ingestion_sequence, right.writer_id, right.node_id,
                     right.publisher_id, right.publisher_epoch,
                     right.source_sequence, right.observed_timestamp_ns);
 }
@@ -383,7 +409,9 @@ Result<std::optional<Record>> SegmentReplayReader::Next() {
 struct ReplayEngine::Impl {
     struct PartitionStream {
         uint32_t topic_id = 0;
+        uint64_t partition_generation = 0;
         uint32_t partition_id = 0;
+        uint64_t writer_id = 0;
         std::string topic_name;
         std::vector<std::unique_ptr<SegmentReplayReader>> readers;
         size_t reader_index = 0;
@@ -415,6 +443,8 @@ struct ReplayEngine::Impl {
     ReplayClock* clock = nullptr;
     ReplaySleeper* sleeper = nullptr;
     std::set<uint32_t> filtered_topics;
+    std::set<uint32_t> filtered_partitions;
+    std::set<uint64_t> filtered_generations;
     std::set<uint64_t> filtered_nodes;
     std::map<SchemaKey, SchemaRefSnapshot> schemas;
     std::vector<PartitionStream> streams;
@@ -424,8 +454,12 @@ struct ReplayEngine::Impl {
     uint64_t first_record_time_ns = 0;
     uint64_t replay_start_time_ns = 0;
 
-    bool Matches(const RecordHeader& header) const noexcept {
+    bool Matches(const PartitionStream& stream,
+                 const RecordHeader& header) const noexcept {
         return Contains(filtered_topics, header.topic_id) &&
+               Contains(filtered_partitions, header.partition_id) &&
+               Contains(filtered_generations,
+                        stream.partition_generation) &&
                Contains(filtered_nodes, header.node_id) &&
                options.filter.ingestion_timestamp_ns.Contains(
                    header.ingestion_timestamp_ns) &&
@@ -449,7 +483,7 @@ struct ReplayEngine::Impl {
             // application schema. They remain visible to inspect/verify tools but
             // are not republished as application messages.
             if ((next->value().header.flags & kRecordFlagGap) != 0) continue;
-            if (Matches(next->value().header)) {
+            if (Matches(*stream, next->value().header)) {
                 return std::move(*next);
             }
         }
@@ -462,8 +496,12 @@ struct ReplayEngine::Impl {
         if (!next.ok()) return next.status();
         if (!next->has_value()) return Status::Ok();
         Record record = std::move(next->value());
-        ready.push(Candidate{.stream_index = stream_index,
-                             .key = OrderKey(record.header),
+        ready.push(Candidate{
+                             .stream_index = stream_index,
+                             .key = OrderKey(record.header,
+                                             streams[stream_index]
+                                                 .partition_generation,
+                                             streams[stream_index].writer_id),
                              .record = std::move(record)});
         return Status::Ok();
     }
@@ -549,6 +587,7 @@ struct ReplayEngine::Impl {
                     : *replay_time,
             .original_source_sequence = header.source_sequence,
             .original_ingestion_sequence = header.ingestion_sequence,
+            .original_partition_generation = stream.partition_generation,
             .original_node_id = header.node_id,
             .original_publisher_id = header.publisher_id,
             .original_publisher_epoch = header.publisher_epoch,
@@ -660,10 +699,17 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
             }
             impl->filtered_topics.insert(found->second);
         }
+        impl->filtered_partitions.insert(
+            impl->options.filter.partition_ids.begin(),
+            impl->options.filter.partition_ids.end());
+        impl->filtered_generations.insert(
+            impl->options.filter.partition_generations.begin(),
+            impl->options.filter.partition_generations.end());
         impl->filtered_nodes.insert(impl->options.filter.node_ids.begin(),
                                     impl->options.filter.node_ids.end());
 
-        using PartitionKey = std::pair<uint32_t, uint32_t>;
+        using PartitionKey =
+            std::tuple<uint32_t, uint64_t, uint32_t>;
         std::map<PartitionKey,
                  std::vector<std::unique_ptr<SegmentReplayReader>>>
             grouped;
@@ -678,8 +724,29 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
             if (!topics.contains(header.topic_id)) {
                 return Corruption("segment topic_id is absent from manifest");
             }
-            grouped[{header.topic_id, header.partition_id}].push_back(
-                std::move(*reader));
+            const uint64_t generation = PartitionGeneration(path);
+            const TopicTableEntry& topic = *topics.at(header.topic_id);
+            if (!topic.partition_maps.empty()) {
+                const auto map = std::find_if(
+                    topic.partition_maps.begin(), topic.partition_maps.end(),
+                    [generation](const TopicPartitionMap& candidate) {
+                        return candidate.generation == generation;
+                    });
+                if (map == topic.partition_maps.end() ||
+                    header.partition_id >= map->partition_count) {
+                    return Corruption(
+                        "segment partition generation is absent from manifest");
+                }
+            }
+            auto& partition_readers =
+                grouped[{header.topic_id, generation, header.partition_id}];
+            if (!partition_readers.empty() &&
+                partition_readers.front()->segment_header().writer_id !=
+                    header.writer_id) {
+                return Corruption(
+                    "partition generation contains multiple writer IDs");
+            }
+            partition_readers.push_back(std::move(*reader));
         }
 
         for (auto& [partition, readers] : grouped) {
@@ -710,7 +777,7 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
                     previous_sequence = record.ingestion_sequence;
                     if ((record.flags & kRecordFlagGap) != 0) continue;
                     const SchemaKey key =
-                        MakeSchemaKey(partition.first, record);
+                        MakeSchemaKey(std::get<0>(partition), record);
                     if (!impl->schemas.contains(key)) {
                         Result<SchemaRefSnapshot> resolved =
                             impl->schema_resolver->Resolve(
@@ -727,10 +794,12 @@ Result<std::unique_ptr<ReplayEngine>> ReplayEngine::Create(
                 }
             }
 
-            const TopicTableEntry& topic = *topics.at(partition.first);
+            const TopicTableEntry& topic = *topics.at(std::get<0>(partition));
             impl->streams.push_back(Impl::PartitionStream{
-                .topic_id = partition.first,
-                .partition_id = partition.second,
+                .topic_id = std::get<0>(partition),
+                .partition_generation = std::get<1>(partition),
+                .partition_id = std::get<2>(partition),
+                .writer_id = readers.front()->segment_header().writer_id,
                 .topic_name = topic.topic_name,
                 .readers = std::move(readers),
                 .reader_index = 0,

@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mino.invalid/schemas/aarch64-qualification-manifest-v1.json",
+  "title": "Mino native Linux AArch64 qualification manifest",
+  "type": "object",
+  "required": [
+    "schema",
+    "qualification",
+    "architecture",
+    "qualification_eligible",
+    "outcome",
+    "expected_commit",
+    "host",
+    "preflight",
+    "tests",
+    "benchmarks",
+    "artifacts_complete",
+    "finished_at_utc"
+  ],
+  "properties": {
+    "schema": {"const": "mino.aarch64.qualification_manifest.v1"},
+    "qualification": {"const": "V-13"},
+    "architecture": {"const": "aarch64"},
+    "qualification_eligible": {"type": "boolean"},
+    "outcome": {"enum": ["passed", "failed"]},
+    "expected_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "host": {
+      "type": "object",
+      "required": [
+        "system",
+        "uname_machine",
+        "kernel",
+        "commit",
+        "source_state",
+        "qemu_indicators",
+        "cpu_model",
+        "memory",
+        "storage",
+        "filesystem",
+        "compiler",
+        "cpu_governor_policy"
+      ],
+      "properties": {
+        "system": {"type": "string", "minLength": 1},
+        "uname_machine": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_state": {"enum": ["clean", "dirty"]},
+        "qemu_indicators": {"type": "array", "items": {"type": "string"}},
+        "cpu_governor_policy": {
+          "type": "object",
+          "required": ["required", "observed", "all_match"],
+          "properties": {
+            "required": {"type": "string", "minLength": 1},
+            "observed": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {"type": "string", "minLength": 1}
+            },
+            "all_match": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "preflight": {
+      "type": "object",
+      "required": ["passed", "errors", "native_attestation"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "errors": {"type": "array", "items": {"type": "string"}},
+        "native_attestation": {"type": "string"}
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/commandEvidence"}
+    },
+    "benchmarks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"enum": ["allocator", "channel", "bridge", "storage", "telemetry"]}
+        }
+      }
+    },
+    "benchmark_measurements": {"type": "object"},
+    "sla": {
+      "type": "object",
+      "required": ["architecture", "passed", "checks", "x86_reference_comparison"],
+      "properties": {
+        "architecture": {"const": "aarch64"},
+        "passed": {"type": "boolean"},
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["metric", "observed", "threshold", "passed"]
+          }
+        },
+        "x86_reference_comparison": {"type": "object"}
+      }
+    },
+    "artifacts_complete": {"type": "boolean"},
+    "failure": {"type": ["string", "null"]},
+    "finished_at_utc": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "commandEvidence": {
+      "type": "object",
+      "required": ["name", "command", "exit_code", "elapsed_seconds", "log"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "exit_code": {"type": "integer"},
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "log": {"$ref": "#/$defs/artifact"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"qualification_eligible": {"const": true}}},
+      "then": {
+        "properties": {
+          "outcome": {"const": "passed"},
+          "artifacts_complete": {"const": true},
+          "host": {
+            "properties": {
+              "system": {"const": "Linux"},
+              "uname_machine": {"const": "aarch64"},
+              "source_state": {"const": "clean"},
+              "qemu_indicators": {"maxItems": 0},
+              "cpu_governor_policy": {
+                "properties": {"all_match": {"const": true}}
+              }
+            }
+          },
+          "preflight": {
+            "properties": {
+              "passed": {"const": true},
+              "native_attestation": {"const": "physical-aarch64"}
+            }
+          },
+          "tests": {"minItems": 7, "maxItems": 7},
+          "benchmarks": {"minItems": 5, "maxItems": 5},
+          "sla": {"properties": {"passed": {"const": true}}}
+        },
+        "required": ["benchmark_measurements", "sla"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "schema": "mino.capacity.production-inventory.v1",
+  "environment": "production",
+  "qualification_approved": false,
+  "topics": [
+    {
+      "topic_id": 101,
+      "name": "telemetry/events",
+      "channel_kind": "broadcast",
+      "capacity": 1024,
+      "max_publishers": 8,
+      "max_subscribers": 32,
+      "partition_count": 2,
+      "record_topology": "isolated",
+      "schema": {
+        "type_id": 4097,
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "major": 1,
+        "minor": 2
+      },
+      "accepted_schemas": [
+        {
+          "type_id": 4097,
+          "digest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "major": 1,
+          "minor": 1
+        }
+      ],
+      "route": {
+        "policy": "static",
+        "version": 7,
+        "targets": [1001]
+      },
+      "planning": {
+        "message_size_bytes": 1024,
+        "slab_class": 6,
+        "slab_slot_bytes": 4096,
+        "peak_messages_per_second": 1000,
+        "peak_publishers": 2,
+        "peak_subscribers": 8,
+        "bridge_lanes": 1
+      },
+      "recorder": {
+        "recorder_id": "recorder-telemetry-a",
+        "buffer_bytes": 16777216,
+        "max_disk_pause_seconds": 10,
+        "disk_bytes_per_second": 2097152
+      }
+    },
+    {
+      "topic_id": 102,
+      "name": "control/commands",
+      "channel_kind": "mpmc",
+      "capacity": 256,
+      "max_publishers": 4,
+      "max_subscribers": 16,
+      "partition_count": 1,
+      "record_topology": "strong_consistent",
+      "schema": {
+        "type_id": 4098,
+        "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+        "major": 3,
+        "minor": 0
+      },
+      "accepted_schemas": [],
+      "route": {
+        "policy": "discovery",
+        "version": 3,
+        "targets": []
+      },
+      "planning": {
+        "message_size_bytes": 512,
+        "slab_class": 4,
+        "slab_slot_bytes": 1024,
+        "peak_messages_per_second": 100,
+        "peak_publishers": 1,
+        "peak_subscribers": 4,
+        "bridge_lanes": 0
+      },
+      "recorder": null
+    }
+  ]
+}

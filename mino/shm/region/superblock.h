@@ -47,9 +47,10 @@ namespace mino {
 
 // Constants.
 inline constexpr uint32_t kSuperBlockMagic = 0x4D494E4F;  // "MINO"
-inline constexpr uint16_t kRegionLayoutVersion = 5;
+inline constexpr uint16_t kRegionLayoutVersion = 6;
 inline constexpr uint16_t kRecoveryDirectoryRegionLayoutVersion = 4;
 inline constexpr uint16_t kChannelDirectoryRegionLayoutVersion = 5;
+inline constexpr uint16_t kSecurityDomainRegionLayoutVersion = 6;
 inline constexpr uint16_t kOldestReadableRegionLayoutVersion = 2;
 // Byte-order detector: stored at Create; a reader on a different-endian host
 // observes a byte-swapped value and rejects the Region (first version only
@@ -89,9 +90,13 @@ struct SuperBlock {
     uint64_t data_size;          // 64
     uint32_t region_id;          // 72 (immutable; assigned at Create)
     uint32_t immutable_rsv0;     // 76
-    uint32_t immutable_crc32;    // 80  CRC over bytes [0, 80)
+    uint32_t immutable_crc32;    // 80; v6 also covers security fields below
     uint32_t immutable_rsv1;     // 84
-    std::byte immutable_pad[40]; // 88..128
+    uint64_t security_domain_id; // 88
+    uint32_t owner_user_id;      // 96
+    uint32_t owner_group_id;     // 100
+    uint32_t access_mode;        // 104 (permission bits only)
+    std::byte immutable_pad[20]; // 108..128
 
     // ---- Lifecycle Control partition (cache line 2: bytes [128,192)) ----
     // Cross-process atomics; access via the *Ref()/Load* helpers below.
@@ -137,6 +142,10 @@ static_assert(offsetof(SuperBlock, data_offset) == 56);
 static_assert(offsetof(SuperBlock, data_size) == 64);
 static_assert(offsetof(SuperBlock, region_id) == 72);
 static_assert(offsetof(SuperBlock, immutable_crc32) == 80);
+static_assert(offsetof(SuperBlock, security_domain_id) == 88);
+static_assert(offsetof(SuperBlock, owner_user_id) == 96);
+static_assert(offsetof(SuperBlock, owner_group_id) == 100);
+static_assert(offsetof(SuperBlock, access_mode) == 104);
 // Cross-partition boundaries must land on cache-line boundaries.
 static_assert(offsetof(SuperBlock, region_epoch) == 128);
 static_assert(offsetof(SuperBlock, clean_shutdown) == 136);
@@ -202,11 +211,18 @@ inline uint32_t Crc32(const void* data, size_t len, uint32_t seed = 0) {
 // SuperBlock helpers
 // ---------------------------------------------------------------------------
 
-// Computes the CRC over the immutable header fields [0, immutable_crc32).
-// This range is fixed and excludes the CRC field itself and all mutable
-// lifecycle/feature fields.
+// Computes the immutable header CRC. Layouts before v6 cover the historical
+// [0, immutable_crc32) range. v6 chains the Security Domain, owner and mode
+// fields while continuing to exclude the CRC field itself.
 inline uint32_t SuperBlockImmutableCrc(const SuperBlock& sb) {
-    return Crc32(&sb, offsetof(SuperBlock, immutable_crc32));
+    uint32_t crc = Crc32(&sb, offsetof(SuperBlock, immutable_crc32));
+    if (sb.layout_version >= kSecurityDomainRegionLayoutVersion) {
+        crc = Crc32(&sb.security_domain_id,
+                    offsetof(SuperBlock, immutable_pad) -
+                        offsetof(SuperBlock, security_domain_id),
+                    crc);
+    }
+    return crc;
 }
 
 // Cross-process atomic accessors. Loads are safe on a const SuperBlock (they

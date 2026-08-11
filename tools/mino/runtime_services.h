@@ -27,6 +27,9 @@ struct RuntimeTopicConfig {
     deployment::LocalTopicConfig bus;
     std::vector<std::byte> descriptor_artifact;
     uint32_t record_partitions = 1;
+    storage::TopicPartitionStrategy record_partition_strategy =
+        storage::TopicPartitionStrategy::kManual;
+    uint64_t record_partition_hash_seed = storage::kDefaultPartitionHashSeed;
 };
 
 struct RuntimeConfig {

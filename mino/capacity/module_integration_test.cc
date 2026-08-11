@@ -19,6 +19,7 @@
 
 #include "mino/registry/coordinator.h"
 #include "mino/runtime/deployment/remote_bridge.h"
+#include "mino/runtime/deployment/remote_bridge_test_helper.h"
 
 namespace mino::capacity {
 namespace {
@@ -34,6 +35,14 @@ public:
 class SinkIngress final : public bridge::BridgeIngressPort {
 public:
     Status DecodeValidatePublish(const bridge::WireFrame&) override {
+        return Status::Ok();
+    }
+};
+
+class AllowAllTopics final : public bridge::BridgeTopicAuthorizer {
+public:
+    Status AuthorizeInbound(const security::AuthenticatedPeer&,
+                            TopicId) const noexcept override {
         return Status::Ok();
     }
 };
@@ -74,6 +83,9 @@ deployment::RemoteBridgeConfig BridgeConfig(
     EXPECT_TRUE(endpoint.ok()) << endpoint.status().ToString();
     deployment::RemoteBridgeConfig config;
     config.schema_store_root = root;
+
+    config.connection.topic_authorizer =
+        std::make_shared<AllowAllTopics>();
     config.connection.mode = bridge::BridgeConnectionMode::kConnect;
     if (endpoint.ok()) config.connection.remote_endpoint = *endpoint;
     config.connection.local_identity = Fence(NodeId{1001}, 1101);
@@ -126,6 +138,11 @@ registry::TopicMetadata Topic() {
         .partition_count = 1,
         .record_topology =
             registry::RecordBackpressureTopology::kIsolated,
+        .acl = registry::TopicAcl{
+            .entries = {{.node_id = NodeId{1},
+                         .security_domain_id = SecurityDomainId{1},
+                         .permissions = registry::kAllTopicPermissions}},
+        },
         .region_version = 1,
         .channel_version = 1,
         .acl_version = 1,
@@ -161,7 +178,7 @@ TEST(ModuleCapacityIntegrationTest,
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
     const std::filesystem::path denied_root = StoreRoot();
-    auto denied = deployment::RemoteBridge::Create(
+    auto denied = deployment::testing::RemoteBridgeTestFactory::Create(
         BridgeConfig(denied_root), &ingress, auth, controller, bridge_charge);
     ASSERT_FALSE(denied.ok());
     EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
@@ -171,7 +188,7 @@ TEST(ModuleCapacityIntegrationTest,
     coordinator.reset();
     EXPECT_TRUE(controller->Snapshot().committed.empty());
     const std::filesystem::path accepted_root = StoreRoot();
-    auto accepted = deployment::RemoteBridge::Create(
+    auto accepted = deployment::testing::RemoteBridgeTestFactory::Create(
         BridgeConfig(accepted_root), &ingress, auth, controller, bridge_charge);
     ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
     EXPECT_EQ(controller->Snapshot().committed.shm_bytes, 50u);

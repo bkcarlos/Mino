@@ -26,6 +26,7 @@
 #include "mino/common/status.h"
 #include "mino/platform/process_identity.h"
 #include "mino/platform/shared_memory.h"
+#include "mino/security/security_domain.h"
 #include "mino/shm/region/channel_directory.h"
 #include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/superblock.h"
@@ -33,6 +34,12 @@
 namespace mino {
 
 class SharedMemoryRegion;
+
+
+
+// Stable per-host default for single-tenant deployments. Multi-tenant or
+// different-security-level deployments must supply distinct explicit IDs.
+SecurityDomainId CurrentSecurityDomainId() noexcept;
 
 // Options for SharedMemoryRegion::Create (design doc section 6.2).
 struct RegionCreateOptions {
@@ -42,6 +49,10 @@ struct RegionCreateOptions {
     // return the ID.
     std::string name;
     uint64_t size_bytes = 0;
+
+    // Zero selects CurrentSecurityDomainId(). The resolved nonzero ID, creator
+    // UID/GID and private mode are sealed into the immutable SuperBlock.
+    SecurityDomainId security_domain;
 
     // Reserved for API compatibility. Create currently requires a writable
     // mapping and rejects read_only=true; use read-only Attach after creation.
@@ -53,7 +64,7 @@ struct RegionCreateOptions {
 
     // Reserved space between the SuperBlock and the data area for the fixed
     // recovery and channel directories plus allocator metadata. Region layout
-    // v5 requires enough space for both directory images.
+    // v6 requires enough space for both directory images.
     uint64_t directory_size_bytes = 64 * 1024;
     uint64_t allocator_size_bytes = 64 * 1024;
 
@@ -65,13 +76,12 @@ struct RegionCreateOptions {
 
 // Options for SharedMemoryRegion::Attach (design doc section 6.2).
 //
-// v5 attachment contract:
-//   * read_only=true supports any number of concurrent processes and never
-//     participates in lifecycle recovery. Region layouts v2-v4 remain readable;
-//     v4 has a Recovery Directory but no Channel Directory. This is offline
-//     read compatibility, not mixed-version rolling compatibility.
+// v6 attachment contract:
+//   * read_only=true supports concurrent processes and never participates in
+//     lifecycle recovery. Unscoped v2-v5 layouts are rejected unless the caller
+//     explicitly requests diagnostic legacy access.
 //   * read_only=false requests the unique supervisor role and requires the
-//     current v5 layout. It fails with kWouldBlock while another supervisor
+//     current v6 layout. It fails with kWouldBlock while another supervisor
 //     process is live. Writable non-supervisor Attach remains unsupported.
 struct RegionV4UpgradeOptions {
     std::string name;
@@ -99,6 +109,16 @@ struct RegionAttachOptions {
     std::string name;
     uint32_t region_id = 0;
     bool read_only = false;
+
+    // Zero selects CurrentSecurityDomainId(). Attach rejects a mismatched domain
+    // with kPermissionDenied before taking the supervisor lock or changing any
+    // lifecycle metadata.
+    SecurityDomainId security_domain;
+
+    // Legacy layouts have no authenticated Security Domain metadata and are
+    // fail-closed by default. This diagnostic/migration escape hatch is honored
+    // only for read-only Attach.
+    bool allow_unscoped_legacy_read_only = false;
 
     // Diagnostic escape hatch for quarantined Regions. It is honored only when
     // read_only=true; writable Attach always rejects QUARANTINED before taking
@@ -152,6 +172,9 @@ public:
     }
     uint64_t size() const noexcept { return segment_->size(); }
     uint32_t region_id() const noexcept { return region_id_; }
+    SecurityDomainId security_domain() const noexcept {
+        return SecurityDomainId{superblock()->security_domain_id};
+    }
     bool read_only() const noexcept { return segment_->read_only(); }
 
     // The SuperBlock at offset 0. Exposed for the region package (Recovery,

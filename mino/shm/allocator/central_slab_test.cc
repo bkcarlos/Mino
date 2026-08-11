@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -51,6 +52,34 @@ ClassTableConfig TestConfig() {
 }
 
 constexpr uint64_t kRegionSize = 1u << 20;  // 1 MiB, plenty for the test
+
+class FakeAllocatorNumaSystem final : public NumaSystem {
+public:
+    FakeAllocatorNumaSystem() {
+        NumaDiscoverySnapshot snapshot;
+        snapshot.linux_native = true;
+        snapshot.online_nodes = "0-1";
+        snapshot.node_cpu_lists = {{0, "0-3"}, {1, "4-7"}};
+        snapshot.process_allowed_mems = "0-1";
+        snapshot.process_allowed_cpus = "0-7";
+        snapshot.current_cpu = 0;
+        auto discovered = BuildNumaTopology(snapshot);
+        if (discovered.ok()) topology = *discovered;
+    }
+
+    Result<NumaTopology> DiscoverTopology() const override { return topology; }
+    int CurrentCpu() const noexcept override {
+        return current_cpu.load(std::memory_order_relaxed);
+    }
+    NumaSyscallResult Mbind(void*, size_t, int, const unsigned long*,
+                            unsigned long, unsigned) const noexcept override {
+        return bind_result;
+    }
+
+    NumaTopology topology;
+    std::atomic<int> current_cpu{0};
+    NumaSyscallResult bind_result;
+};
 
 struct TestAlignedDeleter {
     void operator()(std::byte* p) const {
@@ -497,6 +526,93 @@ TEST_F(CentralSlabTest, LocalCacheControlDoesNotModifySharedMemoryAbi) {
     alloc_.ConfigureLocalCache({.enabled = true});
 
     EXPECT_EQ(std::memcmp(before.data(), region_.get(), kRegionSize), 0);
+}
+
+TEST(CentralSlabNumaTest, PrefersLocalShardAndInvalidatesHintAfterMigration) {
+    FakeAllocatorNumaSystem system;
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 128}};
+    auto region = std::unique_ptr<std::byte[], TestAlignedDeleter>(
+        new (std::align_val_t(64)) std::byte[kRegionSize]);
+    std::memset(region.get(), 0, kRegionSize);
+    auto created = CentralSlabAllocator::Create(
+        region.get(), kRegionSize, config,
+        {.placement = {.system = &system}, .prefer_local_shards = true});
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    CentralSlabAllocator allocator = *created;
+
+    AllocationRequest request;
+    request.object_size = 32;
+    request.type_id = TypeId{0xD602};
+    request.schema = {.short_id = 0xD602, .layout_version = 1};
+    auto node_zero = allocator.Allocate(request);
+    ASSERT_TRUE(node_zero.ok()) << node_zero.status().ToString();
+    uint32_t first_index = 128;
+    for (uint32_t index = 0; index < 128; ++index) {
+        if (allocator.IsSlotOccupiedForRecovery(index)) first_index = index;
+    }
+    EXPECT_LT(first_index, 64u);
+
+    system.current_cpu.store(4, std::memory_order_relaxed);
+    auto node_one = allocator.Allocate(request);
+    ASSERT_TRUE(node_one.ok()) << node_one.status().ToString();
+    uint32_t second_index = 128;
+    for (uint32_t index = 64; index < 128; ++index) {
+        if (allocator.IsSlotOccupiedForRecovery(index)) second_index = index;
+    }
+    EXPECT_GE(second_index, 64u);
+    EXPECT_LT(second_index, 128u);
+
+    const AllocatorLocalCacheStats stats = allocator.local_cache_stats();
+    EXPECT_EQ(stats.numa_local_allocations, 2u);
+    EXPECT_EQ(stats.numa_remote_allocations, 0u);
+    EXPECT_EQ(stats.numa_fallback_allocations, 0u);
+    EXPECT_EQ(stats.numa_migrations, 1u);
+}
+
+TEST(CentralSlabNumaTest, StrictBindFailureLeavesStorageUninitialized) {
+    FakeAllocatorNumaSystem system;
+    system.bind_result = {.result = -1, .error_number = EPERM};
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 128}};
+    auto region = std::unique_ptr<std::byte[], TestAlignedDeleter>(
+        new (std::align_val_t(64)) std::byte[kRegionSize]);
+    std::memset(region.get(), 0, kRegionSize);
+
+    auto created = CentralSlabAllocator::Create(
+        region.get(), kRegionSize, config,
+        {.placement = {.policy = NumaMemoryPolicy::kNode,
+                       .node = 0,
+                       .failure_policy = NumaFailurePolicy::kStrict,
+                       .system = &system}});
+    ASSERT_FALSE(created.ok());
+    EXPECT_EQ(created.status().code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(*reinterpret_cast<const uint32_t*>(region.get()), 0u);
+}
+
+TEST(CentralSlabNumaTest, FallbackBindFailureIsCounted) {
+    FakeAllocatorNumaSystem system;
+    system.bind_result = {.result = -1, .error_number = EPERM};
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 128}};
+    auto region = std::unique_ptr<std::byte[], TestAlignedDeleter>(
+        new (std::align_val_t(64)) std::byte[kRegionSize]);
+    std::memset(region.get(), 0, kRegionSize);
+    auto created = CentralSlabAllocator::Create(
+        region.get(), kRegionSize, config,
+        {.placement = {.policy = NumaMemoryPolicy::kNode,
+                       .node = 0,
+                       .failure_policy = NumaFailurePolicy::kFallback,
+                       .system = &system}});
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    EXPECT_EQ(created->local_cache_stats().numa_bind_errors, 1u);
+
+    AllocationRequest request;
+    request.object_size = 32;
+    request.type_id = TypeId{0xD602};
+    request.schema = {.short_id = 0xD602, .layout_version = 1};
+    ASSERT_TRUE(created->Allocate(request).ok());
+    EXPECT_EQ(created->local_cache_stats().numa_fallback_allocations, 1u);
 }
 
 TEST_F(CentralSlabTest, AttachSeesExistingAllocations) {

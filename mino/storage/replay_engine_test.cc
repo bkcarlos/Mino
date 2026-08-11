@@ -70,10 +70,12 @@ RecordingManifestSnapshot Manifest() {
         TopicTableEntry{.topic_id = 10,
                         .topic_name = "alpha",
                         .config_version = 4,
+                        .partition_maps = {},
                         .schema_snapshot = {Schema(1)}},
         TopicTableEntry{.topic_id = 20,
                         .topic_name = "beta",
                         .config_version = 4,
+                        .partition_maps = {},
                         .schema_snapshot = {Schema(2)}},
     };
     return manifest;
@@ -320,6 +322,63 @@ TEST(ReplayEngineTest, OrdersSegmentsByPartitionSequenceAndMergesTopicHeads) {
     EXPECT_EQ(publisher.messages[2].metadata.original_ingestion_sequence, 2u);
     EXPECT_EQ(publisher.messages[3].topic_id, 20u);
     EXPECT_EQ(publisher.messages[3].metadata.original_ingestion_sequence, 2u);
+}
+
+TEST(ReplayEngineTest, RepartitionGenerationsMergeDeterministicallyAndFilter) {
+    const std::filesystem::path root = TestDirectory("repartition_merge");
+    const std::filesystem::path generation_one =
+        root / "topics/10/partitions/0000/segments";
+    const std::filesystem::path generation_two =
+        root / "topics/10/generations/00000000000000000002/partitions/0000/segments";
+    std::filesystem::create_directories(generation_one);
+    std::filesystem::create_directories(generation_two);
+    const std::vector<Record> old_records = {
+        SampleRecord(10, 0, 1, 100, 1, 1, 100, 1)};
+    const std::vector<Record> new_records = {
+        SampleRecord(10, 0, 1, 100, 2, 1, 100, 1)};
+    const std::filesystem::path old_path = WriteSegment(
+        generation_one, "old.mino", 10, 0, 1, 10, old_records);
+    const std::filesystem::path new_path = WriteSegment(
+        generation_two, "new.mino", 10, 0, 1, 20, new_records);
+
+    RecordingManifestSnapshot manifest = Manifest();
+    manifest.topics[0].partition_maps = {
+        TopicPartitionMap{
+            .map_version = 1,
+            .generation = 1,
+            .partition_count = 1,
+            .strategy = TopicPartitionStrategy::kSource,
+            .state = TopicPartitionMapState::kRetired,
+        },
+        TopicPartitionMap{
+            .map_version = 2,
+            .generation = 2,
+            .partition_count = 1,
+            .strategy = TopicPartitionStrategy::kSource,
+            .state = TopicPartitionMapState::kActive,
+        },
+    };
+    CapturingPublisher merged;
+    auto engine = ReplayEngine::Create({new_path, old_path}, manifest, &merged,
+                                       ReplayOptions{});
+    ASSERT_TRUE(engine.ok()) << engine.status().ToString();
+    ASSERT_TRUE((*engine)->Run().ok());
+    ASSERT_EQ(merged.messages.size(), 2u);
+    EXPECT_EQ(merged.messages[0].metadata.original_partition_generation, 1u);
+    EXPECT_EQ(merged.messages[1].metadata.original_partition_generation, 2u);
+
+    ReplayOptions filtered_options;
+    filtered_options.filter.partition_ids = {0};
+    filtered_options.filter.partition_generations = {2};
+    filtered_options.filter.ingestion_sequence.minimum = 1;
+    CapturingPublisher filtered;
+    auto filtered_engine = ReplayEngine::Create(
+        {old_path, new_path}, manifest, &filtered, filtered_options);
+    ASSERT_TRUE(filtered_engine.ok())
+        << filtered_engine.status().ToString();
+    ASSERT_TRUE((*filtered_engine)->Run().ok());
+    ASSERT_EQ(filtered.messages.size(), 1u);
+    EXPECT_EQ(filtered.messages[0].metadata.original_partition_generation, 2u);
 }
 
 TEST(ReplayEngineTest, SchedulerSupportsOriginalFastSlowAndStepPlayback) {

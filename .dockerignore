@@ -8,3 +8,10 @@ fuzz-corpus-minimized/
 fuzz-artifacts/
 fuzz-output/
 .DS_Store
+# Credentials are always runtime mounts; never include common key/certificate files.
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.crt
+**/secrets/**

@@ -32,6 +32,7 @@
 #include "mino/shm/channel/broadcast_channel.h"
 #include "mino/transport/transport_driver.h"
 #include "mino/transport/transport_switcher.h"
+#include "mino/upgrade/routing_catalog.h"
 
 namespace mino::deployment {
 namespace {
@@ -64,7 +65,8 @@ bool CompleteSchema(const schema::SchemaIdentity& identity) noexcept {
 }
 
 Status ValidateConfig(const LocalBusConfig& config) {
-    if (config.node_id.value == 0 || config.lease_epoch == 0 ||
+    if (config.node_id.value == 0 || config.security_domain_id.value == 0 ||
+        config.lease_epoch == 0 ||
         config.lease_duration_ns == 0 || config.region_id == 0 ||
         config.region_bytes == 0 ||
         config.region_bytes > kMaximumLocalRegionBytes ||
@@ -371,7 +373,7 @@ class LocalTopicBinding final
 public:
     static Result<std::shared_ptr<LocalTopicBinding>> Create(
         const registry::TopicMetadata& metadata, uint32_t region_id,
-        size_t max_payload_bytes) {
+        size_t max_payload_bytes, bool publisher_fenced) {
         try {
             const uint64_t channel_bytes =
                 AlignUp64(BroadcastChannel::RequiredSize(metadata.capacity));
@@ -389,7 +391,8 @@ public:
             }
             return std::shared_ptr<LocalTopicBinding>(new LocalTopicBinding(
                 metadata, region_id, max_payload_bytes, channel_bytes,
-                payload_stride, total_bytes, memory, std::move(*channel)));
+                payload_stride, total_bytes, memory, std::move(*channel),
+                publisher_fenced));
         } catch (const std::bad_alloc&) {
             return Exhausted("cannot allocate local topic region");
         }
@@ -402,6 +405,10 @@ public:
     Result<std::shared_ptr<BusLocalPublisherEndpoint>> OpenPublisher(
         const registry::PublisherRegistration& registration) {
         std::lock_guard lock(lifecycle_mutex_);
+        if (publisher_fenced_) {
+            return Status::Error(StatusCode::kUnavailable,
+                                 "local publisher creation is fenced");
+        }
         if (publisher_active_) {
             return Status::Error(StatusCode::kAlreadyExists,
                                  "local broadcast topic already has a publisher");
@@ -468,14 +475,20 @@ public:
         std::lock_guard lock(publish_mutex_);
         {
             std::lock_guard lifecycle_lock(lifecycle_mutex_);
-            if (!publisher_active_) {
+            if (!publisher_active_ || publisher_fenced_) {
                 return Status::Error(StatusCode::kUnavailable,
-                                     "local publisher endpoint is closed");
+                                     "local publisher endpoint is closed or fenced");
             }
             active_publisher_id_ = registration.publisher_id;
         }
         Result<BroadcastChannel::Reservation> reserved = channel_.TryReserve();
-        if (!reserved.ok()) return reserved.status();
+        if (!reserved.ok()) {
+            if (reserved.status().code() == StatusCode::kWouldBlock) {
+                queue_full_events_.fetch_add(1, std::memory_order_relaxed);
+                queue_dropped_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return reserved.status();
+        }
         const uint64_t sequence = reserved->sequence();
         const uint64_t physical = sequence & (metadata_.capacity - 1u);
         const uint64_t generation64 = sequence / metadata_.capacity + 1u;
@@ -510,6 +523,8 @@ public:
         slot->flags = 0;
         const Status committed = std::move(*reserved).Commit();
         if (!committed.ok()) return committed;
+        last_published_sequence_.store(sequence + 1, std::memory_order_release);
+        published_samples_.fetch_add(1, std::memory_order_relaxed);
         return LocalPublication{
             .source = slot_sources_[physical].source,
             .sequence_num = sequence + 1,
@@ -520,8 +535,22 @@ public:
 
     Result<CanonicalMessage> Poll(
         BroadcastChannel::SubscriberHandle handle) {
+        MINO_RETURN_IF_ERROR(channel_.Heartbeat(handle, MonotonicNowNs()));
         Result<BroadcastChannel::Borrow> borrowed = channel_.Poll(handle);
-        if (!borrowed.ok()) return borrowed.status();
+        if (!borrowed.ok()) {
+            if (borrowed.status().code() == StatusCode::kDegraded ||
+                borrowed.status().code() == StatusCode::kCorruption) {
+                unexplained_loss_count_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return borrowed.status();
+        }
+        outstanding_borrows_.fetch_add(1, std::memory_order_acq_rel);
+        struct BorrowCounterGuard final {
+            std::atomic<uint64_t>* count;
+            ~BorrowCounterGuard() {
+                count->fetch_sub(1, std::memory_order_acq_rel);
+            }
+        } borrow_guard{&outstanding_borrows_};
         const IndexSlotSnapshot snapshot = **borrowed;
         if (snapshot.payload.region_id != region_id_ ||
             snapshot.payload_len == 0 ||
@@ -562,16 +591,88 @@ public:
                     snapshot.payload_len);
         const Status acked = std::move(*borrowed).Ack();
         if (!acked.ok()) return acked;
+        last_consumed_sequence_.store(message.publication.sequence_num,
+                                      std::memory_order_release);
+        observed_samples_.fetch_add(1, std::memory_order_relaxed);
         return message;
     }
 
     const registry::TopicMetadata& metadata() const noexcept { return metadata_; }
+    uint32_t region_id() const noexcept { return region_id_; }
+
+    Status FencePublisher() noexcept {
+        std::lock_guard lock(lifecycle_mutex_);
+        publisher_fenced_ = true;
+        return Status::Ok();
+    }
+
+    Status UnfencePublisher() noexcept {
+        std::lock_guard lock(lifecycle_mutex_);
+        publisher_fenced_ = false;
+        return Status::Ok();
+    }
+
+    LocalBusUpgradeTopicStats UpgradeStats(uint64_t now_ns) const noexcept {
+        const BroadcastChannel::OperationalStats channel =
+            channel_.operational_stats(now_ns);
+        bool publisher_active = false;
+        bool publisher_fenced = false;
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            publisher_active = publisher_active_;
+            publisher_fenced = publisher_fenced_;
+        }
+        return LocalBusUpgradeTopicStats{
+            .topic_id = metadata_.topic_id,
+            .region_id = region_id_,
+            .publisher_creation_fenced = publisher_fenced,
+            .local_publishers = publisher_active ? 1u : 0u,
+            .local_readers = channel.active_subscribers,
+            .outstanding_receipts = 0,
+            .outstanding_borrows =
+                outstanding_borrows_.load(std::memory_order_acquire),
+            .queue_depth = channel.depth,
+            .last_published_sequence =
+                last_published_sequence_.load(std::memory_order_acquire),
+            .last_consumed_sequence =
+                last_consumed_sequence_.load(std::memory_order_acquire),
+            .observed_samples =
+                observed_samples_.load(std::memory_order_relaxed),
+            .duplicate_count =
+                duplicate_count_.load(std::memory_order_relaxed),
+            .unexplained_loss_count =
+                unexplained_loss_count_.load(std::memory_order_relaxed),
+        };
+    }
+
+    LocalBusOperationalStats OperationalStats(uint64_t now_ns) const noexcept {
+        const BroadcastChannel::OperationalStats channel =
+            channel_.operational_stats(now_ns);
+        return LocalBusOperationalStats{
+            .queue_depth = channel.depth,
+            .queue_capacity = channel.capacity,
+            .queue_full_events =
+                queue_full_events_.load(std::memory_order_relaxed),
+            .queue_dropped = queue_dropped_.load(std::memory_order_relaxed),
+            .lease_expirations =
+                lease_expirations_.load(std::memory_order_relaxed),
+            .oldest_heartbeat_age_ns = channel.oldest_heartbeat_age_ns,
+        };
+    }
+
+    uint64_t SweepExpired(uint64_t now_ns, uint64_t lease_ns) noexcept {
+        const uint64_t expired =
+            channel_.EvictStaleSubscribers(now_ns, lease_ns);
+        lease_expirations_.fetch_add(expired, std::memory_order_relaxed);
+        return expired;
+    }
 
 private:
     LocalTopicBinding(registry::TopicMetadata metadata, uint32_t region_id,
                       size_t max_payload_bytes, uint64_t payload_offset,
                       uint64_t payload_stride, uint64_t total_bytes,
-                      void* memory, BroadcastChannel channel)
+                      void* memory, BroadcastChannel channel,
+                      bool publisher_fenced)
         : metadata_(std::move(metadata)),
           region_id_(region_id),
           max_payload_bytes_(max_payload_bytes),
@@ -580,7 +681,8 @@ private:
           total_bytes_(total_bytes),
           memory_(memory),
           channel_(std::move(channel)),
-          slot_sources_(metadata_.capacity) {}
+          slot_sources_(metadata_.capacity),
+          publisher_fenced_(publisher_fenced) {}
 
     registry::TopicMetadata metadata_;
     uint32_t region_id_ = 0;
@@ -591,9 +693,20 @@ private:
     void* memory_ = nullptr;
     BroadcastChannel channel_;
     std::vector<SlotSourceMetadata> slot_sources_;
-    std::mutex lifecycle_mutex_;
+    mutable std::mutex lifecycle_mutex_;
     std::mutex publish_mutex_;
+    std::atomic<uint64_t> queue_full_events_{0};
+    std::atomic<uint64_t> queue_dropped_{0};
+    std::atomic<uint64_t> lease_expirations_{0};
+    std::atomic<uint64_t> outstanding_borrows_{0};
+    std::atomic<uint64_t> last_published_sequence_{0};
+    std::atomic<uint64_t> last_consumed_sequence_{0};
+    std::atomic<uint64_t> published_samples_{0};
+    std::atomic<uint64_t> observed_samples_{0};
+    std::atomic<uint64_t> duplicate_count_{0};
+    std::atomic<uint64_t> unexplained_loss_count_{0};
     bool publisher_active_ = false;
+    bool publisher_fenced_ = false;
     PublisherId active_publisher_id_{};
 };
 
@@ -627,12 +740,22 @@ Result<CanonicalMessage> LocalSubscriberEndpoint::TryPoll() {
 class LocalEndpointProvider final : public BusLocalEndpointProvider,
                                     public transport::LocalRouteProvider {
 public:
-    uint64_t version() const noexcept override { return 1; }
+    uint64_t version() const noexcept override {
+        std::filesystem::path path;
+        {
+            std::lock_guard lock(mutex_);
+            path = routing_catalog_path_;
+        }
+        if (path.empty()) return 1;
+        auto snapshot = upgrade::LoadRegionRoutingSnapshot(path);
+        return snapshot.ok() ? snapshot->generation : 0;
+    }
 
     Status Install(const registry::TopicMetadata& metadata, uint32_t region_id,
-                   size_t max_payload_bytes) {
+                   size_t max_payload_bytes, bool publisher_fenced) {
         Result<std::shared_ptr<LocalTopicBinding>> binding =
-            LocalTopicBinding::Create(metadata, region_id, max_payload_bytes);
+            LocalTopicBinding::Create(metadata, region_id, max_payload_bytes,
+                                      publisher_fenced);
         if (!binding.ok()) return binding.status();
         std::lock_guard lock(mutex_);
         try {
@@ -681,23 +804,111 @@ public:
         };
     }
 
-private:
-    Result<std::shared_ptr<LocalTopicBinding>> Find(
-        const registry::TopicMetadata& topic) const {
+    LocalBusOperationalStats OperationalStats(uint64_t now_ns) const noexcept {
         std::lock_guard lock(mutex_);
-        const auto found = topics_.find(topic.topic_id);
+        LocalBusOperationalStats aggregate;
+        for (const auto& [topic_id, binding] : topics_) {
+            static_cast<void>(topic_id);
+            const LocalBusOperationalStats current =
+                binding->OperationalStats(now_ns);
+            aggregate.queue_depth += current.queue_depth;
+            aggregate.queue_capacity += current.queue_capacity;
+            aggregate.queue_full_events += current.queue_full_events;
+            aggregate.queue_dropped += current.queue_dropped;
+            aggregate.lease_expirations += current.lease_expirations;
+            aggregate.oldest_heartbeat_age_ns = std::max(
+                aggregate.oldest_heartbeat_age_ns,
+                current.oldest_heartbeat_age_ns);
+        }
+        return aggregate;
+    }
+
+    Status BindRoutingCatalog(std::filesystem::path path) {
+        MINO_ASSIGN_OR_RETURN(const auto snapshot,
+                              upgrade::LoadRegionRoutingSnapshot(path));
+        static_cast<void>(snapshot);
+        std::lock_guard lock(mutex_);
+        routing_catalog_path_ = std::move(path);
+        return Status::Ok();
+    }
+
+    Result<LocalBusUpgradeTopicStats> UpgradeStats(TopicId topic_id) const {
+        std::shared_ptr<LocalTopicBinding> binding;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = topics_.find(topic_id);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "local upgrade topic binding is not installed");
+            }
+            binding = found->second;
+        }
+        return binding->UpgradeStats(MonotonicNowNs());
+    }
+
+    Status FencePublisher(TopicId topic_id) {
+        MINO_ASSIGN_OR_RETURN(auto binding, FindInstalled(topic_id));
+        return binding->FencePublisher();
+    }
+
+    Status UnfencePublisher(TopicId topic_id) {
+        MINO_ASSIGN_OR_RETURN(auto binding, FindInstalled(topic_id));
+        return binding->UnfencePublisher();
+    }
+
+    uint64_t SweepExpired(uint64_t now_ns, uint64_t lease_ns) noexcept {
+        std::lock_guard lock(mutex_);
+        uint64_t expired = 0;
+        for (const auto& [topic_id, binding] : topics_) {
+            static_cast<void>(topic_id);
+            expired += binding->SweepExpired(now_ns, lease_ns);
+        }
+        return expired;
+    }
+
+private:
+    Result<std::shared_ptr<LocalTopicBinding>> FindInstalled(
+        TopicId topic_id) const {
+        std::lock_guard lock(mutex_);
+        const auto found = topics_.find(topic_id);
         if (found == topics_.end()) {
             return Status::Error(StatusCode::kNotFound,
                                  "local topic binding is not installed");
         }
-        const registry::TopicMetadata& installed = found->second->metadata();
+        return found->second;
+    }
+
+    Result<std::shared_ptr<LocalTopicBinding>> Find(
+        const registry::TopicMetadata& topic) const {
+        std::shared_ptr<LocalTopicBinding> binding;
+        std::filesystem::path catalog_path;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = topics_.find(topic.topic_id);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "local topic binding is not installed");
+            }
+            binding = found->second;
+            catalog_path = routing_catalog_path_;
+        }
+        const registry::TopicMetadata& installed = binding->metadata();
         if (installed.region_version != topic.region_version ||
             installed.channel_version != topic.channel_version ||
             installed.acl_version != topic.acl_version) {
             return Status::Error(StatusCode::kUnavailable,
                                  "local topic binding version is stale");
         }
-        return found->second;
+        if (!catalog_path.empty()) {
+            MINO_ASSIGN_OR_RETURN(
+                const auto route,
+                upgrade::LoadRegionRoutingSnapshot(catalog_path));
+            if (binding->region_id() != route.active_region.region_id) {
+                return Status::Error(StatusCode::kUnavailable,
+                                     "local endpoint Region is fenced by the durable routing catalog");
+            }
+        }
+        return binding;
     }
 
     static BusLocalResourceBinding ResourceBinding(
@@ -715,12 +926,14 @@ private:
 
     mutable std::mutex mutex_;
     std::unordered_map<TopicId, std::shared_ptr<LocalTopicBinding>> topics_;
+    std::filesystem::path routing_catalog_path_;
 };
 
 }  // namespace
 
 class LocalBusDeployment::Impl final {
 public:
+    uint64_t lease_duration_ns = 0;
     std::shared_ptr<DurableFileIdAllocator> ids;
     std::shared_ptr<registry::Coordinator> coordinator;
     std::shared_ptr<LocalEndpointProvider> endpoints;
@@ -752,6 +965,7 @@ Result<std::unique_ptr<LocalBusDeployment>> LocalBusDeployment::Create(
             .node_id = config.node_id,
             .process_identity = identity,
             .endpoints = {*endpoint},
+            .security_domain_id = config.security_domain_id,
             .trust_domain = "local",
             .health = registry::NodeHealth::kHealthy,
             .lease_epoch = config.lease_epoch,
@@ -801,6 +1015,11 @@ Result<std::unique_ptr<LocalBusDeployment>> LocalBusDeployment::Create(
                 .partition_count = 1,
                 .record_topology =
                     registry::RecordBackpressureTopology::kIsolated,
+                .acl = registry::TopicAcl{
+                    .entries = {{.node_id = config.node_id,
+                                 .security_domain_id = config.security_domain_id,
+                                 .permissions = registry::kAllTopicPermissions}},
+                },
                 .region_version = 1,
                 .channel_version = 1,
                 .acl_version = 1,
@@ -810,9 +1029,13 @@ Result<std::unique_ptr<LocalBusDeployment>> LocalBusDeployment::Create(
             Result<std::shared_ptr<const registry::TopicSnapshot>> topic =
                 coordinator->CreateTopic(std::move(candidate));
             if (!topic.ok()) return topic.status();
+            const uint32_t topic_region_id =
+                configured.region_id == 0 ? config.region_id
+                                          : configured.region_id;
             MINO_RETURN_IF_ERROR(endpoints->Install(
-                (*topic)->metadata, config.region_id,
-                configured.max_payload_bytes));
+                (*topic)->metadata, topic_region_id,
+                configured.max_payload_bytes, !configured.activate));
+            if (!configured.activate) continue;
             const registry::ActivationReadinessProof proof{
                 .topic_id = (*topic)->metadata.topic_id,
                 .config_version = (*topic)->metadata.config_version,
@@ -837,6 +1060,7 @@ Result<std::unique_ptr<LocalBusDeployment>> LocalBusDeployment::Create(
         if (!bus.ok()) return bus.status();
 
         auto impl = std::make_unique<Impl>();
+        impl->lease_duration_ns = config.lease_duration_ns;
         impl->ids = std::move(*ids);
         impl->coordinator = std::move(coordinator);
         impl->endpoints = std::move(endpoints);
@@ -864,5 +1088,41 @@ LocalBusDeployment::~LocalBusDeployment() = default;
 Bus& LocalBusDeployment::bus() noexcept { return *impl_->bus; }
 
 const Bus& LocalBusDeployment::bus() const noexcept { return *impl_->bus; }
+
+LocalBusOperationalStats LocalBusDeployment::OperationalStats(
+    uint64_t now_ns) const noexcept {
+    return impl_->endpoints->OperationalStats(now_ns);
+}
+
+uint64_t LocalBusDeployment::SweepExpiredSubscribers(uint64_t now_ns) noexcept {
+    return impl_->endpoints->SweepExpired(now_ns, impl_->lease_duration_ns);
+}
+
+Status LocalBusDeployment::BindRoutingCatalog(
+    std::filesystem::path catalog_path) {
+    return impl_->endpoints->BindRoutingCatalog(std::move(catalog_path));
+}
+
+Result<LocalBusUpgradeTopicStats> LocalBusDeployment::UpgradeTopicStats(
+    TopicId topic_id) const {
+    return impl_->endpoints->UpgradeStats(topic_id);
+}
+
+Status LocalBusDeployment::FenceUpgradePublisher(TopicId topic_id) {
+    return impl_->endpoints->FencePublisher(topic_id);
+}
+
+Status LocalBusDeployment::UnfenceUpgradePublisher(TopicId topic_id) {
+    return impl_->endpoints->UnfencePublisher(topic_id);
+}
+
+Status LocalBusDeployment::RefreshUpgradeRoute(TopicId topic_id) {
+    MINO_RETURN_IF_ERROR(impl_->switcher->InvalidateTopic(topic_id));
+    return impl_->switcher->RefreshTopic(topic_id);
+}
+
+registry::Coordinator& LocalBusDeployment::coordinator() noexcept {
+    return *impl_->coordinator;
+}
 
 }  // namespace mino::deployment

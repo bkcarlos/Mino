@@ -9,6 +9,7 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/runtime:delivery_receipt",
+        "//mino/security:tls",
     ],
 )
 
@@ -21,6 +22,7 @@ cc_library(
         "//mino/bridge:wire_frame",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/security:tls",
     ],
 )
 
@@ -32,6 +34,34 @@ cc_library(
         ":transport_driver",
         "//mino/common:result",
         "//mino/common:status",
+    ],
+)
+
+cc_library(
+    name = "fabric_driver",
+    srcs = ["fabric_driver.cc"],
+    hdrs = ["fabric_driver.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/bridge:wire_frame",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:fabric_provider",
+        "//mino/security:tls",
+    ],
+)
+
+cc_library(
+    name = "rdma_driver",
+    srcs = ["rdma_driver.cc"],
+    hdrs = ["rdma_driver.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:memory_registration",
+        "//mino/platform:rdma_provider",
+        "//mino/security:tls",
     ],
 )
 
@@ -53,6 +83,7 @@ cc_test(
     deps = [
         ":tcp_driver",
         "//mino/bridge:wire_frame",
+        "//mino/security:test_tls_credentials",
         "@googletest//:gtest_main",
     ],
 )
@@ -62,6 +93,27 @@ cc_test(
     srcs = ["udp_driver_test.cc"],
     deps = [
         ":udp_driver",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fabric_driver_test",
+    srcs = ["fabric_driver_test.cc"],
+    deps = [
+        ":fabric_driver",
+        "//mino/bridge:wire_frame",
+        "//mino/platform:fabric_provider",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "rdma_driver_test",
+    srcs = ["rdma_driver_test.cc"],
+    deps = [
+        ":rdma_driver",
+        "//mino/platform:rdma_provider",
         "@googletest//:gtest_main",
     ],
 )

@@ -1,5 +1,44 @@
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["transport_qualification_sla.json"])
+
+py_library(
+    name = "transport_qualification_lib",
+    srcs = ["transport_qualification.py"],
+)
+
+py_binary(
+    name = "fabric_qualification",
+    srcs = ["fabric_qualification.py"],
+    deps = [":transport_qualification_lib"],
+    python_version = "PY3",
+)
+
+py_binary(
+    name = "rdma_qualification",
+    srcs = ["rdma_qualification.py"],
+    deps = [":transport_qualification_lib"],
+    python_version = "PY3",
+)
+
+py_binary(
+    name = "transport_qualification_finalizer",
+    srcs = ["transport_qualification.py"],
+    main = "transport_qualification.py",
+    python_version = "PY3",
+)
+
+py_test(
+    name = "qualification_contract_test",
+    srcs = ["qualification_contract_test.py"],
+    data = [
+        "transport_qualification_sla.json",
+        "//docs/validation:Transport_qualification_artifact.schema.json",
+    ],
+    deps = [":transport_qualification_lib"],
+    python_version = "PY3",
+)
+
 # Direct ZeroMQ comparison only. This target intentionally does not depend on
 # TransportDriver or any Mino Bridge implementation.
 cc_binary(
@@ -14,6 +53,20 @@ cc_binary(
     deps = [
         "//mino/bridge:reliability",
         "@libzmq//:libzmq",
+    ],
+)
+
+cc_binary(
+    name = "transport_matrix_benchmark",
+    srcs = ["transport_matrix_benchmark.cc"],
+    deps = [
+        "//mino/bridge:wire_frame",
+        "//mino/platform:fabric_provider",
+        "//mino/platform:rdma_provider",
+        "//mino/transport:fabric_driver",
+        "//mino/transport:rdma_driver",
+        "//mino/transport:tcp_driver",
+        "//mino/transport:udp_driver",
     ],
 )
 

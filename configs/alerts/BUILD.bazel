@@ -1,0 +1,15 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["mino.rules.yml"])
+
+py_test(
+    name = "alert_rules_test",
+    size = "small",
+    srcs = ["alert_rules_test.py"],
+    data = [
+        ":mino.rules.yml",
+        "//mino/observability:operational_metrics.cc",
+    ],
+    main = "alert_rules_test.py",
+    python_version = "PY3",
+)

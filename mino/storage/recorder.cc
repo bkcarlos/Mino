@@ -249,25 +249,41 @@ bool SameSchema(const RecorderSchemaMetadata& metadata,
 }
 
 std::filesystem::path PartitionRoot(const std::filesystem::path& session_root,
-                                    TopicId topic_id,
+                                    TopicId topic_id, uint64_t generation,
                                     uint32_t partition_id) {
-    std::ostringstream name;
-    name << std::setfill('0') << std::setw(4) << partition_id;
-    return session_root / "topics" / std::to_string(topic_id.value) /
-           "partitions" / name.str();
+    std::ostringstream partition_name;
+    partition_name << std::setfill('0') << std::setw(4) << partition_id;
+    std::filesystem::path topic_root =
+        session_root / "topics" / std::to_string(topic_id.value);
+    if (generation == 1) {
+        return topic_root / "partitions" / partition_name.str();
+    }
+    std::ostringstream generation_name;
+    generation_name << std::setfill('0') << std::setw(20) << generation;
+    return topic_root / "generations" / generation_name.str() / "partitions" /
+           partition_name.str();
 }
 
 uint64_t DerivedWriterId(uint64_t recording_id, TopicId topic_id,
+                         uint64_t generation,
                          uint32_t partition_id) noexcept {
     uint64_t value = recording_id;
     value ^= static_cast<uint64_t>(topic_id.value) << 32;
-    value ^= static_cast<uint64_t>(partition_id) + 0x9e3779b97f4a7c15ull;
+    value ^= generation * 0x9e3779b97f4a7c15ull;
+    value ^= static_cast<uint64_t>(partition_id) + 0x517cc1b727220a95ull;
     value ^= value >> 30;
     value *= 0xbf58476d1ce4e5b9ull;
     value ^= value >> 27;
     value *= 0x94d049bb133111ebull;
     value ^= value >> 31;
     return value == 0 ? 1 : value;
+}
+
+size_t PartitionBudgetShare(size_t total, uint32_t partition_id,
+                            uint32_t partition_count) noexcept {
+    const size_t quotient = total / partition_count;
+    const size_t remainder = total % partition_count;
+    return quotient + (partition_id < remainder ? 1u : 0u);
 }
 
 Result<size_t> ChargedBytes(size_t payload_size,
@@ -323,16 +339,27 @@ Result<capacity::ResourceVector> EstimateRecorderTopicResources(
                           ValidateRecordingPolicy(config.policy));
 
     capacity::ResourceVector per_partition;
-    if (effective.mode != RecordingMode::kSnapshot) {
-        per_partition.recorder_buffer_bytes =
-            config.buffer_pool_options.global_byte_limit;
-    }
     // Partition manifest plus active segment/snapshot file. This is a
     // conservative descriptor ceiling, not an assertion that all are always open.
     per_partition.file_descriptors = 2;
     MINO_ASSIGN_OR_RETURN(
         auto resources,
         capacity::CheckedScale(per_partition, config.partition_count));
+    if (effective.mode != RecordingMode::kSnapshot) {
+        if (config.total_buffer_byte_limit != 0) {
+            resources.recorder_buffer_bytes = config.total_buffer_byte_limit;
+        } else {
+            capacity::ResourceVector per_partition_buffer;
+            per_partition_buffer.recorder_buffer_bytes =
+                config.buffer_pool_options.global_byte_limit;
+            MINO_ASSIGN_OR_RETURN(
+                auto scaled_buffer,
+                capacity::CheckedScale(per_partition_buffer,
+                                       config.partition_count));
+            MINO_ASSIGN_OR_RETURN(resources,
+                                  capacity::CheckedAdd(resources, scaled_buffer));
+        }
+    }
 
     capacity::ResourceVector topic_resources;
     topic_resources.file_descriptors = 1;  // Topic/session metadata operation.
@@ -352,6 +379,7 @@ public:
     struct PartitionRuntime {
         TopicRuntime* topic = nullptr;
         uint32_t partition_id = 0;
+        uint64_t partition_generation = 1;
         uint64_t writer_id = 0;
         RecorderBufferPoolOptions pool_options;
         std::unique_ptr<RecorderBufferPool> pool;
@@ -371,6 +399,7 @@ public:
         TopicId topic_id{};
         std::string name;
         uint64_t config_version = 0;
+        TopicPartitionMap partition_map;
         EffectiveRecordingPolicy policy;
         std::vector<RecorderSchemaMetadata> schemas;
         std::map<uint32_t, std::unique_ptr<PartitionRuntime>> partitions;
@@ -427,6 +456,21 @@ public:
                     std::numeric_limits<uint64_t>::max() -
                         config.writer_id_base) {
                 return Invalid("recorder writer ID range overflows");
+            }
+            const TopicPartitionMap partition_map{
+                .map_version = config.partition_map_version,
+                .generation = config.partition_generation,
+                .partition_count = config.partition_count,
+                .strategy = config.partition_strategy,
+                .state = TopicPartitionMapState::kActive,
+                .hash_algorithm_version = config.partition_hash_version,
+                .hash_seed = config.partition_hash_seed,
+            };
+            MINO_RETURN_IF_ERROR(ValidateTopicPartitionMap(partition_map));
+            if (config.total_buffer_byte_limit != 0 &&
+                config.total_buffer_byte_limit < config.partition_count) {
+                return Invalid(
+                    "topic buffer budget cannot give every partition one byte");
             }
 
             Result<EffectiveRecordingPolicy> effective =
@@ -510,6 +554,7 @@ public:
                 .topic_id = config.topic_id.value,
                 .topic_name = config.topic_name,
                 .config_version = config.config_version,
+                .partition_maps = {partition_map},
                 .schema_snapshot = schema_snapshot,
             };
             Result<TopicTableEntry> existing =
@@ -521,6 +566,20 @@ public:
                 }
                 if (table.config_version < existing->config_version) {
                     return Invalid("reopened topic config version moved backward");
+                }
+                if (!existing->partition_maps.empty()) {
+                    const auto active = std::find_if(
+                        existing->partition_maps.begin(),
+                        existing->partition_maps.end(),
+                        [](const TopicPartitionMap& map) {
+                            return map.state == TopicPartitionMapState::kActive;
+                        });
+                    if (active == existing->partition_maps.end() ||
+                        *active != partition_map) {
+                        return Invalid(
+                            "reopened topic partition map differs from manifest");
+                    }
+                    table.partition_maps = existing->partition_maps;
                 }
                 manifest_status = manifest_->UpdateTopic(table);
             } else if (existing.status().code() == StatusCode::kNotFound) {
@@ -540,6 +599,7 @@ public:
             topic->topic_id = config.topic_id;
             topic->name = config.topic_name;
             topic->config_version = config.config_version;
+            topic->partition_map = partition_map;
             topic->policy = *effective;
             topic->schemas = std::move(recorder_schemas);
 
@@ -584,6 +644,8 @@ public:
                 }
                 const Status status = partition->writer->Start(now_ns);
                 if (!status.ok()) {
+                    CountStorageFailure(*partition,
+                                        SegmentWriterFailureKind::kWrite);
                     MarkPartitionFailed(*partition, status, now_ns);
                     failed = true;
                 }
@@ -616,7 +678,18 @@ public:
                 return Status::Error(StatusCode::kNotFound,
                                      "recorder topic is not configured");
             }
-            auto found_partition = topic->partitions.find(request.partition_id);
+            MINO_ASSIGN_OR_RETURN(
+                const uint32_t selected_partition_id,
+                SelectTopicPartition(
+                    topic->partition_map,
+                    TopicPartitionRouteInput{
+                        .key = request.partition_key,
+                        .hash = request.partition_hash,
+                        .manual_partition_id = request.partition_id,
+                        .source = request.metadata.source,
+                    }));
+            auto found_partition =
+                topic->partitions.find(selected_partition_id);
             if (found_partition == topic->partitions.end()) {
                 return Status::Error(StatusCode::kNotFound,
                                      "recorder partition is not configured");
@@ -655,7 +728,7 @@ public:
                 record.header.layout_version =
                     request.metadata.schema.layout_version;
                 record.header.topic_id = request.metadata.topic_id.value;
-                record.header.partition_id = request.partition_id;
+                record.header.partition_id = selected_partition_id;
                 record.header.ingestion_timestamp_ns =
                     request.metadata.ingestion_timestamp_ns;
                 record.header.node_id = request.metadata.source.node_id;
@@ -672,6 +745,7 @@ public:
                 Result<uint64_t> stored =
                     partition.snapshot_store->Put(std::move(record));
                 if (!stored.ok()) {
+                    SaturatingAdd(1, &metrics_.write_failures);
                     MarkPartitionFailed(partition, stored.status(), now_ns);
                     return RecorderEnqueueResult{
                         .disposition = RecorderEnqueueDisposition::kFailed,
@@ -688,6 +762,8 @@ public:
                     .disposition = RecorderEnqueueDisposition::kBuffered,
                     .status = Status::Ok(),
                     .acknowledged = std::nullopt,
+                    .partition_id = selected_partition_id,
+                    .partition_generation = topic->partition_map.generation,
                     .discarded = {},
                     .gap_debts = {},
                 };
@@ -730,6 +806,8 @@ public:
 
             RecorderEnqueueResult result;
             result.status = decision->status;
+            result.partition_id = selected_partition_id;
+            result.partition_generation = topic->partition_map.generation;
             result.gap_debts = decision->gap_debts;
             SaturatingAdd(decision->gap_debts.size(), &metrics_.gap_debts);
             Status debt_status = ReportTopologyDebts(
@@ -856,6 +934,8 @@ public:
             Result<TopicWriterPumpResult> pumped =
                 partition.writer->Pump(now_ns);
             if (!pumped.ok()) {
+                CountStorageFailure(partition,
+                                    SegmentWriterFailureKind::kWrite);
                 FailForWriterError(*topic, partition, pumped.status(), now_ns);
                 result.disposition = RecorderEnqueueDisposition::kFailed;
                 result.status = pumped.status();
@@ -867,6 +947,8 @@ public:
                 const Status durable = partition.writer->Flush(
                     RecordAckLevel::kDurable, now_ns);
                 if (!durable.ok()) {
+                    CountStorageFailure(partition,
+                                        SegmentWriterFailureKind::kSync);
                     FailForWriterError(*topic, partition, durable, now_ns);
                     result.disposition = RecorderEnqueueDisposition::kFailed;
                     result.status = durable;
@@ -911,6 +993,8 @@ public:
                         partition->writer->Pump(now_ns,
                                                 max_records_per_partition);
                     if (!pumped.ok()) {
+                        CountStorageFailure(*partition,
+                                            SegmentWriterFailureKind::kWrite);
                         FailForWriterError(*topic, *partition, pumped.status(),
                                            now_ns);
                         aggregate.failures.push_back(RecorderOperationFailure{
@@ -964,6 +1048,8 @@ public:
                 Result<TopicWriterPumpResult> pumped =
                     partition->writer->Pump(now_ns);
                 if (!pumped.ok()) {
+                    CountStorageFailure(*partition,
+                                        SegmentWriterFailureKind::kWrite);
                     FailForWriterError(*topic, *partition, pumped.status(),
                                        now_ns);
                     failed = true;
@@ -972,6 +1058,8 @@ public:
                 AccumulatePump(*pumped, nullptr);
                 const Status status = partition->writer->Flush(level, now_ns);
                 if (!status.ok()) {
+                    CountStorageFailure(*partition,
+                                        SegmentWriterFailureKind::kSync);
                     FailForWriterError(*topic, *partition, status, now_ns);
                     failed = true;
                 }
@@ -1005,16 +1093,22 @@ public:
         RecorderMetrics snapshot = metrics_;
         uint64_t written = 0;
         uint64_t durable = 0;
+        uint64_t pending_bytes = 0;
         for (const auto& [topic_id, topic] : topics_) {
             static_cast<void>(topic_id);
             for (const auto& [partition_id, partition] : topic->partitions) {
                 static_cast<void>(partition_id);
                 SaturatingAdd(partition->written_acks, &written);
                 SaturatingAdd(partition->durable_acks, &durable);
+                if (partition->pool != nullptr) {
+                    SaturatingAdd(partition->pool->stats().bytes_in_use,
+                                  &pending_bytes);
+                }
             }
         }
         snapshot.written_records = written;
         snapshot.durable_records = durable;
+        snapshot.pending_bytes = pending_bytes;
         return snapshot;
     }
 
@@ -1039,6 +1133,8 @@ public:
         return RecorderPartitionStatus{
             .topic_id = topic_id,
             .partition_id = partition_id,
+            .partition_generation = partition.partition_generation,
+            .partition_map_version = topic->partition_map.map_version,
             .recording_mode = topic->policy.mode,
             .has_snapshot = snapshot && partition.snapshot_store->has_snapshot(),
             .writer_state = snapshot ? partition.snapshot_writer_state
@@ -1300,15 +1396,17 @@ private:
     Result<std::unique_ptr<PartitionRuntime>> BuildPartition(
         const RecorderTopicConfig& config, TopicRuntime* topic,
         uint32_t partition_id) {
-        const std::filesystem::path root =
-            PartitionRoot(session_root_, config.topic_id, partition_id);
+        const std::filesystem::path root = PartitionRoot(
+            session_root_, config.topic_id, config.partition_generation,
+            partition_id);
         Status directory = CreateDirectory(root);
         if (!directory.ok()) return directory;
 
         uint64_t writer_id = config.writer_id_base == 0
                                  ? DerivedWriterId(
                                        manifest_->snapshot().session.recording_id,
-                                       config.topic_id, partition_id)
+                                       config.topic_id,
+                                       config.partition_generation, partition_id)
                                  : config.writer_id_base + partition_id;
         if (writer_id == 0) return Invalid("recorder writer ID is zero");
 
@@ -1318,6 +1416,13 @@ private:
             .partition_id = partition_id,
             .writer_id = writer_id,
             .owner_epoch = manifest_->snapshot().session.owner_epoch,
+            .partition_map_version = config.partition_map_version,
+            .partition_generation = config.partition_generation,
+            .partition_count = config.partition_count,
+            .partition_strategy = config.partition_strategy,
+            .partition_map_state = TopicPartitionMapState::kActive,
+            .hash_algorithm_version = config.partition_hash_version,
+            .hash_seed = config.partition_hash_seed,
             .config_version = config.config_version,
         };
         Result<std::unique_ptr<RecordingTopologyCoordinator>> topology =
@@ -1338,6 +1443,11 @@ private:
             partition_manifest = PartitionManifest::Create(
                 root, metadata, options_.manifest_options);
             if (!partition_manifest.ok()) return partition_manifest.status();
+        }
+        if ((*partition_manifest)->snapshot().format_version == 1) {
+            const Status upgraded =
+                (*partition_manifest)->UpgradeLegacyMetadata(metadata);
+            if (!upgraded.ok()) return upgraded;
         }
         if ((*partition_manifest)->snapshot().partition != metadata) {
             return Invalid("partition manifest identity changed on reopen");
@@ -1372,6 +1482,7 @@ private:
             auto partition = std::make_unique<PartitionRuntime>();
             partition->topic = topic;
             partition->partition_id = partition_id;
+            partition->partition_generation = config.partition_generation;
             partition->writer_id = writer_id;
             partition->manifest = std::move(*partition_manifest);
             partition->topology = std::move(*topology);
@@ -1384,19 +1495,29 @@ private:
         if (!recovery.ok()) return recovery;
 
         RecorderBufferPoolOptions pool_options = config.buffer_pool_options;
+        if (config.total_buffer_byte_limit != 0) {
+            const size_t share = PartitionBudgetShare(
+                config.total_buffer_byte_limit, partition_id,
+                config.partition_count);
+            pool_options.global_byte_limit = share;
+            pool_options.default_topic_byte_limit =
+                std::min(pool_options.default_topic_byte_limit, share);
+        }
         const auto configured_topic_limit =
             config.buffer_pool_options.topic_byte_limits.find(config.topic_id);
-        pool_options.topic_byte_limits[config.topic_id] =
+        pool_options.topic_byte_limits[config.topic_id] = std::min(
             configured_topic_limit !=
                     config.buffer_pool_options.topic_byte_limits.end()
                 ? configured_topic_limit->second
-                : config.buffer_pool_options.default_topic_byte_limit;
+                : config.buffer_pool_options.default_topic_byte_limit,
+            pool_options.global_byte_limit);
         Result<std::unique_ptr<RecorderBufferPool>> pool =
             RecorderBufferPool::Create(pool_options);
         if (!pool.ok()) return pool.status();
         auto partition = std::make_unique<PartitionRuntime>();
         partition->topic = topic;
         partition->partition_id = partition_id;
+        partition->partition_generation = config.partition_generation;
         partition->writer_id = writer_id;
         partition->pool_options = pool_options;
         partition->pool = std::move(*pool);
@@ -1481,6 +1602,21 @@ private:
             }
         }
         return session_error_;
+    }
+
+    void CountStorageFailure(
+        const PartitionRuntime& partition,
+        SegmentWriterFailureKind fallback) noexcept {
+        const SegmentWriterFailureKind observed =
+            partition.writer == nullptr ? SegmentWriterFailureKind::kNone
+                                        : partition.writer->failure_kind();
+        const SegmentWriterFailureKind kind =
+            observed == SegmentWriterFailureKind::kNone ? fallback : observed;
+        if (kind == SegmentWriterFailureKind::kSync) {
+            SaturatingAdd(1, &metrics_.sync_failures);
+        } else {
+            SaturatingAdd(1, &metrics_.write_failures);
+        }
     }
 
     void MarkPartitionFailed(PartitionRuntime& partition, Status status,

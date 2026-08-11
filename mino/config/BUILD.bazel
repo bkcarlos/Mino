@@ -1,6 +1,33 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "deployment_config",
+    srcs = ["deployment_config.cc"],
+    hdrs = ["deployment_config.h"],
+    # toml++ 3.4's single header uses a pre-C++23 literal spelling.
+    copts = ["-Wno-deprecated-literal-operator"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "@tomlplusplus",
+    ],
+)
+
+cc_test(
+    name = "deployment_config_test",
+    srcs = ["deployment_config_test.cc"],
+    data = [
+        "//configs:node.production-edge.toml",
+        "//configs:security-domains.toml",
+    ],
+    deps = [
+        ":deployment_config",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "logging_config",
     srcs = [
         "logging_config.cc",

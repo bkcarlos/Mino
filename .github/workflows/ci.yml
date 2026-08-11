@@ -67,6 +67,15 @@ jobs:
       - name: Build (bazel build //...)
         run: bazel build --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} //...
 
+      - name: RDMA and Fabric provider boundaries and mock fault tests
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 --config=${{ matrix.config }} \
+            //mino/platform:fabric_provider_test \
+            //mino/platform:memory_registration_test \
+            //mino/platform:rdma_provider_test \
+            //mino/transport:fabric_driver_test \
+            //mino/transport:rdma_driver_test --test_output=errors
+
       # Manual targets are skipped by //...; compile the P1 stress binary on
       # PRs without starting its hour-long timed phase.
       - name: Compile manual MPMC stress target

@@ -1,0 +1,59 @@
+{
+  "schema": "mino.aarch64.benchmark_sla.v1",
+  "workload_version": 1,
+  "aarch64": {
+    "allocator": {
+      "max_failures": 0,
+      "min_cursor_cache_vs_legacy_ops_ratio": 0.9
+    },
+    "channel": {
+      "required_artifact_status": "MEASURED",
+      "max_reported_errors": 0,
+      "max_64_subscriber_fanout_p99_ns": 50000000
+    },
+    "bridge": {
+      "required_outcome": "passed",
+      "min_messages_per_second": 1000,
+      "max_p99_rtt_us": 100000
+    },
+    "storage_1k_per_batch": {
+      "max_reported_errors": 0,
+      "min_writer_mebibytes_per_second": 5,
+      "max_fdatasync_p99_ns": 200000000,
+      "min_recovery_mebibytes_per_second": 30,
+      "min_buffer_records_per_second": 100000
+    },
+    "telemetry": {
+      "max_dropped": 0,
+      "max_counters_overhead_percent": 250,
+      "max_sampled_1pct_overhead_percent": 250
+    }
+  },
+  "x86_reference": {
+    "allocator": {
+      "status": "NO_PUBLISHED_NUMERIC_SLA",
+      "comparison": "raw result retained for same-workload comparison"
+    },
+    "channel": {
+      "status": "NO_PUBLISHED_NUMERIC_SLA",
+      "comparison": "raw V-14 result retained for same-workload comparison"
+    },
+    "bridge": {
+      "status": "NO_PUBLISHED_NUMERIC_SLA",
+      "comparison": "raw loopback result retained for same-workload comparison"
+    },
+    "storage_1k_per_batch": {
+      "status": "PUBLISHED",
+      "source": "docs/benchmarks/Storage_SLA.md",
+      "max_encode_p99_ns": 10000,
+      "min_writer_mebibytes_per_second": 15,
+      "max_fdatasync_p99_ns": 10000000,
+      "min_recovery_mebibytes_per_second": 150,
+      "min_buffer_records_per_second": 500000
+    },
+    "telemetry": {
+      "status": "NO_PUBLISHED_NUMERIC_SLA",
+      "comparison": "raw V-23 result retained for same-workload comparison"
+    }
+  }
+}

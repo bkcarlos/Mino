@@ -144,6 +144,12 @@ public:
         const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
     static Result<std::vector<std::byte>> EncodeLengthPrefixed(
         const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
+    // Validates canonical header structure, header CRC, body length, flags, and
+    // control opcode without copying or allocating payload bytes. Payload CRC
+    // and payload decoding remain Decode's responsibility.
+    static Result<WireFrameHeader> InspectHeader(
+        std::span<const std::byte> frame_body,
+        const WireFrameLimits& limits = {}) noexcept;
     static Result<WireFrame> Decode(
         std::span<const std::byte> frame_body,
         const WireFrameLimits& limits = {}) noexcept;

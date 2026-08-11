@@ -491,6 +491,42 @@ public:
         uint64_t gap_messages = 0;
     };
 
+    // Cold-path, lock-free aggregate used by production monitoring. It scans the
+    // fixed subscriber table and never mutates channel state.
+    struct OperationalStats {
+        uint64_t depth = 0;
+        uint64_t capacity = 0;
+        uint64_t active_subscribers = 0;
+        uint64_t oldest_heartbeat_age_ns = 0;
+    };
+
+    OperationalStats operational_stats(uint64_t now_ns) const noexcept {
+        const uint64_t producer =
+            control_->publisher_cursor.load(std::memory_order_acquire);
+        const uint64_t membership =
+            control_->current_membership.load(std::memory_order_acquire);
+        OperationalStats result{
+            .depth = producer - MinActiveCursor(producer),
+            .capacity = capacity_,
+        };
+        for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
+            if ((membership & (uint64_t{1} << id)) == 0) continue;
+            const SubscriberSlot& subscriber = subs_[id];
+            if (subscriber.state.load(std::memory_order_acquire) !=
+                static_cast<uint32_t>(SubscriberState::kActive)) {
+                continue;
+            }
+            ++result.active_subscribers;
+            const uint64_t heartbeat =
+                subscriber.heartbeat_ns.load(std::memory_order_acquire);
+            const uint64_t age = now_ns >= heartbeat ? now_ns - heartbeat : 0;
+            if (age > result.oldest_heartbeat_age_ns) {
+                result.oldest_heartbeat_age_ns = age;
+            }
+        }
+        return result;
+    }
+
     // Registers subscriber `id` and returns its handle. The join cut point
     // is the current publisher_cursor: the new subscriber receives only
     // messages published from now on (no history replay). Id reuse is safe:

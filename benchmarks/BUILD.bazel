@@ -207,6 +207,46 @@ py_test(
     python_version = "PY3",
 )
 
+exports_files(["storage_partition_qualification_sla.json"])
+
+py_library(
+    name = "storage_partition_qualification_lib",
+    srcs = ["storage_partition_qualification.py"],
+)
+
+py_binary(
+    name = "storage_partition_qualification",
+    srcs = ["storage_partition_qualification.py"],
+    python_version = "PY3",
+)
+
+py_test(
+    name = "storage_partition_qualification_contract_test",
+    size = "small",
+    srcs = ["storage_partition_qualification_contract_test.py"],
+    data = [
+        "storage_partition_qualification_sla.json",
+        "//docs/validation:Storage_partition_qualification_artifact.schema.json",
+    ],
+    deps = [":storage_partition_qualification_lib"],
+    python_version = "PY3",
+)
+
+cc_binary(
+    name = "storage_partition_benchmark",
+    srcs = ["storage_partition_benchmark.cc"],
+    copts = VALIDATION_COPTS,
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//mino/storage:recorder_buffer_pool",
+        "//mino/storage:recording_manifest",
+        "//mino/storage:topic_writer",
+    ],
+)
+
 cc_binary(
     name = "storage_benchmark",
     srcs = ["storage_benchmark.cc"],

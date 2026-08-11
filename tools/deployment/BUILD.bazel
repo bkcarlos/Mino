@@ -1,0 +1,104 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Dockerfile",
+    "build-image.sh",
+    "image-contract.json",
+    "mino-node-start",
+    "rolling_upgrade_drill.sh",
+])
+
+cc_binary(
+    name = "mino_node",
+    srcs = ["node_supervisor.cc"],
+    deps = [
+        "//mino/common:status",
+        "//mino/config:deployment_config",
+        "//mino/runtime/deployment:local_bus",
+        "//mino/runtime/deployment:monitoring",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/storage:recorder",
+    ],
+)
+
+cc_binary(
+    name = "mino_deploy",
+    srcs = ["main.cc"],
+    deps = [
+        "//mino/common:status",
+        "//mino/config:deployment_config",
+    ],
+)
+
+py_binary(
+    name = "capacity_report",
+    srcs = ["capacity_report.py"],
+    data = [
+        ":mino_deploy",
+        "//docs/operations:capacity-report.schema.json",
+    ],
+    python_version = "PY3",
+)
+
+py_test(
+    name = "capacity_report_test",
+    size = "small",
+    srcs = ["capacity_report_test.py"],
+    data = [
+        ":capacity_report",
+        ":mino_deploy",
+        "//configs:node.production-edge.toml",
+        "//configs/capacity:sample_inputs",
+        "//docs/operations:capacity-report.schema.json",
+    ],
+    python_version = "PY3",
+)
+
+sh_test(
+    name = "rolling_upgrade_drill_test",
+    size = "small",
+    srcs = ["rolling_upgrade_drill.sh"],
+    args = ["$(location //tools/mino:mino)"],
+    data = ["//tools/mino:mino"],
+)
+
+py_test(
+    name = "deployment_contract_test",
+    size = "small",
+    srcs = ["deployment_contract_test.py"],
+    data = [
+        ":Dockerfile",
+        ":build-image.sh",
+        ":emit_image_provenance.py",
+        ":image-contract.json",
+        ":mino-node-start",
+        ":mino_deploy",
+        ":node_supervisor.cc",
+        "//:.dockerignore",
+        "//configs:node.container-recorder.toml",
+        "//configs:node.production-edge.toml",
+        "//configs:security-domains.toml",
+    ],
+)
+
+py_test(
+    name = "node_supervisor_smoke_test",
+    size = "small",
+    srcs = ["node_supervisor_smoke.py"],
+    main = "node_supervisor_smoke.py",
+    data = [
+        ":mino_deploy",
+        ":mino_node",
+        "//configs:node.container-recorder.toml",
+    ],
+)
+
+py_test(
+    name = "container_smoke_test",
+    size = "medium",
+    srcs = ["container_smoke.py"],
+    main = "container_smoke.py",
+    tags = ["container"],
+)

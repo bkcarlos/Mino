@@ -42,6 +42,87 @@ TEST(TelemetryControlTest, ImplementsAllModesAndStableSampling) {
         {PerfTelemetryMode::kFullDebug, 0, 0, 0}));
 }
 
+TEST(TelemetryControlTest, StableSequenceProjectionTracksConfiguredRate) {
+    constexpr uint64_t kSequences = 1'000'000;
+    uint64_t sampled = 0;
+    for (uint64_t sequence = 0; sequence < kSequences; ++sequence) {
+        sampled += IsSampled(SampleKey{17, 29, sequence}, 10'000) ? 1 : 0;
+    }
+    const SampleKey retry{17, 29, 12345};
+    EXPECT_EQ(IsSampled(retry, 10'000), IsSampled(retry, 10'000));
+    EXPECT_NEAR(static_cast<double>(sampled), 10'000.0, 300.0);
+}
+
+TEST(TelemetryControlTest, CachedDecisionTracksEpochAndStableIdentityPrefix) {
+    TelemetryControl control(
+        {PerfTelemetryMode::kSampledLatency, 1'000'000, 25, 100});
+    TelemetryThreadCache cache;
+    TraceDecision first;
+    const SampleKey key{11, 22, 33};
+    ASSERT_TRUE(control.CountersEnabled(&cache));
+    ASSERT_TRUE(control.ShouldTrace(key, &cache, &first));
+    EXPECT_EQ(first.sample_hash, StableSampleHash(key));
+    EXPECT_EQ(first.slow_threshold_ns, 25u);
+    const uint64_t first_epoch = first.policy_epoch;
+
+    ASSERT_TRUE(control.SetPolicy(
+        {PerfTelemetryMode::kCountersOnly, 0, 0, 0}));
+    EXPECT_TRUE(control.CountersEnabled(&cache));
+    TraceDecision disabled;
+    EXPECT_FALSE(control.ShouldTrace(key, &cache, &disabled));
+    EXPECT_GT(cache.policy_epoch(), first_epoch);
+
+    ASSERT_TRUE(control.SetPolicy(
+        {PerfTelemetryMode::kOff, 0, 0, 0}));
+    EXPECT_FALSE(control.CountersEnabled(&cache));
+}
+
+TEST(TelemetryControlTest, BatchCacheChangesOnlyAtSynchronizedBoundary) {
+    TelemetryControl control(
+        {PerfTelemetryMode::kSampledLatency, 1'000'000, 0, 100});
+    TelemetryThreadCache cache;
+    ASSERT_TRUE(control.Synchronize(&cache));
+    TraceDecision before;
+    EXPECT_EQ(control.EvaluateCached(SampleKey{1, 2, 3}, &cache, &before),
+              kTelemetryCount | kTelemetryTrace);
+
+    ASSERT_TRUE(control.SetPolicy({PerfTelemetryMode::kOff, 0, 0, 0}));
+    TraceDecision same_batch;
+    EXPECT_EQ(control.EvaluateCached(SampleKey{1, 2, 4}, &cache, &same_batch),
+              kTelemetryCount | kTelemetryTrace);
+    EXPECT_EQ(same_batch.policy_epoch, before.policy_epoch);
+
+    ASSERT_TRUE(control.Synchronize(&cache));
+    TraceDecision next_batch;
+    EXPECT_EQ(control.EvaluateCached(SampleKey{1, 2, 5}, &cache, &next_batch),
+              0u);
+    EXPECT_GT(cache.policy_epoch(), before.policy_epoch);
+}
+
+TEST(TelemetryControlTest, FixedSourceBatchBoundsPolicyActivationTo256Ops) {
+    TelemetryControl control(
+        {PerfTelemetryMode::kSampledLatency, 1'000'000, 0, 100});
+    TelemetryThreadCache cache;
+    ASSERT_TRUE(control.Synchronize(&cache, 7, 11));
+    const uint64_t first_epoch = cache.policy_epoch();
+    ASSERT_TRUE(control.SetPolicy({PerfTelemetryMode::kOff, 0, 0, 0}));
+
+    for (uint64_t sequence = 0; sequence < 256; ++sequence) {
+        TraceDecision decision;
+        EXPECT_EQ(control.EvaluateSequenceCached(sequence, &cache, &decision),
+                  kTelemetryCount | kTelemetryTrace);
+        EXPECT_EQ(decision.sample_hash,
+                  StableSampleHash(SampleKey{7, 11, sequence}));
+        EXPECT_NE(decision.trace_id_low, 0u);
+        EXPECT_EQ(decision.policy_epoch, first_epoch);
+    }
+
+    ASSERT_TRUE(control.Synchronize(&cache, 7, 11));
+    TraceDecision next_batch;
+    EXPECT_EQ(control.EvaluateSequenceCached(256, &cache, &next_batch), 0u);
+    EXPECT_GT(cache.policy_epoch(), first_epoch);
+}
+
 TEST(TelemetryControlTest, ConcurrentPublicationNeverTearsPolicy) {
     const PerfTelemetryPolicy first{
         PerfTelemetryMode::kSampledLatency, 123, 456, 789};
@@ -165,6 +246,24 @@ TEST(TelemetryTracerTest, AppliesFullDebugEventRateLimit) {
     EXPECT_TRUE(tracer.TryRecordEvent(key, event, 0, 1'000'000'001));
 }
 
+TEST(TelemetryTracerTest, AcceptsPrecomputedDecisionWithoutPolicyReload) {
+    TelemetryControl control(
+        {PerfTelemetryMode::kSampledLatency, 1'000'000, 0, 10});
+    TelemetryThreadCache cache;
+    const SampleKey key{1, 2, 3};
+    TraceDecision decision;
+    ASSERT_TRUE(control.ShouldTrace(key, &cache, &decision));
+    ASSERT_TRUE(control.SetPolicy({PerfTelemetryMode::kOff, 0, 0, 0}));
+
+    TelemetryTracer<8> tracer(control);
+    TraceEvent event;
+    event.trace_id_high = decision.sample_hash;
+    EXPECT_TRUE(tracer.TryRecordSampledEvent(decision, event, 0, 1));
+    TraceEvent observed;
+    ASSERT_TRUE(tracer.TryPop(&observed));
+    EXPECT_EQ(observed.trace_id_high, decision.sample_hash);
+}
+
 TEST(TelemetryTracerTest, AppliesSampledSlowThreshold) {
     TelemetryControl control(
         {PerfTelemetryMode::kSampledLatency, 1'000'000, 100, 10});
@@ -183,6 +282,22 @@ TEST(TelemetryTracerTest, AppliesSampledSlowThreshold) {
 TEST(TelemetryTracerTest, RejectsTemporaryControlAtCompileTime) {
     EXPECT_FALSE((std::is_constructible_v<TelemetryTracer<8>,
                                           TelemetryControl&&>));
+}
+
+TEST(TraceContextTest, ReusesPrecomputedDecisionIds) {
+    const SampleKey key{5, 7, 9};
+    const TraceDecision decision{
+        .sample_hash = 123,
+        .trace_id_low = 456,
+        .policy_epoch = 0,
+        .slow_threshold_ns = 0,
+        .max_events_per_second = 0,
+        .mode = PerfTelemetryMode::kSampledLatency,
+    };
+    const TraceContext context =
+        MakeTraceContext(key, decision, kPerfTraceSampled, 42, 100, 50);
+    EXPECT_EQ(context.trace_id_high, 123u);
+    EXPECT_EQ(context.trace_id_low, 456u);
 }
 
 TEST(TraceContextTest, IsDeterministicAndCarriesClockDomain) {

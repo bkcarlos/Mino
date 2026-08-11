@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "operations_files",
+    srcs = glob(["*.md", "*.json"]),
+)
+
+exports_files([
+    "README.md",
+    "capacity-report.schema.json",
+    "capacity.md",
+    "drill-manifest.schema.json",
+    "drills.md",
+    "quick-drill-summary.json",
+    "runbook.md",
+])

@@ -697,6 +697,23 @@ Journal 存储在共享内存 Recovery Metadata 区域（见 8.1），按 Owner 
 
 Descriptor 必须提供确定性 Object Graph Walker，用于 Validate、Encode、Abort 和 Recovery。若未来支持共享子对象或环，必须引入独立引用/Tracing 协议，不得复用首版树形回收逻辑。
 
+### 8.7 NUMA 感知分配
+
+NUMA 拓扑和 placement 是进程本地运行时信息，不进入 `AllocatorSuperblock`、`ClassDescriptor`、`SlabHeader` 或任何共享热数据。Linux 原生实现从 `/sys/devices/system/node` 读取 CPU/Node 映射，并将 `/proc/self/status` 的 `Mems_allowed_list`、`Cpus_allowed_list` 与当前 cgroup v1/v2 cpuset effective 范围取交集；当前 CPU 通过 `sched_getcpu(2)` 查询。禁止依赖宿主 `libnuma`。
+
+Region 的 allocator/data extent 或 Large Object Pool 创建时可选择：
+
+- `default`：不改变 OS policy，但 CentralSlab 在多节点 topology 上仍可优先本地 bitmap shard；
+- `local`：在创建调用线程当前 node 上使用直接 `mbind(2)`；
+- `node`：绑定到一个 cpuset 允许的显式 node；
+- `stripe`：对全部允许 node 使用 `MPOL_INTERLEAVE`。
+
+`strict` 策略在 topology 不可用、目标 node 不允许或 syscall 失败时中止创建，且必须发生在共享 allocator metadata 发布之前；`fallback` 策略继续使用 OS 默认 placement，同时递增 fallback/bind-error 指标。非 Linux和 allowed node 数小于 2 的环境必须显式报告 fallback，不得伪装为 NUMA 生效。
+
+每个 CentralSlab class 的 64-bit bitmap shard 按 class 内 shard 序号稳定映射到 allowed node。线程仅先扫描当前 node 对应 shard，局部耗尽后再扫描完整 class；跨进程正确性仍由共享 bitmap CAS、Generation 和 Header 发布协议保证。进程本地 cursor magazine 记录上次观察到的 CPU/node，检测到线程迁移后立即丢弃全部 class cursor；它不持有 free slot，因此迁移、进程退出或 Attach 都不会隐藏容量。
+
+进程本地指标至少包括 `local_allocations`、`remote_allocations`、`fallback_allocations`、`bind_errors` 和 `migrations`。指标表示 allocator 选择/placement policy 结果，不等同于硬件 page residency 采样；正式性能报告应另附 `numastat`、PMU 或等价宿主证据。
+
 ---
 
 ## 9. Channel 模型
@@ -1793,6 +1810,31 @@ payload_crc / AEAD tag  4 B  // 可选，由 flags 指示
 
 Fabric Driver 的具体实现（IPCF Channel 配置、NTB BAR 映射、CXL 池租赁）属于部署集成层，不在本设计范围内；本节约束的是任何 Fabric Driver 接入时必须满足的语义契约。
 
+仓库内 `//mino/transport:fabric_driver` 实现上述契约：128B 大端 v1
+window header 显式携带 endianness、window generation、session epoch、producer/
+consumer sequence、CRC32C 与最后发布的 commit marker；生产者/消费者通过
+provider cache-maintenance + release/acquire fence + doorbell 时序发布和回收。
+`kConsumerRelease` 只释放物理窗口，可靠 `kRemoteAccepted` 仍只由 Bridge
+Accepted ACK 调用 `ConfirmRemoteAccepted` 推进。动态 IPCF/NTB/CXL provider
+必须为真实 `kDevice`、报告 provenance/device/link/window 能力；mock 仅存在于
+testonly 目标。peer reset、generation/session 变化同步 fence 并废弃全部旧引用。
+完整协议、attestation/ACL、故障矩阵与物理资格流程见
+`docs/fabric-driver.md`。
+
+### 16.8 RDMA Driver
+
+RDMA Driver 实现与 15.3 相同的完整生命周期接口：`Connect/Listen/Accept/Send/Poll/PollCompletions/Close`。跨 Trust Domain 的 SQ 载荷只能是 16.2 Canonical Wire；`ShmHandle`、SHM Offset、虚拟地址和 C++ 对象镜像不得进入 WR。verbs CQ 成功只证明本地 WR 完成，不能推进 `kRemoteAccepted`；后者仍由 16.5 Bridge Accepted ACK 在协议校验后确认。
+
+- SQ、RQ、CQ、待接收消息、待交付 completion、发送/接收字节和 MR 字节分别有界；满队列返回背压，不允许无限内部缓存；
+- CQ 支持增量/部分完成，terminal success 的累计字节必须等于完整消息；每连接对上层按 post 顺序退休 completion；
+- 每个 retained send 绑定稳定 registration scope、process incarnation、唯一 lease/WR id 与 generation fence；terminal CQ、同步 QP fence、peer death 或 device reset 后先 Deregister，再允许 backing buffer reclaim；
+- 启动调用 provider 的幂等 `RecoverStale(scope, process_id, process_epoch)`；断链同步 fence QP，崩溃由 provider journal + 新 process epoch 清理；
+- 默认 RDMA CM/device provider 必须返回可验证完整 peer identity。无 CM identity 的受控物理 Fabric 必须注入部署 attestor，将 endpoint 与 provider provenance 绑定到完整 principal；两种模式均继续执行 D6-11/D6-12 的 Registry identity fence、Security Domain 和 Topic ACL，缺失任一条件均 fail-closed；
+- 生产只接受 `kDevice` provider。仓库普通构建不链接环境 `libibverbs`；真实设备通过绝对路径、版本化动态 provider ABI 显式接入并记录二进制/plugin hash 与 provenance。测试 loopback 仅存在于 test target，不能由生产配置选择；
+- 统一 benchmark 对 TCP/UDP/RDMA 使用相同 payload matrix，并分别标识 generic driver staging 与 provider-direct registered zero-copy；真实资格报告必须来自 ACTIVE/LINKUP 物理设备和链路，包含 peer identity、device/link facts、commit、binary/plugin hash、provider provenance、CPU、RTT 与 throughput。
+
+实现与运维契约见 `docs/rdma-driver.md`。
+
 ---
 
 ## 17. Recorder、Storage 与 Replay
@@ -2098,6 +2140,15 @@ partition_id = StableHash(partition_key) % partition_count;
 - 首版即使只使用 Partition 0，文件格式也预留 `partition_id`。
 
 禁止通过原子文件 Offset 预留让多个 Writer 并发写同一个 Segment，因为这会显著增加轮转、CRC、索引、压缩、同步和崩溃恢复复杂度。
+
+实现约束补充：
+
+- 路由策略显式取 `key`、`hash`、`source` 或 `manual`；稳定哈希算法版本与 seed 和 partition map 一起持久化，`source` 只哈希 `(node_id, publisher_id, publisher_epoch)`，不含递增 sequence；
+- 每个 Partition 使用独立有界 Buffer、Budget、背压状态和单 Writer；Topic 总 Buffer Budget 按确定性份额切分，份额总和严格等于配置值，热 Partition 不得借空或耗尽其他 Partition 的份额；
+- `ingestion_sequence` 是 Partition-local sequence。Gap 解释来源丢失或该 Partition 的录制丢弃，不作为其他 Partition 的占位符；系统不声明跨 Partition 历史全序；
+- Recording Manifest 保存 map version/generation/count/strategy/hash version/seed 和 lifecycle state，Partition Manifest 固化所属 map identity；Recovery、Retention 与 Replay 按 generation 遍历；
+- repartition 只能 `prepare(new generation) → fence/drain(old) → cutover`。Cutover 必须证明旧 route 已 fenced、queue/reservation/writer 为零且 persisted sequence 覆盖 admitted sequence；禁止原地修改 count/strategy/seed；
+- Replay 可按 partition/generation 过滤，并用 `(ingestion_timestamp, topic, generation, partition, ingestion_sequence, writer, source identity)` 合并可用 Partition head。该 total order 仅用于可复现播放，不虚构原始全局提交顺序。
 
 ### 17.9 磁盘目录
 
@@ -2848,6 +2899,8 @@ struct ClockQuality {
 
 性能开销验证目标：Counters-only 模式吞吐下降不超过 1%，默认采样模式不超过 2%；它们是原型验收目标，不是未经测试的正式 SLA。
 
+V-23 按 ADR-0009 的“相同真实 publish operation 增量”定义测量：compile-off 与各动态 mode 均执行完整生产 `SpscChannel Reserve → 固定字段填充 → Commit → Poll/读取 → Ack`，动态 policy epoch 检查与 Counter 的线程本地批合并必须在固定 256-operation 边界留在计时区（policy 生效延迟因此有界为 256 operations），采样生产者的稳定决策、时钟、Trace Context、Histogram 和 Sidecar 入队必须留在计时区；只有异步 Sidecar 消费/Exporter 排除。极空计算循环单独报告 micro-op 绝对下限，不得用于 ≤1%/≤2% 验收。结果必须包含 DCE sink、预热、clock/noop 校准、多进程、多轮 AB/BA 配对、绝对 ns/op 和跨进程 95% 置信区间，并以 overhead 置信上界判定目标。
+
 #### 21.5.8 聚合与导出
 
 ```text
@@ -3091,6 +3144,8 @@ Fuzz Harness 必须设置内存与时间上限，并保存最小化 Corpus。
 - 时钟同步正常、Uncertainty 超限、Clock Jump 和负延迟样本处理；
 - Exporter 阻塞或失败时数据路径不受影响；
 - NUMA 和绑核信息。
+
+NUMA allocator 报告必须在 Linux 物理机、当前 cpuset 允许至少两个 memory node 时比较 `local`、`interleave/stripe` 和 `remote`，并输出机器、内核、CPU 型号、allowed node/CPU、绑核、policy、参数、分位数、吞吐及 allocator NUMA 指标的 JSON provenance。非 NUMA 环境只能输出 `SKIPPED` 且 `qualification_eligible=false`。Qualification runner 必须 fail-closed：源码非 clean exact commit、物理机 attestation 缺失、governor 不符、任一模式缺失、bind/allocation error、artifact 缺失或 `SKIPPED` 均不得形成资格结果。
 
 ### 23.8 Hermetic CodeGen 测试
 

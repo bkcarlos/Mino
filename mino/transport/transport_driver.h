@@ -20,6 +20,7 @@
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/runtime/delivery_receipt.h"
+#include "mino/security/tls.h"
 
 namespace mino::transport {
 
@@ -410,6 +411,11 @@ public:
     Result<ReceiveResult> Poll(const ReceiveRequest& request);
     Result<CompletionPollResult> PollCompletions(
         const CompletionPollRequest& request);
+    // Returns only a post-handshake, certificate-verified principal. Plaintext
+    // drivers report kUnsupported; an in-progress TLS handshake reports
+    // kWouldBlock without exposing provisional certificate data.
+    Result<security::AuthenticatedPeer> AuthenticatedPeer(
+        ConnectionId connection_id);
     Status Close(ConnectionId connection_id);
 
     DriverState state() const noexcept {
@@ -437,6 +443,8 @@ protected:
     virtual Result<ReceiveResult> DoPoll(const ReceiveRequest& request) = 0;
     virtual Result<CompletionPollResult> DoPollCompletions(
         const CompletionPollRequest& request) = 0;
+    virtual Result<security::AuthenticatedPeer> DoAuthenticatedPeer(
+        ConnectionId connection_id);
     virtual Status DoClose(ConnectionId connection_id) = 0;
 
 private:

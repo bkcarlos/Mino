@@ -1,0 +1,31 @@
+{
+  "schema": "mino.allocator.large_object_pool.qualification_sla.v1",
+  "qualification_id": "D6-08",
+  "minimum_iterations": 1000,
+  "required_modes": [
+    "ordinary",
+    "hugepage",
+    "device-registration"
+  ],
+  "required_sizes": [
+    65536,
+    262144,
+    1048576
+  ],
+  "required_lifetimes": [
+    "short",
+    "batch"
+  ],
+  "thresholds": {
+    "min_operations_per_second": 100,
+    "max_p99_ns": 100000000,
+    "max_internal_fragmentation_bytes": 0,
+    "max_external_fragmentation_bytes": 0,
+    "max_hugepage_fallback_allocations": 0,
+    "max_operation_failures": 0,
+    "max_registration_failures": 0,
+    "max_deregister_errors": 0,
+    "max_coalesce_errors": 0,
+    "max_quota_errors": 0
+  }
+}

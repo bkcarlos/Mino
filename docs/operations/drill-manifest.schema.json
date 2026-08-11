@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mino://operations/drill-manifest/v1",
+  "title": "Mino D6-17 operations drill evidence manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "suite_id",
+    "mode",
+    "qualification_eligible",
+    "commit",
+    "expected_commit",
+    "source_state",
+    "source_changes",
+    "source_changes_sha256",
+    "allow_dirty",
+    "started_at",
+    "finished_at",
+    "elapsed_seconds",
+    "total_budget_seconds",
+    "outcome",
+    "exit_code",
+    "missing_or_failed_scenarios",
+    "provenance",
+    "inputs",
+    "scenarios"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "suite_id": {"const": "mino-d6-17-operations"},
+    "mode": {"enum": ["quick", "qualification"]},
+    "qualification_eligible": {"type": "boolean"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "expected_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "source_state": {"enum": ["clean", "dirty", "unknown"]},
+    "source_changes": {
+      "type": ["array", "null"],
+      "items": {"type": "string", "maxLength": 4096},
+      "maxItems": 100000
+    },
+    "source_changes_sha256": {"$ref": "#/$defs/nullableSha256"},
+    "allow_dirty": {"type": "boolean"},
+    "started_at": {"$ref": "#/$defs/timestamp"},
+    "finished_at": {"anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+    "elapsed_seconds": {"type": ["number", "null"], "minimum": 0},
+    "total_budget_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    "outcome": {"enum": ["running", "passed", "failed"]},
+    "exit_code": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
+    "missing_or_failed_scenarios": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/token"}
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ci", "toolchain"],
+      "properties": {
+        "ci": {
+          "type": "object",
+          "additionalProperties": {"type": ["string", "null"]}
+        },
+        "toolchain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bazel", "python", "python_executable", "python_implementation", "platform", "machine"],
+          "properties": {
+            "bazel": {"type": ["string", "null"]},
+            "python": {"type": ["string", "null"]},
+            "python_executable": {"type": "string"},
+            "python_implementation": {"type": "string"},
+            "platform": {"type": "string"},
+            "machine": {"type": "string"}
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/fileEvidence"}
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 9,
+      "items": {"$ref": "#/$defs/scenario"}
+    }
+  },
+  "$defs": {
+    "token": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableSha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "fileEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size_bytes"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "logEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size_bytes"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/nullableSha256"},
+        "size_bytes": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command", "expected_exit_codes", "expected_failure", "required_output_regex", "started_at", "finished_at", "elapsed_seconds", "exit_code", "watchdog_timeout", "output_marker_valid", "outcome", "log"],
+      "properties": {
+        "name": {"$ref": "#/$defs/token"},
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "expected_exit_codes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+        "expected_failure": {"type": "boolean"},
+        "required_output_regex": {"type": "string", "minLength": 1},
+        "started_at": {"anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+        "finished_at": {"anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+        "elapsed_seconds": {"type": ["number", "null"], "minimum": 0},
+        "exit_code": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
+        "watchdog_timeout": {"type": "boolean"},
+        "output_marker_valid": {"type": "boolean"},
+        "outcome": {"enum": ["not_run", "watchdog_not_started", "passed", "failed"]},
+        "log": {"$ref": "#/$defs/logEvidence"}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "runbook_anchor", "alert_ids", "fault_kind", "real_execution", "budget_seconds", "started_at", "finished_at", "elapsed_seconds", "outcome", "cleanup", "steps"],
+      "properties": {
+        "id": {"$ref": "#/$defs/token"},
+        "title": {"type": "string", "minLength": 1},
+        "runbook_anchor": {"$ref": "#/$defs/token"},
+        "alert_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^Mino[A-Za-z0-9]+$"}},
+        "fault_kind": {"$ref": "#/$defs/token"},
+        "real_execution": {"type": "string", "minLength": 1},
+        "budget_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "started_at": {"anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+        "finished_at": {"anyOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+        "elapsed_seconds": {"type": ["number", "null"], "minimum": 0},
+        "outcome": {"enum": ["not_run", "passed", "failed"]},
+        "cleanup": {"type": "string", "minLength": 1},
+        "steps": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/step"}}
+      }
+    }
+  }
+}

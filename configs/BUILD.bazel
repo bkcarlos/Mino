@@ -1,0 +1,7 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "node.container-recorder.toml",
+    "node.production-edge.toml",
+    "security-domains.toml",
+])

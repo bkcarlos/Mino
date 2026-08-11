@@ -299,7 +299,7 @@ Status BridgePipeline::QueueSessionHello() noexcept {
 Status BridgePipeline::RebindConnection(
     transport::ConnectionId connection_id, uint64_t local_session_epoch,
     uint64_t remote_session_epoch, bool local_dedup_state_lost,
-    uint64_t now_ns) noexcept {
+    uint64_t now_ns, security::AuthenticatedPeer authenticated_peer) noexcept {
     try {
         if (connection_id == transport::kInvalidConnectionId ||
             local_session_epoch == 0 || remote_session_epoch == 0 ||
@@ -318,6 +318,9 @@ Status BridgePipeline::RebindConnection(
         options_.local_session_epoch = local_session_epoch;
         options_.remote_session_epoch = remote_session_epoch;
         options_.local_dedup_state_lost = local_dedup_state_lost;
+        if (authenticated_peer.complete()) {
+            options_.authenticated_peer = std::move(authenticated_peer);
+        }
         control_queue_.clear();
         control_bytes_ = 0;
         pending_acks_.clear();
@@ -610,6 +613,30 @@ Status BridgePipeline::DrainCompletions(const BridgePumpBudget& budget,
     }
 }
 
+Status BridgePipeline::AuthorizeInboundData(
+    const WireFrameHeader& header) const noexcept {
+    if (header.frame_type != FrameType::kData) return Status::Ok();
+    if (!options_.authenticated_peer.complete() &&
+        options_.topic_authorizer == nullptr) {
+        return Status::Ok();
+    }
+    if (!options_.authenticated_peer.complete() ||
+        options_.topic_authorizer == nullptr) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "bridge inbound authorization is incomplete");
+    }
+    if (header.source_node_id != options_.authenticated_peer.node_id.value) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "bridge data source does not match authenticated peer");
+    }
+    if (header.topic_id == 0) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "bridge data topic is zero");
+    }
+    return options_.topic_authorizer->AuthorizeInbound(
+        options_.authenticated_peer, TopicId{header.topic_id});
+}
+
 Status BridgePipeline::QueuePendingInbound(WireFrame frame,
                                            size_t wire_bytes,
                                            bool schema_resolved) noexcept {
@@ -739,6 +766,10 @@ Status BridgePipeline::DrainInbound(const BridgePumpBudget& budget,
                                                : received.status();
     }
     for (transport::ReceivedMessage& message : received->messages) {
+        auto inspected = WireFrameCodec::InspectHeader(
+            message.payload, options_.wire_limits);
+        if (!inspected.ok()) return inspected.status();
+        MINO_RETURN_IF_ERROR(AuthorizeInboundData(*inspected));
         auto decoded = WireFrameCodec::Decode(message.payload,
                                               options_.wire_limits);
         if (!decoded.ok()) return decoded.status();

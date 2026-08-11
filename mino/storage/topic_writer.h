@@ -159,6 +159,7 @@ public:
     Status error_status() const;
     uint64_t next_ingestion_sequence() const;
     uint64_t duplicate_count() const;
+    SegmentWriterFailureKind failure_kind() const;
 
 private:
     struct SourceKey {

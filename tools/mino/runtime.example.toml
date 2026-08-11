@@ -35,8 +35,13 @@ schema_type = "example.Event"
 channel_capacity = 256
 max_subscribers = 16
 max_payload_bytes = 1048576
-# Canonical Bus messages currently carry no partition key, so only 1 is allowed.
-record_partitions = 1
+# Recorder creates one independent bounded buffer + single writer per partition.
+# source hashes (node_id, publisher_id, publisher_epoch), preserving one source's
+# strict order while allowing cross-source scaling. buffer_bytes is a topic-wide
+# conserved budget split across these partitions.
+record_partitions = 4
+record_partition_strategy = "source"
+record_partition_hash_seed = 7883954046471516209
 
 [[topics]]
 name = "replay/events"
@@ -46,3 +51,5 @@ channel_capacity = 256
 max_subscribers = 16
 max_payload_bytes = 1048576
 record_partitions = 1
+record_partition_strategy = "manual"
+record_partition_hash_seed = 7883954046471516209

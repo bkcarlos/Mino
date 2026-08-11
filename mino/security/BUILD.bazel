@@ -1,0 +1,42 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "security_domain",
+    hdrs = ["security_domain.h"],
+)
+
+cc_library(
+    name = "tls",
+    srcs = ["tls.cc"],
+    hdrs = ["tls.h"],
+    deps = [
+        "//mino/common:ids",
+        "//mino/common:result",
+        ":security_domain",
+        "//mino/common:status",
+        "@openssl//:ssl",
+    ],
+)
+
+cc_library(
+    name = "test_tls_credentials",
+    testonly = True,
+    srcs = ["test_tls_credentials.cc"],
+    hdrs = ["test_tls_credentials.h"],
+    deps = [
+        ":tls",
+        "//mino/common:result",
+        "@openssl//:ssl",
+    ],
+)
+
+cc_test(
+    name = "tls_test",
+    srcs = ["tls_test.cc"],
+    deps = [
+        ":test_tls_credentials",
+        ":tls",
+        "@googletest//:gtest_main",
+        "@openssl//:ssl",
+    ],
+)

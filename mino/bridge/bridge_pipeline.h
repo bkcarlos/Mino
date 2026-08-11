@@ -45,6 +45,16 @@ public:
     virtual void CommitPolled() noexcept = 0;
 };
 
+class BridgeTopicAuthorizer {
+public:
+    virtual ~BridgeTopicAuthorizer() = default;
+    // Called synchronously before schema negotiation, dedup mutation, pending
+    // queue retention, or ingress allocation. Implementations must fail closed.
+    virtual Status AuthorizeInbound(
+        const security::AuthenticatedPeer& peer,
+        TopicId topic_id) const noexcept = 0;
+};
+
 class BridgeIngressPort {
 public:
     virtual ~BridgeIngressPort() = default;
@@ -68,6 +78,10 @@ struct BridgePipelineOptions {
     RetransmitWindowOptions retransmit;
     uint16_t lane_index = 0;
     uint16_t lane_count = 1;
+    // Incomplete/null preserve the lower-level unauthenticated test seam.
+    // Production RemoteBridge supplies a complete transport-authenticated peer.
+    security::AuthenticatedPeer authenticated_peer;
+    const BridgeTopicAuthorizer* topic_authorizer = nullptr;
 };
 
 struct BridgePumpBudget {
@@ -106,7 +120,8 @@ public:
                             uint64_t local_session_epoch,
                             uint64_t remote_session_epoch,
                             bool local_dedup_state_lost,
-                            uint64_t now_ns) noexcept;
+                            uint64_t now_ns,
+                            security::AuthenticatedPeer authenticated_peer = {}) noexcept;
 
     bool session_ready() const noexcept { return session_ready_; }
     bool peer_dedup_state_lost() const noexcept {
@@ -219,6 +234,8 @@ private:
                                  BridgePumpResult* result) noexcept;
     Status QueuePendingInbound(WireFrame frame, size_t wire_bytes,
                                bool schema_resolved = false) noexcept;
+    Status AuthorizeInboundData(
+        const WireFrameHeader& header) const noexcept;
     Status StageReadyFrames(std::vector<WireFrame>* frames) noexcept;
     Status HandleFrame(const WireFrame& frame, uint64_t now_ns,
                        BridgePumpResult* result) noexcept;

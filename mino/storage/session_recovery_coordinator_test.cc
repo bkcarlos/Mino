@@ -167,6 +167,7 @@ void CreateActiveFixture(const std::filesystem::path& root,
                     ->AddTopic(TopicTableEntry{.topic_id = 10,
                                                .topic_name = "events",
                                                .config_version = 1,
+                                               .partition_maps = {},
                                                .schema_snapshot = {}})
                     .ok());
     recording->reset();
@@ -236,6 +237,7 @@ TEST(SessionRecoveryCoordinatorTest,
                     ->AddTopic(TopicTableEntry{.topic_id = 10,
                                                .topic_name = "events",
                                                .config_version = 1,
+                                               .partition_maps = {},
                                                .schema_snapshot = {schema_snapshot}})
                     .ok());
     recording->reset();

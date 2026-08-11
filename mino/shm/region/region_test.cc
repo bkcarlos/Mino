@@ -12,6 +12,9 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "mino/platform/shared_memory.h"
@@ -336,6 +339,70 @@ TEST_F(RegionTest, RejectsInvalidCreateOptions) {
             StatusCode::kInvalidArgument);
 }
 
+TEST_F(RegionTest, SecurityDomainMismatchFailsBeforeLifecycleMutation) {
+  const std::string name = Name("sd");
+  RegionCreateOptions create;
+  create.name = name;
+  create.size_bytes = 1024 * 1024;
+  create.security_domain = SecurityDomainId{41};
+  auto region = SharedMemoryRegion::Create(create);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  const SuperBlock* sb = region->superblock();
+  EXPECT_EQ(sb->security_domain_id, 41u);
+  EXPECT_EQ(sb->access_mode, 0600u);
+  EXPECT_EQ(region->security_domain(), SecurityDomainId{41});
+
+  const RegionState state_before = LoadRegionState(*sb);
+  const uint64_t epoch_before = LoadRegionEpoch(*sb);
+  const uint64_t service_fence_before = LoadServiceFence(*sb);
+  RegionAttachOptions attach;
+  attach.name = name;
+  attach.read_only = true;
+  attach.security_domain = SecurityDomainId{42};
+  auto denied = SharedMemoryRegion::Attach(attach);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.status().code(), StatusCode::kPermissionDenied);
+  EXPECT_EQ(LoadRegionState(*sb), state_before);
+  EXPECT_EQ(LoadRegionEpoch(*sb), epoch_before);
+  EXPECT_EQ(LoadServiceFence(*sb), service_fence_before);
+}
+
+TEST_F(RegionTest, AttachRejectsSecurityMetadataCrcCorruption) {
+  const std::string name = Name("sc");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  region->superblock()->security_domain_id ^= 1u;
+
+  RegionAttachOptions attach;
+  attach.name = name;
+  attach.read_only = true;
+  auto rejected = SharedMemoryRegion::Attach(attach);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.status().code(), StatusCode::kCorruption);
+}
+
+TEST_F(RegionTest, AttachRejectsPermissiveMarkerMode) {
+  const std::string name = Name("pm");
+  auto region = Create(name);
+  ASSERT_TRUE(region.ok()) << region.status().ToString();
+  const int marker_fd = ::shm_open(name.c_str(), O_RDWR, 0);
+  ASSERT_GE(marker_fd, 0);
+  ASSERT_EQ(::fchmod(marker_fd, 0644), 0);
+  ASSERT_EQ(::close(marker_fd), 0);
+
+  RegionAttachOptions attach;
+  attach.name = name;
+  attach.read_only = true;
+  auto denied = SharedMemoryRegion::Attach(attach);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.status().code(), StatusCode::kPermissionDenied);
+
+  const int restore_fd = ::shm_open(name.c_str(), O_RDWR, 0);
+  ASSERT_GE(restore_fd, 0);
+  ASSERT_EQ(::fchmod(restore_fd, 0600), 0);
+  ASSERT_EQ(::close(restore_fd), 0);
+}
+
 TEST_F(RegionTest, AttachRequiresNameAndOptionallyMatchesRegionId) {
   const std::string name = Name("ao");
   auto region = Create(name);
@@ -457,6 +524,9 @@ TEST_F(RegionTest, V2LayoutIsReadOnlyCompatible) {
   RegionAttachOptions reader_options;
   reader_options.name = name;
   reader_options.read_only = true;
+  EXPECT_EQ(SharedMemoryRegion::Attach(reader_options).status().code(),
+            StatusCode::kPermissionDenied);
+  reader_options.allow_unscoped_legacy_read_only = true;
   auto reader = SharedMemoryRegion::Attach(reader_options);
   ASSERT_TRUE(reader.ok()) << reader.status().ToString();
   EXPECT_TRUE(reader->read_only());
@@ -465,7 +535,7 @@ TEST_F(RegionTest, V2LayoutIsReadOnlyCompatible) {
   writer_options.name = name;
   auto writer = SharedMemoryRegion::Attach(writer_options);
   ASSERT_FALSE(writer.ok());
-  EXPECT_EQ(writer.status().code(), StatusCode::kUnsupported);
+  EXPECT_EQ(writer.status().code(), StatusCode::kPermissionDenied);
 
   ASSERT_TRUE(reader->Detach().ok());
   sb->layout_version = kRegionLayoutVersion;
@@ -483,6 +553,9 @@ TEST_F(RegionTest, V4LayoutIsReadOnlyCompatibleWithoutChannelDirectory) {
   RegionAttachOptions reader_options;
   reader_options.name = name;
   reader_options.read_only = true;
+  EXPECT_EQ(SharedMemoryRegion::Attach(reader_options).status().code(),
+            StatusCode::kPermissionDenied);
+  reader_options.allow_unscoped_legacy_read_only = true;
   auto reader = SharedMemoryRegion::Attach(reader_options);
   ASSERT_TRUE(reader.ok()) << reader.status().ToString();
   EXPECT_EQ(reader->channel_directory().status().code(),
@@ -492,7 +565,7 @@ TEST_F(RegionTest, V4LayoutIsReadOnlyCompatibleWithoutChannelDirectory) {
   writer_options.name = name;
   auto writer = SharedMemoryRegion::Attach(writer_options);
   ASSERT_FALSE(writer.ok());
-  EXPECT_EQ(writer.status().code(), StatusCode::kUnsupported);
+  EXPECT_EQ(writer.status().code(), StatusCode::kPermissionDenied);
 
   ASSERT_TRUE(reader->Detach().ok());
   sb->layout_version = kRegionLayoutVersion;

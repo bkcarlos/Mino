@@ -6,9 +6,12 @@ module(
 bazel_dep(name = "rules_cc", version = "0.2.18")
 bazel_dep(name = "googletest", version = "1.15.2")
 bazel_dep(name = "platforms", version = "1.0.0")
-bazel_dep(name = "bazel_skylib", version = "1.8.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
 bazel_dep(name = "spdlog", version = "1.15.3")
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
+# Production TLS is pinned to BCR's source-built OpenSSL targets. Consumers link
+# @openssl//:ssl (and its transitive :crypto), never a host-installed library.
+bazel_dep(name = "openssl", version = "3.5.5.bcr.4")
 # Benchmark-only ZeroMQ comparison. Production transport code does not depend
 # on libzmq; BCR builds the pinned source release hermetically with CMake.
 bazel_dep(name = "libzmq", version = "4.3.5.bcr.5")

@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "coordinator-topic-snapshot.sample.json",
+    "node-budget.sample.json",
+    "production-inventory.sample.json",
+])
+
+filegroup(
+    name = "sample_inputs",
+    srcs = [
+        "coordinator-topic-snapshot.sample.json",
+        "node-budget.sample.json",
+        "production-inventory.sample.json",
+    ],
+)

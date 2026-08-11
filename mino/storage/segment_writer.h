@@ -84,6 +84,12 @@ struct SegmentAppendResult {
     bool rotate_needed = false;
 };
 
+enum class SegmentWriterFailureKind : uint8_t {
+    kNone = 0,
+    kWrite = 1,
+    kSync = 2,
+};
+
 struct SegmentWriterStats {
     uint64_t write_syscalls = 0;
     uint64_t writev_syscalls = 0;
@@ -132,6 +138,9 @@ public:
     uint64_t durable_bytes() const noexcept { return durable_bytes_; }
     uint64_t durable_records() const noexcept { return durable_records_; }
     SegmentWriterStats stats() const noexcept { return stats_; }
+    SegmentWriterFailureKind failure_kind() const noexcept {
+        return failure_kind_;
+    }
     bool rotation_needed(uint64_t now_ns) const noexcept;
 
 private:
@@ -145,7 +154,7 @@ private:
     Status WritePendingGathered();
     Status WriteAll(std::span<const std::byte> bytes);
     Status DataSync(uint64_t now_ns);
-    Status Poison(Status status);
+    Status Poison(Status status, SegmentWriterFailureKind kind);
     bool WouldRotate(size_t encoded_record_size, uint64_t now_ns) const noexcept;
     bool BatchDue(uint64_t now_ns) const noexcept;
     bool IntervalSyncDue(uint64_t now_ns) const noexcept;
@@ -155,6 +164,7 @@ private:
     SegmentWriterOptions options_;
     SegmentWriterState state_ = SegmentWriterState::kOpen;
     Status error_status_ = Status::Ok();
+    SegmentWriterFailureKind failure_kind_ = SegmentWriterFailureKind::kNone;
 
     uint64_t opened_at_ns_ = 0;
     uint32_t topic_id_ = 0;

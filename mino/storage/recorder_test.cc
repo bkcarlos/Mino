@@ -380,6 +380,103 @@ TEST(RecorderTest, DrivesTwoTopicsAndMultiplePartitionsIndependently) {
               2u);
 }
 
+TEST(RecorderTest, HotKeyIsolatedByConservedPartitionBudgets) {
+    auto artifact = CompileArtifact("HotKey");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    auto recorder = Recorder::Create(TestDirectory("hot_key"), SessionMetadata());
+    ASSERT_TRUE(recorder.ok()) << recorder.status().ToString();
+    RecorderTopicConfig config =
+        TopicConfig(TopicId{19}, "hot-key", *artifact, 2);
+    config.partition_strategy = TopicPartitionStrategy::kKey;
+    config.total_buffer_byte_limit = 2u * kRecorderSmallBufferClassBytes;
+    config.buffer_pool_options.global_byte_limit =
+        config.total_buffer_byte_limit;
+    config.buffer_pool_options.default_topic_byte_limit =
+        config.total_buffer_byte_limit;
+    config.buffer_pool_options.queue_capacity = 1;
+    ASSERT_TRUE((*recorder)->AddTopic(config).ok());
+    ASSERT_TRUE((*recorder)->Start(1).ok());
+
+    std::array<std::byte, 1> hot_key{std::byte{0}};
+    std::array<std::byte, 1> cool_key{std::byte{1}};
+    const TopicPartitionMap map{
+        .map_version = config.partition_map_version,
+        .generation = config.partition_generation,
+        .partition_count = config.partition_count,
+        .strategy = config.partition_strategy,
+        .state = TopicPartitionMapState::kActive,
+        .hash_algorithm_version = config.partition_hash_version,
+        .hash_seed = config.partition_hash_seed,
+    };
+    const uint32_t hot_partition = SelectTopicPartition(
+        map, TopicPartitionRouteInput{
+                 .key = hot_key,
+                 .hash = std::nullopt,
+                 .manual_partition_id = std::nullopt,
+                 .source = {}})
+                                       .value();
+    for (uint16_t candidate = 1;
+         SelectTopicPartition(
+             map, TopicPartitionRouteInput{
+                      .key = cool_key,
+                      .hash = std::nullopt,
+                      .manual_partition_id = std::nullopt,
+                      .source = {}})
+                 .value() == hot_partition;
+         ++candidate) {
+        ASSERT_LT(candidate, 256u);
+        cool_key[0] = static_cast<std::byte>(candidate);
+    }
+
+    const std::vector<std::byte> first_payload = Payload(1);
+    RecorderEnqueueRequest first{
+        .partition_id = 0,
+        .partition_key = hot_key,
+        .partition_hash = std::nullopt,
+        .metadata = Metadata(TopicId{19}, artifact->identity, 1,
+                             first_payload),
+        .payload = first_payload,
+        .user_tag = 0,
+        .available_cursor = std::nullopt,
+        .timeout = std::chrono::nanoseconds::zero(),
+    };
+    auto first_result = (*recorder)->Enqueue(first);
+    ASSERT_TRUE(first_result.ok()) << first_result.status().ToString();
+    EXPECT_EQ(first_result->disposition, RecorderEnqueueDisposition::kBuffered);
+    EXPECT_EQ(first_result->partition_id, hot_partition);
+
+    const std::vector<std::byte> second_payload = Payload(2);
+    RecorderEnqueueRequest second = first;
+    second.metadata = Metadata(TopicId{19}, artifact->identity, 2,
+                               second_payload);
+    second.payload = second_payload;
+    auto hot_result = (*recorder)->Enqueue(second);
+    ASSERT_TRUE(hot_result.ok()) << hot_result.status().ToString();
+    EXPECT_EQ(hot_result->disposition, RecorderEnqueueDisposition::kDropped);
+
+    RecorderEnqueueRequest cool = second;
+    cool.partition_key = cool_key;
+    auto cool_result = (*recorder)->Enqueue(cool);
+    ASSERT_TRUE(cool_result.ok()) << cool_result.status().ToString();
+    EXPECT_EQ(cool_result->disposition, RecorderEnqueueDisposition::kBuffered);
+    EXPECT_NE(cool_result->partition_id, hot_partition);
+
+    const auto hot_status =
+        (*recorder)->GetPartitionStatus(TopicId{19}, hot_partition, 2000);
+    const auto cool_status = (*recorder)->GetPartitionStatus(
+        TopicId{19}, cool_result->partition_id, 2000);
+    ASSERT_TRUE(hot_status.ok());
+    ASSERT_TRUE(cool_status.ok());
+    EXPECT_LE(hot_status->buffer_pool.bytes_in_use,
+              kRecorderSmallBufferClassBytes);
+    EXPECT_LE(cool_status->buffer_pool.bytes_in_use,
+              kRecorderSmallBufferClassBytes);
+    EXPECT_LE(hot_status->buffer_pool.bytes_in_use +
+                  cool_status->buffer_pool.bytes_in_use,
+              config.total_buffer_byte_limit);
+    ASSERT_TRUE((*recorder)->Stop(2000).ok());
+}
+
 TEST(RecorderTest, PersistsSchemaBeforeAdmissionAndRejectsIllegalPolicy) {
     auto artifact = CompileArtifact("Ordered");
     ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
@@ -658,6 +755,13 @@ std::ptrdiff_t FailEveryWrite(int, const std::byte*, size_t,
     return -1;
 }
 
+int FailEverySync(int, void* context) noexcept {
+    auto* failing = static_cast<FailingWrite*>(context);
+    ++failing->calls;
+    errno = EIO;
+    return -1;
+}
+
 TEST(RecorderTest,
      SnapshotOverwritesWithoutSegmentsContinuesAndValidatesManifestIdentity) {
     auto artifact = CompileArtifact("SnapshotState");
@@ -816,6 +920,35 @@ TEST(RecorderTest,
     EXPECT_EQ(identity_error.code(), StatusCode::kCorruption);
 }
 
+TEST(RecorderTest, CountsRealStorageSyncFailureSeparately) {
+    auto artifact = CompileArtifact("SyncFailure");
+    ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
+    auto recorder = Recorder::Create(TestDirectory("sync_failure"),
+                                     SessionMetadata());
+    ASSERT_TRUE(recorder.ok()) << recorder.status().ToString();
+    FailingWrite failing;
+    RecorderTopicConfig config =
+        TopicConfig(TopicId{19}, "sync-failure", *artifact);
+    config.policy.mode = RecordingMode::kDurable;
+    config.policy.ack_level = RecordAckLevel::kDurable;
+    config.policy.sync_policy = SegmentSyncPolicy::kPerBatch;
+    config.segment_options.data_sync_hook = FailEverySync;
+    config.segment_options.io_hook_context = &failing;
+    ASSERT_TRUE((*recorder)->AddTopic(config).ok());
+    ASSERT_TRUE((*recorder)->Start(1000).ok());
+    const std::vector<std::byte> payload = Payload(1);
+    auto enqueued = (*recorder)->Enqueue(
+        0, Metadata(TopicId{19}, artifact->identity, 1, payload), payload);
+    ASSERT_TRUE(enqueued.ok()) << enqueued.status().ToString();
+    EXPECT_EQ(enqueued->disposition, RecorderEnqueueDisposition::kFailed);
+    EXPECT_EQ(enqueued->status.code(), StatusCode::kUnavailable);
+    const RecorderMetrics metrics = (*recorder)->metrics();
+    EXPECT_EQ(metrics.sync_failures, 1u);
+    EXPECT_EQ(metrics.write_failures, 0u);
+    EXPECT_EQ(metrics.writer_failures, 1u);
+    EXPECT_GT(failing.calls, 0u);
+}
+
 TEST(RecorderTest, IsolatesWriterFailureFromHealthyTopic) {
     auto artifact = CompileArtifact("Isolated");
     ASSERT_TRUE(artifact.ok()) << artifact.status().ToString();
@@ -834,6 +967,7 @@ TEST(RecorderTest, IsolatesWriterFailureFromHealthyTopic) {
     ASSERT_TRUE((*recorder)->Start(1000).ok());
     EnqueueOk(**recorder, 0, TopicId{15}, artifact->identity, 1, 1);
     EnqueueOk(**recorder, 0, TopicId{16}, artifact->identity, 1, 2);
+    EXPECT_GT((*recorder)->metrics().pending_bytes, 0u);
 
     auto pumped = (*recorder)->Pump(1002);
     ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
@@ -842,6 +976,12 @@ TEST(RecorderTest, IsolatesWriterFailureFromHealthyTopic) {
     EXPECT_EQ(pumped->data_records, 1u);
     EXPECT_EQ((*recorder)->state(), RecorderState::kDegraded);
     EXPECT_EQ((*recorder)->error_status().code(), StatusCode::kDegraded);
+    const RecorderMetrics operational = (*recorder)->metrics();
+    EXPECT_EQ(operational.write_failures, 1u);
+    EXPECT_EQ(operational.sync_failures, 0u);
+    EXPECT_EQ(operational.writer_failures, 1u);
+    EXPECT_EQ(operational.written_records, 1u);
+    EXPECT_EQ(operational.pending_bytes, 0u);
     EXPECT_EQ((*recorder)->GetPartitionStatus(TopicId{15}, 0, 1002)
                   ->writer_state,
               TopicWriterState::kError);

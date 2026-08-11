@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
 #if defined(__linux__)
 #define MINO_TCP_USE_EPOLL 1
 #include <sys/epoll.h>
@@ -51,6 +52,7 @@ using TimePoint = Clock::time_point;
 constexpr size_t kTcpPrefixBytes = 4;
 constexpr size_t kTcpReadChunkBytes = 64u * 1024u;
 constexpr size_t kIoBudgetBytes = 256u * 1024u;
+constexpr size_t kTlsRecordPlaintextBytes = 4u * 1024u;
 constexpr size_t kMaxGatheredWriteBuffers = 64;
 
 #if defined(MINO_TCP_USE_KQUEUE)
@@ -394,10 +396,12 @@ Status ValidateTcpDriverOptions(const TcpDriverOptions& options) {
         return Invalid("TCP message or accept bounds are invalid");
     }
     if (options.heartbeat_interval_ms == 0 || options.idle_timeout_ms == 0 ||
-        options.partial_frame_timeout_ms == 0 || options.io_poll_max_ms == 0 ||
+        options.partial_frame_timeout_ms == 0 ||
+        options.tls_handshake_timeout_ms == 0 || options.io_poll_max_ms == 0 ||
         options.heartbeat_interval_ms >= options.idle_timeout_ms ||
         options.idle_timeout_ms > kMaxOperationTimeoutMs ||
         options.partial_frame_timeout_ms > kMaxOperationTimeoutMs ||
+        options.tls_handshake_timeout_ms > kMaxOperationTimeoutMs ||
         options.io_poll_max_ms > 1000) {
         return Invalid("TCP heartbeat, idle, or poll timing is invalid");
     }
@@ -649,6 +653,12 @@ public:
         }
         MINO_ASSIGN_OR_RETURN(auto local_endpoint,
                               FromSocketAddress(local_storage, local_size));
+        std::unique_ptr<security::TlsChannel> tls;
+        if (options_.tls_factory) {
+            MINO_ASSIGN_OR_RETURN(
+                tls, options_.tls_factory->Create(
+                         socket_fd.get(), security::TlsRole::kClient));
+        }
 
         std::lock_guard lock(mutex_);
         if (stop_requested_.load(std::memory_order_acquire)) {
@@ -668,6 +678,8 @@ public:
             .peer_endpoint = request.remote_endpoint,
         };
         connection.fd = socket_fd.release();
+        connection.tls = std::move(tls);
+        connection.tls_handshake_started = now;
         connection.last_valid_receive = now;
         connection.last_transmit = now;
         auto [inserted, was_inserted] =
@@ -938,10 +950,10 @@ public:
             ConsumeReadyMessageLocked(message, &result);
         }
         if (ready_receive_messages_ != 0) NotifyReadyWaitersLocked();
-        const bool should_wake_worker =
-            !result.messages.empty() &&
-            receive_capacity_blocked_.exchange(false,
-                                               std::memory_order_acq_rel);
+        const bool should_wake_worker = !result.messages.empty();
+        if (should_wake_worker) {
+            receive_capacity_blocked_.store(false, std::memory_order_release);
+        }
         lock.unlock();
         if (should_wake_worker) Wake();
         return result;
@@ -1018,6 +1030,21 @@ public:
                              "TCP connection does not exist");
     }
 
+    Result<security::AuthenticatedPeer> AuthenticatedPeer(
+        ConnectionId id) const {
+        std::lock_guard lock(mutex_);
+        const auto found = connections_.find(id);
+        if (found == connections_.end()) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "TCP connection does not exist");
+        }
+        if (!found->second.tls) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "TCP connection is plaintext");
+        }
+        return found->second.tls->peer();
+    }
+
     TcpDriverStats Stats() const noexcept {
         std::lock_guard lock(mutex_);
         std::lock_guard send_lock(send_ingress_mutex_);
@@ -1076,13 +1103,35 @@ private:
         size_t queued_control_messages = 0;
     };
 
+    enum class TlsWriteSource : uint8_t {
+        kNone,
+        kHeartbeat,
+        kControl,
+        kData,
+    };
+
+    enum class TlsPendingOperation : uint8_t { kNone, kRead, kWrite };
+
     struct Connection {
         ConnectionInfo info;
         int fd = -1;
         bool closing = false;
+        std::unique_ptr<security::TlsChannel> tls;
+        security::TlsIoNeed tls_handshake_need = security::TlsIoNeed::kNone;
+        TlsPendingOperation tls_pending_operation = TlsPendingOperation::kNone;
+        security::TlsIoNeed tls_io_need = security::TlsIoNeed::kNone;
+        size_t tls_read_retry_length = 0;
+        size_t tls_write_retry_length = 0;
+        const std::byte* tls_write_retry_data = nullptr;
+        TlsWriteSource tls_write_source = TlsWriteSource::kNone;
+        std::array<std::byte, kTcpReadChunkBytes> tls_read_buffer{};
+        TimePoint tls_handshake_started{};
+        ConnectionId accepting_listener_id = kInvalidConnectionId;
+        bool accepted_announced = false;
         std::vector<std::byte> receive_buffer;
         size_t receive_offset = 0;
         uint32_t expected_body_size = 0;
+        uint64_t completed_receive_frames = 0;
         size_t reserved_body_bytes = 0;
         bool receive_paused_for_capacity = false;
         std::optional<TimePoint> partial_frame_started;
@@ -1138,6 +1187,98 @@ private:
         return !connection.control_writes.empty() ||
                !connection.data_writes.empty() ||
                connection.heartbeat_pending;
+    }
+
+    static bool TlsHandshakeNeedsRead(const Connection& connection) noexcept {
+        return connection.tls && !connection.tls->handshake_complete() &&
+               connection.tls_handshake_need != security::TlsIoNeed::kWrite;
+    }
+
+    static bool TlsHandshakeNeedsWrite(const Connection& connection) noexcept {
+        return connection.tls && !connection.tls->handshake_complete() &&
+               connection.tls_handshake_need != security::TlsIoNeed::kRead;
+    }
+
+    static bool TlsNeedReady(security::TlsIoNeed need,
+                             short events) noexcept {
+        return need == security::TlsIoNeed::kNone ||
+               (need == security::TlsIoNeed::kRead &&
+                (events & POLLIN) != 0) ||
+               (need == security::TlsIoNeed::kWrite &&
+                (events & POLLOUT) != 0);
+    }
+
+    static bool TlsPendingRead(const Connection& connection) noexcept {
+        return connection.tls_pending_operation == TlsPendingOperation::kRead;
+    }
+
+    static bool TlsPendingWrite(const Connection& connection) noexcept {
+        return connection.tls_pending_operation == TlsPendingOperation::kWrite;
+    }
+
+    static void ClearTlsPendingOperation(Connection& connection) noexcept {
+        connection.tls_pending_operation = TlsPendingOperation::kNone;
+        connection.tls_io_need = security::TlsIoNeed::kNone;
+        connection.tls_read_retry_length = 0;
+        connection.tls_write_retry_length = 0;
+        connection.tls_write_retry_data = nullptr;
+        connection.tls_write_source = TlsWriteSource::kNone;
+    }
+
+    Status PublishAcceptedLocked(Connection& connection) {
+        if (connection.accepting_listener_id == kInvalidConnectionId ||
+            connection.accepted_announced ||
+            accepted_.size() >= options_.max_pending_accepts) {
+            return Status::Ok();
+        }
+        if (!listeners_.contains(connection.accepting_listener_id)) {
+            return Unavailable("TCP listener closed during TLS handshake");
+        }
+        accepted_.push_back(AcceptedConnection{
+            .listener_id = connection.accepting_listener_id,
+            .info = connection.info,
+        });
+        connection.accepted_announced = true;
+        accept_cv_.notify_all();
+        return Status::Ok();
+    }
+
+    Status AdvanceTlsHandshakeLocked(Connection& connection) {
+        if (!connection.tls) return Status::Ok();
+        if (!connection.tls->handshake_complete()) {
+            auto advanced = connection.tls->Handshake();
+            if (!advanced.ok()) return advanced.status();
+            if (advanced->peer_closed) {
+                return Unavailable("TLS peer closed during handshake");
+            }
+            connection.tls_handshake_need = advanced->need;
+            if (!connection.tls->handshake_complete()) return Status::Ok();
+            connection.tls_handshake_need = security::TlsIoNeed::kNone;
+            connection.last_valid_receive = Clock::now();
+            connection.last_transmit = connection.last_valid_receive;
+        }
+        return PublishAcceptedLocked(connection);
+    }
+
+    void AdvanceTlsHandshakesLocked() {
+        std::vector<std::pair<ConnectionId, Status>> failures;
+        for (auto& [id, connection] : connections_) {
+            if (!connection.tls || connection.tls->handshake_complete()) {
+                if (connection.tls && !connection.accepted_announced &&
+                    connection.accepting_listener_id != kInvalidConnectionId) {
+                    const Status published = PublishAcceptedLocked(connection);
+                    if (!published.ok()) failures.emplace_back(id, published);
+                }
+                continue;
+            }
+            if (connection.tls_handshake_need == security::TlsIoNeed::kNone) {
+                const Status advanced = AdvanceTlsHandshakeLocked(connection);
+                if (!advanced.ok()) failures.emplace_back(id, advanced);
+            }
+        }
+        for (const auto& [id, failure] : failures) {
+            CloseConnectionLocked(id, failure);
+        }
     }
 
     Result<ConnectionId> NextIdLocked() {
@@ -1227,12 +1368,17 @@ private:
     void DrainBufferedReceivesLocked() {
         std::vector<std::pair<ConnectionId, Status>> failures;
         for (auto& [id, connection] : connections_) {
-            if (connection.closing ||
-                connection.receive_offset == connection.receive_buffer.size()) {
-                continue;
+            if (connection.closing) continue;
+            Status status = Status::Ok();
+            if (connection.receive_offset != connection.receive_buffer.size()) {
+                status = ProcessConnectionReceiveBufferLocked(connection);
             }
-            const Status status =
-                ProcessConnectionReceiveBufferLocked(connection);
+            if (status.ok() && connection.tls &&
+                connection.tls->handshake_complete() &&
+                connection.tls_pending_operation == TlsPendingOperation::kNone &&
+                connection.tls->has_buffered_read()) {
+                status = ReadConnectionLocked(connection);
+            }
             if (!status.ok()) failures.emplace_back(id, status);
         }
         for (const auto& [id, status] : failures) {
@@ -1248,6 +1394,8 @@ private:
         bool has_immediate_writes = false;
         for (auto& [id, connection] : connections_) {
             if (connection.closing || connection.write_blocked ||
+                (connection.tls && !connection.tls->handshake_complete()) ||
+                TlsPendingRead(connection) ||
                 !HasPendingWriteLocked(connection)) {
                 continue;
             }
@@ -1357,8 +1505,14 @@ private:
         for (auto& [id, connection] : connections_) {
             uint32_t events = EPOLLRDHUP;
             if (CanReadLocked(connection)) events |= EPOLLIN;
-            if (connection.write_blocked &&
-                HasPendingWriteLocked(connection)) {
+            if (TlsHandshakeNeedsWrite(connection) ||
+                (connection.tls_pending_operation !=
+                     TlsPendingOperation::kNone &&
+                 connection.tls_io_need == security::TlsIoNeed::kWrite) ||
+                (connection.write_blocked &&
+                 connection.tls_pending_operation ==
+                     TlsPendingOperation::kNone &&
+                 HasPendingWriteLocked(connection))) {
                 events |= EPOLLOUT;
             }
             MINO_RETURN_IF_ERROR(SetEpollInterestLocked(
@@ -1408,6 +1562,7 @@ private:
                 const TimePoint now = Clock::now();
                 has_immediate_writes = DrainSendIngressLocked();
                 ProcessClosuresAndTimersLocked(now);
+                AdvanceTlsHandshakesLocked();
                 for (auto& [id, connection] : connections_) {
                     (void)id;
                     PrepareReceiveReservationLocked(connection);
@@ -1448,10 +1603,14 @@ private:
                 return;
             }
             for (int index = 0; index < ready; ++index) {
-                std::lock_guard lock(mutex_);
-                const auto found = event_tokens_.find(events[index].data.u64);
-                if (found == event_tokens_.end()) continue;
-                const PollToken token = found->second;
+                PollToken token;
+                {
+                    std::lock_guard lock(mutex_);
+                    const auto found =
+                        event_tokens_.find(events[index].data.u64);
+                    if (found == event_tokens_.end()) continue;
+                    token = found->second;
+                }
                 if (token.kind == PollKind::kWake) {
                     ConsumeWake();
                     continue;
@@ -1471,8 +1630,9 @@ private:
                     poll_events |= POLLHUP;
                 }
                 if (token.kind == PollKind::kListener) {
-                    ProcessListenerEventLocked(token, poll_events);
+                    ProcessListenerEvent(token, poll_events);
                 } else {
+                    std::lock_guard lock(mutex_);
                     ProcessConnectionEventLocked(token, poll_events);
                 }
             }
@@ -1610,8 +1770,15 @@ private:
                 connection.fd, EVFILT_READ, CanReadLocked(connection),
                 connection.event_token, &connection.read_registered,
                 &connection.read_enabled));
-            const bool needs_write = connection.write_blocked &&
-                                     HasPendingWriteLocked(connection);
+            const bool needs_write =
+                TlsHandshakeNeedsWrite(connection) ||
+                (connection.tls_pending_operation !=
+                     TlsPendingOperation::kNone &&
+                 connection.tls_io_need == security::TlsIoNeed::kWrite) ||
+                (connection.write_blocked &&
+                 connection.tls_pending_operation ==
+                     TlsPendingOperation::kNone &&
+                 HasPendingWriteLocked(connection));
             MINO_RETURN_IF_ERROR(SetKqueueFilterLocked(
                 connection.fd, EVFILT_WRITE, needs_write,
                 connection.event_token, &connection.write_registered,
@@ -1669,6 +1836,7 @@ private:
                 const TimePoint now = Clock::now();
                 has_immediate_writes = DrainSendIngressLocked();
                 ProcessClosuresAndTimersLocked(now);
+                AdvanceTlsHandshakesLocked();
                 for (auto& [id, connection] : connections_) {
                     (void)id;
                     PrepareReceiveReservationLocked(connection);
@@ -1711,15 +1879,17 @@ private:
                 FailWorker();
                 return;
             }
-
             bool wake_failed = false;
             for (int index = 0; index < ready; ++index) {
-                std::lock_guard lock(mutex_);
-                const uint64_t event_token =
-                    DecodeKqueueToken(events[index].udata);
-                const auto found = event_tokens_.find(event_token);
-                if (found == event_tokens_.end()) continue;
-                const PollToken token = found->second;
+                PollToken token;
+                {
+                    std::lock_guard lock(mutex_);
+                    const uint64_t event_token =
+                        DecodeKqueueToken(events[index].udata);
+                    const auto found = event_tokens_.find(event_token);
+                    if (found == event_tokens_.end()) continue;
+                    token = found->second;
+                }
                 if (static_cast<uintptr_t>(token.fd) != events[index].ident) {
                     continue;
                 }
@@ -1745,8 +1915,9 @@ private:
                     poll_events |= POLLHUP;
                 }
                 if (token.kind == PollKind::kListener) {
-                    ProcessListenerEventLocked(token, poll_events);
+                    ProcessListenerEvent(token, poll_events);
                 } else {
+                    std::lock_guard lock(mutex_);
                     ProcessConnectionEventLocked(token, poll_events);
                 }
             }
@@ -1771,6 +1942,7 @@ private:
                 std::lock_guard lock(mutex_);
                 (void)DrainSendIngressLocked();
                 ProcessClosuresAndTimersLocked(Clock::now());
+                AdvanceTlsHandshakesLocked();
                 DrainBufferedReceivesLocked();
                 descriptors.reserve(1 + listeners_.size() + connections_.size());
                 tokens.reserve(descriptors.capacity());
@@ -1798,9 +1970,14 @@ private:
                     PrepareHeartbeatLocked(connection, Clock::now());
                     short poll_events = 0;
                     if (CanReadLocked(connection)) poll_events |= POLLIN;
-                    if (!connection.control_writes.empty() ||
-                        !connection.data_writes.empty() ||
-                        connection.heartbeat_pending) {
+                    if (TlsHandshakeNeedsWrite(connection) ||
+                        (connection.tls_pending_operation !=
+                             TlsPendingOperation::kNone &&
+                         connection.tls_io_need ==
+                             security::TlsIoNeed::kWrite) ||
+                        (connection.tls_pending_operation ==
+                             TlsPendingOperation::kNone &&
+                         HasPendingWriteLocked(connection))) {
                         poll_events |= POLLOUT;
                     }
                     descriptors.push_back(pollfd{.fd = connection.fd,
@@ -1827,11 +2004,10 @@ private:
                     ConsumeWake();
                     continue;
                 }
-                std::lock_guard lock(mutex_);
                 if (token.kind == PollKind::kListener) {
-                    ProcessListenerEventLocked(token,
-                                               descriptors[index].revents);
+                    ProcessListenerEvent(token, descriptors[index].revents);
                 } else {
+                    std::lock_guard lock(mutex_);
                     ProcessConnectionEventLocked(token,
                                                  descriptors[index].revents);
                 }
@@ -1841,6 +2017,13 @@ private:
 #endif
 
     void WorkerLoop() noexcept {
+        // OpenSSL's socket BIO does not expose MSG_NOSIGNAL. Block SIGPIPE only
+        // on this dedicated I/O thread so a peer close becomes an SSL error
+        // instead of terminating the process; application threads are untouched.
+        sigset_t blocked_signals;
+        (void)::sigemptyset(&blocked_signals);
+        (void)::sigaddset(&blocked_signals, SIGPIPE);
+        (void)::pthread_sigmask(SIG_BLOCK, &blocked_signals, nullptr);
         try {
 #if defined(MINO_TCP_USE_EPOLL)
             WorkerLoopEpoll();
@@ -1905,10 +2088,18 @@ private:
             std::chrono::milliseconds(options_.idle_timeout_ms);
         const auto partial_timeout =
             std::chrono::milliseconds(options_.partial_frame_timeout_ms);
+        const auto tls_handshake_timeout =
+            std::chrono::milliseconds(options_.tls_handshake_timeout_ms);
         for (const auto& [id, connection] : connections_) {
             if (connection.closing) {
                 close_connections.emplace_back(
                     id, Unavailable("TCP connection was closed"));
+            } else if (connection.tls &&
+                       !connection.tls->handshake_complete() &&
+                       now - connection.tls_handshake_started >=
+                           tls_handshake_timeout) {
+                close_connections.emplace_back(
+                    id, Timeout("TLS handshake timed out"));
             } else if (now - connection.last_valid_receive >= idle_timeout) {
                 close_connections.emplace_back(
                     id, Unavailable("TCP connection idle timeout"));
@@ -2131,7 +2322,8 @@ private:
     }
 
     void PrepareHeartbeatLocked(Connection& connection, TimePoint now) noexcept {
-        if (!connection.heartbeat_pending &&
+        if ((!connection.tls || connection.tls->handshake_complete()) &&
+            !connection.heartbeat_pending &&
             connection.control_writes.empty() &&
             connection.data_writes.empty() &&
             now - connection.last_transmit >=
@@ -2143,6 +2335,19 @@ private:
 
     bool CanReadLocked(Connection& connection) noexcept {
         if (connection.closing) return false;
+        if (connection.tls && !connection.tls->handshake_complete()) {
+            return TlsHandshakeNeedsRead(connection);
+        }
+        if (connection.accepting_listener_id != kInvalidConnectionId &&
+            !connection.accepted_announced) {
+            return false;
+        }
+        // Readiness for a pending TLS operation always retries that exact
+        // operation. In particular, WANT_READ from Write must not dispatch Read,
+        // and WANT_WRITE from Read must not dispatch Write.
+        if (connection.tls_pending_operation != TlsPendingOperation::kNone) {
+            return connection.tls_io_need != security::TlsIoNeed::kWrite;
+        }
         if (connection.reserved_body_bytes != 0) return true;
         std::lock_guard receive_lock(receive_mutex_);
         const bool can_read =
@@ -2186,30 +2391,45 @@ private:
         ++reserved_receive_messages_;
     }
 
-    void ProcessListenerEventLocked(const PollToken& token, short events) {
-        const auto found = listeners_.find(token.id);
-        if (found == listeners_.end() || found->second.fd != token.fd) return;
+    void ProcessListenerEvent(const PollToken& token, short events) {
         if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            CloseListenerLocked(token.id);
+            std::lock_guard lock(mutex_);
+            const auto found = listeners_.find(token.id);
+            if (found != listeners_.end() && found->second.fd == token.fd) {
+                CloseListenerLocked(token.id);
+            }
             return;
         }
         if ((events & POLLIN) == 0) return;
 
-        while (accepted_.size() < options_.max_pending_accepts &&
-               connections_.size() < config_.max_connections) {
+        for (;;) {
+            {
+                std::lock_guard lock(mutex_);
+                const auto found = listeners_.find(token.id);
+                if (found == listeners_.end() || found->second.fd != token.fd ||
+                    found->second.closing ||
+                    accepted_.size() >= options_.max_pending_accepts ||
+                    connections_.size() >= config_.max_connections) {
+                    return;
+                }
+            }
+
             sockaddr_storage peer_storage{};
             socklen_t peer_size = sizeof(peer_storage);
             UniqueFd accepted_fd(::accept(
-                found->second.fd, reinterpret_cast<sockaddr*>(&peer_storage),
+                token.fd, reinterpret_cast<sockaddr*>(&peer_storage),
                 &peer_size));
             if (accepted_fd.get() < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-                CloseListenerLocked(token.id);
+                std::lock_guard lock(mutex_);
+                const auto found = listeners_.find(token.id);
+                if (found != listeners_.end() && found->second.fd == token.fd) {
+                    CloseListenerLocked(token.id);
+                }
                 return;
             }
-            Status configured = ConfigureTcpSocket(accepted_fd.get());
-            if (!configured.ok()) continue;
+            if (!ConfigureTcpSocket(accepted_fd.get()).ok()) continue;
 
             sockaddr_storage local_storage{};
             socklen_t local_size = sizeof(local_storage);
@@ -2218,10 +2438,28 @@ private:
                               &local_size) != 0) {
                 continue;
             }
-            auto local_endpoint =
-                FromSocketAddress(local_storage, local_size);
+            auto local_endpoint = FromSocketAddress(local_storage, local_size);
             auto peer_endpoint = FromSocketAddress(peer_storage, peer_size);
             if (!local_endpoint.ok() || !peer_endpoint.ok()) continue;
+
+            // Credential snapshots, PEM parsing, key validation, SSL_CTX creation,
+            // and SSL allocation are intentionally outside mutex_.
+            std::unique_ptr<security::TlsChannel> tls;
+            if (options_.tls_factory) {
+                auto created = options_.tls_factory->Create(
+                    accepted_fd.get(), security::TlsRole::kServer);
+                if (!created.ok()) continue;
+                tls = std::move(*created);
+            }
+
+            std::lock_guard lock(mutex_);
+            const auto listener = listeners_.find(token.id);
+            if (listener == listeners_.end() || listener->second.fd != token.fd ||
+                listener->second.closing ||
+                accepted_.size() >= options_.max_pending_accepts ||
+                connections_.size() >= config_.max_connections) {
+                continue;
+            }
             auto id_result = NextIdLocked();
             if (!id_result.ok()) return;
             const ConnectionId id = *id_result;
@@ -2235,6 +2473,9 @@ private:
                 .peer_endpoint = *peer_endpoint,
             };
             connection.fd = accepted_fd.release();
+            connection.tls = std::move(tls);
+            connection.tls_handshake_started = now;
+            connection.accepting_listener_id = token.id;
             connection.last_valid_receive = now;
             connection.last_transmit = now;
             const ConnectionInfo info = connection.info;
@@ -2251,11 +2492,14 @@ private:
                 connections_.erase(inserted);
                 throw;
             }
-            accepted_.push_back(AcceptedConnection{
-                .listener_id = token.id,
-                .info = info,
-            });
-            accept_cv_.notify_all();
+            if (!inserted->second.tls) {
+                inserted->second.accepted_announced = true;
+                accepted_.push_back(AcceptedConnection{
+                    .listener_id = token.id,
+                    .info = info,
+                });
+                accept_cv_.notify_all();
+            }
         }
     }
 
@@ -2270,6 +2514,46 @@ private:
                                   Unavailable("TCP socket poll failed"));
             return;
         }
+        if (found->second.tls &&
+            !found->second.tls->handshake_complete()) {
+            if (!TlsNeedReady(found->second.tls_handshake_need, events)) return;
+            const Status handshake = AdvanceTlsHandshakeLocked(found->second);
+            if (!handshake.ok()) {
+                CloseConnectionLocked(token.id, handshake);
+            }
+            // The readiness was consumed by SSL_do_handshake. Never reuse a
+            // possibly stale bit to start application Read or Write in this turn.
+            return;
+        }
+        if (found->second.accepting_listener_id != kInvalidConnectionId &&
+            !found->second.accepted_announced) {
+            return;
+        }
+        if (found->second.tls_pending_operation !=
+            TlsPendingOperation::kNone) {
+            if (!TlsNeedReady(found->second.tls_io_need, events)) {
+                if ((events & POLLHUP) != 0) {
+                    CloseConnectionLocked(
+                        token.id, Unavailable("TCP peer closed connection"));
+                }
+                return;
+            }
+            Status retried = Status::Ok();
+            if (TlsPendingWrite(found->second)) {
+                found->second.write_blocked = false;
+                retried = WriteConnectionLocked(found->second);
+            } else {
+                retried = ReadConnectionLocked(found->second);
+            }
+            if (!retried.ok()) {
+                CloseConnectionLocked(token.id, retried);
+                return;
+            }
+            if (found->second.tls_pending_operation !=
+                TlsPendingOperation::kNone) {
+                return;
+            }
+        }
         if ((events & POLLIN) != 0) {
             const Status read_status = ReadConnectionLocked(found->second);
             if (!read_status.ok()) {
@@ -2279,7 +2563,9 @@ private:
         }
         found = connections_.find(token.id);
         if (found == connections_.end()) return;
-        if ((events & POLLOUT) != 0) {
+        if ((events & POLLOUT) != 0 &&
+            found->second.tls_pending_operation ==
+                TlsPendingOperation::kNone) {
             found->second.write_blocked = false;
             const Status write_status = WriteConnectionLocked(found->second);
             if (!write_status.ok()) {
@@ -2371,6 +2657,7 @@ private:
                         .payload = std::move(payload),
                     });
                 }
+                ++connection.completed_receive_frames;
                 if (ready_receive_messages_ >=
                         options_.max_ready_receive_messages ||
                     ready_receive_bytes_ + reserved_receive_bytes_ >=
@@ -2396,18 +2683,24 @@ private:
                 return Status::Ok();
             }
             connection.partial_frame_started = Clock::now();
+            return Status::Ok();
         }
     }
 
     Status ReadConnectionLocked(Connection& connection) {
+        if (TlsPendingWrite(connection)) return Status::Ok();
+        const uint64_t completed_before = connection.completed_receive_frames;
         MINO_RETURN_IF_ERROR(ProcessConnectionReceiveBufferLocked(connection));
+        if (connection.completed_receive_frames != completed_before) {
+            return Status::Ok();
+        }
         if (connection.receive_paused_for_capacity ||
             (connection.expected_body_size != 0 &&
              connection.reserved_body_bytes == 0)) {
             return Status::Ok();
         }
         size_t budget = kIoBudgetBytes;
-        std::array<std::byte, kTcpReadChunkBytes> chunk{};
+        std::array<std::byte, kTcpReadChunkBytes> plaintext_chunk{};
         while (budget != 0) {
             CompactConnectionReceiveBufferLocked(connection);
             const size_t max_buffered =
@@ -2416,85 +2709,180 @@ private:
             if (connection.receive_buffer.size() >= max_buffered) {
                 return Corruption("TCP receive buffer exceeded frame bound");
             }
-            const size_t amount =
-                std::min({chunk.size(), budget,
-                          max_buffered - connection.receive_buffer.size()});
-            ssize_t received;
-            do {
-                received = ::recv(connection.fd, chunk.data(), amount, 0);
-            } while (received < 0 && errno == EINTR);
-            if (received == 0) {
-                return connection.receive_buffer.empty() &&
-                               connection.expected_body_size == 0
-                           ? Unavailable("TCP peer closed connection")
-                           : Corruption("TCP stream ended inside frame");
-            }
-            if (received < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const size_t amount = connection.tls_read_retry_length != 0
+                                      ? connection.tls_read_retry_length
+                                      : std::min({kTcpReadChunkBytes, budget,
+                                                  max_buffered -
+                                                      connection.receive_buffer.size()});
+            size_t received_bytes = 0;
+            const std::byte* received_data = nullptr;
+            if (connection.tls) {
+                auto received = connection.tls->Read(
+                    std::span<std::byte>(connection.tls_read_buffer).first(amount));
+                if (!received.ok()) return received.status();
+                if (received->peer_closed) {
+                    return connection.receive_buffer.empty() &&
+                                   connection.expected_body_size == 0
+                               ? Unavailable("TLS peer closed connection")
+                               : Corruption("TLS stream ended inside frame");
+                }
+                connection.tls_io_need = received->need;
+                if (received->bytes == 0 &&
+                    received->need != security::TlsIoNeed::kNone) {
+                    connection.tls_pending_operation =
+                        TlsPendingOperation::kRead;
+                    connection.tls_read_retry_length = amount;
                     return Status::Ok();
                 }
-                return Unavailable("TCP receive failed");
+                ClearTlsPendingOperation(connection);
+                received_bytes = received->bytes;
+                received_data = connection.tls_read_buffer.data();
+            } else {
+                ssize_t received;
+                do {
+                    received = ::recv(connection.fd, plaintext_chunk.data(), amount, 0);
+                } while (received < 0 && errno == EINTR);
+                if (received == 0) {
+                    return connection.receive_buffer.empty() &&
+                                   connection.expected_body_size == 0
+                               ? Unavailable("TCP peer closed connection")
+                               : Corruption("TCP stream ended inside frame");
+                }
+                if (received < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return Status::Ok();
+                    }
+                    return Unavailable("TCP receive failed");
+                }
+                received_bytes = static_cast<size_t>(received);
+                received_data = plaintext_chunk.data();
             }
             if (!connection.partial_frame_started.has_value()) {
                 connection.partial_frame_started = Clock::now();
             }
             connection.receive_buffer.insert(
-                connection.receive_buffer.end(), chunk.begin(),
-                chunk.begin() + received);
-            budget -= static_cast<size_t>(received);
+                connection.receive_buffer.end(), received_data,
+                received_data + static_cast<ptrdiff_t>(received_bytes));
+            budget -= received_bytes;
             MINO_RETURN_IF_ERROR(
                 ProcessConnectionReceiveBufferLocked(connection));
+            if (connection.completed_receive_frames != completed_before) {
+                return Status::Ok();
+            }
             if (connection.receive_paused_for_capacity ||
                 (connection.expected_body_size != 0 &&
                  connection.reserved_body_bytes == 0)) {
+                return Status::Ok();
+            }
+            // Do not begin another SSL_read while outbound frames are queued.
+            // A successful read is complete; yielding here lets full-duplex peers
+            // write before either side creates a new WANT_* read dependency.
+            if (connection.tls && HasPendingWriteLocked(connection)) {
                 return Status::Ok();
             }
         }
         return Status::Ok();
     }
 
+    Result<size_t> WriteContiguousLocked(
+        Connection& connection, std::span<const std::byte> bytes,
+        TlsWriteSource source) {
+        if (connection.tls) {
+            if (TlsPendingRead(connection)) {
+                return Internal("TLS read must complete before TLS write");
+            }
+            if (connection.tls_write_retry_length != 0) {
+                if (source != connection.tls_write_source ||
+                    bytes.data() != connection.tls_write_retry_data ||
+                    bytes.size() < connection.tls_write_retry_length) {
+                    return Internal("TLS write retry source or arguments changed");
+                }
+                bytes = bytes.first(connection.tls_write_retry_length);
+            }
+            auto written = connection.tls->Write(bytes);
+            if (!written.ok()) return written.status();
+            if (written->peer_closed) {
+                return Unavailable("TLS peer closed during write");
+            }
+            connection.tls_io_need = written->need;
+            if (written->bytes == 0 &&
+                written->need != security::TlsIoNeed::kNone) {
+                connection.tls_pending_operation =
+                    TlsPendingOperation::kWrite;
+                connection.tls_write_retry_length = bytes.size();
+                connection.tls_write_retry_data = bytes.data();
+                connection.tls_write_source = source;
+                connection.write_blocked = true;
+                return size_t{0};
+            }
+            ClearTlsPendingOperation(connection);
+            return written->bytes;
+        }
+        ssize_t sent;
+        do {
+            sent = SendNoSignal(connection.fd, bytes.data(), bytes.size());
+        } while (sent < 0 && errno == EINTR);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                connection.write_blocked = true;
+                return size_t{0};
+            }
+            return Unavailable("TCP send failed");
+        }
+        if (sent == 0) return Unavailable("TCP send made no progress");
+        return static_cast<size_t>(sent);
+    }
+
     Status WriteConnectionLocked(Connection& connection) {
+        if (connection.tls && !connection.tls->handshake_complete()) {
+            return Status::Ok();
+        }
+        if (TlsPendingRead(connection)) return Status::Ok();
         size_t budget = kIoBudgetBytes;
         while (budget != 0) {
             // A heartbeat is also a stream frame. Once any part of it has been
             // written, finish it before switching to either user queue.
             if (connection.heartbeat_pending &&
-                connection.heartbeat_offset != 0) {
+                (connection.heartbeat_offset != 0 ||
+                 connection.tls_write_source == TlsWriteSource::kHeartbeat)) {
                 const size_t remaining =
                     heartbeat_wire_.size() - connection.heartbeat_offset;
-                const size_t amount = std::min(remaining, budget);
-                const ssize_t sent = SendNoSignal(
-                    connection.fd,
-                    heartbeat_wire_.data() + connection.heartbeat_offset,
-                    amount);
-                if (sent < 0) {
-                    if (errno == EINTR) continue;
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        connection.write_blocked = true;
-                        return Status::Ok();
-                    }
-                    return Unavailable("TCP heartbeat send failed");
-                }
-                if (sent == 0) {
-                    return Unavailable("TCP heartbeat made no progress");
-                }
+                const size_t amount = std::min(
+                    remaining,
+                    connection.tls
+                        ? std::min(budget, kTlsRecordPlaintextBytes)
+                        : budget);
+                MINO_ASSIGN_OR_RETURN(
+                    const size_t sent,
+                    WriteContiguousLocked(
+                        connection,
+                        std::span<const std::byte>(heartbeat_wire_)
+                            .subspan(connection.heartbeat_offset, amount),
+                        TlsWriteSource::kHeartbeat));
+                if (sent == 0) return Status::Ok();
                 ++successful_send_syscalls_;
-                sent_bytes_ += static_cast<size_t>(sent);
-                connection.heartbeat_offset += static_cast<size_t>(sent);
-                budget -= static_cast<size_t>(sent);
+                sent_bytes_ += sent;
+                connection.heartbeat_offset += sent;
+                budget -= sent;
                 connection.last_transmit = Clock::now();
                 if (connection.heartbeat_offset == heartbeat_wire_.size()) {
                     connection.heartbeat_pending = false;
                     connection.heartbeat_offset = 0;
                 }
+                if (connection.tls) return Status::Ok();
                 continue;
             }
 
             std::deque<PendingWrite>* writes = nullptr;
             bool is_control = false;
-            size_t gather_limit = kMaxGatheredWriteBuffers;
-            if (!connection.data_writes.empty() &&
-                connection.data_writes.front().offset != 0) {
+            size_t gather_limit = connection.tls ? 1 : kMaxGatheredWriteBuffers;
+            if (connection.tls_write_source == TlsWriteSource::kControl) {
+                writes = &connection.control_writes;
+                is_control = true;
+            } else if (connection.tls_write_source == TlsWriteSource::kData) {
+                writes = &connection.data_writes;
+            } else if (!connection.data_writes.empty() &&
+                       connection.data_writes.front().offset != 0) {
                 writes = &connection.data_writes;
                 // Finishing this frame may expose higher-priority control data.
                 if (!connection.control_writes.empty()) gather_limit = 1;
@@ -2513,13 +2901,18 @@ private:
                 std::array<iovec, kMaxGatheredWriteBuffers> vectors{};
                 size_t vector_count = 0;
                 size_t vector_bytes = 0;
+                const size_t write_budget =
+                    connection.tls
+                        ? std::min(budget, kTlsRecordPlaintextBytes)
+                        : budget;
                 for (PendingWrite& write : *writes) {
-                    if (vector_count >= gather_limit || vector_bytes >= budget) {
+                    if (vector_count >= gather_limit ||
+                        vector_bytes >= write_budget) {
                         break;
                     }
                     const size_t remaining = write.bytes.size() - write.offset;
                     const size_t amount =
-                        std::min(remaining, budget - vector_bytes);
+                        std::min(remaining, write_budget - vector_bytes);
                     vectors[vector_count++] = iovec{
                         .iov_base = write.bytes.data() + write.offset,
                         .iov_len = amount,
@@ -2527,27 +2920,44 @@ private:
                     vector_bytes += amount;
                 }
 
-                ssize_t sent = -1;
-                do {
-                    sent = SendMessageNoSignal(
-                        connection.fd,
-                        std::span<iovec>(vectors).first(vector_count));
-                } while (sent < 0 && errno == EINTR);
-                if (sent < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        connection.write_blocked = true;
-                        return Status::Ok();
+                size_t sent_bytes = 0;
+                if (connection.tls) {
+                    MINO_ASSIGN_OR_RETURN(
+                        sent_bytes,
+                        WriteContiguousLocked(
+                            connection,
+                            std::span<const std::byte>(
+                                static_cast<const std::byte*>(
+                                    vectors[0].iov_base),
+                                vectors[0].iov_len),
+                            is_control ? TlsWriteSource::kControl
+                                       : TlsWriteSource::kData));
+                    if (sent_bytes == 0) return Status::Ok();
+                } else {
+                    ssize_t sent = -1;
+                    do {
+                        sent = SendMessageNoSignal(
+                            connection.fd,
+                            std::span<iovec>(vectors).first(vector_count));
+                    } while (sent < 0 && errno == EINTR);
+                    if (sent < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            connection.write_blocked = true;
+                            return Status::Ok();
+                        }
+                        return Unavailable("TCP gathered send failed");
                     }
-                    return Unavailable("TCP gathered send failed");
+                    if (sent == 0) {
+                        return Unavailable("TCP send made no progress");
+                    }
+                    sent_bytes = static_cast<size_t>(sent);
                 }
-                if (sent == 0) return Unavailable("TCP send made no progress");
 
                 ++successful_send_syscalls_;
                 if (vector_count > 1) {
                     ++gathered_send_syscalls_;
                     gathered_send_buffers_ += vector_count;
                 }
-                const size_t sent_bytes = static_cast<size_t>(sent);
                 sent_bytes_ += sent_bytes;
                 budget -= sent_bytes;
                 connection.last_transmit = Clock::now();
@@ -2579,33 +2989,32 @@ private:
                                                released_bytes,
                                                released_messages);
                 }
+                if (connection.tls) return Status::Ok();
                 continue;
             }
 
             if (!connection.heartbeat_pending) break;
-            const size_t amount = std::min(heartbeat_wire_.size(), budget);
-            const ssize_t sent = SendNoSignal(connection.fd,
-                                               heartbeat_wire_.data(), amount);
-            if (sent < 0) {
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    connection.write_blocked = true;
-                    return Status::Ok();
-                }
-                return Unavailable("TCP heartbeat send failed");
-            }
-            if (sent == 0) {
-                return Unavailable("TCP heartbeat made no progress");
-            }
+            const size_t amount = std::min(
+                heartbeat_wire_.size(),
+                connection.tls ? std::min(budget, kTlsRecordPlaintextBytes)
+                               : budget);
+            MINO_ASSIGN_OR_RETURN(
+                const size_t sent,
+                WriteContiguousLocked(
+                    connection,
+                    std::span<const std::byte>(heartbeat_wire_).first(amount),
+                    TlsWriteSource::kHeartbeat));
+            if (sent == 0) return Status::Ok();
             ++successful_send_syscalls_;
-            sent_bytes_ += static_cast<size_t>(sent);
-            connection.heartbeat_offset = static_cast<size_t>(sent);
-            budget -= static_cast<size_t>(sent);
+            sent_bytes_ += sent;
+            connection.heartbeat_offset = sent;
+            budget -= sent;
             connection.last_transmit = Clock::now();
             if (connection.heartbeat_offset == heartbeat_wire_.size()) {
                 connection.heartbeat_pending = false;
                 connection.heartbeat_offset = 0;
             }
+            if (connection.tls) return Status::Ok();
         }
         if (!HasPendingWriteLocked(connection)) {
             connection.write_blocked = false;
@@ -2744,6 +3153,11 @@ Result<ReceiveResult> TcpDriver::DoPoll(const ReceiveRequest& request) {
 Result<CompletionPollResult> TcpDriver::DoPollCompletions(
     const CompletionPollRequest& request) {
     return impl_->PollCompletions(request);
+}
+
+Result<security::AuthenticatedPeer> TcpDriver::DoAuthenticatedPeer(
+    ConnectionId connection_id) {
+    return impl_->AuthenticatedPeer(connection_id);
 }
 
 Status TcpDriver::DoClose(ConnectionId connection_id) {

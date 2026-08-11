@@ -1,5 +1,25 @@
 package(default_visibility = ["//visibility:private"])
 
+py_library(
+    name = "aarch64_validation_lib",
+    srcs = ["aarch64_validation.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "aarch64_validation",
+    srcs = ["aarch64_validation.py"],
+    python_version = "PY3",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "aarch64_cross_smoke",
+    srcs = ["aarch64_cross_smoke.py"],
+    python_version = "PY3",
+    visibility = ["//visibility:public"],
+)
+
 genrule(
     name = "hermetic_clang_version",
     outs = ["hermetic-clang-version.txt"],

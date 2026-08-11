@@ -128,6 +128,12 @@ bool IsPowerOfTwo(uint32_t value) noexcept {
     return value != 0 && (value & (value - 1)) == 0;
 }
 
+bool ValidTopicPermission(TopicPermission permission) noexcept {
+    const uint32_t value = static_cast<uint32_t>(permission);
+    return value != 0 && (value & ~kAllTopicPermissions) == 0 &&
+           (value & (value - 1)) == 0;
+}
+
 bool HasNonzeroDigest(const schema::CanonicalDigest& digest) noexcept {
     return std::any_of(digest.begin(), digest.end(),
                        [](std::byte value) { return value != std::byte{0}; });
@@ -160,6 +166,9 @@ Status ValidateNodeRegistration(const NodeRegistration& registration,
         registration.process_identity.node_id != registration.node_id.value) {
         return Invalid("node and exact process identity must be nonzero and agree");
     }
+    if (registration.security_domain_id.value == 0) {
+        return Invalid("node security domain must be nonzero");
+    }
     if (registration.endpoints.empty()) {
         return Invalid("node must advertise at least one endpoint");
     }
@@ -185,6 +194,28 @@ Status ValidateNodeRegistration(const NodeRegistration& registration,
         registration.lease_duration_ns > kMaxLeaseDurationNs ||
         registration.config_version == 0) {
         return Invalid("node health, lease, or config version is invalid");
+    }
+    return Status::Ok();
+}
+
+Status ValidateTopicPermission(const TopicMetadata& metadata,
+                               SecurityDomainId security_domain_id,
+                               NodeId node_id, TopicPermission permission) {
+    if (security_domain_id.value == 0 || node_id.value == 0 ||
+        !ValidTopicPermission(permission)) {
+        return Invalid("Topic ACL subject or permission is invalid");
+    }
+    const uint32_t required = static_cast<uint32_t>(permission);
+    const auto entry = std::find_if(
+        metadata.acl.entries.begin(), metadata.acl.entries.end(),
+        [security_domain_id, node_id](const TopicAclEntry& candidate) {
+            return candidate.security_domain_id == security_domain_id &&
+                   candidate.node_id == node_id;
+        });
+    if (entry == metadata.acl.entries.end() ||
+        (entry->permissions & required) != required) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Topic ACL denies the requested operation");
     }
     return Status::Ok();
 }
@@ -253,6 +284,29 @@ Status ValidateTopicMetadata(const TopicMetadata& metadata,
         !HasNonzeroDigest(metadata.schema.canonical_digest())) {
         return Invalid("schema identity is incomplete");
     }
+    if (metadata.acl.entries.empty()) {
+        return Invalid("Topic ACL must contain at least one explicit grant");
+    }
+    if (metadata.acl.entries.size() > kMaxTopicAclEntries) {
+        return Status::Error(StatusCode::kResourceExhausted,
+                             "Topic ACL exceeds the hard entry bound");
+    }
+    for (size_t i = 0; i < metadata.acl.entries.size(); ++i) {
+        const TopicAclEntry& entry = metadata.acl.entries[i];
+        if (entry.node_id.value == 0 ||
+            entry.security_domain_id.value == 0 || entry.permissions == 0 ||
+            (entry.permissions & ~kAllTopicPermissions) != 0) {
+            return Invalid(
+                "Topic ACL entry is empty or contains unknown permissions");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (entry.node_id == metadata.acl.entries[j].node_id &&
+                entry.security_domain_id ==
+                    metadata.acl.entries[j].security_domain_id) {
+                return Invalid("Topic ACL domain/node subjects must be unique");
+            }
+        }
+    }
     if (metadata.accepted_schemas.size() > kMaxAcceptedSchemasPerTopic) {
         return Status::Error(StatusCode::kResourceExhausted,
                              "accepted schema set exceeds topic bound");
@@ -290,6 +344,18 @@ Status ValidateTopicMetadata(const TopicMetadata& metadata,
                 (route.preferred_transport.has_value() &&
                  !ValidTransportKind(*route.preferred_transport))) {
                 return Invalid("static route target or transport is invalid");
+            }
+            const uint32_t subscribe =
+                static_cast<uint32_t>(TopicPermission::kSubscribe);
+            const bool acl_allows_target = std::any_of(
+                metadata.acl.entries.begin(), metadata.acl.entries.end(),
+                [route, subscribe](const TopicAclEntry& entry) {
+                    return entry.node_id == route.target_node &&
+                           (entry.permissions & subscribe) == subscribe;
+                });
+            if (!acl_allows_target) {
+                return Invalid(
+                    "static route target is not allowed to subscribe by Topic ACL");
             }
             for (size_t j = 0; j < i; ++j) {
                 if (route.target_node == metadata.static_routes[j].target_node) {

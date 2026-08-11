@@ -39,6 +39,7 @@
 #include "mino/common/ids.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/platform/numa.h"
 #include "mino/shm/allocator/bitmap.h"
 #include "mino/shm/allocator/class_table.h"
 #include "mino/shm/allocator/generation_array.h"
@@ -138,20 +139,32 @@ struct AllocatorLocalCacheConfig {
     bool enabled = true;
 };
 
+struct AllocatorNumaConfig {
+    NumaPlacementConfig placement;
+    bool prefer_local_shards = true;
+};
+
 struct AllocatorLocalCacheStats {
+    uint64_t allocations = 0;
     uint64_t hint_hits = 0;
     uint64_t fallback_scans = 0;
     uint64_t cache_bypasses = 0;
     uint64_t exhaustions = 0;
     uint64_t drain_count = 0;
+    uint64_t numa_local_allocations = 0;
+    uint64_t numa_remote_allocations = 0;
+    uint64_t numa_fallback_allocations = 0;
+    uint64_t numa_bind_errors = 0;
+    uint64_t numa_migrations = 0;
 };
 
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
 // Region following the strict 9-step protocol of design doc 8.3.
 //
-// The object itself is a process-local facade: all mutable state lives in
-// shared memory so that Create() (first process) and Attach() (subsequent
-// processes) yield equivalent allocators.
+// The object itself is a process-local facade. Allocation ownership and
+// lifecycle state live in shared memory so Create() and Attach() remain
+// equivalent; NUMA topology, cursor hints and metrics are explicitly local to
+// each facade and never become part of the SHM ABI.
 class CentralSlabAllocator {
 public:
     static constexpr uint64_t kMetadataHeaderSize = 64;
@@ -161,16 +174,18 @@ public:
     // `data_region_size` is the total size of the Region in bytes and must
     // cover allocator metadata plus all configured slots. The memory must be
     // zero-initialized.
-    static Result<CentralSlabAllocator> Create(void* shm_base,
-                                               uint64_t data_region_size,
-                                               const ClassTableConfig& config);
+    static Result<CentralSlabAllocator> Create(
+        void* shm_base, uint64_t data_region_size,
+        const ClassTableConfig& config,
+        const AllocatorNumaConfig& numa_config = {});
 
     // Initializes allocator metadata in the Region allocator sub-region and
     // places all SlabHeader/payload slots in the Region data sub-region.
     // Returned Handles are relative to region_base and carry region_id.
     static Result<CentralSlabAllocator> CreateInRegion(
         const RegionAllocatorStorage& storage,
-        const ClassTableConfig& config);
+        const ClassTableConfig& config,
+        const AllocatorNumaConfig& numa_config = {});
 
     // Attaches to an existing allocator previously initialized with Create().
     // Validates the superblock magic, metadata version and generation array
@@ -335,7 +350,8 @@ private:
         void* shm_base, uint64_t available_size, uint64_t metadata_capacity,
         uint64_t slot_area_offset, uint64_t slot_capacity,
         uint32_t region_id, uint64_t handle_offset_bias,
-        const ClassTableConfig& config);
+        const ClassTableConfig& config,
+        const AllocatorNumaConfig& numa_config);
     static Result<CentralSlabAllocator> AttachWithBias(
         void* shm_base, uint64_t available_size, uint64_t handle_offset_bias);
 

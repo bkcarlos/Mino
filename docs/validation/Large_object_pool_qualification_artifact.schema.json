@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mino.invalid/schemas/large-object-pool-qualification-v1.json",
+  "title": "Mino D6-08 physical large-object-pool qualification manifest",
+  "type": "object",
+  "required": [
+    "schema",
+    "qualification_id",
+    "source",
+    "attestation",
+    "host",
+    "inputs",
+    "preflight",
+    "sla",
+    "artifacts",
+    "artifacts_complete",
+    "outcome",
+    "qualification_eligible",
+    "errors"
+  ],
+  "properties": {
+    "schema": {"const": "mino.allocator.large_object_pool.qualification.v1"},
+    "qualification_id": {"const": "D6-08"},
+    "source": {"$ref": "#/$defs/source"},
+    "attestation": {"const": "physical-hugepage-device"},
+    "host": {"type": "object"},
+    "inputs": {
+      "type": "object",
+      "required": ["benchmark_sha256", "plugin_sha256", "approved_plugin_sha256", "policy_sha256", "schema_sha256"],
+      "properties": {
+        "benchmark_sha256": {"$ref": "#/$defs/sha256"},
+        "plugin_sha256": {"$ref": "#/$defs/sha256"},
+        "approved_plugin_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_sha256": {"$ref": "#/$defs/sha256"},
+        "schema_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "preflight": {
+      "type": "object",
+      "required": ["passed", "hugepages", "locked_memory", "device", "numa"],
+      "properties": {"passed": {"type": "boolean"}}
+    },
+    "sla": {
+      "type": "object",
+      "required": ["policy_sha256", "checks", "passed"],
+      "properties": {
+        "policy_sha256": {"$ref": "#/$defs/sha256"},
+        "checks": {"type": "array", "items": {"$ref": "#/$defs/check"}},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+    "artifacts_complete": {"type": "boolean"},
+    "outcome": {"enum": ["passed", "failed"]},
+    "qualification_eligible": {"type": "boolean"},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source": {
+      "type": "object",
+      "required": ["expected_commit", "commit", "state"],
+      "properties": {
+        "expected_commit": {"$ref": "#/$defs/commit"},
+        "commit": {"$ref": "#/$defs/commit"},
+        "state": {"enum": ["clean", "dirty", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "check": {
+      "type": "object",
+      "required": ["mode", "bytes", "lifetime", "metric", "observed", "threshold", "passed"],
+      "properties": {
+        "mode": {"enum": ["ordinary", "hugepage", "device-registration"]},
+        "bytes": {"enum": [65536, 262144, 1048576]},
+        "lifetime": {"enum": ["short", "batch"]},
+        "metric": {"type": "string", "minLength": 1},
+        "passed": {"type": "boolean"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"qualification_eligible": {"const": true}}},
+      "then": {
+        "properties": {
+          "source": {"properties": {"state": {"const": "clean"}}},
+          "preflight": {"properties": {"passed": {"const": true}}},
+          "sla": {"properties": {"passed": {"const": true}}},
+          "artifacts_complete": {"const": true},
+          "outcome": {"const": "passed"},
+          "errors": {"maxItems": 0}
+        }
+      }
+    }
+  ]
+}

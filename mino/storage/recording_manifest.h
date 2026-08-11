@@ -17,11 +17,12 @@
 #include <vector>
 
 #include "mino/common/result.h"
+#include "mino/storage/topic_partition.h"
 
 namespace mino::storage {
 
-inline constexpr uint16_t kRecordingManifestFormatVersion = 1;
-inline constexpr uint16_t kPartitionManifestFormatVersion = 1;
+inline constexpr uint16_t kRecordingManifestFormatVersion = 2;
+inline constexpr uint16_t kPartitionManifestFormatVersion = 2;
 inline constexpr size_t kSchemaDigestSize = 32;
 
 enum class ManifestFaultPoint : uint8_t {
@@ -40,6 +41,7 @@ struct ManifestLimits {
     size_t max_manifest_bytes = 64u * 1024u * 1024u;
     size_t max_topics = 65536;
     size_t max_schemas_per_topic = 65536;
+    size_t max_partition_maps_per_topic = 1024;
     size_t max_segments = 1u << 20;
     size_t max_topic_name_bytes = 1024;
     size_t max_relative_path_bytes = 4096;
@@ -71,6 +73,10 @@ struct TopicTableEntry {
     uint32_t topic_id = 0;
     std::string topic_name;
     uint64_t config_version = 0;
+    // Ordered immutable partition-map generations. Lifecycle state is the only
+    // field that may advance after insertion. Empty is accepted only for legacy
+    // manifests created before Topic Partition metadata was introduced.
+    std::vector<TopicPartitionMap> partition_maps;
     std::vector<SchemaRefSnapshot> schema_snapshot;
 
     bool operator==(const TopicTableEntry&) const = default;
@@ -131,6 +137,13 @@ struct PartitionMetadata {
     uint32_t partition_id = 0;
     uint64_t writer_id = 0;
     uint64_t owner_epoch = 0;
+    uint64_t partition_map_version = 1;
+    uint64_t partition_generation = 1;
+    uint32_t partition_count = 1;
+    TopicPartitionStrategy partition_strategy = TopicPartitionStrategy::kManual;
+    TopicPartitionMapState partition_map_state = TopicPartitionMapState::kActive;
+    uint16_t hash_algorithm_version = kStablePartitionHashVersion;
+    uint64_t hash_seed = kDefaultPartitionHashSeed;
     uint64_t config_version = 0;
 
     bool operator==(const PartitionMetadata&) const = default;
@@ -138,6 +151,8 @@ struct PartitionMetadata {
 
 struct PartitionManifestSnapshot {
     uint64_t generation = 0;
+    // Decoder provenance only; it is not an additional serialized field.
+    uint16_t format_version = kPartitionManifestFormatVersion;
     PartitionMetadata partition;
     std::optional<DurableCheckpoint> checkpoint;
     std::vector<SegmentManifestEntry> segments;
@@ -184,6 +199,16 @@ public:
     // Topic ID/name mapping is immutable. Config version and schema snapshot
     // may only move forward; schema refs already present may not change.
     Status UpdateTopic(TopicTableEntry topic) noexcept;
+    // Repartition is an explicit generation protocol. Prepare persists a new
+    // generation, BeginDrain fences the old active route, and Cutover requires a
+    // conservation proof before atomically retiring old and activating new.
+    Status PrepareTopicPartitionMap(uint32_t topic_id,
+                                    TopicPartitionMap next) noexcept;
+    Status BeginTopicPartitionDrain(uint32_t topic_id,
+                                    uint64_t prepared_generation) noexcept;
+    Status CutoverTopicPartitionMap(uint32_t topic_id,
+                                    uint64_t prepared_generation,
+                                    const PartitionDrainProof& proof) noexcept;
     Status UpdateSessionConfigVersion(uint64_t config_version) noexcept;
 
     Result<TopicTableEntry> FindTopic(uint32_t topic_id) const noexcept;
@@ -221,6 +246,9 @@ public:
     PartitionManifest(PartitionManifest&&) = delete;
     PartitionManifest& operator=(PartitionManifest&&) = delete;
 
+    // One-time v1 migration. Identity fields that existed in v1 remain
+    // immutable; only the newly introduced partition-map metadata is populated.
+    Status UpgradeLegacyMetadata(PartitionMetadata metadata) noexcept;
     Status AddSegment(SegmentManifestEntry segment) noexcept;
     Status UpdateSegment(SegmentManifestEntry segment) noexcept;
     Status UpdateCheckpoint(DurableCheckpoint checkpoint) noexcept;

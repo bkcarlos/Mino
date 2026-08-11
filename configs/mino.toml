@@ -22,3 +22,96 @@ max_files = 5
 enabled = false
 queue_size = 8192
 thread_count = 1
+
+# MonitoringDeployment consumes these bounded values. Prometheus is loopback-only
+# by default; use a firewall or authenticated sidecar before binding externally.
+[observability]
+aggregate_interval_ms = 1000
+
+[observability.prometheus]
+enabled = true
+bind_address = "127.0.0.1"
+port = 9464
+request_bytes_limit = 4096
+header_count_limit = 32
+response_bytes_limit = 262144
+connection_limit = 16
+worker_threads = 2
+read_timeout_ms = 1000
+write_timeout_ms = 2000
+accept_poll_ms = 100
+
+[observability.otlp]
+enabled = false
+# The production assembly has a fixed 16-snapshot queue. Enabling OTLP requires
+# installation of a caller-owned bounded, non-blocking OtlpJsonSink.
+snapshot_queue_capacity = 16
+
+# Process-local NUMA placement for Region allocator creation. This policy is
+# never serialized into shared-memory metadata. Supported values are default,
+# local, node, and stripe (Linux MPOL_INTERLEAVE across allowed nodes).
+[allocator.numa]
+policy = "local"
+# Used only when policy = "node"; the node must be allowed by Mems_allowed_list
+# and the active cgroup cpuset.
+node = 0
+# strict fails Region/Slab creation on discovery/mbind errors; fallback records
+# the error and continues with the operating-system default placement.
+failure_policy = "fallback"
+prefer_local_shards = true
+
+# Process assembly creates one LargeObjectPool per purpose. These settings are
+# not a substitute for SharedMemorySegment backing observations or a device
+# provider; strict HugePage mode fails if the authoritative mapping fell back.
+[allocator.large_objects]
+segment_size_bytes = 65536
+minimum_registered_object_bytes = 65536
+registration_quota_bytes = 1073741824
+# Must be stable and unique for this deployment/pool across process restarts.
+registration_scope_id = 55048
+huge_page_failure_policy = "fallback"
+
+# Device registration is disabled until process assembly injects a concrete
+# MemoryRegistrationProvider. Setting enabled=true without one is an error; Mino
+# never reports software/mock registration as device registration.
+[allocator.large_objects.registration]
+enabled = false
+provider = "none"
+
+# RDMA is disabled unless deployment assembly loads an approved absolute-path
+# device plugin. The in-tree test loopback cannot be selected here. Production
+# RemoteBridge additionally requires verified peer identity and Coordinator ACL.
+[transport.rdma]
+enabled = false
+provider_plugin = ""
+device = ""
+authentication_mode = "verified_peer"
+send_queue_depth = 256
+receive_queue_depth = 256
+completion_queue_depth = 512
+max_message_bytes = 16777216
+max_queued_send_bytes = 67108864
+max_queued_receive_bytes = 67108864
+registration_quota_bytes = 268435456
+# Stable across restarts for this deployment/driver; process epoch changes.
+registration_scope_id = 54790
+
+# Shared Fabric is disabled unless assembly loads an approved absolute-path IPCF,
+# NTB, or CXL device plugin and injects a controlled attestation verifier. The
+# attestation binds node/domain/provider/device/window generation/session. A TOML
+# value alone can never enable mock mode or bypass Coordinator Topic ACL checks.
+[transport.fabric]
+enabled = false
+kind = "ntb" # ipcf | ntb | cxl
+provider_plugin = ""
+device = ""
+fabric_domain = 0
+channel_id = 0
+max_windows_per_connection = 64
+event_queue_depth = 256
+receive_queue_depth = 256
+completion_queue_depth = 256
+max_message_bytes = 16777216
+max_queued_receive_bytes = 67108864
+# Must differ from the local Registry Security Domain. Same-domain peers use SHM.
+expected_peer_security_domain = 0

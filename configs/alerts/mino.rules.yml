@@ -1,0 +1,143 @@
+{
+  "groups": [
+    {
+      "name": "mino-critical",
+      "interval": "30s",
+      "rules": [
+        {
+          "alert": "MinoMonitoringDown",
+          "expr": "up{job=\"mino\"} == 0",
+          "for": "2m",
+          "labels": {"severity": "critical", "component": "exporter"},
+          "annotations": {"summary": "Mino Prometheus endpoint is unavailable", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#monitoring-down"}
+        },
+        {
+          "alert": "MinoMonitoringSnapshotStale",
+          "expr": "time() - mino_monitoring_last_snapshot_unixtime_seconds > 30",
+          "for": "2m",
+          "labels": {"severity": "critical", "component": "exporter"},
+          "annotations": {"summary": "Mino monitoring snapshots are stale", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#monitoring-down"}
+        },
+        {
+          "alert": "MinoQueueNearCapacity",
+          "expr": "mino_queue_capacity > 0 and mino_queue_depth / mino_queue_capacity > 0.9",
+          "for": "5m",
+          "labels": {"severity": "warning", "component": "queue"},
+          "annotations": {"summary": "Mino aggregate queue depth is above 90 percent", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#queue-saturation"}
+        },
+        {
+          "alert": "MinoQueueDrops",
+          "expr": "increase(mino_queue_dropped_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "queue"},
+          "annotations": {"summary": "Mino queues are dropping work", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#queue-saturation"}
+        },
+        {
+          "alert": "MinoSlabAllocationFailures",
+          "expr": "increase(mino_slab_allocation_failures_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "slab"},
+          "annotations": {"summary": "Mino slab allocations are failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#slab-failure"}
+        },
+        {
+          "alert": "MinoSlabCorruption",
+          "expr": "increase(mino_slab_corruption_total[5m]) > 0",
+          "for": "0m",
+          "labels": {"severity": "critical", "component": "slab"},
+          "annotations": {"summary": "Mino detected slab corruption", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#slab-failure"}
+        },
+        {
+          "alert": "MinoLeaseExpirations",
+          "expr": "increase(mino_lease_expirations_total[10m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "warning", "component": "lease"},
+          "annotations": {"summary": "Mino participant leases are expiring", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#lease-expiration"}
+        },
+        {
+          "alert": "MinoLeaseHeartbeatStale",
+          "expr": "mino_lease_oldest_heartbeat_age_seconds > 120",
+          "for": "2m",
+          "labels": {"severity": "critical", "component": "lease"},
+          "annotations": {"summary": "Mino oldest participant heartbeat is stale", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#lease-expiration"}
+        },
+        {
+          "alert": "MinoBridgeDisconnected",
+          "expr": "mino_bridge_configured == 1 and mino_bridge_connected == 0",
+          "for": "2m",
+          "labels": {"severity": "critical", "component": "bridge"},
+          "annotations": {"summary": "Configured Mino bridge has no connected session", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#bridge-disconnected"}
+        },
+        {
+          "alert": "MinoBridgeReconnectFailures",
+          "expr": "increase(mino_bridge_reconnect_failures_total[5m]) > 2",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "bridge"},
+          "annotations": {"summary": "Mino bridge reconnect attempts are failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#bridge-disconnected"}
+        },
+        {
+          "alert": "MinoStorageWriteFailures",
+          "expr": "increase(mino_storage_write_failures_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "storage"},
+          "annotations": {"summary": "Mino storage writes are failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#storage-failure"}
+        },
+        {
+          "alert": "MinoStorageBacklog",
+          "expr": "mino_storage_pending_bytes > 1073741824",
+          "for": "10m",
+          "labels": {"severity": "warning", "component": "storage"},
+          "annotations": {"summary": "Mino storage backlog exceeds one GiB", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#storage-failure"}
+        },
+        {
+          "alert": "MinoOtlpQueueNearCapacity",
+          "expr": "mino_otlp_export_queue_capacity > 0 and mino_otlp_export_queue_depth / mino_otlp_export_queue_capacity > 0.8",
+          "for": "5m",
+          "labels": {"severity": "warning", "component": "exporter"},
+          "annotations": {"summary": "Mino OTLP snapshot queue is near capacity", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#exporter-failure"}
+        },
+        {
+          "alert": "MinoOtlpDropsOrFailures",
+          "expr": "increase(mino_otlp_export_dropped_total[5m]) + increase(mino_otlp_export_failures_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "exporter"},
+          "annotations": {"summary": "Mino OTLP snapshots are dropping or failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#exporter-failure"}
+        },
+        {
+          "alert": "MinoCapacityHeadroomLow",
+          "expr": "mino_capacity_min_headroom_bytes > 0 and mino_capacity_headroom_bytes < mino_capacity_min_headroom_bytes",
+          "for": "5m",
+          "labels": {"severity": "critical", "component": "capacity"},
+          "annotations": {"summary": "Mino capacity headroom is below its safety floor", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#capacity-exhaustion"}
+        },
+        {
+          "alert": "MinoCapacityRejections",
+          "expr": "increase(mino_capacity_rejections_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "warning", "component": "capacity"},
+          "annotations": {"summary": "Mino capacity controller is rejecting reservations", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#capacity-exhaustion"}
+        },
+        {
+          "alert": "MinoTlsHandshakeFailures",
+          "expr": "increase(mino_tls_handshake_failures_total[5m]) > 2",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "tls_acl"},
+          "annotations": {"summary": "Mino TLS handshakes are repeatedly failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#tls-and-acl"}
+        },
+        {
+          "alert": "MinoTlsCertificateExpiring",
+          "expr": "mino_tls_certificate_expiry_unixtime_seconds > 0 and mino_tls_certificate_expiry_unixtime_seconds - time() < 604800",
+          "for": "10m",
+          "labels": {"severity": "warning", "component": "tls_acl"},
+          "annotations": {"summary": "Mino process certificate expires within seven days", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#tls-and-acl"}
+        },
+        {
+          "alert": "MinoAclDeniedSpike",
+          "expr": "increase(mino_acl_denied_total[5m]) > 10",
+          "for": "1m",
+          "labels": {"severity": "warning", "component": "tls_acl"},
+          "annotations": {"summary": "Mino ACL denials increased unexpectedly", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#tls-and-acl"}
+        }
+      ]
+    }
+  ]
+}

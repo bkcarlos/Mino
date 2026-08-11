@@ -1,5 +1,34 @@
 # Validation benchmarks
 
+## TCP / UDP / RDMA / Fabric transport matrix (D6-06/D6-07)
+
+`//benchmarks/transport:transport_matrix_benchmark` runs the same Canonical Wire
+application payload matrix over TCP, UDP, RDMA Driver staging, provider-direct
+registered RDMA zero-copy, and IPCF/NTB/CXL Fabric windows. Client JSONL includes process CPU, p50/p99 RTT,
+throughput, wire size, copy mode, and provider provenance. The RDMA modes require
+an absolute-path real device plugin and never fall back to the test mock.
+
+Physical qualification is manual and two-host only:
+`.github/workflows/rdma-qualification.yml` verifies ACTIVE/LINKUP device ports,
+peer identity, exact commit, binary/plugin SHA-256, provider provenance, and the
+complete result matrix before retaining evidence. See `docs/rdma-driver.md`.
+
+Fabric qualification is independently manual and two-host only through
+`.github/workflows/fabric-qualification.yml`. It requires an approved real device
+plugin, active physical device/link evidence, cross-Trust-Domain node identities,
+and emits commit/binary/plugin/provider provenance. See `docs/fabric-driver.md`.
+
+## Large-object-pool matrix and physical qualification (D6-08)
+
+`//benchmarks/allocator:large_object_pool_benchmark` compares ordinary, actual
+HugePage, and dynamic device-registration pools across three sizes and short/batch
+usage. `//benchmarks/allocator:large_object_pool_qualification` binds the clean
+commit, physical device/link and NUMA provenance, HugePage pool/actual mapping,
+memlock, approved plugin SHA-256, throughput/p99/fragmentation/fallback SLAs, and
+five hashed artifacts. Local mock/no-device runs are explicitly non-qualified.
+See `docs/large-object-pool.md` and
+`.github/workflows/large-object-pool-qualification.yml`.
+
 ## Validation benchmark target
 
 `//benchmarks:validation_benchmark` directly exercises existing production APIs for V-14, V-15, V-16, V-17, V-18, and V-27. Build and run:
@@ -14,6 +43,38 @@ bazel run --config=release //benchmarks:validation_benchmark -- \
 ```
 
 Use `--suite=memory` or `--suite=storage` to isolate phases. Full options, methodology, JSON Schema, and the no-data template are documented in `docs/benchmarks/Validation_Benchmark_Methodology.md`.
+
+# Topic Partition benchmark (V-24)
+
+`//benchmarks:storage_partition_benchmark` runs the production per-partition
+`RecorderBufferPool` + `TopicWriter` path at exactly 1, 2, 4, 8, and 16
+partitions. It emits `mino.storage_partition_benchmark.v1` JSON containing the
+measured single-writer threshold, aggregate scaling and efficiency,
+per-partition throughput imbalance, and record p50/p99 latency. `--target-ingress-rps`
+marks whether the measured one-writer threshold requires partitioning.
+
+Formal qualification is driven by
+`benchmarks/storage_partition_qualification.py`; free-form hardware naming is
+not qualification evidence. The runner probes CPU/governors, `findmnt`, and
+`lsblk`, executes multiple concurrent processes for multiple complete rounds,
+validates errors/record conservation/stable-map/imbalance/p99/throughput, and
+applies the versioned single-writer/scaling-efficiency policy. Non-target hosts
+produce only `outcome=nonqualified` with `qualification_eligible=false`.
+
+```bash
+bazel run --config=release //benchmarks:storage_partition_benchmark -- \
+  --records=20000 --payload-bytes=1024 \
+  --target-ingress-rps=1000000 \
+  --qualification-hardware="i9-9900KS; Samsung 980 PRO NVMe; ext4; Linux x86-64" \
+  --directory=/code/Mino/.cache \
+  --output-json=/tmp/mino-storage-partition-v24.json
+```
+
+The deterministic merge/order correctness tests are not inferred from benchmark
+throughput; they remain part of `//mino/storage:replay_engine_test` and
+`//mino/storage:topic_partition_test`. Complete qualification methodology,
+policy, evidence hashes, and the self-hosted workflow are documented in
+`docs/benchmarks/Storage_Partition_Qualification.md`.
 
 # Storage benchmark
 

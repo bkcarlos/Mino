@@ -12,10 +12,12 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <iomanip>
 #include <limits>
 #include <new>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -184,6 +186,22 @@ storage::RecorderSchemaMetadata RecorderSchema(
 bool SameSchema(const storage::RecorderSchemaMetadata& left,
                 const storage::RecorderSchemaMetadata& right) noexcept {
     return left == right;
+}
+
+std::filesystem::path RuntimePartitionRoot(
+    const std::filesystem::path& session_root, uint32_t topic_id,
+    uint64_t generation, uint32_t partition_id) {
+    std::ostringstream partition_name;
+    partition_name << std::setfill('0') << std::setw(4) << partition_id;
+    std::filesystem::path topic_root =
+        session_root / "topics" / std::to_string(topic_id);
+    if (generation == 1) {
+        return topic_root / "partitions" / partition_name.str();
+    }
+    std::ostringstream generation_name;
+    generation_name << std::setfill('0') << std::setw(20) << generation;
+    return topic_root / "generations" / generation_name.str() / "partitions" /
+           partition_name.str();
 }
 
 const RuntimeTopicConfig* FindRuntimeTopic(const RuntimeConfig& config,
@@ -509,7 +527,8 @@ Result<RuntimeConfig> LoadRuntimeConfig(
             MINO_RETURN_IF_ERROR(ValidateKeys(
                 *topic, prefix,
                 {"name", "schema_artifact", "schema_type", "channel_capacity",
-                 "max_subscribers", "max_payload_bytes", "record_partitions"}));
+                 "max_subscribers", "max_payload_bytes", "record_partitions",
+                 "record_partition_strategy", "record_partition_hash_seed"}));
             Result<std::string> name = RequiredString(*topic, "name", prefix + ".name");
             if (!name.ok()) return name.status();
             Result<std::string> artifact_path = RequiredString(
@@ -563,11 +582,34 @@ Result<RuntimeConfig> LoadRuntimeConfig(
             Result<uint32_t> partitions = Integer<uint32_t>(
                 *topic, "record_partitions", prefix + ".record_partitions", 1,
                 false);
-            if (!partitions.ok() || (partitions.ok() && *partitions != 1)) {
+            if (!partitions.ok() ||
+                (partitions.ok() &&
+                 *partitions > storage::kMaximumTopicPartitions)) {
                 return partitions.ok()
-                           ? Invalid("record_partitions must be 1 because Bus messages have no partition key")
+                           ? Invalid("record_partitions exceeds the storage bound")
                            : partitions.status();
             }
+            storage::TopicPartitionStrategy partition_strategy =
+                storage::TopicPartitionStrategy::kManual;
+            if (const toml::node* strategy_node =
+                    topic->get("record_partition_strategy");
+                strategy_node != nullptr) {
+                const std::optional<std::string_view> strategy =
+                    strategy_node->value<std::string_view>();
+                if (!strategy.has_value()) {
+                    return Invalid("'" + prefix +
+                                   ".record_partition_strategy' must be a string");
+                }
+                Result<storage::TopicPartitionStrategy> parsed =
+                    storage::ParseTopicPartitionStrategy(*strategy);
+                if (!parsed.ok()) return parsed.status();
+                partition_strategy = *parsed;
+            }
+            Result<uint64_t> hash_seed = Integer<uint64_t>(
+                *topic, "record_partition_hash_seed",
+                prefix + ".record_partition_hash_seed",
+                storage::kDefaultPartitionHashSeed, false, true);
+            if (!hash_seed.ok()) return hash_seed.status();
             RuntimeTopicConfig configured{
                 .bus = deployment::LocalTopicConfig{
                     .name = std::move(*name),
@@ -578,6 +620,8 @@ Result<RuntimeConfig> LoadRuntimeConfig(
                 },
                 .descriptor_artifact = std::move(*artifact),
                 .record_partitions = *partitions,
+                .record_partition_strategy = partition_strategy,
+                .record_partition_hash_seed = *hash_seed,
             };
             config.bus.topics.push_back(configured.bus);
             config.topics.push_back(std::move(configured));
@@ -586,6 +630,18 @@ Result<RuntimeConfig> LoadRuntimeConfig(
         for (const RuntimeTopicConfig& topic : config.topics) {
             maximum_payload_bytes =
                 std::max(maximum_payload_bytes, topic.bus.max_payload_bytes);
+            if (topic.record_partition_strategy ==
+                    storage::TopicPartitionStrategy::kKey ||
+                topic.record_partition_strategy ==
+                    storage::TopicPartitionStrategy::kHash) {
+                return Invalid(
+                    "Bus recorder assembly supports source or manual partition strategy");
+            }
+            if (config.recorder_buffer_bytes / topic.record_partitions <
+                topic.bus.max_payload_bytes) {
+                return Invalid(
+                    "record.buffer_bytes cannot admit one maximum payload per partition");
+            }
         }
         constexpr uint64_t kMaximumRecordRuntimeMs = 24ull * 60 * 60 * 1000;
         constexpr uint64_t kMaximumStopAfterRecords = 1ull << 40;
@@ -654,29 +710,89 @@ Status BusRecorderServiceLauncher::Run(
                 return Status::Error(StatusCode::kNotFound,
                                      "recording topic is absent from runtime config");
             }
-            Result<std::unique_ptr<storage::PartitionManifest>> partition_manifest =
-                storage::PartitionManifest::Open(
-                    session_root / "topics" /
-                    std::to_string(manifest_topic.topic_id) / "partitions/0000");
-            if (!partition_manifest.ok()) return partition_manifest.status();
-            const storage::PartitionMetadata partition_identity =
-                (*partition_manifest)->snapshot().partition;
-            partition_manifest->reset();
-            if (partition_identity.topic_id != manifest_topic.topic_id ||
-                partition_identity.partition_id != 0 ||
-                partition_identity.config_version != manifest_topic.config_version ||
-                partition_identity.writer_id == 0) {
-                return Status::Error(
-                    StatusCode::kCorruption,
-                    "recording partition identity differs from the topic manifest");
+            storage::TopicPartitionMap active_map{
+                .map_version = manifest_topic.config_version,
+                .generation = 1,
+                .partition_count = configured->record_partitions,
+                .strategy = configured->record_partition_strategy,
+                .state = storage::TopicPartitionMapState::kActive,
+                .hash_algorithm_version = storage::kStablePartitionHashVersion,
+                .hash_seed = configured->record_partition_hash_seed,
+            };
+            if (!manifest_topic.partition_maps.empty()) {
+                const auto persisted = std::find_if(
+                    manifest_topic.partition_maps.begin(),
+                    manifest_topic.partition_maps.end(),
+                    [](const storage::TopicPartitionMap& map) {
+                        return map.state ==
+                               storage::TopicPartitionMapState::kActive;
+                    });
+                if (persisted == manifest_topic.partition_maps.end()) {
+                    return Status::Error(
+                        StatusCode::kCorruption,
+                        "recording topic has no active partition map");
+                }
+                active_map = *persisted;
+            }
+            if (active_map.partition_count != configured->record_partitions ||
+                active_map.strategy !=
+                    configured->record_partition_strategy ||
+                active_map.hash_seed !=
+                    configured->record_partition_hash_seed) {
+                return Invalid(
+                    "runtime partition config differs from the recording manifest");
+            }
+            uint64_t writer_id_base = 0;
+            for (uint32_t partition_id = 0;
+                 partition_id < active_map.partition_count; ++partition_id) {
+                Result<std::unique_ptr<storage::PartitionManifest>>
+                    partition_manifest = storage::PartitionManifest::Open(
+                        RuntimePartitionRoot(
+                            session_root, manifest_topic.topic_id,
+                            active_map.generation, partition_id));
+                if (!partition_manifest.ok()) {
+                    return partition_manifest.status();
+                }
+                const bool legacy_partition =
+                    (*partition_manifest)->snapshot().format_version == 1;
+                const storage::PartitionMetadata partition_identity =
+                    (*partition_manifest)->snapshot().partition;
+                partition_manifest->reset();
+                if (partition_id == 0) {
+                    writer_id_base = partition_identity.writer_id;
+                }
+                if (partition_identity.topic_id != manifest_topic.topic_id ||
+                    partition_identity.partition_id != partition_id ||
+                    (!legacy_partition &&
+                     (partition_identity.partition_generation !=
+                          active_map.generation ||
+                      partition_identity.partition_map_version !=
+                          active_map.map_version ||
+                      partition_identity.partition_count !=
+                          active_map.partition_count)) ||
+                    partition_identity.writer_id !=
+                        writer_id_base + partition_id ||
+                    partition_identity.config_version !=
+                        manifest_topic.config_version ||
+                    writer_id_base == 0) {
+                    return Status::Error(
+                        StatusCode::kCorruption,
+                        "recording partition identity differs from the topic manifest");
+                }
             }
 
             storage::RecorderTopicConfig recorder_topic;
             recorder_topic.topic_id = TopicId{manifest_topic.topic_id};
             recorder_topic.topic_name = manifest_topic.topic_name;
             recorder_topic.config_version = manifest_topic.config_version;
-            recorder_topic.partition_count = configured->record_partitions;
-            recorder_topic.writer_id_base = partition_identity.writer_id;
+            recorder_topic.partition_count = active_map.partition_count;
+            recorder_topic.partition_map_version = active_map.map_version;
+            recorder_topic.partition_generation = active_map.generation;
+            recorder_topic.partition_strategy = active_map.strategy;
+            recorder_topic.partition_hash_version =
+                active_map.hash_algorithm_version;
+            recorder_topic.partition_hash_seed = active_map.hash_seed;
+            recorder_topic.writer_id_base = writer_id_base;
             recorder_topic.policy.mode = storage::RecordingMode::kDurable;
             recorder_topic.policy.backpressure_topology =
                 storage::RecordBackpressureTopology::kIsolated;
@@ -686,6 +802,8 @@ Status BusRecorderServiceLauncher::Run(
                 storage::SegmentSyncPolicy::kPerBatch;
             recorder_topic.policy.require_complete_recording = true;
             recorder_topic.buffer_pool_options.global_byte_limit =
+                config_.recorder_buffer_bytes;
+            recorder_topic.total_buffer_byte_limit =
                 config_.recorder_buffer_bytes;
             recorder_topic.buffer_pool_options.default_topic_byte_limit =
                 config_.recorder_buffer_bytes;

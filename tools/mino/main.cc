@@ -47,6 +47,7 @@
 #include "tools/mino/inspector.h"
 #include "tools/mino/runtime_services.h"
 #include "tools/mino/storage_commands.h"
+#include "tools/mino/upgrade_commands.h"
 
 namespace {
 
@@ -73,6 +74,7 @@ USAGE:
     mino record create <session_root> --recording-id N --owner-id N --owner-epoch N
                        --config-version N --topic <id>:<name> ...
     mino record run <session_root> --runtime-config <file>
+    mino upgrade <plan|status|execute|resume|rollback> ...
 
 OPTIONS:
     --layout <file>   Layout sidecar describing class table and ring buffers.
@@ -450,6 +452,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string command = argv[1];
+
+    if (command == "upgrade") {
+        std::vector<std::string> upgrade_args;
+        upgrade_args.reserve(static_cast<size_t>(argc - 2));
+        for (int index = 2; index < argc; ++index) {
+            upgrade_args.emplace_back(argv[index]);
+        }
+        return mino::tools::RunUpgradeCommand(upgrade_args, std::cout, std::cerr);
+    }
 
     if (command == "storage" || command == "replay" || command == "record") {
         std::vector<std::string> storage_args;

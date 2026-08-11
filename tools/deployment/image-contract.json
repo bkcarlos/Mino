@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "binaries": [
+    "/usr/local/bin/mino",
+    "/usr/local/bin/mino-deploy",
+    "/usr/local/bin/mino-node"
+  ],
+  "default_process": {
+    "entrypoint": ["/usr/local/bin/mino-deploy"],
+    "command": [
+      "start",
+      "--config",
+      "/etc/mino/node.toml",
+      "--",
+      "/usr/local/bin/mino-node",
+      "--config",
+      "/etc/mino/node.toml"
+    ]
+  },
+  "identity": {"uid": 65532, "gid": 65532, "root_forbidden": true},
+  "filesystem": {
+    "read_only_root_required": true,
+    "writable_mounts": [
+      "/var/lib/mino/data",
+      "/var/lib/mino/schemas",
+      "/run/mino"
+    ],
+    "read_only_mounts": ["/run/secrets/mino"],
+    "namespace_attestation": "/run/secrets/mino/security-domain.namespace"
+  },
+  "health": {
+    "path": "/-/healthy",
+    "port_from": "monitoring.port",
+    "probe": [
+      "/usr/local/bin/mino-deploy",
+      "probe",
+      "--config",
+      "/etc/mino/node.toml",
+      "--kind",
+      "health"
+    ]
+  },
+  "termination": {
+    "signals": ["SIGTERM", "SIGINT"],
+    "grace_from": "node.shutdown_grace_ms"
+  },
+  "supply_chain": {
+    "base_references": "registry/name@sha256:digest",
+    "sbom": "SPDX JSON generated from the final image",
+    "provenance": "BuildKit metadata plus image and SBOM digests"
+  },
+  "secrets": {
+    "delivery": "runtime read-only file mount only",
+    "environment_values_forbidden": true,
+    "image_layer_material_forbidden": true
+  }
+}

@@ -43,6 +43,20 @@ cc_library(
 )
 
 cc_library(
+    name = "upgrade_commands",
+    srcs = ["upgrade_commands.cc"],
+    hdrs = ["upgrade_commands.h"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/registry",
+        "//mino/schema:descriptor",
+        "//mino/upgrade",
+    ],
+)
+
+cc_library(
     name = "runtime_services",
     srcs = ["runtime_services.cc"],
     hdrs = ["runtime_services.h"],
@@ -127,6 +141,7 @@ cc_binary(
         ":inspector",
         ":runtime_services",
         ":storage_commands",
+        ":upgrade_commands",
         "//mino/common:status",
         "//mino/shm/recovery:scanner",
     ],

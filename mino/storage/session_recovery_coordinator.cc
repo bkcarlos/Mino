@@ -93,11 +93,19 @@ Status ValidateNoSymlinkAncestors(const std::filesystem::path& path,
 
 std::filesystem::path ExpectedPartitionRoot(
     const std::filesystem::path& session_root, uint32_t topic_id,
-    uint32_t partition_id) {
+    uint64_t generation, uint32_t partition_id) {
     std::ostringstream partition_name;
     partition_name << std::setfill('0') << std::setw(4) << partition_id;
-    return (session_root / "topics" / std::to_string(topic_id) / "partitions" /
-            partition_name.str())
+    std::filesystem::path topic_root =
+        session_root / "topics" / std::to_string(topic_id);
+    if (generation == 1) {
+        return (topic_root / "partitions" / partition_name.str())
+            .lexically_normal();
+    }
+    std::ostringstream generation_name;
+    generation_name << std::setfill('0') << std::setw(20) << generation;
+    return (topic_root / "generations" / generation_name.str() /
+            "partitions" / partition_name.str())
         .lexically_normal();
 }
 
@@ -216,24 +224,32 @@ private:
 
     Result<std::vector<std::filesystem::path>> DiscoverPartitions() {
         std::vector<std::filesystem::path> roots;
-        for (const TopicTableEntry& topic : manifest_->snapshot().topics) {
-            const std::filesystem::path partitions =
-                root_ / "topics" / std::to_string(topic.topic_id) / "partitions";
+        auto append_partitions = [&](const std::filesystem::path& partitions,
+                                     bool required) -> Status {
             std::error_code error;
             if (!std::filesystem::is_directory(partitions, error) || error) {
-                return Corruption("recording topic partitions directory is missing");
+                if (!required && !error) return Status::Ok();
+                return Corruption(
+                    "recording topic partitions directory is missing");
             }
             MINO_RETURN_IF_ERROR(
                 ValidateNoSymlinkAncestors(partitions, true));
             for (const auto& entry :
                  std::filesystem::directory_iterator(partitions, error)) {
-                if (error) return Unavailable("cannot enumerate partitions: " + error.message());
+                if (error) {
+                    return Unavailable("cannot enumerate partitions: " +
+                                       error.message());
+                }
                 const std::filesystem::file_status status =
                     entry.symlink_status(error);
-                if (error) return Unavailable("cannot inspect partition: " + error.message());
+                if (error) {
+                    return Unavailable("cannot inspect partition: " +
+                                       error.message());
+                }
                 if (std::filesystem::is_symlink(status) ||
                     !std::filesystem::is_directory(status)) {
-                    return Corruption("partition entry is not a real directory");
+                    return Corruption(
+                        "partition entry is not a real directory");
                 }
                 MINO_RETURN_IF_ERROR(
                     ValidateNoSymlinkAncestors(entry.path(), true));
@@ -242,6 +258,48 @@ private:
                     return Status::Error(StatusCode::kResourceExhausted,
                                          "session has too many partitions");
                 }
+            }
+            return Status::Ok();
+        };
+
+        for (const TopicTableEntry& topic : manifest_->snapshot().topics) {
+            const std::filesystem::path topic_root =
+                root_ / "topics" / std::to_string(topic.topic_id);
+            const bool legacy_required = topic.partition_maps.empty() ||
+                std::any_of(topic.partition_maps.begin(),
+                            topic.partition_maps.end(),
+                            [](const TopicPartitionMap& map) {
+                                return map.generation == 1;
+                            });
+            MINO_RETURN_IF_ERROR(append_partitions(
+                topic_root / "partitions", legacy_required));
+
+            const std::filesystem::path generations = topic_root / "generations";
+            std::error_code error;
+            if (!std::filesystem::exists(generations, error)) {
+                if (error) {
+                    return Unavailable("cannot inspect partition generations: " +
+                                       error.message());
+                }
+                continue;
+            }
+            MINO_RETURN_IF_ERROR(
+                ValidateNoSymlinkAncestors(generations, true));
+            for (const auto& generation :
+                 std::filesystem::directory_iterator(generations, error)) {
+                if (error) {
+                    return Unavailable("cannot enumerate generations: " +
+                                       error.message());
+                }
+                const std::filesystem::file_status status =
+                    generation.symlink_status(error);
+                if (error || std::filesystem::is_symlink(status) ||
+                    !std::filesystem::is_directory(status)) {
+                    return Corruption(
+                        "partition generation is not a real directory");
+                }
+                MINO_RETURN_IF_ERROR(append_partitions(
+                    generation.path() / "partitions", true));
             }
         }
         std::sort(roots.begin(), roots.end());
@@ -443,7 +501,7 @@ private:
             PartitionManifest::Open(partition_root, options_.manifest_options);
         if (!opened.ok()) return opened.status();
         PartitionManifest& manifest = **opened;
-        const PartitionMetadata partition = manifest.snapshot().partition;
+        PartitionMetadata partition = manifest.snapshot().partition;
         const RecordingSessionMetadata& session = manifest_->snapshot().session;
         if (partition.recording_id != session.recording_id ||
             partition.owner_epoch != session.owner_epoch) {
@@ -451,8 +509,68 @@ private:
         }
         Result<TopicTableEntry> topic = manifest_->FindTopic(partition.topic_id);
         if (!topic.ok()) return Corruption("partition topic is absent from session");
+        if (manifest.snapshot().format_version == 1) {
+            PartitionMetadata upgraded = partition;
+            if (!topic->partition_maps.empty()) {
+                const auto map = std::find_if(
+                    topic->partition_maps.begin(), topic->partition_maps.end(),
+                    [&partition](const TopicPartitionMap& candidate) {
+                        return candidate.generation ==
+                               partition.partition_generation;
+                    });
+                if (map == topic->partition_maps.end()) {
+                    return Corruption(
+                        "legacy partition generation is absent from topic map");
+                }
+                upgraded.partition_map_version = map->map_version;
+                upgraded.partition_generation = map->generation;
+                upgraded.partition_count = map->partition_count;
+                upgraded.partition_strategy = map->strategy;
+                upgraded.partition_map_state = map->state;
+                upgraded.hash_algorithm_version =
+                    map->hash_algorithm_version;
+                upgraded.hash_seed = map->hash_seed;
+            } else {
+                const std::filesystem::path siblings =
+                    partition_root.parent_path();
+                std::error_code count_error;
+                size_t count = 0;
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(siblings,
+                                                          count_error)) {
+                    if (count_error) break;
+                    if (entry.is_directory(count_error) && !count_error) ++count;
+                }
+                if (count_error || count == 0 ||
+                    count > kMaximumTopicPartitions) {
+                    return Corruption(
+                        "cannot infer legacy topic partition count");
+                }
+                upgraded.partition_count = static_cast<uint32_t>(count);
+            }
+            MINO_RETURN_IF_ERROR(
+                manifest.UpgradeLegacyMetadata(upgraded));
+            partition = upgraded;
+        }
         if (partition.config_version > topic->config_version) {
             return Corruption("partition config version exceeds topic manifest");
+        }
+        if (!topic->partition_maps.empty()) {
+            const auto partition_map = std::find_if(
+                topic->partition_maps.begin(), topic->partition_maps.end(),
+                [&partition](const TopicPartitionMap& map) {
+                    return map.generation == partition.partition_generation;
+                });
+            if (partition_map == topic->partition_maps.end() ||
+                partition_map->map_version != partition.partition_map_version ||
+                partition_map->partition_count != partition.partition_count ||
+                partition_map->strategy != partition.partition_strategy ||
+                partition_map->hash_algorithm_version !=
+                    partition.hash_algorithm_version ||
+                partition_map->hash_seed != partition.hash_seed) {
+                return Corruption(
+                    "partition map identity differs from session manifest");
+            }
         }
         std::error_code path_error;
         const std::filesystem::path actual_root =
@@ -460,6 +578,7 @@ private:
         if (path_error) return Unavailable("cannot resolve partition path");
         const std::filesystem::path expected_root = std::filesystem::absolute(
             ExpectedPartitionRoot(root_, partition.topic_id,
+                                  partition.partition_generation,
                                   partition.partition_id),
             path_error).lexically_normal();
         if (path_error || actual_root != expected_root) {
@@ -472,6 +591,8 @@ private:
         DurableBoundaryReport boundary{
             .topic_id = partition.topic_id,
             .partition_id = partition.partition_id,
+            .partition_generation = partition.partition_generation,
+            .partition_map_version = partition.partition_map_version,
         };
         std::set<std::filesystem::path> tracked;
         std::vector<SegmentManifestEntry> tracked_snapshot =

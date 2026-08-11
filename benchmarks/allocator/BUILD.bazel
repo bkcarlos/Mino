@@ -1,5 +1,80 @@
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["large_object_pool_qualification_sla.json"])
+
+py_library(
+    name = "large_object_pool_qualification_lib",
+    srcs = ["large_object_pool_qualification.py"],
+)
+
+py_binary(
+    name = "large_object_pool_qualification",
+    srcs = ["large_object_pool_qualification.py"],
+    python_version = "PY3",
+)
+
+py_test(
+    name = "large_object_pool_qualification_contract_test",
+    srcs = ["large_object_pool_qualification_contract_test.py"],
+    data = [
+        "large_object_pool_qualification_sla.json",
+        "//docs/validation:Large_object_pool_qualification_artifact.schema.json",
+    ],
+    deps = [":large_object_pool_qualification_lib"],
+    python_version = "PY3",
+)
+
+py_binary(
+    name = "numa_qualification",
+    srcs = ["numa_qualification.py"],
+    python_version = "PY3",
+)
+
+py_test(
+    name = "numa_qualification_test",
+    srcs = ["numa_qualification.py"],
+    args = ["--self-test"],
+    main = "numa_qualification.py",
+    python_version = "PY3",
+)
+
+cc_binary(
+    name = "numa_allocator_benchmark",
+    srcs = ["numa_allocator_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//mino/platform:numa",
+        "//mino/shm/allocator:central_slab",
+    ],
+)
+
+cc_binary(
+    name = "large_object_pool_benchmark",
+    srcs = ["large_object_pool_benchmark.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    deps = [
+        "//mino/platform:memory_registration",
+        "//mino/platform:numa",
+        "//mino/platform:rdma_provider",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:large_object_pool",
+    ],
+)
+
 cc_binary(
     name = "allocator_benchmark",
     srcs = ["allocator_benchmark.cc"],

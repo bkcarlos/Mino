@@ -313,6 +313,7 @@ protected:
             .node_id = local_node_,
             .process_identity = TestProcessIdentity(local_node_),
             .endpoints = {*endpoint},
+            .security_domain_id = SecurityDomainId{1},
             .trust_domain = "bus-test",
             .health = registry::NodeHealth::kHealthy,
             .lease_epoch = 5,
@@ -349,7 +350,9 @@ protected:
         bus_ = std::move(*bus);
     }
 
-    TopicId CreateTopic(bool activate = true) {
+    TopicId CreateTopic(
+        bool activate = true,
+        uint32_t permissions = registry::kAllTopicPermissions) {
         registry::TopicMetadata candidate{
             .topic_id = {},
             .name = "bus/topic/" + std::to_string(next_topic_name_++),
@@ -373,6 +376,11 @@ protected:
             .partition_count = 1,
             .record_topology =
                 registry::RecordBackpressureTopology::kIsolated,
+            .acl = registry::TopicAcl{
+                .entries = {{.node_id = local_node_,
+                             .security_domain_id = SecurityDomainId{1},
+                             .permissions = permissions}},
+            },
             .region_version = 11,
             .channel_version = 12,
             .acl_version = 13,
@@ -452,6 +460,17 @@ TEST_F(BusTest, CreatesPublisherAndSubscriberByNameAndId) {
     auto subscriber =
         bus_->CreateSubscriber(TopicName(second), TestSchema());
     ASSERT_TRUE(subscriber.ok()) << subscriber.status().ToString();
+}
+
+TEST_F(BusTest, TopicAclDenialStopsBeforeOpeningLocalEndpoint) {
+    const TopicId topic = CreateTopic(
+        true, static_cast<uint32_t>(registry::TopicPermission::kSubscribe));
+
+    auto denied = bus_->CreatePublisher(topic, TestSchema());
+    ASSERT_FALSE(denied.ok());
+    EXPECT_EQ(denied.status().code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(endpoints_->observed_publishers, 0u);
+    EXPECT_EQ(Usage(topic).publishers, 0u);
 }
 
 TEST_F(BusTest, RejectsIncompleteMismatchedAndNonActiveTopics) {

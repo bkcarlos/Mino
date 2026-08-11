@@ -8,7 +8,10 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <new>
+#include <utility>
 
 #include "mino/common/checked_arithmetic.h"
 #include "mino/shm/allocator/generation_array.h"
@@ -20,6 +23,13 @@ constexpr uint32_t kLargePoolMagic = 0x4D4C504Fu;  // "MLPO"
 constexpr uint16_t kLargePoolVersion = 2;
 constexpr uint32_t kDefaultSegmentSize = 64u * 1024u;
 constexpr uint16_t kLargeObjectClassId = 0xFFFFu;
+constexpr uint32_t kPurposeMask = 0x7u;
+constexpr uint32_t kHugeRequestedBit = 1u << 3;
+constexpr uint32_t kHugeActualBit = 1u << 4;
+constexpr uint32_t kHugeFallbackShift = 8;
+constexpr uint32_t kHugeFallbackMask = 0xFFu << kHugeFallbackShift;
+constexpr uint32_t kKnownPoolFlags = kPurposeMask | kHugeRequestedBit |
+                                     kHugeActualBit | kHugeFallbackMask;
 
 struct alignas(64) LargePoolSuperblock {
     uint32_t magic;
@@ -97,6 +107,80 @@ Result<PoolLayout> ComputeLayout(uint32_t segment_count,
     return layout;
 }
 
+bool IsRegisteredPurpose(LargeObjectPoolPurpose purpose) {
+    return purpose == LargeObjectPoolPurpose::kDma ||
+           purpose == LargeObjectPoolPurpose::kRdmaRegistered;
+}
+
+MemoryRegistrationKind RegistrationKindFor(LargeObjectPoolPurpose purpose) {
+    return purpose == LargeObjectPoolPurpose::kRdmaRegistered
+               ? MemoryRegistrationKind::kRdma
+               : MemoryRegistrationKind::kDma;
+}
+
+LargeObjectRegistration RegistrationRequirementFor(
+    LargeObjectPoolPurpose purpose) {
+    if (purpose == LargeObjectPoolPurpose::kDma) {
+        return LargeObjectRegistration::kDma;
+    }
+    if (purpose == LargeObjectPoolPurpose::kRdmaRegistered) {
+        return LargeObjectRegistration::kRdma;
+    }
+    return LargeObjectRegistration::kNone;
+}
+
+bool IsValidPurpose(uint32_t value) {
+    return value <= static_cast<uint32_t>(
+                        LargeObjectPoolPurpose::kRdmaRegistered);
+}
+
+uint32_t EncodePoolFlags(const LargeObjectPoolOptions& options) {
+    uint32_t flags = static_cast<uint32_t>(options.purpose);
+    if (options.huge_pages.requested) flags |= kHugeRequestedBit;
+    if (options.huge_pages.actual) flags |= kHugeActualBit;
+    flags |= (static_cast<uint32_t>(options.huge_pages.fallback_reason) <<
+              kHugeFallbackShift) &
+             kHugeFallbackMask;
+    return flags;
+}
+
+Status ValidateOptions(const LargeObjectPoolOptions& options,
+                       bool require_registration_provider) {
+    if (options.huge_pages.actual && !options.huge_pages.requested) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "actual HugePage backing was not requested");
+    }
+    if (options.purpose == LargeObjectPoolPurpose::kHugePage &&
+        !options.huge_pages.requested) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "HugePage pool requires a backing observation");
+    }
+    if (options.huge_pages.strict && options.huge_pages.requested &&
+        !options.huge_pages.actual) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "strict HugePage pool cannot use fallback backing");
+    }
+    if (!IsRegisteredPurpose(options.purpose)) return Status::Ok();
+    if (options.registration_scope_id == 0 ||
+        !options.registration_owner.valid() ||
+        options.registration_quota_bytes == 0 ||
+        options.minimum_registered_object_bytes == 0) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "registered pool requires scope, owner, quota and minimum size");
+    }
+    if (!require_registration_provider) return Status::Ok();
+    if (options.registration_provider == nullptr ||
+        options.registration_provider->provider_class() ==
+            MemoryRegistrationProviderClass::kUnavailable ||
+        !options.registration_provider->Supports(
+            RegistrationKindFor(options.purpose))) {
+        return Status::Error(StatusCode::kUnsupported,
+                             "requested registration provider is unavailable");
+    }
+    return Status::Ok();
+}
+
 Status ValidateStorage(const LargeObjectPoolStorage& storage) {
     if (storage.region_base == nullptr || storage.region_size == 0 ||
         storage.pool_size < sizeof(LargePoolSuperblock)) {
@@ -157,15 +241,60 @@ void CopyHeader(const SlabHeader& source, SlabHeader* destination) {
 
 }  // namespace
 
+struct LargeObjectPool::LocalNumaState {
+    NumaTopology topology;
+    const NumaSystem* system = nullptr;
+    std::vector<uint32_t> effective_nodes;
+    bool placement_fallback = false;
+    std::atomic<uint64_t> local_allocations{0};
+    std::atomic<uint64_t> remote_allocations{0};
+    std::atomic<uint64_t> fallback_allocations{0};
+    std::atomic<uint64_t> bind_errors{0};
+};
+
+struct LargeObjectPool::LocalSpecializedState {
+    struct Registration {
+        RegisteredMemory memory;
+        MemoryRegistrationOwner lease;
+        LargeObjectLifetime lifetime = LargeObjectLifetime::kAllocation;
+        uint64_t pins = 0;
+    };
+
+    MemoryRegistrationProvider* provider = nullptr;
+    MemoryRegistrationProviderClass provider_class =
+        MemoryRegistrationProviderClass::kUnavailable;
+    uint64_t scope_id = 0;
+    MemoryRegistrationOwner owner;
+    uint64_t quota_bytes = 0;
+    uint64_t minimum_object_bytes = 0;
+    mutable std::mutex mutex;
+    std::map<std::pair<uint64_t, uint32_t>, Registration> registrations;
+    std::atomic<uint64_t> registration_bytes{0};
+    std::atomic<uint64_t> allocations{0};
+    std::atomic<uint64_t> allocation_failures{0};
+    std::atomic<uint64_t> huge_page_fallback_allocations{0};
+    std::atomic<uint64_t> registration_failures{0};
+    std::atomic<uint64_t> registrations_recovered{0};
+    std::atomic<uint64_t> registration_recovery_bytes{0};
+};
+
 Result<LargeObjectPool> LargeObjectPool::Create(
     void* shm_base, uint64_t pool_size, uint32_t max_object_size,
-    uint32_t segment_size) {
+    uint32_t segment_size, const NumaPlacementConfig& numa_config) {
+    LargeObjectPoolOptions options;
+    options.numa = numa_config;
+    return Create(shm_base, pool_size, max_object_size, segment_size, options);
+}
+
+Result<LargeObjectPool> LargeObjectPool::Create(
+    void* shm_base, uint64_t pool_size, uint32_t max_object_size,
+    uint32_t segment_size, const LargeObjectPoolOptions& options) {
     return Create(LargeObjectPoolStorage{.region_base = shm_base,
                                          .region_size = pool_size,
                                          .pool_offset = 0,
                                          .pool_size = pool_size,
                                          .region_id = 0},
-                  max_object_size, segment_size);
+                  max_object_size, segment_size, options);
 }
 
 Result<LargeObjectPool> LargeObjectPool::Attach(void* shm_base,
@@ -178,10 +307,30 @@ Result<LargeObjectPool> LargeObjectPool::Attach(void* shm_base,
                                          .region_id = region_id});
 }
 
+Result<LargeObjectPool> LargeObjectPool::Attach(
+    void* shm_base, uint64_t pool_size, uint32_t region_id,
+    const LargeObjectPoolOptions& options) {
+    return Attach(LargeObjectPoolStorage{.region_base = shm_base,
+                                         .region_size = pool_size,
+                                         .pool_offset = 0,
+                                         .pool_size = pool_size,
+                                         .region_id = region_id},
+                  options);
+}
+
 Result<LargeObjectPool> LargeObjectPool::Create(
     const LargeObjectPoolStorage& storage, uint32_t max_object_size,
-    uint32_t segment_size) {
+    uint32_t segment_size, const NumaPlacementConfig& numa_config) {
+    LargeObjectPoolOptions options;
+    options.numa = numa_config;
+    return Create(storage, max_object_size, segment_size, options);
+}
+
+Result<LargeObjectPool> LargeObjectPool::Create(
+    const LargeObjectPoolStorage& storage, uint32_t max_object_size,
+    uint32_t segment_size, const LargeObjectPoolOptions& options) {
     MINO_RETURN_IF_ERROR(ValidateStorage(storage));
+    MINO_RETURN_IF_ERROR(ValidateOptions(options, /*require_provider=*/true));
     if (max_object_size == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "max_object_size must be positive");
@@ -225,6 +374,14 @@ Result<LargeObjectPool> LargeObjectPool::Create(
 
     auto* region_base = static_cast<std::byte*>(storage.region_base);
     std::byte* pool_base = region_base + storage.pool_offset;
+    if (storage.pool_size > std::numeric_limits<size_t>::max()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "NUMA placement extent exceeds addressable size");
+    }
+    MINO_ASSIGN_OR_RETURN(
+        NumaPlacementResult placement,
+        ApplyNumaPlacement(pool_base, static_cast<size_t>(storage.pool_size),
+                           options.numa));
     auto* super = new (pool_base) LargePoolSuperblock{};
     super->magic = kLargePoolMagic;
     super->version = kLargePoolVersion;
@@ -236,6 +393,7 @@ Result<LargeObjectPool> LargeObjectPool::Create(
     super->segment_size = segment_size;
     super->segment_count = segment_count;
     super->bitmap_words = layout.bitmap_words;
+    super->reserved0 = EncodePoolFlags(options);
     super->metadata_size = layout.payload_offset;
     super->immutable_crc32 = SuperblockCrc(*super);
     std::atomic_ref(super->draining).store(0, std::memory_order_relaxed);
@@ -271,6 +429,11 @@ Result<LargeObjectPool> LargeObjectPool::Create(
     pool.pool_offset_ = storage.pool_offset;
     pool.pool_size_ = storage.pool_size;
     pool.region_id_ = storage.region_id;
+    pool.purpose_ = options.purpose;
+    pool.huge_pages_requested_ = options.huge_pages.requested;
+    pool.huge_pages_actual_ = options.huge_pages.actual;
+    pool.actual_page_size_ = options.huge_pages.actual_page_size;
+    pool.huge_page_fallback_reason_ = options.huge_pages.fallback_reason;
     pool.max_object_size_ = max_object_size;
     pool.segment_size_ = segment_size;
     pool.segment_count_ = segment_count;
@@ -282,11 +445,55 @@ Result<LargeObjectPool> LargeObjectPool::Create(
     pool.headers_region_offset_ = headers_region_offset;
     pool.payload_region_offset_ = payload_region_offset;
     pool.draining_ = &super->draining;
+    pool.local_numa_state_ = std::make_shared<LocalNumaState>();
+    pool.local_numa_state_->topology = std::move(placement.topology);
+    pool.local_numa_state_->system = options.numa.system == nullptr
+                                         ? &NativeNumaSystem()
+                                         : options.numa.system;
+    pool.local_numa_state_->effective_nodes =
+        std::move(placement.effective_nodes);
+    pool.local_numa_state_->placement_fallback = placement.fallback;
+    if (placement.bind_error) {
+        pool.local_numa_state_->bind_errors.store(1,
+                                                  std::memory_order_relaxed);
+    }
+    pool.local_specialized_state_ = std::make_shared<LocalSpecializedState>();
+    pool.local_specialized_state_->provider = options.registration_provider;
+    pool.local_specialized_state_->provider_class =
+        options.registration_provider == nullptr
+            ? MemoryRegistrationProviderClass::kUnavailable
+            : options.registration_provider->provider_class();
+    pool.local_specialized_state_->scope_id = options.registration_scope_id;
+    pool.local_specialized_state_->owner = options.registration_owner;
+    pool.local_specialized_state_->quota_bytes =
+        options.registration_quota_bytes;
+    pool.local_specialized_state_->minimum_object_bytes =
+        options.minimum_registered_object_bytes;
+    if (IsRegisteredPurpose(pool.purpose_) &&
+        options.recover_stale_registrations) {
+        MINO_ASSIGN_OR_RETURN(
+            MemoryRegistrationRecoveryResult recovered,
+            options.registration_provider->RecoverStale({
+                .scope_id = options.registration_scope_id,
+                .current_process_id = options.registration_owner.process_id,
+                .current_process_epoch = options.registration_owner.process_epoch,
+            }));
+        pool.local_specialized_state_->registrations_recovered.store(
+            recovered.registrations_released, std::memory_order_relaxed);
+        pool.local_specialized_state_->registration_recovery_bytes.store(
+            recovered.bytes_released, std::memory_order_relaxed);
+    }
     return pool;
 }
 
 Result<LargeObjectPool> LargeObjectPool::Attach(
     const LargeObjectPoolStorage& storage) {
+    return Attach(storage, LargeObjectPoolOptions{});
+}
+
+Result<LargeObjectPool> LargeObjectPool::Attach(
+    const LargeObjectPoolStorage& storage,
+    const LargeObjectPoolOptions& options) {
     MINO_RETURN_IF_ERROR(ValidateStorage(storage));
     auto* region_base = static_cast<std::byte*>(storage.region_base);
     std::byte* pool_base = region_base + storage.pool_offset;
@@ -304,13 +511,39 @@ Result<LargeObjectPool> LargeObjectPool::Attach(
         return Status::Error(StatusCode::kCorruption,
                              "large pool storage identity mismatch");
     }
-    if (super->max_object_size == 0 || super->segment_size < 64 ||
+    const uint32_t flags = super->reserved0;
+    const uint32_t purpose_bits = flags & kPurposeMask;
+    const uint32_t fallback_bits =
+        (flags & kHugeFallbackMask) >> kHugeFallbackShift;
+    if ((flags & ~kKnownPoolFlags) != 0 || !IsValidPurpose(purpose_bits) ||
+        fallback_bits > static_cast<uint32_t>(
+                            HugePageFallbackReason::kSystemError) ||
+        ((flags & kHugeActualBit) != 0 &&
+         (flags & kHugeRequestedBit) == 0) ||
+        super->max_object_size == 0 || super->segment_size < 64 ||
         (super->segment_size & (super->segment_size - 1u)) != 0 ||
         super->segment_count == 0 ||
         std::atomic_ref(const_cast<uint32_t&>(super->draining))
                 .load(std::memory_order_acquire) > 1) {
         return Status::Error(StatusCode::kCorruption,
                              "large pool configuration is invalid");
+    }
+    const auto persisted_purpose =
+        static_cast<LargeObjectPoolPurpose>(purpose_bits);
+    const bool explicit_registration = options.registration_provider != nullptr ||
+                                       options.registration_scope_id != 0;
+    if (explicit_registration) {
+        if (options.purpose != persisted_purpose) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "registration options do not match pool purpose");
+        }
+        MINO_RETURN_IF_ERROR(
+            ValidateOptions(options, /*require_registration_provider=*/true));
+    }
+    if (options.huge_pages.strict && (flags & kHugeRequestedBit) != 0 &&
+        (flags & kHugeActualBit) == 0) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "strict HugePage attach rejected fallback backing");
     }
     MINO_ASSIGN_OR_RETURN(
         PoolLayout layout,
@@ -354,6 +587,12 @@ Result<LargeObjectPool> LargeObjectPool::Attach(
     pool.pool_offset_ = storage.pool_offset;
     pool.pool_size_ = storage.pool_size;
     pool.region_id_ = storage.region_id;
+    pool.purpose_ = persisted_purpose;
+    pool.huge_pages_requested_ = (flags & kHugeRequestedBit) != 0;
+    pool.huge_pages_actual_ = (flags & kHugeActualBit) != 0;
+    pool.actual_page_size_ = options.huge_pages.actual_page_size;
+    pool.huge_page_fallback_reason_ =
+        static_cast<HugePageFallbackReason>(fallback_bits);
     pool.max_object_size_ = super->max_object_size;
     pool.segment_size_ = super->segment_size;
     pool.segment_count_ = super->segment_count;
@@ -366,6 +605,43 @@ Result<LargeObjectPool> LargeObjectPool::Attach(
     pool.headers_region_offset_ = headers_region_offset;
     pool.payload_region_offset_ = payload_region_offset;
     pool.draining_ = const_cast<uint32_t*>(&super->draining);
+    pool.local_numa_state_ = std::make_shared<LocalNumaState>();
+    pool.local_numa_state_->system = &NativeNumaSystem();
+    Result<NumaTopology> topology =
+        pool.local_numa_state_->system->DiscoverTopology();
+    if (topology.ok()) {
+        pool.local_numa_state_->topology = std::move(*topology);
+    } else {
+        pool.local_numa_state_->placement_fallback = true;
+        pool.local_numa_state_->topology.fallback_reason =
+            topology.status().ToString();
+    }
+    pool.local_specialized_state_ = std::make_shared<LocalSpecializedState>();
+    if (explicit_registration) {
+        pool.local_specialized_state_->provider = options.registration_provider;
+        pool.local_specialized_state_->provider_class =
+            options.registration_provider->provider_class();
+        pool.local_specialized_state_->scope_id = options.registration_scope_id;
+        pool.local_specialized_state_->owner = options.registration_owner;
+        pool.local_specialized_state_->quota_bytes =
+            options.registration_quota_bytes;
+        pool.local_specialized_state_->minimum_object_bytes =
+            options.minimum_registered_object_bytes;
+        if (options.recover_stale_registrations) {
+            MINO_ASSIGN_OR_RETURN(
+                MemoryRegistrationRecoveryResult recovered,
+                options.registration_provider->RecoverStale({
+                    .scope_id = options.registration_scope_id,
+                    .current_process_id = options.registration_owner.process_id,
+                    .current_process_epoch =
+                        options.registration_owner.process_epoch,
+                }));
+            pool.local_specialized_state_->registrations_recovered.store(
+                recovered.registrations_released, std::memory_order_relaxed);
+            pool.local_specialized_state_->registration_recovery_bytes.store(
+                recovered.bytes_released, std::memory_order_relaxed);
+        }
+    }
     return pool;
 }
 
@@ -374,44 +650,125 @@ bool LargeObjectPool::is_draining() const noexcept {
            std::atomic_ref(*draining_).load(std::memory_order_acquire) != 0;
 }
 
-Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
-                                            TypeId type_id) {
-    if (object_size == 0 || object_size > max_object_size_) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "large object size is outside pool bounds");
-    }
-    if (is_draining()) {
-        return Status::Error(StatusCode::kUnavailable,
-                             "large object pool is draining");
-    }
-    const uint32_t segments_needed = static_cast<uint32_t>(
-        (static_cast<uint64_t>(object_size) + segment_size_ - 1u) /
-        segment_size_);
+LargeObjectNumaStats LargeObjectPool::numa_stats() const noexcept {
+    if (local_numa_state_ == nullptr) return {};
+    return {
+        .local_allocations = local_numa_state_->local_allocations.load(
+            std::memory_order_relaxed),
+        .remote_allocations = local_numa_state_->remote_allocations.load(
+            std::memory_order_relaxed),
+        .fallback_allocations = local_numa_state_->fallback_allocations.load(
+            std::memory_order_relaxed),
+        .bind_errors = local_numa_state_->bind_errors.load(
+            std::memory_order_relaxed),
+    };
+}
 
-    uint32_t run_start = 0;
-    bool claimed = false;
-    for (uint32_t attempt = 0; attempt < segment_count_ && !claimed; ++attempt) {
-        uint32_t run_length = 0;
-        for (uint32_t segment = 0; segment < segment_count_; ++segment) {
-            if (IsSegmentSet(segment)) {
-                run_length = 0;
-                continue;
-            }
-            if (run_length == 0) {
-                run_start = segment;
-            }
-            ++run_length;
-            if (run_length == segments_needed) {
-                break;
-            }
+MemoryRegistrationProviderClass
+LargeObjectPool::registration_provider_class() const noexcept {
+    return local_specialized_state_ == nullptr
+               ? MemoryRegistrationProviderClass::kUnavailable
+               : local_specialized_state_->provider_class;
+}
+
+LargeObjectPoolMetrics LargeObjectPool::metrics() const noexcept {
+    LargeObjectPoolMetrics result;
+    result.capacity_bytes =
+        static_cast<uint64_t>(segment_count_) * segment_size_;
+    uint64_t occupied_segments = 0;
+    uint64_t current_free = 0;
+    uint64_t largest_free = 0;
+    for (uint32_t segment = 0; segment < segment_count_; ++segment) {
+        if (!IsSegmentSet(segment)) {
+            ++current_free;
+            largest_free = std::max(largest_free, current_free);
+            continue;
         }
-        if (run_length < segments_needed) {
-            return Status::Error(StatusCode::kResourceExhausted,
-                                 "large object pool exhausted");
+        current_free = 0;
+        ++occupied_segments;
+        const SlabHeader& header = headers_[segment];
+        if (header.allocation_role.load(std::memory_order_acquire) == 0 &&
+            VerifyImmutableHeader(header) && header.object_size != 0 &&
+            header.object_size <= max_object_size_) {
+            result.allocated_object_bytes += header.object_size;
         }
-        uint32_t done = 0;
-        for (; done < segments_needed; ++done) {
-            const uint32_t segment = run_start + done;
+    }
+    result.reserved_extent_bytes = occupied_segments * segment_size_;
+    result.free_bytes = result.capacity_bytes - result.reserved_extent_bytes;
+    result.internal_fragmentation_bytes =
+        result.reserved_extent_bytes >= result.allocated_object_bytes
+            ? result.reserved_extent_bytes - result.allocated_object_bytes
+            : 0;
+    result.largest_free_extent_bytes = largest_free * segment_size_;
+    result.external_fragmentation_bytes =
+        result.free_bytes >= result.largest_free_extent_bytes
+            ? result.free_bytes - result.largest_free_extent_bytes
+            : 0;
+    if (local_specialized_state_ != nullptr) {
+        result.allocations = local_specialized_state_->allocations.load(
+            std::memory_order_relaxed);
+        result.allocation_failures =
+            local_specialized_state_->allocation_failures.load(
+                std::memory_order_relaxed);
+        result.huge_page_fallback_allocations =
+            local_specialized_state_->huge_page_fallback_allocations.load(
+                std::memory_order_relaxed);
+        result.registration_bytes =
+            local_specialized_state_->registration_bytes.load(
+                std::memory_order_relaxed);
+        result.registration_failures =
+            local_specialized_state_->registration_failures.load(
+                std::memory_order_relaxed);
+        result.registrations_recovered =
+            local_specialized_state_->registrations_recovered.load(
+                std::memory_order_relaxed);
+        result.registration_recovery_bytes =
+            local_specialized_state_->registration_recovery_bytes.load(
+                std::memory_order_relaxed);
+    }
+    return result;
+}
+
+Result<uint32_t> LargeObjectPool::FindAndClaimExtent(
+    uint32_t segments_needed, uint64_t alignment) {
+    for (uint32_t attempt = 0; attempt < segment_count_; ++attempt) {
+        uint32_t best_start = segment_count_;
+        uint32_t best_run_length = std::numeric_limits<uint32_t>::max();
+        uint32_t run_begin = 0;
+        while (run_begin < segment_count_) {
+            while (run_begin < segment_count_ && IsSegmentSet(run_begin)) {
+                ++run_begin;
+            }
+            uint32_t run_end = run_begin;
+            while (run_end < segment_count_ && !IsSegmentSet(run_end)) {
+                ++run_end;
+            }
+            const uint32_t run_length = run_end - run_begin;
+            if (run_length >= segments_needed) {
+                for (uint32_t candidate = run_begin;
+                     candidate <= run_end - segments_needed; ++candidate) {
+                    const uintptr_t address = reinterpret_cast<uintptr_t>(
+                        payload_base_ +
+                        static_cast<uint64_t>(candidate) * segment_size_);
+                    if (address % alignment == 0) {
+                        if (run_length < best_run_length) {
+                            best_start = candidate;
+                            best_run_length = run_length;
+                        }
+                        break;
+                    }
+                }
+            }
+            run_begin = run_end + (run_end == run_begin ? 1u : 0u);
+        }
+        if (best_start == segment_count_) {
+            return Status::Error(
+                StatusCode::kResourceExhausted,
+                "no aligned contiguous extent satisfies allocation request");
+        }
+        uint32_t claimed = 0;
+        for (; claimed < segments_needed; ++claimed) {
+            const uint32_t segment = best_start + claimed;
             const uint64_t mask = uint64_t{1} << (segment % 64u);
             auto& word = segment_bitmap_[segment / 64u];
             uint64_t expected = word.load(std::memory_order_acquire);
@@ -420,22 +777,296 @@ Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
             }
-            if ((expected & mask) != 0) {
-                break;
-            }
+            if ((expected & mask) != 0) break;
         }
-        if (done == segments_needed) {
-            claimed = true;
-        } else {
-            for (uint32_t i = 0; i < done; ++i) {
-                ClearSegmentBit(run_start + i);
-            }
+        if (claimed == segments_needed) return best_start;
+        for (uint32_t index = 0; index < claimed; ++index) {
+            ClearSegmentBit(best_start + index);
         }
     }
-    if (!claimed) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "large object pool exhausted under contention");
+    return Status::Error(StatusCode::kResourceExhausted,
+                         "large object extent claim lost under contention");
+}
+
+Status LargeObjectPool::PrepareRegistration(
+    ShmHandle handle, const LargeObjectAllocationRequest& request,
+    uint32_t segments_needed) {
+    LocalSpecializedState& state = *local_specialized_state_;
+    uint64_t bytes = 0;
+    if (!CheckedMulU64(segments_needed, segment_size_, &bytes)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "registration extent size overflow");
     }
+    uint64_t used = state.registration_bytes.load(std::memory_order_acquire);
+    for (;;) {
+        if (bytes > state.quota_bytes || used > state.quota_bytes - bytes) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "memory registration quota exceeded");
+        }
+        if (state.registration_bytes.compare_exchange_weak(
+                used, used + bytes, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
+
+    MINO_ASSIGN_OR_RETURN(const uint32_t first, ResolveLocked(handle));
+    const MemoryRegistrationOwner owner =
+        request.lifetime == LargeObjectLifetime::kLease ? request.lease
+                                                        : state.owner;
+    auto registered = state.provider->Register({
+        .address = payload_base_ + static_cast<uint64_t>(first) * segment_size_,
+        .bytes = bytes,
+        .alignment = request.alignment,
+        .scope_id = state.scope_id,
+        .kind = RegistrationKindFor(purpose_),
+        .owner = owner,
+        .require_physical_contiguous =
+            request.contiguity == LargeObjectContiguity::kPhysical,
+    });
+    if (!registered.ok()) {
+        state.registration_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        return registered.status();
+    }
+    const bool invalid =
+        registered->registration_id == 0 || registered->bytes != bytes ||
+        registered->kind != RegistrationKindFor(purpose_) ||
+        registered->owner != owner ||
+        (request.contiguity == LargeObjectContiguity::kPhysical &&
+         !registered->physically_contiguous);
+    if (invalid) {
+        const Status cleanup = state.provider->Deregister(*registered);
+        if (cleanup.ok()) {
+            state.registration_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+            return Status::Error(
+                StatusCode::kCorruption,
+                "registration provider returned invalid facts");
+        }
+        std::lock_guard lock(state.mutex);
+        state.registrations.emplace(
+            std::make_pair(handle.offset, handle.generation),
+            LocalSpecializedState::Registration{
+                .memory = *registered,
+                .lease = owner,
+                .lifetime = request.lifetime,
+                .pins = 0,
+            });
+        return cleanup;
+    }
+    std::lock_guard lock(state.mutex);
+    const auto [iterator, inserted] = state.registrations.emplace(
+        std::make_pair(handle.offset, handle.generation),
+        LocalSpecializedState::Registration{
+            .memory = *registered,
+            .lease = owner,
+            .lifetime = request.lifetime,
+            .pins = request.lifetime == LargeObjectLifetime::kLease ? 1u : 0u,
+        });
+    (void)iterator;
+    if (!inserted) {
+        const Status cleanup = state.provider->Deregister(*registered);
+        state.registration_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        return cleanup.ok()
+                   ? Status::Error(StatusCode::kAlreadyExists,
+                                   "handle is already registered")
+                   : cleanup;
+    }
+    return Status::Ok();
+}
+
+Status LargeObjectPool::ReleaseRegistration(ShmHandle handle,
+                                            bool require_unpinned) {
+    if (local_specialized_state_ == nullptr ||
+        local_specialized_state_->provider == nullptr) {
+        return IsRegisteredPurpose(purpose_)
+                   ? Status::Error(
+                         StatusCode::kUnavailable,
+                         "registered-pool recovery requires its device provider")
+                   : Status::Ok();
+    }
+    LocalSpecializedState& state = *local_specialized_state_;
+    std::lock_guard lock(state.mutex);
+    auto iterator = state.registrations.find(
+        std::make_pair(handle.offset, handle.generation));
+    if (iterator == state.registrations.end()) return Status::Ok();
+    if (require_unpinned && iterator->second.pins != 0) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "registered object still has an active Pin lease");
+    }
+    const Status status = state.provider->Deregister(iterator->second.memory);
+    if (!status.ok()) {
+        state.registration_failures.fetch_add(1, std::memory_order_relaxed);
+        return status;
+    }
+    state.registration_bytes.fetch_sub(iterator->second.memory.bytes,
+                                       std::memory_order_acq_rel);
+    state.registrations.erase(iterator);
+    return Status::Ok();
+}
+
+Status LargeObjectPool::Pin(ShmHandle handle,
+                            MemoryRegistrationOwner lease) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t first, ResolveLocked(handle));
+    (void)first;
+    if (!lease.valid() || local_specialized_state_ == nullptr) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "Pin requires a valid registered-buffer lease");
+    }
+    std::lock_guard lock(local_specialized_state_->mutex);
+    auto iterator = local_specialized_state_->registrations.find(
+        std::make_pair(handle.offset, handle.generation));
+    if (iterator == local_specialized_state_->registrations.end()) {
+        return Status::Error(StatusCode::kNotFound,
+                             "registered buffer is not local to this process");
+    }
+    if (iterator->second.lease != lease) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Pin lease does not own this registration");
+    }
+    ++iterator->second.pins;
+    return Status::Ok();
+}
+
+Status LargeObjectPool::Unpin(ShmHandle handle,
+                              MemoryRegistrationOwner lease) {
+    MINO_ASSIGN_OR_RETURN(const uint32_t first, ResolveLocked(handle));
+    (void)first;
+    if (!lease.valid() || local_specialized_state_ == nullptr) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "Unpin requires a valid registered-buffer lease");
+    }
+    std::lock_guard lock(local_specialized_state_->mutex);
+    auto iterator = local_specialized_state_->registrations.find(
+        std::make_pair(handle.offset, handle.generation));
+    if (iterator == local_specialized_state_->registrations.end()) {
+        return Status::Error(StatusCode::kNotFound,
+                             "registered buffer is not local to this process");
+    }
+    if (iterator->second.lease != lease) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Unpin lease does not own this registration");
+    }
+    if (iterator->second.pins == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "registered buffer is already unpinned");
+    }
+    --iterator->second.pins;
+    return Status::Ok();
+}
+
+Result<uint64_t> LargeObjectPool::ReleaseLease(
+    MemoryRegistrationOwner lease) {
+    if (!lease.valid() || local_specialized_state_ == nullptr) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "lease release requires a valid lease");
+    }
+    LocalSpecializedState& state = *local_specialized_state_;
+    std::lock_guard lock(state.mutex);
+    uint64_t released = 0;
+    for (auto iterator = state.registrations.begin();
+         iterator != state.registrations.end();) {
+        if (iterator->second.lease != lease) {
+            ++iterator;
+            continue;
+        }
+        const Status status = state.provider->Deregister(iterator->second.memory);
+        if (!status.ok()) {
+            state.registration_failures.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            return status;
+        }
+        state.registration_bytes.fetch_sub(iterator->second.memory.bytes,
+                                           std::memory_order_acq_rel);
+        iterator = state.registrations.erase(iterator);
+        ++released;
+    }
+    return released;
+}
+
+Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
+                                            TypeId type_id) {
+    if (purpose_ != LargeObjectPoolPurpose::kNormal) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "specialized pool allocation requires an explicit request");
+    }
+    return Allocate(LargeObjectAllocationRequest{
+        .object_size = object_size,
+        .type_id = type_id,
+        .purpose = LargeObjectPoolPurpose::kNormal,
+        .alignment = 1,
+        .contiguity = LargeObjectContiguity::kVirtual,
+        .registration = LargeObjectRegistration::kNone,
+        .lifetime = LargeObjectLifetime::kAllocation,
+        .lease = {},
+    });
+}
+
+Result<ShmHandle> LargeObjectPool::Allocate(
+    const LargeObjectAllocationRequest& request) {
+    const uint32_t object_size = request.object_size;
+    const TypeId type_id = request.type_id;
+    const bool registered = IsRegisteredPurpose(purpose_);
+    if (object_size == 0 || object_size > max_object_size_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "large object size is outside pool bounds");
+    }
+    if (request.purpose != purpose_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "allocation purpose does not match isolated pool");
+    }
+    if (request.registration != RegistrationRequirementFor(purpose_)) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "allocation registration requirement does not match pool purpose");
+    }
+    if (request.alignment == 0 ||
+        (request.alignment & (request.alignment - 1u)) != 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "large object alignment must be a power of two");
+    }
+    if (!registered &&
+        (request.contiguity == LargeObjectContiguity::kPhysical ||
+         request.lifetime == LargeObjectLifetime::kLease)) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "physical contiguity and lease lifetime require a registered pool");
+    }
+    if (registered) {
+        if (local_specialized_state_ == nullptr ||
+            local_specialized_state_->provider == nullptr ||
+            local_specialized_state_->provider_class ==
+                MemoryRegistrationProviderClass::kUnavailable) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "registered pool has no device provider");
+        }
+        if (object_size < local_specialized_state_->minimum_object_bytes) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "object is below registered-pool minimum; use a normal pool");
+        }
+        if (request.lifetime == LargeObjectLifetime::kLease &&
+            !request.lease.valid()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "lease lifetime requires a valid lease");
+        }
+    }
+    if (is_draining()) {
+        return Status::Error(StatusCode::kUnavailable,
+                             "large object pool is draining");
+    }
+    const uint32_t segments_needed = static_cast<uint32_t>(
+        (static_cast<uint64_t>(object_size) + segment_size_ - 1u) /
+        segment_size_);
+    auto extent = FindAndClaimExtent(segments_needed, request.alignment);
+    if (!extent.ok()) {
+        if (local_specialized_state_ != nullptr) {
+            local_specialized_state_->allocation_failures.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        return extent.status();
+    }
+    const uint32_t run_start = *extent;
 
     for (uint32_t i = 0; i < segments_needed; ++i) {
         headers_[run_start + i].object_state.store(
@@ -487,8 +1118,16 @@ Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
         header.type_id = type_id.value;
         header.layout_version = 0;
         header.schema_short_id = 0;
-        header.owner_epoch.store(0, std::memory_order_relaxed);
-        header.allocation_transaction_id.store(0, std::memory_order_relaxed);
+        const MemoryRegistrationOwner owner =
+            request.lifetime == LargeObjectLifetime::kLease
+                ? request.lease
+                : (local_specialized_state_ == nullptr
+                       ? MemoryRegistrationOwner{}
+                       : local_specialized_state_->owner);
+        header.owner_epoch.store(registered ? owner.process_epoch : 0,
+                                 std::memory_order_relaxed);
+        header.allocation_transaction_id.store(
+            registered ? owner.lease_id : 0, std::memory_order_relaxed);
         header.allocation_role.store(i, std::memory_order_relaxed);
         header.immutable_header_crc = ComputeImmutableHeaderCrc(header);
     }
@@ -504,10 +1143,57 @@ Result<ShmHandle> LargeObjectPool::Allocate(uint32_t object_size,
         return Status::Error(StatusCode::kInternal,
                              "validated large pool handle arithmetic failed");
     }
-    return ShmHandle{.offset = handle_offset,
-                     .generation = generations_[run_start].load(
-                         std::memory_order_acquire),
-                     .region_id = region_id_};
+    const ShmHandle handle{
+        .offset = handle_offset,
+        .generation =
+            generations_[run_start].load(std::memory_order_acquire),
+        .region_id = region_id_,
+    };
+    if (registered) {
+        const Status registration =
+            PrepareRegistration(handle, request, segments_needed);
+        if (!registration.ok()) {
+            if (local_specialized_state_ != nullptr) {
+                local_specialized_state_->registration_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            const Status rollback = ClearObjectForRecovery(
+                run_start, StateBits(ObjectState::kAllocated));
+            return rollback.ok() ? registration : rollback;
+        }
+    }
+    if (huge_pages_requested_ && !huge_pages_actual_ &&
+        local_specialized_state_ != nullptr) {
+        local_specialized_state_->huge_page_fallback_allocations.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    if (local_numa_state_ != nullptr) {
+        if (local_numa_state_->placement_fallback ||
+            !local_numa_state_->topology.numa_available ||
+            local_numa_state_->effective_nodes.empty() ||
+            local_numa_state_->system == nullptr) {
+            local_numa_state_->fallback_allocations.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            const int cpu = local_numa_state_->system->CurrentCpu();
+            const int node = local_numa_state_->topology.NodeForCpu(cpu);
+            if (node >= 0 &&
+                std::binary_search(local_numa_state_->effective_nodes.begin(),
+                                   local_numa_state_->effective_nodes.end(),
+                                   static_cast<uint32_t>(node))) {
+                local_numa_state_->local_allocations.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                local_numa_state_->remote_allocations.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (local_specialized_state_ != nullptr) {
+        local_specialized_state_->allocations.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return handle;
 }
 
 Status LargeObjectPool::Publish(ShmHandle handle) {
@@ -558,6 +1244,7 @@ Status LargeObjectPool::Reclaim(ShmHandle handle) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "large object must be retired or unpublished");
     }
+    MINO_RETURN_IF_ERROR(ReleaseRegistration(handle, /*require_unpinned=*/true));
     return ClearObjectForRecovery(first, state);
 }
 
@@ -590,6 +1277,7 @@ Result<LargeObjectPlan> LargeObjectPool::InspectPlan(ShmHandle handle) const {
     plan.handle = handle;
     plan.object_size = first_header.object_size;
     plan.type_id = TypeId{first_header.type_id};
+    plan.purpose = purpose_;
     plan.segments.reserve(segment_count);
     uint32_t remaining = first_header.object_size;
     for (uint32_t i = 0; i < segment_count; ++i) {
@@ -870,6 +1558,10 @@ Status LargeObjectPool::ClearObjectForRecovery(uint32_t first_segment,
                                  "large recovery continuation is invalid");
         }
     }
+    MINO_ASSIGN_OR_RETURN(ShmHandle recovery_handle,
+                          HandleForRecovery(first_segment));
+    MINO_RETURN_IF_ERROR(
+        ReleaseRegistration(recovery_handle, /*require_unpinned=*/false));
     for (uint32_t i = count; i-- > 0;) {
         const uint32_t segment = first_segment + i;
         if (!IsSegmentSet(segment)) {

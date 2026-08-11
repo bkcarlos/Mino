@@ -1,0 +1,78 @@
+{
+  "schema": "mino.transport.qualification.sla.v1",
+  "qualifications": {
+    "rdma": {
+      "cases": {
+        "tcp": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "udp": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "rdma": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "rdma-zero-copy": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "registered-zero-copy"
+        }
+      }
+    },
+    "fabric": {
+      "required_kinds": ["ipcf", "ntb", "cxl"],
+      "cases": {
+        "tcp": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "fabric-ipcf": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "fabric-ntb": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        },
+        "fabric-cxl": {
+          "max_p50_rtt_ns": 1000000000,
+          "max_p99_rtt_ns": 5000000000,
+          "max_process_cpu_ns": 1800000000000,
+          "min_payload_bytes_per_second": 1,
+          "max_elapsed_ns": 1800000000000,
+          "copy_mode": "driver-staging"
+        }
+      }
+    }
+  }
+}

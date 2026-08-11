@@ -218,6 +218,7 @@ PartitionMetadata PartitionMetadataForTest() {
         .partition_id = 3,
         .writer_id = 29,
         .owner_epoch = 3,
+        .partition_count = 4,
         .config_version = 1,
     };
 }

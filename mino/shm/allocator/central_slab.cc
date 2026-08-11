@@ -14,6 +14,7 @@
 
 #include "mino/shm/allocator/central_slab.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -72,6 +73,8 @@ std::atomic<uint64_t> g_next_local_cache_id{1};
 struct ThreadCursorMagazine {
     uint64_t cache_id = 0;
     uint64_t epoch = 0;
+    int observed_cpu = -1;
+    int observed_node = -1;
     std::array<uint32_t, kMaxClassCount> next_bits{};
     std::array<bool, kMaxClassCount> valid{};
 };
@@ -85,6 +88,8 @@ uint32_t GetThreadCursor(uint64_t cache_id, uint64_t epoch,
     if (magazine.cache_id != cache_id || magazine.epoch != epoch) {
         magazine.cache_id = cache_id;
         magazine.epoch = epoch;
+        magazine.observed_cpu = -1;
+        magazine.observed_node = -1;
         magazine.valid.fill(false);
     }
     if (!magazine.valid[class_id]) {
@@ -105,11 +110,44 @@ void SetThreadCursor(uint64_t cache_id, uint64_t epoch, uint16_t class_id,
     if (magazine.cache_id != cache_id || magazine.epoch != epoch) {
         magazine.cache_id = cache_id;
         magazine.epoch = epoch;
+        magazine.observed_cpu = -1;
+        magazine.observed_node = -1;
         magazine.valid.fill(false);
     }
     magazine.next_bits[class_id] = next_bit;
     magazine.valid[class_id] = true;
 }
+
+int ObserveThreadNode(uint64_t cache_id, uint64_t epoch,
+                      const NumaTopology& topology, const NumaSystem& system,
+                      std::atomic<uint64_t>* migration_count) {
+    ThreadCursorMagazine& magazine = g_thread_cursor_magazine;
+    const int cpu = system.CurrentCpu();
+    const int node = topology.NodeForCpu(cpu);
+    if (magazine.cache_id != cache_id || magazine.epoch != epoch) {
+        magazine.cache_id = cache_id;
+        magazine.epoch = epoch;
+        magazine.observed_cpu = cpu;
+        magazine.observed_node = node;
+        magazine.valid.fill(false);
+    } else if (magazine.observed_cpu != cpu || magazine.observed_node != node) {
+        magazine.observed_cpu = cpu;
+        magazine.observed_node = node;
+        magazine.valid.fill(false);
+        if (migration_count != nullptr) {
+            migration_count->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return node;
+}
+
+struct NumaRuntime {
+    NumaTopology topology;
+    const NumaSystem* system = nullptr;
+    std::vector<uint32_t> effective_nodes;
+    bool prefer_local_shards = true;
+    bool placement_fallback = false;
+};
 
 }  // namespace
 
@@ -127,11 +165,18 @@ struct CentralSlabAllocator::LocalCacheState {
     const uint64_t cache_id;
     std::atomic<uint64_t> epoch{1};
     std::atomic<bool> enabled{true};
+    std::atomic<uint64_t> allocations{0};
     std::atomic<uint64_t> hint_hits{0};
     std::atomic<uint64_t> fallback_scans{0};
     std::atomic<uint64_t> cache_bypasses{0};
     std::atomic<uint64_t> exhaustions{0};
     std::atomic<uint64_t> drain_count{0};
+    std::atomic<uint64_t> numa_local_allocations{0};
+    std::atomic<uint64_t> numa_remote_allocations{0};
+    std::atomic<uint64_t> numa_fallback_allocations{0};
+    std::atomic<uint64_t> numa_bind_errors{0};
+    std::atomic<uint64_t> numa_migrations{0};
+    std::shared_ptr<const NumaRuntime> numa_runtime;
 };
 
 Result<CentralSlabAllocator::Layout> CentralSlabAllocator::ComputeLayout(
@@ -169,14 +214,17 @@ Result<CentralSlabAllocator::Layout> CentralSlabAllocator::ComputeLayout(
 }
 
 Result<CentralSlabAllocator> CentralSlabAllocator::Create(
-    void* shm_base, uint64_t data_region_size, const ClassTableConfig& config) {
+    void* shm_base, uint64_t data_region_size, const ClassTableConfig& config,
+    const AllocatorNumaConfig& numa_config) {
     return CreateWithStorage(shm_base, data_region_size, data_region_size,
                              /*slot_area_offset=*/0, data_region_size,
-                             /*region_id=*/0, /*handle_offset_bias=*/0, config);
+                             /*region_id=*/0, /*handle_offset_bias=*/0, config,
+                             numa_config);
 }
 
 Result<CentralSlabAllocator> CentralSlabAllocator::CreateInRegion(
-    const RegionAllocatorStorage& storage, const ClassTableConfig& config) {
+    const RegionAllocatorStorage& storage, const ClassTableConfig& config,
+    const AllocatorNumaConfig& numa_config) {
     if (storage.region_base == nullptr || storage.allocator_offset > storage.region_size ||
         storage.data_offset > storage.region_size ||
         storage.data_offset < storage.allocator_offset ||
@@ -192,13 +240,15 @@ Result<CentralSlabAllocator> CentralSlabAllocator::CreateInRegion(
     return CreateWithStorage(
         static_cast<std::byte*>(storage.region_base) + storage.allocator_offset,
         available_size, storage.allocator_size, slot_area_offset,
-        storage.data_size, storage.region_id, storage.allocator_offset, config);
+        storage.data_size, storage.region_id, storage.allocator_offset, config,
+        numa_config);
 }
 
 Result<CentralSlabAllocator> CentralSlabAllocator::CreateWithStorage(
     void* shm_base, uint64_t available_size, uint64_t metadata_capacity,
     uint64_t slot_area_offset, uint64_t slot_capacity, uint32_t region_id,
-    uint64_t handle_offset_bias, const ClassTableConfig& config) {
+    uint64_t handle_offset_bias, const ClassTableConfig& config,
+    const AllocatorNumaConfig& numa_config) {
     if (shm_base == nullptr) {
         return Status::Error(StatusCode::kInvalidArgument, "shm_base is null");
     }
@@ -220,6 +270,15 @@ Result<CentralSlabAllocator> CentralSlabAllocator::CreateWithStorage(
         return Status::Error(StatusCode::kResourceExhausted,
                              "Region allocator metadata or data area is too small");
     }
+    const uint64_t placement_bytes = slot_area_offset + slot_bytes;
+    if (placement_bytes > std::numeric_limits<size_t>::max()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "NUMA placement extent exceeds addressable size");
+    }
+    MINO_ASSIGN_OR_RETURN(
+        NumaPlacementResult placement,
+        ApplyNumaPlacement(shm_base, static_cast<size_t>(placement_bytes),
+                           numa_config.placement));
 
     auto* super = new (shm_base) AllocatorSuperblock{};
     super->magic = kAllocatorMagic;
@@ -280,6 +339,19 @@ Result<CentralSlabAllocator> CentralSlabAllocator::CreateWithStorage(
     alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
     alloc.local_cache_state_ = std::make_shared<LocalCacheState>();
+    auto numa_runtime = std::make_shared<NumaRuntime>();
+    numa_runtime->topology = std::move(placement.topology);
+    numa_runtime->system = numa_config.placement.system == nullptr
+                               ? &NativeNumaSystem()
+                               : numa_config.placement.system;
+    numa_runtime->effective_nodes = std::move(placement.effective_nodes);
+    numa_runtime->prefer_local_shards = numa_config.prefer_local_shards;
+    numa_runtime->placement_fallback = placement.fallback;
+    alloc.local_cache_state_->numa_runtime = std::move(numa_runtime);
+    if (placement.bind_error) {
+        alloc.local_cache_state_->numa_bind_errors.store(
+            1, std::memory_order_relaxed);
+    }
     return alloc;
 }
 
@@ -444,6 +516,16 @@ Result<CentralSlabAllocator> CentralSlabAllocator::AttachWithBias(
     alloc.handle_offset_bias_ = handle_offset_bias;
     alloc.next_transaction_id_ = &super->next_transaction_id;
     alloc.local_cache_state_ = std::make_shared<LocalCacheState>();
+    auto numa_runtime = std::make_shared<NumaRuntime>();
+    numa_runtime->system = &NativeNumaSystem();
+    Result<NumaTopology> topology = numa_runtime->system->DiscoverTopology();
+    if (topology.ok()) {
+        numa_runtime->topology = std::move(*topology);
+    } else {
+        numa_runtime->placement_fallback = true;
+        numa_runtime->topology.fallback_reason = topology.status().ToString();
+    }
+    alloc.local_cache_state_->numa_runtime = std::move(numa_runtime);
     return alloc;
 }
 
@@ -464,6 +546,8 @@ AllocatorLocalCacheConfig CentralSlabAllocator::local_cache_config() const noexc
 AllocatorLocalCacheStats CentralSlabAllocator::local_cache_stats() const noexcept {
     if (local_cache_state_ == nullptr) return {};
     return AllocatorLocalCacheStats{
+        .allocations =
+            local_cache_state_->allocations.load(std::memory_order_relaxed),
         .hint_hits = local_cache_state_->hint_hits.load(std::memory_order_relaxed),
         .fallback_scans =
             local_cache_state_->fallback_scans.load(std::memory_order_relaxed),
@@ -473,6 +557,17 @@ AllocatorLocalCacheStats CentralSlabAllocator::local_cache_stats() const noexcep
             local_cache_state_->exhaustions.load(std::memory_order_relaxed),
         .drain_count =
             local_cache_state_->drain_count.load(std::memory_order_relaxed),
+        .numa_local_allocations = local_cache_state_->numa_local_allocations.load(
+            std::memory_order_relaxed),
+        .numa_remote_allocations = local_cache_state_->numa_remote_allocations.load(
+            std::memory_order_relaxed),
+        .numa_fallback_allocations =
+            local_cache_state_->numa_fallback_allocations.load(
+                std::memory_order_relaxed),
+        .numa_bind_errors = local_cache_state_->numa_bind_errors.load(
+            std::memory_order_relaxed),
+        .numa_migrations = local_cache_state_->numa_migrations.load(
+            std::memory_order_relaxed),
     };
 }
 
@@ -516,36 +611,118 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
         return Status::Error(StatusCode::kUnavailable, "size class is draining");
     }
 
-    // Steps 3-5: use a bounded process-local cursor magazine to select a shard,
-    // then claim directly in the shared bitmap. No free slot is ever held in the
-    // magazine, so process death cannot hide capacity from Attach/recovery.
+    // Steps 3-5: process-local topology maps each 64-bit class shard to an
+    // allowed node by relative shard index. The current thread first scans only
+    // shards mapped to its node, then falls back to the complete class range.
+    // Neither the current node nor the hint is written to shared memory.
     const uint32_t range_begin = cls.bitmap_shard_offset;
     const uint32_t range_end = range_begin + cls.slot_count;
     uint32_t bit_index = 0;
+    bool numa_local = false;
+    bool numa_remote = false;
+    bool numa_fallback = false;
     LocalCacheState* const cache = local_cache_state_.get();
+    const std::shared_ptr<const NumaRuntime> numa_runtime =
+        cache == nullptr ? nullptr : cache->numa_runtime;
     if (cache != nullptr && cache->enabled.load(std::memory_order_acquire)) {
         const uint64_t epoch = cache->epoch.load(std::memory_order_acquire);
-        const uint32_t hint = GetThreadCursor(
-            cache->cache_id, epoch, class_id, range_begin, cls.slot_count);
-        Result<BitmapClaim> claim = bitmap_.FindAndSetFreeBitInRangeHinted(
-            range_begin, range_end, hint);
-        if (!claim.ok()) {
-            cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
-            if (claim.status().code() == StatusCode::kResourceExhausted) {
-                cache->exhaustions.fetch_add(1, std::memory_order_relaxed);
+        uint32_t hint = range_begin;
+        bool claimed = false;
+        int current_node = -1;
+        const bool numa_active =
+            numa_runtime != nullptr && numa_runtime->prefer_local_shards &&
+            numa_runtime->topology.numa_available &&
+            numa_runtime->system != nullptr;
+        if (numa_active) {
+            current_node = ObserveThreadNode(
+                cache->cache_id, epoch, numa_runtime->topology,
+                *numa_runtime->system, &cache->numa_migrations);
+            // ObserveThreadNode invalidates the magazine after a migration.
+            hint = GetThreadCursor(cache->cache_id, epoch, class_id, range_begin,
+                                   cls.slot_count);
+            const uint32_t class_shards =
+                (cls.slot_count + kBitmapShardBits - 1) / kBitmapShardBits;
+            const uint32_t hinted_shard =
+                (hint - range_begin) / kBitmapShardBits;
+            for (uint32_t probe = 0; probe < class_shards; ++probe) {
+                const uint32_t relative_shard =
+                    (hinted_shard + probe) % class_shards;
+                const uint32_t assigned_node =
+                    numa_runtime->topology.allowed_nodes[
+                        relative_shard %
+                        numa_runtime->topology.allowed_nodes.size()];
+                if (current_node < 0 ||
+                    assigned_node != static_cast<uint32_t>(current_node)) {
+                    continue;
+                }
+                const uint32_t local_begin =
+                    range_begin + relative_shard * kBitmapShardBits;
+                const uint32_t local_end =
+                    std::min(range_end, local_begin + kBitmapShardBits);
+                const uint32_t local_hint =
+                    hint >= local_begin && hint < local_end ? hint : local_begin;
+                Result<BitmapClaim> local_claim =
+                    bitmap_.FindAndSetFreeBitInRangeHinted(
+                        local_begin, local_end, local_hint);
+                if (local_claim.ok()) {
+                    bit_index = local_claim->bit_index;
+                    claimed = true;
+                    numa_local = true;
+                    cache->hint_hits.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                if (local_claim.status().code() !=
+                    StatusCode::kResourceExhausted) {
+                    return local_claim.status();
+                }
             }
-            return claim.status();
-        }
-        bit_index = claim->bit_index;
-        if (claim->shards_probed == 1) {
-            cache->hint_hits.fetch_add(1, std::memory_order_relaxed);
+            if (!claimed) {
+                numa_fallback = true;
+                cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
+            }
         } else {
-            cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
+            numa_fallback = true;
+            hint = GetThreadCursor(cache->cache_id, epoch, class_id, range_begin,
+                                   cls.slot_count);
+        }
+        if (!claimed) {
+            Result<BitmapClaim> claim = bitmap_.FindAndSetFreeBitInRangeHinted(
+                range_begin, range_end, hint);
+            if (!claim.ok()) {
+                cache->fallback_scans.fetch_add(1, std::memory_order_relaxed);
+                if (claim.status().code() == StatusCode::kResourceExhausted) {
+                    cache->exhaustions.fetch_add(1, std::memory_order_relaxed);
+                }
+                return claim.status();
+            }
+            bit_index = claim->bit_index;
+            if (!numa_active) {
+                if (claim->shards_probed == 1) {
+                    cache->hint_hits.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    cache->fallback_scans.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                }
+            } else {
+                const uint32_t relative_shard =
+                    (bit_index - range_begin) / kBitmapShardBits;
+                const uint32_t assigned_node =
+                    numa_runtime->topology.allowed_nodes[
+                        relative_shard %
+                        numa_runtime->topology.allowed_nodes.size()];
+                if (current_node >= 0 &&
+                    assigned_node == static_cast<uint32_t>(current_node)) {
+                    numa_local = true;
+                } else {
+                    numa_remote = true;
+                }
+            }
         }
         const uint32_t next_bit =
             bit_index + 1 == range_end ? range_begin : bit_index + 1;
         SetThreadCursor(cache->cache_id, epoch, class_id, next_bit);
     } else {
+        numa_fallback = true;
         if (cache != nullptr) {
             cache->cache_bypasses.fetch_add(1, std::memory_order_relaxed);
         }
@@ -611,6 +788,22 @@ Result<ShmHandle> CentralSlabAllocator::Allocate(const AllocationRequest& reques
     // any thread that observes kAllocated with acquire ordering.
     header.object_state.store(static_cast<uint32_t>(ObjectState::kAllocated),
                               std::memory_order_release);
+    if (cache != nullptr) {
+        cache->allocations.fetch_add(1, std::memory_order_relaxed);
+        if (numa_local) {
+            cache->numa_local_allocations.fetch_add(1,
+                                                    std::memory_order_relaxed);
+        }
+        if (numa_remote) {
+            cache->numa_remote_allocations.fetch_add(1,
+                                                     std::memory_order_relaxed);
+        }
+        if (numa_fallback ||
+            (numa_runtime != nullptr && numa_runtime->placement_fallback)) {
+            cache->numa_fallback_allocations.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
 
     // Step 9: return the Handle. offset is relative to shm_base so the
     // Handle stays valid across different mappings of the same Region.

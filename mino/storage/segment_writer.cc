@@ -373,7 +373,8 @@ Status SegmentWriter::WritePendingGathered() {
         }
         if (buffer_count == 0 || request_bytes == 0) {
             return Poison(Status::Error(StatusCode::kInternal,
-                                        "segment writev made no request"));
+                                        "segment writev made no request"),
+                          SegmentWriterFailureKind::kWrite);
         }
 
         std::ptrdiff_t written = -1;
@@ -398,17 +399,20 @@ Status SegmentWriter::WritePendingGathered() {
         }
         if (written < 0) {
             if (errno == EINTR) continue;
-            return Poison(IoError("cannot append segment", path_));
+            return Poison(IoError("cannot append segment", path_),
+                          SegmentWriterFailureKind::kWrite);
         }
         if (written == 0) {
             return Poison(Status::Error(StatusCode::kUnavailable,
-                                        "zero-byte segment writev"));
+                                        "zero-byte segment writev"),
+                          SegmentWriterFailureKind::kWrite);
         }
         const size_t count = static_cast<size_t>(written);
         if (count > request_bytes) {
             return Poison(Status::Error(
-                StatusCode::kInternal,
-                "segment writev hook over-reported bytes"));
+                              StatusCode::kInternal,
+                              "segment writev hook over-reported bytes"),
+                          SegmentWriterFailureKind::kWrite);
         }
         stats_.io_bytes_written += count;
 
@@ -463,16 +467,19 @@ Status SegmentWriter::WriteAll(std::span<const std::byte> bytes) {
         }
         if (written < 0) {
             if (errno == EINTR) continue;
-            return Poison(IoError("cannot append segment", path_));
+            return Poison(IoError("cannot append segment", path_),
+                          SegmentWriterFailureKind::kWrite);
         }
         if (written == 0) {
             return Poison(Status::Error(StatusCode::kUnavailable,
-                                        "zero-byte segment write"));
+                                        "zero-byte segment write"),
+                          SegmentWriterFailureKind::kWrite);
         }
         const size_t count = static_cast<size_t>(written);
         if (count > request) {
             return Poison(Status::Error(StatusCode::kInternal,
-                                        "segment write hook over-reported bytes"));
+                                        "segment write hook over-reported bytes"),
+                          SegmentWriterFailureKind::kWrite);
         }
         offset += count;
         stats_.io_bytes_written += count;
@@ -494,7 +501,8 @@ Status SegmentWriter::DataSync(uint64_t now_ns) {
         }
         if (result == 0) break;
         if (errno == EINTR) continue;
-        return Poison(IoError("cannot fdatasync segment", path_));
+        return Poison(IoError("cannot fdatasync segment", path_),
+                      SegmentWriterFailureKind::kSync);
     }
     durable_bytes_ = written_bytes_;
     durable_records_ = written_records_;
@@ -503,9 +511,10 @@ Status SegmentWriter::DataSync(uint64_t now_ns) {
     return Status::Ok();
 }
 
-Status SegmentWriter::Poison(Status status) {
+Status SegmentWriter::Poison(Status status, SegmentWriterFailureKind kind) {
     if (state_ != SegmentWriterState::kError) {
         error_status_ = std::move(status);
+        failure_kind_ = kind;
         state_ = SegmentWriterState::kError;
     }
     return error_status_;

@@ -53,9 +53,9 @@ using shared_memory_internal::SharedMemoryTestPoint;
 constexpr uint64_t kFallbackHugePageSize = 2ull * 1024 * 1024;
 std::atomic<shared_memory_internal::SharedMemoryTestHook> g_test_hook{nullptr};
 
-void RunTestHook(SharedMemoryTestPoint point) {
+bool RunTestHook(SharedMemoryTestPoint point) {
     auto hook = g_test_hook.load(std::memory_order_acquire);
-    if (hook != nullptr) hook(point);
+    return hook != nullptr && hook(point);
 }
 
 Status ErrnoStatus(std::string_view what, int error_number = errno) {
@@ -254,6 +254,10 @@ struct MarkerMapping {
 };
 
 Result<MarkerMapping> MapMarkerFd(int fd) {
+    if (RunTestHook(SharedMemoryTestPoint::kBeforeMarkerMap)) {
+        return Status::Error(StatusCode::kInternal,
+                             "injected marker mmap failure");
+    }
     void* address = ::mmap(nullptr, sizeof(SharedMemoryMarkerRecord),
                            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (address == MAP_FAILED) return ErrnoStatus("mmap(marker) failed");
@@ -380,6 +384,33 @@ Result<void*> MapDataFd(int fd, uint64_t size, bool read_only,
     void* mapping = ::mmap(nullptr, size, prot, MAP_SHARED | extra_flags, fd, 0);
     if (mapping == MAP_FAILED) return ErrnoStatus("mmap(data) failed");
     return mapping;
+}
+
+struct FileSecurity {
+    uint64_t owner_user_id = 0;
+    uint64_t owner_group_id = 0;
+    uint32_t permissions = 0;
+};
+
+Result<FileSecurity> ReadFileSecurity(int fd, std::string_view what) {
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+        return ErrnoStatus(std::string("fstat(") + std::string(what) +
+                           ") failed");
+    }
+    return FileSecurity{
+        .owner_user_id = static_cast<uint64_t>(st.st_uid),
+        .owner_group_id = static_cast<uint64_t>(st.st_gid),
+        .permissions = static_cast<uint32_t>(st.st_mode & 0777),
+    };
+}
+
+Status SetPrivatePermissions(int fd, std::string_view what) {
+    if (::fchmod(fd, 0600) != 0) {
+        return ErrnoStatus(std::string("fchmod(") + std::string(what) +
+                           ") failed");
+    }
+    return Status::Ok();
 }
 
 uint64_t RandomToken() {
@@ -737,6 +768,7 @@ struct CreatedFallbackMapping {
     void* base = nullptr;
     uint64_t size = 0;
     uint64_t page_size = 0;
+    FileSecurity security;
 };
 
 Result<CreatedFallbackMapping> CreateFallback(
@@ -769,6 +801,12 @@ Result<CreatedFallbackMapping> CreateFallback(
     }
     if (data_fd < 0) return ErrnoStatus("shm_open(fallback data) failed");
     (void)::fcntl(data_fd, F_SETFD, FD_CLOEXEC);
+    const Status private_data =
+        SetPrivatePermissions(data_fd, "fallback data");
+    if (!private_data.ok()) {
+        ::close(data_fd);
+        return private_data;
+    }
     if (::ftruncate(data_fd, static_cast<off_t>(payload.data_size)) != 0) {
         const int saved_errno = errno;
         ::close(data_fd);
@@ -784,7 +822,11 @@ Result<CreatedFallbackMapping> CreateFallback(
     payload.backing_inode = static_cast<uint64_t>(st.st_ino);
     payload.flags |=
         shared_memory_internal::kMarkerFlagBackingSizeCommitted;
-    MINO_RETURN_IF_ERROR(PublishMarker(marker.record, payload));
+    const Status identity_published = PublishMarker(marker.record, payload);
+    if (!identity_published.ok()) {
+        ::close(data_fd);
+        return identity_published;
+    }
     RunTestHook(SharedMemoryTestPoint::kAfterBackingIdentityRecorded);
 
     auto mapping = MapDataFd(data_fd, payload.data_size,
@@ -802,6 +844,11 @@ Result<CreatedFallbackMapping> CreateFallback(
         .base = mapping.value(),
         .size = payload.data_size,
         .page_size = payload.page_size,
+        .security = FileSecurity{
+            .owner_user_id = static_cast<uint64_t>(st.st_uid),
+            .owner_group_id = static_cast<uint64_t>(st.st_gid),
+            .permissions = static_cast<uint32_t>(st.st_mode & 0777),
+        },
     };
 }
 
@@ -852,6 +899,12 @@ SharedMemorySegment& SharedMemorySegment::operator=(
         actual_page_size_ = other.actual_page_size_;
         huge_page_fallback_reason_ = other.huge_page_fallback_reason_;
         huge_page_fallback_errno_ = other.huge_page_fallback_errno_;
+        marker_owner_user_id_ = other.marker_owner_user_id_;
+        marker_owner_group_id_ = other.marker_owner_group_id_;
+        marker_permissions_ = other.marker_permissions_;
+        backing_owner_user_id_ = other.backing_owner_user_id_;
+        backing_owner_group_id_ = other.backing_owner_group_id_;
+        backing_permissions_ = other.backing_permissions_;
         name_ = std::move(other.name_);
         other.base_ = nullptr;
         other.size_ = 0;
@@ -860,6 +913,12 @@ SharedMemorySegment& SharedMemorySegment::operator=(
         other.actual_page_size_ = 0;
         other.huge_page_fallback_reason_ = HugePageFallbackReason::kNone;
         other.huge_page_fallback_errno_ = 0;
+        other.marker_owner_user_id_ = 0;
+        other.marker_owner_group_id_ = 0;
+        other.marker_permissions_ = 0;
+        other.backing_owner_user_id_ = 0;
+        other.backing_owner_group_id_ = 0;
+        other.backing_permissions_ = 0;
     }
     return *this;
 }
@@ -918,6 +977,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
             continue;
         }
         (void)::fcntl(marker_fd, F_SETFD, FD_CLOEXEC);
+        Status private_marker = SetPrivatePermissions(marker_fd, "marker");
+        if (!private_marker.ok()) {
+            ::close(marker_fd);
+            (void)::shm_unlink(options.name.c_str());
+            return private_marker;
+        }
         if (::ftruncate(marker_fd,
                         static_cast<off_t>(sizeof(SharedMemoryMarkerRecord))) != 0) {
             Status status = ErrnoStatus("ftruncate(marker) failed");
@@ -949,6 +1014,7 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
         auto mapped = MapMarkerFd(marker_fd);
         if (!mapped.ok()) {
             ::close(marker_fd);
+            (void)::shm_unlink(options.name.c_str());
             return mapped.status();
         }
         MarkerMapping marker = std::move(mapped).value();
@@ -976,6 +1042,7 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
                                          O_NOFOLLOW,
                                      0600);
                 if (huge_fd >= 0 &&
+                    SetPrivatePermissions(huge_fd, "huge data").ok() &&
                     ::ftruncate(huge_fd, static_cast<off_t>(data_size)) == 0) {
                     struct stat st;
                     if (::fstat(huge_fd, &st) == 0) {
@@ -985,8 +1052,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
                             static_cast<uint64_t>(st.st_ino);
                         payload.flags |= shared_memory_internal::
                             kMarkerFlagBackingSizeCommitted;
-                        MINO_RETURN_IF_ERROR(
-                            PublishMarker(marker.record, payload));
+                        const Status identity_published =
+                            PublishMarker(marker.record, payload);
+                        if (!identity_published.ok()) {
+                            ::close(huge_fd);
+                            return identity_published;
+                        }
                         RunTestHook(
                             SharedMemoryTestPoint::kAfterBackingIdentityRecorded);
                         auto mapping = MapDataFd(huge_fd, data_size,
@@ -1003,6 +1074,22 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
                                 (void)::munmap(mapping.value(), data_size);
                                 return ready;
                             }
+                            auto marker_security_result =
+                                ReadFileSecurity(marker.fd, "marker");
+                            if (!marker_security_result.ok()) {
+                                (void)::munmap(mapping.value(), data_size);
+                                return marker_security_result.status();
+                            }
+                            const FileSecurity marker_security =
+                                *marker_security_result;
+                            const FileSecurity backing_security{
+                                .owner_user_id =
+                                    static_cast<uint64_t>(st.st_uid),
+                                .owner_group_id =
+                                    static_cast<uint64_t>(st.st_gid),
+                                .permissions =
+                                    static_cast<uint32_t>(st.st_mode & 0777),
+                            };
                             cleanup.Commit();
                             SharedMemorySegment segment;
                             segment.base_ = mapping.value();
@@ -1011,6 +1098,18 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
                             segment.huge_pages_requested_ = true;
                             segment.huge_pages_actual_ = true;
                             segment.actual_page_size_ = payload.page_size;
+                            segment.marker_owner_user_id_ =
+                                marker_security.owner_user_id;
+                            segment.marker_owner_group_id_ =
+                                marker_security.owner_group_id;
+                            segment.marker_permissions_ =
+                                marker_security.permissions;
+                            segment.backing_owner_user_id_ =
+                                backing_security.owner_user_id;
+                            segment.backing_owner_group_id_ =
+                                backing_security.owner_group_id;
+                            segment.backing_permissions_ =
+                                backing_security.permissions;
                             segment.name_ = options.name;
                             return segment;
                         }
@@ -1031,6 +1130,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
         MINO_ASSIGN_OR_RETURN(
             CreatedFallbackMapping fallback,
             CreateFallback(marker, payload, fallback_reason, fallback_errno));
+        auto marker_security_result = ReadFileSecurity(marker.fd, "marker");
+        if (!marker_security_result.ok()) {
+            (void)::munmap(fallback.base, fallback.size);
+            return marker_security_result.status();
+        }
+        const FileSecurity marker_security = *marker_security_result;
         cleanup.Commit();
         SharedMemorySegment segment;
         segment.base_ = fallback.base;
@@ -1041,6 +1146,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
         segment.actual_page_size_ = fallback.page_size;
         segment.huge_page_fallback_reason_ = fallback_reason;
         segment.huge_page_fallback_errno_ = fallback_errno;
+        segment.marker_owner_user_id_ = marker_security.owner_user_id;
+        segment.marker_owner_group_id_ = marker_security.owner_group_id;
+        segment.marker_permissions_ = marker_security.permissions;
+        segment.backing_owner_user_id_ = fallback.security.owner_user_id;
+        segment.backing_owner_group_id_ = fallback.security.owner_group_id;
+        segment.backing_permissions_ = fallback.security.permissions;
         segment.name_ = options.name;
         return segment;
     }
@@ -1075,6 +1186,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Open(
     int marker_fd = ::shm_open(options.name.c_str(), O_RDONLY, 0);
     if (marker_fd < 0) return ErrnoStatus("open marker failed");
     (void)::fcntl(marker_fd, F_SETFD, FD_CLOEXEC);
+    auto marker_security_result = ReadFileSecurity(marker_fd, "marker");
+    if (!marker_security_result.ok()) {
+        ::close(marker_fd);
+        return marker_security_result.status();
+    }
+    const FileSecurity marker_security = *marker_security_result;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(
                               options.creating_wait_timeout_ms);
@@ -1150,6 +1267,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Open(
         ::close(data_fd);
         return identity;
     }
+    auto backing_security_result = ReadFileSecurity(data_fd, "backing");
+    if (!backing_security_result.ok()) {
+        ::close(data_fd);
+        return backing_security_result.status();
+    }
+    const FileSecurity backing_security = *backing_security_result;
     auto mapping = MapDataFd(data_fd, payload.data_size, read_only, map_flags);
     ::close(data_fd);
     if (!mapping.ok()) return mapping.status();
@@ -1163,6 +1286,12 @@ Result<SharedMemorySegment> SharedMemorySegment::Open(
          shared_memory_internal::kMarkerFlagHugeRequested) != 0;
     segment.huge_pages_actual_ = kind == MarkerBackingKind::kHugeFile;
     segment.actual_page_size_ = payload.page_size;
+    segment.marker_owner_user_id_ = marker_security.owner_user_id;
+    segment.marker_owner_group_id_ = marker_security.owner_group_id;
+    segment.marker_permissions_ = marker_security.permissions;
+    segment.backing_owner_user_id_ = backing_security.owner_user_id;
+    segment.backing_owner_group_id_ = backing_security.owner_group_id;
+    segment.backing_permissions_ = backing_security.permissions;
     if (payload.fallback_reason >
         static_cast<uint32_t>(HugePageFallbackReason::kSystemError)) {
         (void)::munmap(segment.base_, segment.size_);
@@ -1194,6 +1323,12 @@ Status SharedMemorySegment::Close() {
     actual_page_size_ = 0;
     huge_page_fallback_reason_ = HugePageFallbackReason::kNone;
     huge_page_fallback_errno_ = 0;
+    marker_owner_user_id_ = 0;
+    marker_owner_group_id_ = 0;
+    marker_permissions_ = 0;
+    backing_owner_user_id_ = 0;
+    backing_owner_group_id_ = 0;
+    backing_permissions_ = 0;
     return Status::Ok();
 }
 

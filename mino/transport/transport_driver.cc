@@ -666,6 +666,11 @@ Status TransportDriver::DoConfirmRemoteAccepted(SendOperation) {
     return Unsupported("driver does not support protocol ACK confirmation");
 }
 
+Result<security::AuthenticatedPeer> TransportDriver::DoAuthenticatedPeer(
+    ConnectionId) {
+    return Unsupported("driver does not expose an authenticated peer");
+}
+
 TransportDriver::ActiveOperation::~ActiveOperation() {
     if (driver_ != nullptr) driver_->ReleaseActiveOperation();
 }
@@ -1032,6 +1037,26 @@ Result<CompletionPollResult> TransportDriver::PollCompletions(
                 "driver returned mismatched delivery completion");
         }
         return result;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<security::AuthenticatedPeer> TransportDriver::AuthenticatedPeer(
+    ConnectionId connection_id) {
+    try {
+        if (connection_id == kInvalidConnectionId) {
+            return Invalid("authenticated-peer connection id must be non-zero");
+        }
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        auto peer = DoAuthenticatedPeer(connection_id);
+        if (!peer.ok()) return peer.status();
+        if (!peer->complete()) {
+            return InvalidDriverResult(
+                "driver returned an incomplete authenticated peer");
+        }
+        return peer;
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }

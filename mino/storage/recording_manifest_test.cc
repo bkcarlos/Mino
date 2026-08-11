@@ -95,10 +95,21 @@ RecordingManifestSnapshot RecordingSnapshot() {
         TopicTableEntry{.topic_id = 10,
                         .topic_name = "camera.front",
                         .config_version = 8,
+                        .partition_maps = {TopicPartitionMap{
+                            .map_version = 8,
+                            .generation = 1,
+                            .partition_count = 4,
+                            .strategy = TopicPartitionStrategy::kSource,
+                            .state = TopicPartitionMapState::kActive,
+                            .hash_algorithm_version =
+                                kStablePartitionHashVersion,
+                            .hash_seed = 99,
+                        }},
                         .schema_snapshot = {Schema(1, 1), Schema(2, 33)}},
         TopicTableEntry{.topic_id = 20,
                         .topic_name = "imu",
                         .config_version = 9,
+                        .partition_maps = {},
                         .schema_snapshot = {Schema(3, 65)}},
     };
     return snapshot;
@@ -176,7 +187,7 @@ TEST(RecordingManifestCodecTest, RoundTripsExplicitLittleEndianFormats) {
     ASSERT_TRUE(encoded_recording.ok())
         << encoded_recording.status().ToString();
     ASSERT_GE(encoded_recording->size(), 76u);
-    EXPECT_EQ(static_cast<uint8_t>((*encoded_recording)[8]), 1u);
+    EXPECT_EQ(static_cast<uint8_t>((*encoded_recording)[8]), 2u);
     EXPECT_EQ(static_cast<uint8_t>((*encoded_recording)[9]), 0u);
     EXPECT_EQ(static_cast<uint8_t>((*encoded_recording)[10]), 76u);
     EXPECT_EQ(static_cast<uint8_t>((*encoded_recording)[11]), 0u);
@@ -190,8 +201,8 @@ TEST(RecordingManifestCodecTest, RoundTripsExplicitLittleEndianFormats) {
     ASSERT_TRUE(encoded_partition.ok())
         << encoded_partition.status().ToString();
     ASSERT_GE(encoded_partition->size(), 104u);
-    EXPECT_EQ(static_cast<uint8_t>((*encoded_partition)[8]), 1u);
-    EXPECT_EQ(static_cast<uint8_t>((*encoded_partition)[10]), 104u);
+    EXPECT_EQ(static_cast<uint8_t>((*encoded_partition)[8]), 2u);
+    EXPECT_EQ(static_cast<uint8_t>((*encoded_partition)[10]), 136u);
     auto decoded_partition = DecodePartitionManifest(*encoded_partition);
     ASSERT_TRUE(decoded_partition.ok())
         << decoded_partition.status().ToString();
@@ -224,8 +235,8 @@ TEST(RecordingManifestCodecTest, RejectsCorruptionBoundsDuplicatesAndTraversal) 
 
     auto partition = EncodePartitionManifest(PartitionSnapshot());
     ASSERT_TRUE(partition.ok()) << partition.status().ToString();
-    (*partition)[104 + 8] = std::byte{99};
-    WriteLe32(&*partition, 100, Crc32c(*partition, 100));
+    (*partition)[136 + 8] = std::byte{99};
+    WriteLe32(&*partition, 132, Crc32c(*partition, 132));
     EXPECT_EQ(DecodePartitionManifest(*partition).status().code(),
               StatusCode::kCorruption);
 }
@@ -238,6 +249,7 @@ TEST(RecordingManifestTest, EnforcesOwnerTopicMappingAndRecoveryWatermarks) {
     TopicTableEntry topic{.topic_id = 10,
                           .topic_name = "camera.front",
                           .config_version = 8,
+                          .partition_maps = {},
                           .schema_snapshot = {Schema(1, 1)}};
     ASSERT_TRUE((*manifest)->AddTopic(topic).ok());
     EXPECT_EQ((*manifest)->FindTopic(10)->topic_name, "camera.front");
@@ -269,6 +281,60 @@ TEST(RecordingManifestTest, EnforcesOwnerTopicMappingAndRecoveryWatermarks) {
     rollback.minimum_config_version = 10;
     EXPECT_EQ(RecordingManifest::Open(root, rollback).status().code(),
               StatusCode::kCorruption);
+}
+
+TEST(RecordingManifestTest, RepartitionNeedsNewGenerationDrainAndCutoverProof) {
+    const std::filesystem::path root = TestDirectory("repartition");
+    auto manifest = RecordingManifest::Create(root, RecordingSnapshot().session);
+    ASSERT_TRUE(manifest.ok()) << manifest.status().ToString();
+    TopicPartitionMap active{
+        .map_version = 1,
+        .generation = 1,
+        .partition_count = 1,
+        .strategy = TopicPartitionStrategy::kSource,
+        .state = TopicPartitionMapState::kActive,
+    };
+    ASSERT_TRUE((*manifest)
+                    ->AddTopic(TopicTableEntry{
+                        .topic_id = 30,
+                        .topic_name = "partitioned",
+                        .config_version = 1,
+                        .partition_maps = {active},
+                        .schema_snapshot = {},
+                    })
+                    .ok());
+    TopicPartitionMap prepared = active;
+    prepared.map_version = 2;
+    prepared.generation = 2;
+    prepared.partition_count = 4;
+    prepared.state = TopicPartitionMapState::kPrepared;
+    ASSERT_TRUE((*manifest)->PrepareTopicPartitionMap(30, prepared).ok());
+
+    TopicTableEntry illegal = *(*manifest)->FindTopic(30);
+    illegal.partition_maps.front().partition_count = 2;
+    EXPECT_EQ((*manifest)->UpdateTopic(illegal).code(),
+              StatusCode::kInvalidArgument);
+    ASSERT_TRUE((*manifest)->BeginTopicPartitionDrain(30, 2).ok());
+    EXPECT_EQ((*manifest)
+                  ->CutoverTopicPartitionMap(30, 2, PartitionDrainProof{})
+                  .code(),
+              StatusCode::kWouldBlock);
+    const PartitionDrainProof proof{
+        .old_routes_fenced = true,
+        .queued_records = 0,
+        .reserved_records = 0,
+        .active_writers = 0,
+        .last_admitted_sequence = 77,
+        .last_persisted_sequence = 77,
+    };
+    ASSERT_TRUE((*manifest)->CutoverTopicPartitionMap(30, 2, proof).ok());
+    const TopicTableEntry cutover = *(*manifest)->FindTopic(30);
+    ASSERT_EQ(cutover.partition_maps.size(), 2u);
+    EXPECT_EQ(cutover.partition_maps[0].state,
+              TopicPartitionMapState::kRetired);
+    EXPECT_EQ(cutover.partition_maps[1].state,
+              TopicPartitionMapState::kActive);
+    EXPECT_EQ(cutover.partition_maps[1].partition_count, 4u);
 }
 
 TEST(PartitionManifestTest, EnforcesStateMachineCheckpointAndOrphanApis) {

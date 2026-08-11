@@ -93,12 +93,13 @@ static_assert(sizeof(SharedMemoryMarkerRecord) <= 2048);
 
 // Test-only deterministic fault points. Production code never installs a hook.
 enum class SharedMemoryTestPoint {
+    kBeforeMarkerMap,
     kAfterCreatingMarker,
     kBeforeMarkerPublication,
     kAfterBackingIdentityRecorded,
     kAfterUnlinkingPublished,
 };
-using SharedMemoryTestHook = void (*)(SharedMemoryTestPoint);
+using SharedMemoryTestHook = bool (*)(SharedMemoryTestPoint);
 void SetSharedMemoryTestHook(SharedMemoryTestHook hook) noexcept;
 
 }  // namespace mino::shared_memory_internal

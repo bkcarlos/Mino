@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mino://validation/storage-partition-qualification/v1",
+  "title": "Mino D6-09/V-24 storage partition qualification evidence",
+  "type": "object",
+  "required": [
+    "schema",
+    "qualification_id",
+    "validation",
+    "source",
+    "configuration",
+    "configuration_sha256",
+    "policy",
+    "artifact_schema",
+    "benchmark",
+    "host",
+    "filesystem",
+    "storage",
+    "target_evaluation",
+    "process_runs",
+    "sla",
+    "artifacts_complete",
+    "qualification_eligible",
+    "outcome",
+    "errors",
+    "started_unix_ns",
+    "finished_unix_ns"
+  ],
+  "properties": {
+    "schema": {"const": "mino.storage_partition_qualification.v1"},
+    "qualification_id": {"const": "D6-09"},
+    "validation": {"const": "V-24"},
+    "source": {"$ref": "#/$defs/source"},
+    "configuration": {"$ref": "#/$defs/configuration"},
+    "configuration_sha256": {"$ref": "#/$defs/sha256"},
+    "policy": {"$ref": "#/$defs/hashedInput"},
+    "artifact_schema": {"$ref": "#/$defs/hashedInput"},
+    "benchmark": {"$ref": "#/$defs/hashedInput"},
+    "host": {"$ref": "#/$defs/host"},
+    "filesystem": {"$ref": "#/$defs/filesystem"},
+    "storage": {"$ref": "#/$defs/storage"},
+    "target_evaluation": {"$ref": "#/$defs/targetEvaluation"},
+    "process_runs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/processRun"}
+    },
+    "sla": {"$ref": "#/$defs/sla"},
+    "artifacts_complete": {"type": "boolean"},
+    "qualification_eligible": {"type": "boolean"},
+    "outcome": {"enum": ["passed", "failed", "nonqualified"]},
+    "errors": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "started_unix_ns": {"type": "integer", "minimum": 1},
+    "finished_unix_ns": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optionalSha256": {"type": "string", "pattern": "^([0-9a-f]{64})?$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "artifact": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "hashedInput": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "schema": {"type": "string"},
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/optionalSha256"}
+      },
+      "additionalProperties": false
+    },
+    "sourceObservation": {
+      "type": "object",
+      "required": ["commit", "state"],
+      "properties": {
+        "commit": {"type": "string"},
+        "state": {"enum": ["clean", "dirty", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["expected_commit", "before", "after"],
+      "properties": {
+        "expected_commit": {"type": "string"},
+        "before": {"$ref": "#/$defs/sourceObservation"},
+        "after": {"$ref": "#/$defs/sourceObservation"}
+      },
+      "additionalProperties": false
+    },
+    "workload": {
+      "type": "object",
+      "required": ["records_per_scenario", "payload_bytes", "target_ingress_records_per_second"],
+      "properties": {
+        "records_per_scenario": {"type": "integer", "minimum": 16},
+        "payload_bytes": {"type": "integer", "minimum": 1},
+        "target_ingress_records_per_second": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "configuration": {
+      "type": "object",
+      "required": [
+        "rounds",
+        "processes",
+        "concurrency",
+        "partition_counts",
+        "workload",
+        "build_config",
+        "storage_directory",
+        "timeout_seconds",
+        "hardware_attestation"
+      ],
+      "properties": {
+        "rounds": {"type": "integer"},
+        "processes": {"type": "integer"},
+        "concurrency": {"const": "processes_concurrent_within_each_round"},
+        "partition_counts": {
+          "type": "array",
+          "prefixItems": [{"const": 1}, {"const": 2}, {"const": 4}, {"const": 8}, {"const": 16}],
+          "items": false,
+          "minItems": 5,
+          "maxItems": 5
+        },
+        "workload": {"oneOf": [{"$ref": "#/$defs/workload"}, {"type": "object", "maxProperties": 0}]},
+        "build_config": {"type": "string"},
+        "storage_directory": {"type": "string", "minLength": 1},
+        "timeout_seconds": {"type": "integer"},
+        "hardware_attestation": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "host": {
+      "type": "object",
+      "required": ["system", "machine", "kernel", "cpu_model", "cpu_governors"],
+      "properties": {
+        "system": {"type": "string"},
+        "machine": {"type": "string"},
+        "kernel": {"type": "string"},
+        "cpu_model": {"type": "string"},
+        "cpu_governors": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "filesystem": {
+      "type": "object",
+      "required": ["target", "source", "filesystem", "mount_options", "probe_error"],
+      "properties": {
+        "target": {"type": "string"},
+        "source": {"type": "string"},
+        "filesystem": {"type": "string"},
+        "mount_options": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "probe_error": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "storage": {
+      "type": "object",
+      "required": ["mount_source", "device", "parent_device", "type", "model", "serial", "transport", "rotational", "probe_error"],
+      "properties": {
+        "mount_source": {"type": "string"},
+        "device": {"type": "string"},
+        "parent_device": {"type": "string"},
+        "type": {"type": "string"},
+        "model": {"type": "string"},
+        "serial": {"type": "string"},
+        "transport": {"type": "string"},
+        "rotational": {"oneOf": [{"type": "boolean"}, {"type": "null"}]},
+        "probe_error": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "targetEvaluation": {
+      "type": "object",
+      "required": ["matches", "reasons"],
+      "properties": {
+        "matches": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      },
+      "additionalProperties": false
+    },
+    "processRun": {
+      "type": "object",
+      "required": ["round", "process", "command", "command_shell", "started_unix_ns", "finished_unix_ns", "duration_seconds", "exit_code", "execution_error", "log", "json"],
+      "properties": {
+        "round": {"type": "integer", "minimum": 1},
+        "process": {"type": "integer", "minimum": 1},
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "command_shell": {"type": "string", "minLength": 1},
+        "started_unix_ns": {"type": "integer", "minimum": 1},
+        "finished_unix_ns": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "exit_code": {"type": "integer"},
+        "execution_error": {"type": "string"},
+        "log": {"$ref": "#/$defs/artifact"},
+        "json": {"oneOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "slaCheck": {
+      "type": "object",
+      "required": ["metric", "partitions", "aggregation", "observed", "threshold", "policy", "passed"],
+      "properties": {
+        "metric": {"enum": ["single_writer_threshold_records_per_second", "scaling_efficiency"]},
+        "partitions": {"enum": [1, 2, 4, 8, 16]},
+        "aggregation": {"const": "minimum"},
+        "observed": {"type": "number", "minimum": 0},
+        "threshold": {"type": "number", "minimum": 0},
+        "policy": {"const": ">="},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "required": ["partitions", "throughput_records_per_second", "minimum_scaling_efficiency", "maximum_partition_throughput_imbalance_ratio", "maximum_record_latency_p99_ns"],
+      "properties": {
+        "partitions": {"enum": [1, 2, 4, 8, 16]},
+        "throughput_records_per_second": {
+          "type": "object",
+          "required": ["minimum", "median", "maximum"],
+          "properties": {
+            "minimum": {"type": "number", "exclusiveMinimum": 0},
+            "median": {"type": "number", "exclusiveMinimum": 0},
+            "maximum": {"type": "number", "exclusiveMinimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "minimum_scaling_efficiency": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_partition_throughput_imbalance_ratio": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_record_latency_p99_ns": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "sla": {
+      "type": "object",
+      "required": ["aggregation", "checks", "observations", "passed"],
+      "properties": {
+        "aggregation": {"const": "minimum_across_all_processes_and_rounds"},
+        "checks": {"type": "array", "items": {"$ref": "#/$defs/slaCheck"}},
+        "observations": {"type": "array", "items": {"$ref": "#/$defs/observation"}},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"qualification_eligible": {"const": true}}, "required": ["qualification_eligible"]},
+      "then": {
+        "properties": {
+          "outcome": {"const": "passed"},
+          "artifacts_complete": {"const": true},
+          "errors": {"maxItems": 0},
+          "target_evaluation": {"properties": {"matches": {"const": true}, "reasons": {"maxItems": 0}}},
+          "sla": {"properties": {"passed": {"const": true}}},
+          "configuration": {
+            "properties": {
+              "rounds": {"minimum": 2},
+              "processes": {"minimum": 2}
+            }
+          },
+          "source": {
+            "properties": {
+              "expected_commit": {"$ref": "#/$defs/commit"},
+              "before": {"properties": {"commit": {"$ref": "#/$defs/commit"}, "state": {"const": "clean"}}},
+              "after": {"properties": {"commit": {"$ref": "#/$defs/commit"}, "state": {"const": "clean"}}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "nonqualified"}}, "required": ["outcome"]},
+      "then": {
+        "properties": {
+          "qualification_eligible": {"const": false},
+          "artifacts_complete": {"const": true},
+          "errors": {"maxItems": 0},
+          "configuration": {
+            "properties": {
+              "rounds": {"minimum": 2},
+              "processes": {"minimum": 2}
+            }
+          },
+          "target_evaluation": {"properties": {"matches": {"const": false}, "reasons": {"minItems": 1}}},
+          "sla": {"properties": {"passed": {"const": true}}}
+        }
+      }
+    }
+  ]
+}

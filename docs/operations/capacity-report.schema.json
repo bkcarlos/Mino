@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mino.invalid/schemas/capacity-report-v1.json",
+  "title": "Mino D6-15 complete production Topic capacity report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "qualification_id",
+    "mode",
+    "outcome",
+    "qualification_eligible",
+    "generated_unix_ns",
+    "source",
+    "hardware",
+    "commands",
+    "inputs",
+    "inventory_coverage",
+    "scenario",
+    "resources",
+    "slab_classes",
+    "topics",
+    "rejections",
+    "errors",
+    "report_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "mino.capacity.report.v1"},
+    "qualification_id": {"const": "D6-15"},
+    "mode": {"enum": ["report", "qualify"]},
+    "outcome": {"enum": ["PASS", "FAIL"]},
+    "qualification_eligible": {"type": "boolean"},
+    "generated_unix_ns": {"type": "integer", "minimum": 1},
+    "source": {"$ref": "#/$defs/source"},
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configured", "observed"],
+      "properties": {
+        "configured": {"type": "object"},
+        "observed": {"type": "object"}
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invocation", "verification"],
+      "properties": {
+        "invocation": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "verification": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/input"}
+    },
+    "inventory_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configured", "snapshot", "reported", "exact"],
+      "properties": {
+        "configured": {"$ref": "#/$defs/topicSet"},
+        "snapshot": {"$ref": "#/$defs/topicSet"},
+        "reported": {"$ref": "#/$defs/topicSet"},
+        "exact": {"type": "boolean"}
+      }
+    },
+    "scenario": {"type": "object"},
+    "resources": {
+      "type": "object",
+      "minProperties": 14,
+      "additionalProperties": {"$ref": "#/$defs/resourceRow"}
+    },
+    "slab_classes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/slabClass"}
+    },
+    "topics": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/topic"}
+    },
+    "rejections": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rejection"}
+    },
+    "errors": {"type": "array", "items": {"type": "string"}},
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_commit", "commit", "state"],
+      "properties": {
+        "expected_commit": {"oneOf": [{"$ref": "#/$defs/commit"}, {"const": ""}]},
+        "commit": {"oneOf": [{"$ref": "#/$defs/commit"}, {"const": ""}]},
+        "state": {"enum": ["clean", "dirty", "unknown"]}
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "bytes", "sha256"],
+      "properties": {
+        "kind": {"enum": ["deployment_config", "coordinator_snapshot", "production_inventory", "node_budget", "artifact_schema"]},
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "topicIdentity": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": 1},
+        {"type": "string", "minLength": 1}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "topicSet": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/topicIdentity"}
+    },
+    "resourceRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "committed", "headroom", "emergency"],
+      "properties": {
+        "limit": {"type": "integer", "minimum": 0},
+        "committed": {"type": "integer", "minimum": 0},
+        "headroom": {"type": "integer", "minimum": 0},
+        "emergency": {"type": "integer", "minimum": 0}
+      }
+    },
+    "schemaIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type_id", "digest", "major", "minor"],
+      "properties": {
+        "type_id": {"type": "integer", "minimum": 1},
+        "digest": {"$ref": "#/$defs/sha256"},
+        "major": {"type": "integer", "minimum": 0},
+        "minor": {"type": "integer", "minimum": 0}
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["partition", "what_if", "slab_class", "resources"],
+      "properties": {
+        "partition": {"type": "integer", "minimum": 0},
+        "what_if": {"type": "boolean"},
+        "slab_class": {"type": "integer", "minimum": 0},
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["region_bytes", "slab_bytes"],
+          "properties": {
+            "region_bytes": {"type": "integer", "minimum": 1},
+            "slab_bytes": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "version", "target_node"],
+      "properties": {
+        "policy": {"enum": ["static", "discovery"]},
+        "version": {"type": "integer", "minimum": 0},
+        "target_node": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}
+      }
+    },
+    "recorder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recorder_id", "disk_pause_seconds", "buffer_bytes", "disk_bytes_per_second"],
+      "properties": {
+        "recorder_id": {"type": "string", "minLength": 1},
+        "disk_pause_seconds": {"type": "integer", "minimum": 1},
+        "buffer_bytes": {"type": "integer", "minimum": 1},
+        "disk_bytes_per_second": {"type": "integer", "minimum": 1}
+      }
+    },
+    "topic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic_id", "name", "schemas", "routes", "partitions", "recorder", "resources"],
+      "properties": {
+        "topic_id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 1},
+        "schemas": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/schemaIdentity"}},
+        "routes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/route"}},
+        "partitions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/partition"}},
+        "recorder": {"oneOf": [{"$ref": "#/$defs/recorder"}, {"type": "null"}]},
+        "resources": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "slabClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "slot_bytes", "limit_bytes", "emergency_bytes", "committed_bytes", "headroom_bytes"],
+      "properties": {
+        "class": {"type": "integer", "minimum": 0},
+        "slot_bytes": {"type": "integer", "minimum": 1},
+        "limit_bytes": {"type": "integer", "minimum": 1},
+        "emergency_bytes": {"type": "integer", "minimum": 0},
+        "committed_bytes": {"type": "integer", "minimum": 0},
+        "headroom_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "scope", "dimension", "requested", "available", "reason"],
+      "properties": {
+        "kind": {"enum": ["node-budget", "slab-budget", "topic-policy", "recorder-policy"]},
+        "scope": {"type": "string", "minLength": 1},
+        "dimension": {"type": "string", "minLength": 1},
+        "requested": {"type": "integer", "minimum": 0},
+        "available": {"type": "integer", "minimum": 0},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"qualification_eligible": {"const": true}}},
+      "then": {
+        "properties": {
+          "mode": {"const": "qualify"},
+          "outcome": {"const": "PASS"},
+          "errors": {"maxItems": 0},
+          "rejections": {"maxItems": 0},
+          "source": {
+            "properties": {
+              "state": {"const": "clean"},
+              "expected_commit": {"$ref": "#/$defs/commit"},
+              "commit": {"$ref": "#/$defs/commit"}
+            }
+          },
+          "inventory_coverage": {"properties": {"exact": {"const": true}}},
+          "topics": {"minItems": 1}
+        }
+      }
+    }
+  ]
+}

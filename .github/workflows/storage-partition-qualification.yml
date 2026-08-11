@@ -1,0 +1,103 @@
+name: Storage Partition Qualification
+
+on:
+  schedule:
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      storage_directory:
+        description: Existing directory on the target local Samsung 980 PRO NVMe/ext4 filesystem
+        required: true
+        default: /code/Mino/.cache
+        type: string
+      rounds:
+        description: Complete 1/2/4/8/16 matrix rounds (minimum 2)
+        required: true
+        default: "3"
+        type: string
+      processes:
+        description: Concurrent benchmark processes per round (minimum 2)
+        required: true
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-partition-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: D6-09 / V-24 physical NVMe partition qualification
+    runs-on: [self-hosted, linux, x64, storage-performance]
+    timeout-minutes: 180
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      STORAGE_DIRECTORY: ${{ inputs.storage_directory || '/code/Mino/.cache' }}
+      QUALIFICATION_ROUNDS: ${{ inputs.rounds || '3' }}
+      QUALIFICATION_PROCESSES: ${{ inputs.processes || '2' }}
+      EVIDENCE_DIRECTORY: ${{ runner.temp }}/mino-storage-partition-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout exact clean source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Verify immutable target prerequisites
+        run: |
+          test "$(uname -s)" = Linux
+          command -v bazel
+          command -v findmnt
+          command -v lsblk
+          command -v gcc-12
+          command -v g++-12
+          test -d "${STORAGE_DIRECTORY}"
+          git --no-pager diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Test qualification contracts and build release benchmark
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //benchmarks:storage_partition_qualification_contract_test \
+            --test_output=errors
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks:storage_partition_benchmark
+
+      - name: Run multi-process, multi-round qualification
+        run: |
+          python3 benchmarks/storage_partition_qualification.py \
+            --repo="${GITHUB_WORKSPACE}" \
+            --benchmark="${GITHUB_WORKSPACE}/bazel-bin/benchmarks/storage_partition_benchmark" \
+            --output-dir="${EVIDENCE_DIRECTORY}" \
+            --storage-dir="${STORAGE_DIRECTORY}" \
+            --expected-commit="${GITHUB_SHA}" \
+            --policy="${GITHUB_WORKSPACE}/benchmarks/storage_partition_qualification_sla.json" \
+            --schema="${GITHUB_WORKSPACE}/docs/validation/Storage_partition_qualification_artifact.schema.json" \
+            --build-config="bazel --lockfile_mode=error --config=gcc12 --config=release" \
+            --hardware-attestation=auto-probed-local-block-device \
+            --rounds="${QUALIFICATION_ROUNDS}" \
+            --processes="${QUALIFICATION_PROCESSES}"
+
+      - name: Verify final evidence is qualification eligible
+        if: always()
+        run: |
+          python3 benchmarks/storage_partition_qualification.py \
+            --verify-manifest="${EVIDENCE_DIRECTORY}/manifest.json" \
+            --require-expected-commit="${GITHUB_SHA}" \
+            --require-qualified
+
+      - name: Upload complete D6-09/V-24 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: storage-partition-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIRECTORY }}/
+          if-no-files-found: error
+          retention-days: 180

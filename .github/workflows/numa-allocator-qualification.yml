@@ -1,0 +1,82 @@
+name: NUMA Allocator Qualification
+
+on:
+  schedule:
+    - cron: "41 2 1 * *"
+  workflow_dispatch:
+    inputs:
+      expected_governor:
+        description: Governor preconfigured on every qualification CPU
+        required: true
+        default: performance
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: numa-allocator-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: Physical multi-NUMA allocator qualification
+    runs-on: [self-hosted, linux, x64, mino-numa]
+    timeout-minutes: 60
+    env:
+      CC: gcc-12
+      CXX: g++-12
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Verify immutable physical runner prerequisites
+        run: |
+          test "$(uname -s)" = Linux
+          command -v bazel
+          command -v gcc-12
+          command -v g++-12
+          test -r /sys/devices/system/node/online
+          git --no-pager diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Build release NUMA benchmark and runner self-test
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //benchmarks/allocator:numa_qualification_test
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks/allocator:numa_allocator_benchmark
+
+      - name: Run fail-closed physical NUMA qualification
+        run: |
+          python3 benchmarks/allocator/numa_qualification.py \
+            --benchmark="${GITHUB_WORKSPACE}/bazel-bin/benchmarks/allocator/numa_allocator_benchmark" \
+            --output-dir="${RUNNER_TEMP}/mino-numa-allocator-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --expected-commit="${GITHUB_SHA}" \
+            --native-attestation=physical-numa \
+            --expected-governor="${{ inputs.expected_governor || 'performance' }}" \
+            --threads=8 \
+            --iterations=1000000 \
+            --slots=16384
+
+      - name: Verify qualification manifest fail closed
+        if: always()
+        run: |
+          python3 benchmarks/allocator/numa_qualification.py \
+            --verify-manifest="${RUNNER_TEMP}/mino-numa-allocator-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/manifest.json" \
+            --require-expected-commit="${GITHUB_SHA}"
+
+      - name: Upload complete NUMA evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: numa-allocator-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-numa-allocator-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 180

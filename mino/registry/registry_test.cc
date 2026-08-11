@@ -145,6 +145,7 @@ NodeRegistration Node(NodeId node_id, uint64_t pid, uint64_t epoch,
         .process_identity = Identity(node_id, pid, epoch),
         .endpoints = {Endpoint(static_cast<uint8_t>(node_id.value),
                                static_cast<uint16_t>(4000 + node_id.value))},
+        .security_domain_id = SecurityDomainId{7},
         .trust_domain = "test-domain",
         .health = NodeHealth::kHealthy,
         .lease_epoch = epoch,
@@ -159,6 +160,18 @@ schema::SchemaIdentity Schema(uint64_t short_id = 7,
     digest[0] = static_cast<std::byte>(short_id);
     digest[31] = std::byte{0x5a};
     return schema::SchemaIdentity(short_id, digest, schema_version, 1);
+}
+
+TopicAcl TestAcl() {
+    TopicAcl acl;
+    for (uint64_t node = 1; node <= 64; ++node) {
+        acl.entries.push_back(TopicAclEntry{
+            .node_id = NodeId{node},
+            .security_domain_id = SecurityDomainId{7},
+            .permissions = kAllTopicPermissions,
+        });
+    }
+    return acl;
 }
 
 TopicMetadata DiscoveryTopic(std::string name = "test/topic") {
@@ -179,6 +192,7 @@ TopicMetadata DiscoveryTopic(std::string name = "test/topic") {
         .max_subscribers = 16,
         .partition_count = 1,
         .record_topology = RecordBackpressureTopology::kIsolated,
+        .acl = TestAcl(),
         .region_version = 1,
         .channel_version = 1,
         .acl_version = 1,
@@ -285,6 +299,90 @@ TEST(MetadataValidationTest, RejectsMalformedCapacitySchemaRoutesAndChannels) {
     topic.accepted_schemas = {Schema(8), Schema(8)};
     EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
               StatusCode::kInvalidArgument);
+    topic = DiscoveryTopic();
+    topic.acl.entries.clear();
+    EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
+              StatusCode::kInvalidArgument);
+    topic = StaticTopic("static/acl-denied", NodeId{1});
+    topic.acl.entries[0].permissions =
+        static_cast<uint32_t>(TopicPermission::kPublish);
+    EXPECT_EQ(ValidateTopicMetadata(topic, limits, true).code(),
+              StatusCode::kInvalidArgument);
+}
+
+TEST(TopicAclTest, CanonicalizesOrderAndBindsDomainWithNode) {
+    auto probe = std::make_shared<FakeLivenessProbe>();
+    auto coordinator = MakeCoordinator(probe);
+    TopicMetadata metadata = DiscoveryTopic("topic/acl-canonical");
+    std::reverse(metadata.acl.entries.begin(), metadata.acl.entries.end());
+    auto created = coordinator->CreateTopic(std::move(metadata));
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    const TopicMetadata& canonical = (*created)->metadata;
+    ASSERT_GT(canonical.acl.entries.size(), 1u);
+    EXPECT_TRUE(std::is_sorted(
+        canonical.acl.entries.begin(), canonical.acl.entries.end(),
+        [](const TopicAclEntry& lhs, const TopicAclEntry& rhs) {
+            if (lhs.security_domain_id != rhs.security_domain_id) {
+                return lhs.security_domain_id < rhs.security_domain_id;
+            }
+            return lhs.node_id < rhs.node_id;
+        }));
+    EXPECT_TRUE(ValidateTopicPermission(
+                    canonical, SecurityDomainId{7}, NodeId{1},
+                    TopicPermission::kPublish)
+                    .ok());
+    EXPECT_EQ(ValidateTopicPermission(canonical, SecurityDomainId{8}, NodeId{1},
+                                      TopicPermission::kPublish)
+                  .code(),
+              StatusCode::kPermissionDenied);
+
+    TopicMetadata reordered = canonical;
+    std::reverse(reordered.acl.entries.begin(), reordered.acl.entries.end());
+    ++reordered.config_version;
+    EXPECT_TRUE(coordinator
+                    ->UpdateTopic(std::move(reordered), canonical.config_version)
+                    .ok());
+}
+
+TEST(TopicAclTest, RegistrationAndPinsDenyMissingPermissions) {
+    auto probe = std::make_shared<FakeLivenessProbe>();
+    auto coordinator = MakeCoordinator(probe);
+    const NodeRegistration node = Node(NodeId{4}, 404, 41, 1000);
+    ASSERT_TRUE(coordinator->RegisterNode(node, 0).ok());
+    TopicMetadata metadata = DiscoveryTopic("topic/acl");
+    metadata.acl.entries = {{
+        .node_id = node.node_id,
+        .security_domain_id = node.security_domain_id,
+        .permissions = static_cast<uint32_t>(TopicPermission::kSubscribe),
+    }};
+    const TopicId topic_id = CreateAndActivate(*coordinator, std::move(metadata));
+
+    const PublisherRegistration publisher{
+        .topic_id = topic_id,
+        .publisher_id = PublisherId{1},
+        .generation = 1,
+        .owner = Owner(node),
+    };
+    EXPECT_EQ(coordinator->RegisterPublisher(publisher, 1).code(),
+              StatusCode::kPermissionDenied);
+
+    const SubscriberRegistration subscriber{
+        .topic_id = topic_id,
+        .subscriber_id = SubscriberId{1},
+        .generation = 1,
+        .owner = Owner(node),
+    };
+    EXPECT_TRUE(coordinator->RegisterSubscriber(subscriber, 1).ok());
+
+    const TopicPinRegistration bridge{
+        .topic_id = topic_id,
+        .pin_id = TopicPinId{1},
+        .kind = TopicPinKind::kBridge,
+        .generation = 1,
+        .owner = Owner(node),
+    };
+    EXPECT_EQ(coordinator->AcquireTopicPin(bridge, 1).code(),
+              StatusCode::kPermissionDenied);
 }
 
 TEST(NodeRegistryTest, RegistrationIsIdempotentAndSnapshotsAreImmutableCopies) {
@@ -303,6 +401,18 @@ TEST(NodeRegistryTest, RegistrationIsIdempotentAndSnapshotsAreImmutableCopies) {
     ASSERT_EQ((*old_snapshot)->nodes.size(), 1u);
     EXPECT_EQ((*old_snapshot)->nodes[0].last_heartbeat_ns, 10u);
     EXPECT_EQ(registry->size(), 1u);
+}
+
+TEST(NodeRegistryTest, SecurityDomainIsImmutableAcrossNodeUpdate) {
+    auto probe = std::make_shared<FakeLivenessProbe>();
+    auto registry_result = NodeRegistry::Create({}, probe);
+    ASSERT_TRUE(registry_result.ok());
+    auto registry = std::move(*registry_result);
+    NodeRegistration node = Node(NodeId{2}, 202, 22);
+    ASSERT_TRUE(registry->Register(node, 1).ok());
+    node.security_domain_id = SecurityDomainId{8};
+    node.config_version = 2;
+    EXPECT_EQ(registry->Update(node, 1, 2).code(), StatusCode::kUnsupported);
 }
 
 TEST(NodeRegistryTest, ConcurrentRegistrationRemainsSingleAndBounded) {
@@ -559,6 +669,26 @@ TEST(RoutingTest, StaticRoutesIgnoreDiscoveryMembership) {
     ASSERT_EQ((*after)->routes.size(), 1u);
     EXPECT_EQ((*after)->routes[0].target_node, target.node_id);
     EXPECT_EQ(coordinator->DiscoverySubscriberNodes(topic_id).status().code(),
+              StatusCode::kUnsupported);
+}
+
+TEST(ConfigUpdateTest, ActiveAclChangesRequireReplacement) {
+    auto probe = std::make_shared<FakeLivenessProbe>();
+    auto coordinator = MakeCoordinator(probe);
+    const TopicId topic_id =
+        CreateAndActivate(*coordinator, DiscoveryTopic("topic/acl-update"));
+    auto current = coordinator->GetTopic(topic_id);
+    ASSERT_TRUE(current.ok());
+
+    TopicMetadata replacement = (*current)->metadata;
+    replacement.acl.entries[0].permissions =
+        static_cast<uint32_t>(TopicPermission::kSubscribe);
+    ++replacement.acl_version;
+    ++replacement.config_version;
+    EXPECT_EQ(coordinator
+                  ->UpdateTopic(replacement,
+                                (*current)->metadata.config_version)
+                  .code(),
               StatusCode::kUnsupported);
 }
 

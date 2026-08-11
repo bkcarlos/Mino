@@ -36,11 +36,16 @@ constexpr std::array<std::byte, 8> kPartitionMagic = {
     std::byte{'M'}, std::byte{'I'}, std::byte{'N'}, std::byte{'O'},
     std::byte{'P'}, std::byte{'A'}, std::byte{'R'}, std::byte{'M'},
 };
+constexpr uint16_t kLegacyManifestFormatVersion = 1;
 constexpr size_t kRecordingHeaderSize = 76;
 constexpr size_t kRecordingCrcOffset = 72;
-constexpr size_t kPartitionHeaderSize = 104;
-constexpr size_t kPartitionCrcOffset = 100;
-constexpr size_t kTopicFixedSize = 24;
+constexpr size_t kLegacyPartitionHeaderSize = 104;
+constexpr size_t kLegacyPartitionCrcOffset = 100;
+constexpr size_t kPartitionHeaderSize = 136;
+constexpr size_t kPartitionCrcOffset = 132;
+
+constexpr size_t kTopicFixedSize = 32;
+constexpr size_t kPartitionMapFixedSize = 40;
 constexpr size_t kSchemaFixedSize = 48;
 constexpr size_t kSegmentFixedSize = 64;
 constexpr uint64_t kEncodedSegmentHeaderSize = 52;
@@ -142,6 +147,8 @@ Status ValidateLimits(const ManifestLimits& limits) {
     if (limits.max_topics == 0 || limits.max_topics > kHardMaxEntries ||
         limits.max_schemas_per_topic == 0 ||
         limits.max_schemas_per_topic > kHardMaxEntries ||
+        limits.max_partition_maps_per_topic == 0 ||
+        limits.max_partition_maps_per_topic > kHardMaxEntries ||
         limits.max_segments == 0 || limits.max_segments > kHardMaxEntries) {
         return Invalid("manifest entry limit is out of bounds");
     }
@@ -412,6 +419,32 @@ Status ValidateRecordingSnapshot(const RecordingManifestSnapshot& snapshot,
         if (topic.schema_snapshot.size() > limits.max_schemas_per_topic) {
             return Exhausted("topic schema snapshot exceeds entry limit");
         }
+        if (topic.partition_maps.size() >
+            limits.max_partition_maps_per_topic) {
+            return Exhausted("topic partition map history exceeds entry limit");
+        }
+        uint64_t previous_map_version = 0;
+        uint64_t previous_partition_generation = 0;
+        size_t active_maps = 0;
+        size_t draining_maps = 0;
+        for (const TopicPartitionMap& map : topic.partition_maps) {
+            MINO_RETURN_IF_ERROR(ValidateTopicPartitionMap(map));
+            if (map.map_version <= previous_map_version ||
+                map.generation <= previous_partition_generation) {
+                return Corruption(
+                    "topic partition maps are duplicate or unordered");
+            }
+            previous_map_version = map.map_version;
+            previous_partition_generation = map.generation;
+            active_maps += map.state == TopicPartitionMapState::kActive ? 1u : 0u;
+            draining_maps +=
+                map.state == TopicPartitionMapState::kDraining ? 1u : 0u;
+        }
+        if (!topic.partition_maps.empty() &&
+            (active_maps > 1 || draining_maps > 1 ||
+             (active_maps == 0 && draining_maps == 0))) {
+            return Corruption("topic partition map lifecycle is inconsistent");
+        }
         uint32_t previous_ref = 0;
         std::set<std::array<std::byte, kSchemaDigestSize>> digests;
         std::set<std::string> paths;
@@ -438,6 +471,19 @@ Status ValidatePartitionSnapshot(const PartitionManifestSnapshot& snapshot,
         snapshot.partition.topic_id == 0 || snapshot.partition.writer_id == 0 ||
         snapshot.partition.owner_epoch == 0) {
         return Invalid("partition manifest metadata contains a zero identity");
+    }
+    const TopicPartitionMap map{
+        .map_version = snapshot.partition.partition_map_version,
+        .generation = snapshot.partition.partition_generation,
+        .partition_count = snapshot.partition.partition_count,
+        .strategy = snapshot.partition.partition_strategy,
+        .state = snapshot.partition.partition_map_state,
+        .hash_algorithm_version = snapshot.partition.hash_algorithm_version,
+        .hash_seed = snapshot.partition.hash_seed,
+    };
+    MINO_RETURN_IF_ERROR(ValidateTopicPartitionMap(map));
+    if (snapshot.partition.partition_id >= map.partition_count) {
+        return Invalid("partition ID exceeds its persisted partition count");
     }
     if (snapshot.segments.size() > limits.max_segments) {
         return Exhausted("partition manifest has too many segments");
@@ -710,7 +756,8 @@ Status AtomicWriteManifest(const std::filesystem::path& root,
 }
 
 Status ValidateEnvelope(std::span<const std::byte> encoded,
-                        std::span<const std::byte> magic, uint16_t version,
+                        std::span<const std::byte> magic,
+                        uint16_t minimum_version, uint16_t maximum_version,
                         size_t header_size, size_t crc_offset,
                         const ManifestLimits& limits) {
     MINO_RETURN_IF_ERROR(ValidateLimits(limits));
@@ -724,7 +771,7 @@ Status ValidateEnvelope(std::span<const std::byte> encoded,
     Cursor cursor(encoded, 8);
     MINO_ASSIGN_OR_RETURN(const uint16_t actual_version, cursor.U16());
     MINO_ASSIGN_OR_RETURN(const uint16_t actual_header_size, cursor.U16());
-    if (actual_version != version) {
+    if (actual_version < minimum_version || actual_version > maximum_version) {
         return Status::Error(StatusCode::kUnsupported,
                              "manifest version is unsupported");
     }
@@ -745,7 +792,12 @@ Result<std::vector<std::byte>> EncodeRecordingInternal(
     size_t total = kRecordingHeaderSize;
     for (const TopicTableEntry& topic : snapshot.topics) {
         if (!AddSize(total, kTopicFixedSize, &total) ||
-            !AddSize(total, topic.topic_name.size(), &total)) {
+            !AddSize(total, topic.topic_name.size(), &total) ||
+            topic.partition_maps.size() >
+                std::numeric_limits<size_t>::max() / kPartitionMapFixedSize ||
+            !AddSize(total,
+                     topic.partition_maps.size() * kPartitionMapFixedSize,
+                     &total)) {
             return Exhausted("recording manifest size overflows");
         }
         for (const SchemaRefSnapshot& schema : topic.schema_snapshot) {
@@ -778,12 +830,23 @@ Result<std::vector<std::byte>> EncodeRecordingInternal(
         AppendU32(&out, static_cast<uint32_t>(topic.topic_name.size()));
         AppendU64(&out, topic.config_version);
         AppendU32(&out, static_cast<uint32_t>(topic.schema_snapshot.size()));
-        AppendU32(&out, 0);
+        AppendU32(&out, static_cast<uint32_t>(topic.partition_maps.size()));
+        AppendU64(&out, 0);
         const std::span<const char> topic_chars(topic.topic_name.data(),
                                                 topic.topic_name.size());
         const std::span<const std::byte> topic_bytes =
             std::as_bytes(topic_chars);
         out.insert(out.end(), topic_bytes.begin(), topic_bytes.end());
+        for (const TopicPartitionMap& map : topic.partition_maps) {
+            AppendU64(&out, map.map_version);
+            AppendU64(&out, map.generation);
+            AppendU64(&out, map.hash_seed);
+            AppendU32(&out, map.partition_count);
+            AppendU8(&out, static_cast<uint8_t>(map.strategy));
+            AppendU8(&out, static_cast<uint8_t>(map.state));
+            AppendU16(&out, map.hash_algorithm_version);
+            AppendU64(&out, 0);
+        }
         for (const SchemaRefSnapshot& schema : topic.schema_snapshot) {
             const std::string path = schema.descriptor_path.generic_string();
             AppendU32(&out, schema.schema_ref);
@@ -807,8 +870,11 @@ Result<std::vector<std::byte>> EncodeRecordingInternal(
 Result<RecordingManifestSnapshot> DecodeRecordingInternal(
     std::span<const std::byte> encoded, const ManifestLimits& limits) {
     MINO_RETURN_IF_ERROR(ValidateEnvelope(
-        encoded, kRecordingMagic, kRecordingManifestFormatVersion,
-        kRecordingHeaderSize, kRecordingCrcOffset, limits));
+        encoded, kRecordingMagic, kLegacyManifestFormatVersion,
+        kRecordingManifestFormatVersion, kRecordingHeaderSize,
+        kRecordingCrcOffset, limits));
+    Cursor version_cursor(encoded, 8);
+    MINO_ASSIGN_OR_RETURN(const uint16_t format_version, version_cursor.U16());
     Cursor cursor(encoded, 20);
     RecordingManifestSnapshot snapshot;
     MINO_ASSIGN_OR_RETURN(snapshot.generation, cursor.U64());
@@ -830,14 +896,47 @@ Result<RecordingManifestSnapshot> DecodeRecordingInternal(
         MINO_ASSIGN_OR_RETURN(const uint32_t name_length, cursor.U32());
         MINO_ASSIGN_OR_RETURN(topic.config_version, cursor.U64());
         MINO_ASSIGN_OR_RETURN(const uint32_t schema_count, cursor.U32());
-        MINO_ASSIGN_OR_RETURN(const uint32_t reserved, cursor.U32());
-        if (reserved != 0) return Corruption("topic reserved bits are non-zero");
+        uint32_t partition_map_count = 0;
+        if (format_version == kLegacyManifestFormatVersion) {
+            MINO_ASSIGN_OR_RETURN(const uint32_t reserved, cursor.U32());
+            if (reserved != 0) {
+                return Corruption("topic reserved bits are non-zero");
+            }
+        } else {
+            MINO_ASSIGN_OR_RETURN(partition_map_count, cursor.U32());
+            MINO_ASSIGN_OR_RETURN(const uint64_t reserved, cursor.U64());
+            if (reserved != 0) {
+                return Corruption("topic reserved bits are non-zero");
+            }
+        }
         if (schema_count > limits.max_schemas_per_topic) {
             return Exhausted("topic schema snapshot exceeds entry limit");
+        }
+        if (partition_map_count > limits.max_partition_maps_per_topic) {
+            return Exhausted("topic partition map history exceeds entry limit");
         }
         MINO_ASSIGN_OR_RETURN(
             topic.topic_name,
             cursor.String(name_length, limits.max_topic_name_bytes));
+        topic.partition_maps.reserve(partition_map_count);
+        for (uint32_t map_index = 0; map_index < partition_map_count;
+             ++map_index) {
+            TopicPartitionMap map;
+            MINO_ASSIGN_OR_RETURN(map.map_version, cursor.U64());
+            MINO_ASSIGN_OR_RETURN(map.generation, cursor.U64());
+            MINO_ASSIGN_OR_RETURN(map.hash_seed, cursor.U64());
+            MINO_ASSIGN_OR_RETURN(map.partition_count, cursor.U32());
+            MINO_ASSIGN_OR_RETURN(const uint8_t strategy, cursor.U8());
+            MINO_ASSIGN_OR_RETURN(const uint8_t state, cursor.U8());
+            MINO_ASSIGN_OR_RETURN(map.hash_algorithm_version, cursor.U16());
+            MINO_ASSIGN_OR_RETURN(const uint64_t reserved, cursor.U64());
+            if (reserved != 0) {
+                return Corruption("partition map reserved bits are non-zero");
+            }
+            map.strategy = static_cast<TopicPartitionStrategy>(strategy);
+            map.state = static_cast<TopicPartitionMapState>(state);
+            topic.partition_maps.push_back(map);
+        }
         topic.schema_snapshot.reserve(schema_count);
         for (uint32_t schema_index = 0; schema_index < schema_count;
              ++schema_index) {
@@ -889,6 +988,13 @@ Result<std::vector<std::byte>> EncodePartitionInternal(
     AppendU64(&out, snapshot.partition.writer_id);
     AppendU64(&out, snapshot.partition.owner_epoch);
     AppendU64(&out, snapshot.partition.config_version);
+    AppendU64(&out, snapshot.partition.partition_map_version);
+    AppendU64(&out, snapshot.partition.partition_generation);
+    AppendU64(&out, snapshot.partition.hash_seed);
+    AppendU32(&out, snapshot.partition.partition_count);
+    AppendU8(&out, static_cast<uint8_t>(snapshot.partition.partition_strategy));
+    AppendU8(&out, static_cast<uint8_t>(snapshot.partition.partition_map_state));
+    AppendU16(&out, snapshot.partition.hash_algorithm_version);
     AppendU32(&out, snapshot.checkpoint.has_value() ? 1u : 0u);
     AppendU32(&out, static_cast<uint32_t>(snapshot.segments.size()));
     AppendU64(&out, snapshot.checkpoint.has_value()
@@ -926,18 +1032,52 @@ Result<std::vector<std::byte>> EncodePartitionInternal(
 
 Result<PartitionManifestSnapshot> DecodePartitionInternal(
     std::span<const std::byte> encoded, const ManifestLimits& limits) {
+    Cursor version_cursor(encoded, 8);
+    MINO_ASSIGN_OR_RETURN(const uint16_t format_version, version_cursor.U16());
+    const size_t header_size =
+        format_version == kLegacyManifestFormatVersion
+            ? kLegacyPartitionHeaderSize
+            : kPartitionHeaderSize;
+    const size_t crc_offset =
+        format_version == kLegacyManifestFormatVersion
+            ? kLegacyPartitionCrcOffset
+            : kPartitionCrcOffset;
     MINO_RETURN_IF_ERROR(ValidateEnvelope(
-        encoded, kPartitionMagic, kPartitionManifestFormatVersion,
-        kPartitionHeaderSize, kPartitionCrcOffset, limits));
+        encoded, kPartitionMagic, kLegacyManifestFormatVersion,
+        kPartitionManifestFormatVersion, header_size, crc_offset, limits));
     Cursor cursor(encoded, 20);
     PartitionManifestSnapshot snapshot;
+    snapshot.format_version = format_version;
     MINO_ASSIGN_OR_RETURN(snapshot.generation, cursor.U64());
     MINO_ASSIGN_OR_RETURN(snapshot.partition.recording_id, cursor.U64());
     MINO_ASSIGN_OR_RETURN(snapshot.partition.topic_id, cursor.U32());
     MINO_ASSIGN_OR_RETURN(snapshot.partition.partition_id, cursor.U32());
+    if (format_version == kLegacyManifestFormatVersion) {
+        if (snapshot.partition.partition_id >= kMaximumTopicPartitions) {
+            return Corruption("legacy partition ID exceeds the supported bound");
+        }
+        snapshot.partition.partition_count =
+            snapshot.partition.partition_id + 1;
+    }
     MINO_ASSIGN_OR_RETURN(snapshot.partition.writer_id, cursor.U64());
     MINO_ASSIGN_OR_RETURN(snapshot.partition.owner_epoch, cursor.U64());
     MINO_ASSIGN_OR_RETURN(snapshot.partition.config_version, cursor.U64());
+    if (format_version != kLegacyManifestFormatVersion) {
+        MINO_ASSIGN_OR_RETURN(snapshot.partition.partition_map_version,
+                              cursor.U64());
+        MINO_ASSIGN_OR_RETURN(snapshot.partition.partition_generation,
+                              cursor.U64());
+        MINO_ASSIGN_OR_RETURN(snapshot.partition.hash_seed, cursor.U64());
+        MINO_ASSIGN_OR_RETURN(snapshot.partition.partition_count, cursor.U32());
+        MINO_ASSIGN_OR_RETURN(const uint8_t strategy, cursor.U8());
+        MINO_ASSIGN_OR_RETURN(const uint8_t state, cursor.U8());
+        MINO_ASSIGN_OR_RETURN(snapshot.partition.hash_algorithm_version,
+                              cursor.U16());
+        snapshot.partition.partition_strategy =
+            static_cast<TopicPartitionStrategy>(strategy);
+        snapshot.partition.partition_map_state =
+            static_cast<TopicPartitionMapState>(state);
+    }
     MINO_ASSIGN_OR_RETURN(const uint32_t has_checkpoint, cursor.U32());
     MINO_ASSIGN_OR_RETURN(const uint32_t segment_count, cursor.U32());
     DurableCheckpoint checkpoint;
@@ -1201,12 +1341,135 @@ Status RecordingManifest::UpdateTopic(TopicTableEntry topic) noexcept {
         const bool initial_schema_binding =
             topic.config_version == found->config_version &&
             found->schema_snapshot.empty() && !topic.schema_snapshot.empty();
+        const bool initial_partition_binding =
+            topic.config_version == found->config_version &&
+            found->partition_maps.empty() && !topic.partition_maps.empty();
+        if (topic.partition_maps != found->partition_maps &&
+            !initial_partition_binding) {
+            return Invalid(
+                "partition maps require prepare/drain/cutover generation APIs");
+        }
         if (topic.config_version == found->config_version && topic != *found &&
-            !initial_schema_binding) {
+            !initial_schema_binding && !initial_partition_binding) {
             return Invalid("topic snapshot change requires a newer config version");
         }
         if (topic == *found) return Status::Ok();
         *found = std::move(topic);
+        return Commit(std::move(next));
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::exception& error) {
+        return Invalid(error.what());
+    }
+}
+
+Status RecordingManifest::PrepareTopicPartitionMap(
+    uint32_t topic_id, TopicPartitionMap next_map) noexcept {
+    try {
+        if (poisoned_) return Unavailable("recording manifest is poisoned");
+        RecordingManifestSnapshot next = snapshot_;
+        auto topic = std::find_if(
+            next.topics.begin(), next.topics.end(),
+            [topic_id](const TopicTableEntry& entry) {
+                return entry.topic_id == topic_id;
+            });
+        if (topic == next.topics.end()) {
+            return Status::Error(StatusCode::kNotFound, "topic ID is unknown");
+        }
+        const auto current = std::find_if(
+            topic->partition_maps.begin(), topic->partition_maps.end(),
+            [](const TopicPartitionMap& map) {
+                return map.state == TopicPartitionMapState::kActive;
+            });
+        if (current == topic->partition_maps.end()) {
+            return Invalid("topic has no active partition map");
+        }
+        MINO_RETURN_IF_ERROR(ValidatePartitionMapPrepare(*current, next_map));
+        topic->partition_maps.push_back(next_map);
+        return Commit(std::move(next));
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::exception& error) {
+        return Invalid(error.what());
+    }
+}
+
+Status RecordingManifest::BeginTopicPartitionDrain(
+    uint32_t topic_id, uint64_t prepared_generation) noexcept {
+    try {
+        if (poisoned_) return Unavailable("recording manifest is poisoned");
+        RecordingManifestSnapshot next = snapshot_;
+        auto topic = std::find_if(
+            next.topics.begin(), next.topics.end(),
+            [topic_id](const TopicTableEntry& entry) {
+                return entry.topic_id == topic_id;
+            });
+        if (topic == next.topics.end()) {
+            return Status::Error(StatusCode::kNotFound, "topic ID is unknown");
+        }
+        auto current = std::find_if(
+            topic->partition_maps.begin(), topic->partition_maps.end(),
+            [](const TopicPartitionMap& map) {
+                return map.state == TopicPartitionMapState::kActive;
+            });
+        auto prepared = std::find_if(
+            topic->partition_maps.begin(), topic->partition_maps.end(),
+            [prepared_generation](const TopicPartitionMap& map) {
+                return map.generation == prepared_generation &&
+                       map.state == TopicPartitionMapState::kPrepared;
+            });
+        if (current == topic->partition_maps.end() ||
+            prepared == topic->partition_maps.end()) {
+            return Invalid("repartition drain requires active and prepared maps");
+        }
+        MINO_RETURN_IF_ERROR(
+            ValidatePartitionMapBeginDrain(*current, *prepared));
+        current->state = TopicPartitionMapState::kDraining;
+        return Commit(std::move(next));
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::exception& error) {
+        return Invalid(error.what());
+    }
+}
+
+Status RecordingManifest::CutoverTopicPartitionMap(
+    uint32_t topic_id, uint64_t prepared_generation,
+    const PartitionDrainProof& proof) noexcept {
+    try {
+        if (poisoned_) return Unavailable("recording manifest is poisoned");
+        RecordingManifestSnapshot next = snapshot_;
+        auto topic = std::find_if(
+            next.topics.begin(), next.topics.end(),
+            [topic_id](const TopicTableEntry& entry) {
+                return entry.topic_id == topic_id;
+            });
+        if (topic == next.topics.end()) {
+            return Status::Error(StatusCode::kNotFound, "topic ID is unknown");
+        }
+        auto draining = std::find_if(
+            topic->partition_maps.begin(), topic->partition_maps.end(),
+            [](const TopicPartitionMap& map) {
+                return map.state == TopicPartitionMapState::kDraining;
+            });
+        auto prepared = std::find_if(
+            topic->partition_maps.begin(), topic->partition_maps.end(),
+            [prepared_generation](const TopicPartitionMap& map) {
+                return map.generation == prepared_generation &&
+                       map.state == TopicPartitionMapState::kPrepared;
+            });
+        if (draining == topic->partition_maps.end() ||
+            prepared == topic->partition_maps.end()) {
+            return Invalid("repartition cutover requires draining and prepared maps");
+        }
+        MINO_RETURN_IF_ERROR(
+            ValidatePartitionMapCutover(*draining, *prepared, proof));
+        draining->state = TopicPartitionMapState::kRetired;
+        prepared->state = TopicPartitionMapState::kActive;
+        topic->config_version =
+            std::max(topic->config_version, prepared->map_version);
+        next.session.config_version =
+            std::max(next.session.config_version, topic->config_version);
         return Commit(std::move(next));
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -1362,6 +1625,7 @@ Status PartitionManifest::Commit(PartitionManifestSnapshot next) noexcept {
             return Exhausted("partition manifest generation is exhausted");
         }
         next.generation = snapshot_.generation + 1;
+        next.format_version = kPartitionManifestFormatVersion;
         auto encoded = EncodePartitionInternal(next, options_.limits);
         if (!encoded.ok()) return encoded.status();
         const Status written = AtomicWriteManifest(root_, *encoded, options_);
@@ -1371,6 +1635,34 @@ Status PartitionManifest::Commit(PartitionManifestSnapshot next) noexcept {
         }
         snapshot_ = std::move(next);
         return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::exception& error) {
+        return Invalid(error.what());
+    }
+}
+
+Status PartitionManifest::UpgradeLegacyMetadata(
+    PartitionMetadata metadata) noexcept {
+    try {
+        if (poisoned_) return Unavailable("partition manifest is poisoned");
+        if (snapshot_.format_version != kLegacyManifestFormatVersion) {
+            return snapshot_.partition == metadata
+                       ? Status::Ok()
+                       : Invalid("partition metadata is immutable");
+        }
+        const PartitionMetadata& old = snapshot_.partition;
+        if (old.recording_id != metadata.recording_id ||
+            old.topic_id != metadata.topic_id ||
+            old.partition_id != metadata.partition_id ||
+            old.writer_id != metadata.writer_id ||
+            old.owner_epoch != metadata.owner_epoch ||
+            old.config_version != metadata.config_version) {
+            return Invalid("legacy partition identity fields are immutable");
+        }
+        PartitionManifestSnapshot next = snapshot_;
+        next.partition = metadata;
+        return Commit(std::move(next));
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     } catch (const std::exception& error) {

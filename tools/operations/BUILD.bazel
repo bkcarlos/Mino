@@ -1,0 +1,62 @@
+package(default_visibility = ["//visibility:public"])
+
+py_binary(
+    name = "credential_preflight_drill",
+    srcs = ["credential_preflight_drill.py"],
+    main = "credential_preflight_drill.py",
+    python_version = "PY3",
+)
+
+py_binary(
+    name = "drill_runner",
+    srcs = ["drill_runner.py"],
+    data = [
+        "//configs/alerts:mino.rules.yml",
+        "//configs/drills:operations_drills.json",
+        "//docs/operations:operations_files",
+        ":credential_preflight_drill.py",
+    ],
+    main = "drill_runner.py",
+    python_version = "PY3",
+)
+
+py_test(
+    name = "operations_contract_test",
+    size = "small",
+    srcs = ["operations_contract_test.py"],
+    data = [
+        ":credential_preflight_drill.py",
+        ":drill_runner.py",
+        "//configs/alerts:mino.rules.yml",
+        "//configs/drills:operations_drills.json",
+        "//docs/operations:operations_files",
+        "//mino/bridge:BUILD.bazel",
+        "//mino/bridge:bridge_pipeline_test.cc",
+        "//mino/bridge:connection_manager_test.cc",
+        "//mino/capacity:BUILD.bazel",
+        "//mino/capacity:capacity_test.cc",
+        "//mino/observability:BUILD.bazel",
+        "//mino/observability:exporter_test.cc",
+        "//mino/registry:BUILD.bazel",
+        "//mino/registry:registry_test.cc",
+        "//mino/runtime:BUILD.bazel",
+        "//mino/runtime:runtime_recovery_stress_test.cc",
+        "//mino/security:BUILD.bazel",
+        "//mino/security:tls_test.cc",
+        "//mino/storage:BUILD.bazel",
+        "//mino/storage:storage_fault_test.cc",
+        "//mino/upgrade:BUILD.bazel",
+        "//mino/upgrade:rolling_upgrade_integration_test.cc",
+        "//tools/deployment:BUILD.bazel",
+    ],
+    main = "operations_contract_test.py",
+    python_version = "PY3",
+)
+
+test_suite(
+    name = "operations_tests",
+    tests = [
+        ":operations_contract_test",
+        "//configs/alerts:alert_rules_test",
+    ],
+)

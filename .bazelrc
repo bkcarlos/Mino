@@ -26,6 +26,11 @@ build --host_cxxopt=-Wall
 build --host_cxxopt=-Wextra
 build --host_cxxopt=-Werror
 
+# Build the pinned BCR OpenSSL source inside Bazel instead of downloading its
+# optional pre-generated assembly side archive. This keeps TLS hermetic while
+# avoiding a second GitHub release dependency in restricted build environments.
+build --@openssl//:use-pregenerated=false
+
 # GCC 12 emits a false positive from libstdc++'s std::variant destructor when a
 # non-active std::string alternative is optimized under -O2. Keep this opt-in
 # so Clang and newer GCC versions retain the full warning set.

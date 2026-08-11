@@ -23,6 +23,7 @@ cc_library(
         "//mino/common:status",
         "//mino/platform:process_identity",
         "//mino/schema:descriptor",
+        "//mino/security:security_domain",
         "//mino/shm/channel:queue_full_policy",
         "//mino/transport:transport_driver",
     ],
@@ -34,5 +35,13 @@ cc_test(
     deps = [
         ":registry",
         "@googletest//:gtest_main",
+    ],
+)
+
+test_suite(
+    name = "topic_acl_test",
+    tests = [
+        ":registry_test",
+        "//mino/transport:transport_switcher_test",
     ],
 )

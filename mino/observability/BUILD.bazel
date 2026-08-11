@@ -6,8 +6,10 @@ cc_library(
     srcs = [
         "clock.cc",
         "metrics.cc",
+        "operational_metrics.cc",
         "otlp_exporter.cc",
         "prometheus_exporter.cc",
+        "prometheus_http_endpoint.cc",
         "telemetry.cc",
         "tracing.cc",
     ],
@@ -16,12 +18,18 @@ cc_library(
         "clock.h",
         "exporter.h",
         "metrics.h",
+        "operational_metrics.h",
         "otlp_exporter.h",
         "prometheus_exporter.h",
+        "prometheus_http_endpoint.h",
         "telemetry.h",
         "tracing.h",
     ],
     deps = ["//mino/common:status"],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_test(
@@ -60,9 +68,31 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "prometheus_http_endpoint_test",
+    srcs = ["prometheus_http_endpoint_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "monitoring_drill_test",
+    srcs = ["monitoring_drill_test.cc"],
+    data = ["//configs/alerts:mino.rules.yml"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # V-23: compare baseline, Off, Counters, 1% Sampled, and Full telemetry cost.
 cc_binary(
     name = "v23_telemetry_benchmark",
     srcs = ["v23_telemetry_benchmark.cc"],
-    deps = [":observability"],
+    deps = [
+        ":observability",
+        "//mino/shm/channel:spsc",
+    ],
 )

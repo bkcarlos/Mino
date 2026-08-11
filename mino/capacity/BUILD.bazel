@@ -19,6 +19,7 @@ cc_test(
         "//mino/common:status",
         "//mino/registry",
         "//mino/runtime/deployment:remote_bridge",
+        "//mino/runtime/deployment:remote_bridge_test_helper",
         "@googletest//:gtest_main",
     ],
 )

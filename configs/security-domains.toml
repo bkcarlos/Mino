@@ -1,0 +1,10 @@
+# Reviewed deployment-wide isolation inventory. Every untrusted domain must have
+# a distinct non-root UID, GID, and orchestrator namespace.
+schema_version = 1
+
+[[domains]]
+security_domain_id = 7
+trusted = false
+uid = 65532
+gid = 65532
+namespace = "mino-domain-7"

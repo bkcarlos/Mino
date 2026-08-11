@@ -44,6 +44,102 @@ class ShardedCounter {
     static_assert(Shards > 0);
 
 public:
+    // Single-writer fixed-shard view. It replaces a contended atomic RMW with
+    // local arithmetic plus a relaxed atomic store, while every snapshot still
+    // observes a monotonic cumulative shard value. Exactly one LocalShard may
+    // write a shard at a time; use Add() when writers must share a shard.
+    class LocalShard {
+    public:
+        LocalShard() noexcept = default;
+        LocalShard(const LocalShard&) = delete;
+        LocalShard& operator=(const LocalShard&) = delete;
+        LocalShard(LocalShard&&) noexcept = default;
+        LocalShard& operator=(LocalShard&&) noexcept = default;
+
+        void Add(uint64_t value) noexcept {
+            value_ += value;
+            target_->store(value_, std::memory_order_relaxed);
+        }
+        void Increment() noexcept { Add(1); }
+        uint64_t value() const noexcept { return value_; }
+
+    private:
+        friend class ShardedCounter;
+        explicit LocalShard(std::atomic<uint64_t>* target) noexcept
+            : target_(target),
+              value_(target->load(std::memory_order_relaxed)) {}
+
+        std::atomic<uint64_t>* target_ = nullptr;
+        uint64_t value_ = 0;
+    };
+
+    // Thread-local batching for counters whose snapshot boundary is explicit.
+    // Flush is lossless and uses one relaxed RMW for the whole batch. Callers
+    // must Flush before a snapshot that is required to include their current
+    // batch; the destructor is a final conservation backstop.
+    class LocalBatch {
+    public:
+        LocalBatch() noexcept = default;
+        LocalBatch(const LocalBatch&) = delete;
+        LocalBatch& operator=(const LocalBatch&) = delete;
+        LocalBatch(LocalBatch&& other) noexcept
+            : target_(other.target_), pending_(other.pending_),
+              updates_(other.updates_), batch_size_(other.batch_size_) {
+            other.target_ = nullptr;
+            other.pending_ = 0;
+            other.updates_ = 0;
+        }
+        LocalBatch& operator=(LocalBatch&& other) noexcept {
+            if (this == &other) return *this;
+            Flush();
+            target_ = other.target_;
+            pending_ = other.pending_;
+            updates_ = other.updates_;
+            batch_size_ = other.batch_size_;
+            other.target_ = nullptr;
+            other.pending_ = 0;
+            other.updates_ = 0;
+            return *this;
+        }
+        ~LocalBatch() { Flush(); }
+
+        void Add(uint64_t value) noexcept {
+            pending_ += value;
+            if (++updates_ == batch_size_) Flush();
+        }
+        void Increment() noexcept { Add(1); }
+        // For a caller that already owns a fixed batch boundary. This is only
+        // local arithmetic; Flush() must be called at that boundary.
+        void Accumulate(uint64_t value) noexcept {
+            pending_ += value;
+            updates_ = 1;
+        }
+        void Flush() noexcept {
+            if (target_ == nullptr || updates_ == 0) return;
+            target_->fetch_add(pending_, std::memory_order_relaxed);
+            pending_ = 0;
+            updates_ = 0;
+        }
+        uint64_t pending() const noexcept { return pending_; }
+
+    private:
+        friend class ShardedCounter;
+        LocalBatch(std::atomic<uint64_t>* target, uint32_t batch_size) noexcept
+            : target_(target), batch_size_(batch_size == 0 ? 1 : batch_size) {}
+
+        std::atomic<uint64_t>* target_ = nullptr;
+        uint64_t pending_ = 0;
+        uint32_t updates_ = 0;
+        uint32_t batch_size_ = 1;
+    };
+
+    LocalShard BindLocalShard(size_t shard) noexcept {
+        return LocalShard(&shards_[shard % Shards].value);
+    }
+    LocalBatch BindLocalBatch(size_t shard, uint32_t batch_size = 256) noexcept {
+        return LocalBatch(&shards_[shard % Shards].value, batch_size);
+    }
+
     void Add(uint64_t value, size_t shard) noexcept {
         shards_[shard % Shards].value.fetch_add(value,
                                                 std::memory_order_relaxed);

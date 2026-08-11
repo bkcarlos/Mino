@@ -1,0 +1,111 @@
+name: D6-08 Physical Large Object Pool Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: RDMA device name exposed under /sys/class/infiniband
+        required: true
+        type: string
+      port:
+        description: Active physical RDMA port
+        required: true
+        default: "1"
+        type: string
+      plugin:
+        description: Absolute approved RDMA device-provider plugin path
+        required: true
+        type: string
+      hugetlbfs_path:
+        description: Pre-provisioned hugetlbfs mount with at least 64 MiB free
+        required: true
+        default: /mnt/mino-hugetlb
+        type: string
+      numa_node:
+        description: Allowed NUMA node containing the device-local memory pool
+        required: true
+        type: string
+      iterations:
+        description: Operations per size/lifetime/mode (minimum 1000)
+        required: true
+        default: "10000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mino-d6-08-large-object-pool
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: Real HugePage plus device-registration qualification
+    runs-on: [self-hosted, linux, x64, mino-large-object-pool]
+    environment: physical-rdma
+    timeout-minutes: 90
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      APPROVED_PROVIDER_SHA256: ${{ vars.RDMA_PROVIDER_SHA256 }}
+      INPUT_DEVICE: ${{ inputs.device }}
+      INPUT_PORT: ${{ inputs.port }}
+      INPUT_PLUGIN: ${{ inputs.plugin }}
+      INPUT_HUGETLBFS_PATH: ${{ inputs.hugetlbfs_path }}
+      INPUT_NUMA_NODE: ${{ inputs.numa_node }}
+      INPUT_ITERATIONS: ${{ inputs.iterations }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Build benchmark and run qualification contract tests
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //benchmarks/allocator:large_object_pool_qualification_contract_test \
+            --test_output=errors
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks/allocator:large_object_pool_benchmark
+
+      - name: Verify clean exact commit including untracked files
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Run fail-closed physical D6-08 qualification
+        run: |
+          python3 benchmarks/allocator/large_object_pool_qualification.py \
+            --benchmark="${GITHUB_WORKSPACE}/bazel-bin/benchmarks/allocator/large_object_pool_benchmark" \
+            --plugin="${INPUT_PLUGIN}" \
+            --approved-plugin-sha256="${APPROVED_PROVIDER_SHA256}" \
+            --device="${INPUT_DEVICE}" \
+            --port="${INPUT_PORT}" \
+            --hugetlbfs-path="${INPUT_HUGETLBFS_PATH}" \
+            --numa-node="${INPUT_NUMA_NODE}" \
+            --iterations="${INPUT_ITERATIONS}" \
+            --expected-commit="${GITHUB_SHA}" \
+            --physical-attestation=physical-hugepage-device \
+            --sla-policy=benchmarks/allocator/large_object_pool_qualification_sla.json \
+            --artifact-schema=docs/validation/Large_object_pool_qualification_artifact.schema.json \
+            --output-dir="${RUNNER_TEMP}/mino-d6-08-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Verify complete eligible manifest
+        if: always()
+        run: |
+          python3 benchmarks/allocator/large_object_pool_qualification.py \
+            --verify-manifest="${RUNNER_TEMP}/mino-d6-08-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/manifest.json" \
+            --require-expected-commit="${GITHUB_SHA}"
+
+      - name: Upload immutable qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d6-08-large-object-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-d6-08-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 180

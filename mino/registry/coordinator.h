@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -90,6 +91,23 @@ public:
                        const DrainCompletionProof& completion);
     Status DeleteTopic(TopicId topic_id);
 
+    // Rolling-upgrade control-plane operations. BeginUpgradeDrain linearizes
+    // the complete source set under one lock: after it returns, all topics are
+    // Draining and RegisterPublisher rejects every new source publisher. The
+    // returned immutable snapshots are the authoritative usage baseline.
+    Result<std::vector<std::shared_ptr<const TopicSnapshot>>> BeginUpgradeDrain(
+        std::span<const TopicId> topic_ids);
+    Result<std::vector<std::shared_ptr<const TopicSnapshot>>> UpgradeUsageSnapshot(
+        std::span<const TopicId> topic_ids) const;
+    Status CancelUpgradeDrain(std::span<const TopicId> topic_ids);
+
+    // Validates the complete source set before changing any topic. Exact
+    // participant/pin tables, usage counters, and per-topic channel/borrow
+    // proofs all gate the atomic Draining -> Deleted transition. Replaying the
+    // operation after a crash is idempotent when every topic is already Deleted.
+    Status RetireAndDeleteUpgradeTopics(
+        std::span<const DrainCompletionProof> completions);
+
     Status RegisterPublisher(const PublisherRegistration& registration,
                              uint64_t now_ns);
     Status UnregisterPublisher(const PublisherRegistration& registration);
@@ -166,8 +184,8 @@ private:
         std::string_view name);
 
     Status ValidateStaticRouteNodesLocked(const TopicMetadata& metadata) const;
-    Status ValidateOwnerLocked(const NodeLeaseOwner& owner,
-                               uint64_t now_ns) const;
+    Result<SecurityDomainId> ValidateOwnerLocked(
+        const NodeLeaseOwner& owner, uint64_t now_ns) const;
     Status AdvanceTopicStateLocked(TopicEntry& entry, TopicState expected,
                                    TopicState next);
     Result<std::shared_ptr<const SubscriberNodeSetSnapshot>>

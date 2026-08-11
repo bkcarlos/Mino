@@ -201,6 +201,23 @@ TEST_F(SharedMemoryConcurrencyTest,
 }
 
 TEST_F(SharedMemoryConcurrencyTest,
+       MarkerMapFailureUnlinksNewCreatingMarker) {
+    const std::string name = Name("map_failure");
+    const pid_t child = StartHelper("fail-marker-map", name);
+    ASSERT_NE(child, -1);
+    ExpectExit(child, 71);
+
+    errno = 0;
+    const int leaked_marker = ::shm_open(name.c_str(), O_RDONLY, 0);
+    EXPECT_EQ(leaked_marker, -1);
+    EXPECT_EQ(errno, ENOENT);
+    if (leaked_marker >= 0) (void)::close(leaked_marker);
+
+    auto recreated = SharedMemorySegment::Create(name, 8192);
+    ASSERT_TRUE(recreated.ok()) << recreated.status().ToString();
+}
+
+TEST_F(SharedMemoryConcurrencyTest,
        CreatingWaitIsBoundedAndKilledCreatorIsRecovered) {
     const std::string name = Name("creating");
     const pid_t child = StartHelper("stop-after-marker", name);

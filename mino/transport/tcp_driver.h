@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "mino/common/result.h"
+#include "mino/security/tls.h"
 #include "mino/transport/transport_driver.h"
 
 namespace mino::transport {
@@ -25,7 +26,11 @@ struct TcpDriverOptions {
     uint32_t heartbeat_interval_ms = 1000;
     uint32_t idle_timeout_ms = 5000;
     uint32_t partial_frame_timeout_ms = 5000;
+    uint32_t tls_handshake_timeout_ms = 5000;
     uint32_t io_poll_max_ms = 50;
+    // Null preserves the explicit plaintext TcpDriver mode. Production remote
+    // Bridge composition rejects that mode unless a test-only override is set.
+    std::shared_ptr<security::TlsChannelFactory> tls_factory;
     // Untracked protocol-control frames have an independent bounded reserve so
     // ACK traffic can still make progress when the tracked data quota is full.
     size_t max_control_send_buffer_bytes = 16u * 1024u * 1024u + 4u;
@@ -80,6 +85,8 @@ protected:
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override;
     Result<CompletionPollResult> DoPollCompletions(
         const CompletionPollRequest& request) override;
+    Result<security::AuthenticatedPeer> DoAuthenticatedPeer(
+        ConnectionId connection_id) override;
     Status DoClose(ConnectionId connection_id) override;
 
 private:

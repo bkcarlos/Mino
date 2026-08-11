@@ -14,8 +14,10 @@
 
 #include "mino/shm/region/region.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <limits>
 #include <new>
 #include <random>
 #include <utility>
@@ -37,15 +39,54 @@
 namespace mino {
 namespace {
 
+constexpr uint32_t kPrivateRegionPermissions = 0600;
 
+uint64_t CurrentUserId() noexcept {
+#if defined(__unix__) || defined(__APPLE__)
+    return static_cast<uint64_t>(::geteuid());
+#else
+    return 0;
+#endif
+}
 
-// Generates a 128-bit region UUID from a secure random source (design doc 6.4).
+uint64_t CurrentGroupId() noexcept {
+#if defined(__unix__) || defined(__APPLE__)
+    return static_cast<uint64_t>(::getegid());
+#else
+    return 0;
+#endif
+}
+
+SecurityDomainId ResolveSecurityDomain(SecurityDomainId configured) noexcept {
+    return configured.value == 0 ? CurrentSecurityDomainId() : configured;
+}
+
+Status ValidateSegmentSecurity(const SharedMemorySegment& segment) {
+    const uint64_t user = CurrentUserId();
+    const uint64_t group = CurrentGroupId();
+    if (segment.marker_owner_user_id() != user ||
+        segment.backing_owner_user_id() != user ||
+        segment.marker_owner_group_id() != group ||
+        segment.backing_owner_group_id() != group) {
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "Region owner UID/GID does not match the attaching process");
+    }
+    if (segment.marker_permissions() != kPrivateRegionPermissions ||
+        segment.backing_permissions() != kPrivateRegionPermissions) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Region marker and backing must have mode 0600");
+    }
+    return Status::Ok();
+}
+
+// Generates a nonzero 128-bit region UUID from a secure random source.
 void GenerateRegionUuid(uint64_t* lo, uint64_t* hi) {
     std::random_device rd;
-    const uint64_t a = (static_cast<uint64_t>(rd()) << 32) | rd();
-    const uint64_t b = (static_cast<uint64_t>(rd()) << 32) | rd();
-    *lo = a;
-    *hi = b;
+    do {
+        *lo = (static_cast<uint64_t>(rd()) << 32) | rd();
+        *hi = (static_cast<uint64_t>(rd()) << 32) | rd();
+    } while (*lo == 0 && *hi == 0);
 }
 
 uint32_t HostPageSize() {
@@ -124,6 +165,12 @@ Status ValidateOfflineV4Source(const SuperBlock& sb) {
 }
 
 }  // namespace
+
+SecurityDomainId CurrentSecurityDomainId() noexcept {
+    // UID 0 remains distinct and nonzero. Explicit deployment IDs are required
+    // when one OS account hosts more than one security level or tenant.
+    return SecurityDomainId{CurrentUserId() + 1};
+}
 
 SharedMemoryRegion::SharedMemoryRegion(SharedMemoryRegion&& other) noexcept {
     MoveFrom(std::move(other));
@@ -204,6 +251,15 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
         return Status::Error(StatusCode::kInvalidArgument,
                              "region size must be > 0");
     }
+    const SecurityDomainId security_domain =
+        ResolveSecurityDomain(options.security_domain);
+    if (security_domain.value == 0 ||
+        CurrentUserId() > std::numeric_limits<uint32_t>::max() ||
+        CurrentGroupId() > std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "Region Security Domain or owner identity is invalid");
+    }
 
     // Compute the sub-region layout with checked arithmetic (6.3 note).
     // Layout: [0, kSuperBlockSize) SuperBlock, then Directory, then Allocator,
@@ -252,8 +308,19 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     shm_opts.use_huge_pages = options.use_huge_pages;
     MINO_ASSIGN_OR_RETURN(SharedMemorySegment segment,
                           SharedMemorySegment::Create(shm_opts));
-    MINO_ASSIGN_OR_RETURN(const int supervisor_lock_fd,
-                          TryAcquireSupervisorLock(options.name));
+    const Status segment_security = ValidateSegmentSecurity(segment);
+    if (!segment_security.ok()) {
+        (void)segment.Close();
+        (void)SharedMemorySegment::Unlink(options.name);
+        return segment_security;
+    }
+    auto supervisor_lock = TryAcquireSupervisorLock(options.name);
+    if (!supervisor_lock.ok()) {
+        (void)segment.Close();
+        (void)SharedMemorySegment::Unlink(options.name);
+        return supervisor_lock.status();
+    }
+    const int supervisor_lock_fd = *supervisor_lock;
 
     // Initialize the SuperBlock (6.1: INITIALIZING). Zero the header region
     // first so all padding/reserved fields are deterministic. Placement
@@ -274,8 +341,13 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     sb->data_offset = data_off;
     sb->data_size = data_size;
     sb->region_id = region_id;
+    sb->security_domain_id = security_domain.value;
+    sb->owner_user_id = static_cast<uint32_t>(segment.backing_owner_user_id());
+    sb->owner_group_id = static_cast<uint32_t>(segment.backing_owner_group_id());
+    sb->access_mode = segment.backing_permissions();
     sb->feature_flags = options.feature_flags;
-    sb->minimum_reader_version = options.minimum_reader_version;
+    sb->minimum_reader_version = std::max<uint32_t>(
+        options.minimum_reader_version, kSecurityDomainRegionLayoutVersion);
 
     // Lifecycle: begin INITIALIZING, in-use (clean_shutdown=false), epoch 1.
     StoreRegionEpoch(*sb, 1);
@@ -294,7 +366,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     StoreServiceFence(
         *sb, EncodeServiceFence(/*epoch=*/1, ServiceFencePhase::kOwned));
 
-    // Seal the immutable header with its CRC (covers fields [0, 80)).
+    // Seal the immutable identity and Security Domain metadata with its CRC.
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
 
     // Initialize both fixed-capacity directory images before publishing ACTIVE.
@@ -331,6 +403,9 @@ Status SharedMemoryRegion::ValidateImmutableHeader(
     // Step 3: Magic and header length.
     if (sb.magic != kSuperBlockMagic) {
         return Status::Error(StatusCode::kCorruption, "bad superblock magic");
+    }
+    if (sb.region_uuid_lo == 0 && sb.region_uuid_hi == 0) {
+        return Status::Error(StatusCode::kCorruption, "Region UUID is zero");
     }
     if (sb.header_size != kSuperBlockSize) {
         return Status::Error(StatusCode::kCorruption,
@@ -425,6 +500,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     MINO_ASSIGN_OR_RETURN(
         SharedMemorySegment segment,
         SharedMemorySegment::Open(options.name, options.read_only));
+    MINO_RETURN_IF_ERROR(ValidateSegmentSecurity(segment));
 
     const uint64_t object_size = segment.size();
     if (object_size < kSuperBlockSize) {
@@ -442,6 +518,32 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     // features pass them via expected_feature_flags (currently 0).
     MINO_RETURN_IF_ERROR(ValidateImmutableHeader(*sb, object_size,
                                                  /*expected_feature_flags=*/0));
+
+    if (sb->layout_version < kSecurityDomainRegionLayoutVersion) {
+        if (!(options.read_only && options.allow_unscoped_legacy_read_only)) {
+            return Status::Error(
+                StatusCode::kPermissionDenied,
+                "legacy Region has no authenticated Security Domain metadata");
+        }
+    } else {
+        const SecurityDomainId expected =
+            ResolveSecurityDomain(options.security_domain);
+        if (sb->security_domain_id == 0 ||
+            sb->security_domain_id != expected.value) {
+            return Status::Error(StatusCode::kPermissionDenied,
+                                 "Region Security Domain mismatch");
+        }
+        if (sb->owner_user_id != segment.backing_owner_user_id() ||
+            sb->owner_group_id != segment.backing_owner_group_id() ||
+            sb->access_mode != segment.backing_permissions() ||
+            segment.marker_owner_user_id() != segment.backing_owner_user_id() ||
+            segment.marker_owner_group_id() !=
+                segment.backing_owner_group_id() ||
+            segment.marker_permissions() != segment.backing_permissions()) {
+            return Status::Error(StatusCode::kPermissionDenied,
+                                 "Region owner or permission metadata mismatch");
+        }
+    }
 
     // Step 8: full Region is mapped (segment maps the whole object).
 
@@ -601,6 +703,7 @@ Status SharedMemoryRegion::UpgradeV4ToV5Offline(
     MINO_ASSIGN_OR_RETURN(SharedMemorySegment segment,
                           SharedMemorySegment::Open(options.name,
                                                     /*read_only=*/false));
+    MINO_RETURN_IF_ERROR(ValidateSegmentSecurity(segment));
     if (segment.size() < kSuperBlockSize) {
         return Status::Error(StatusCode::kCorruption,
                              "upgrade source is smaller than SuperBlock");
@@ -701,10 +804,24 @@ Status SharedMemoryRegion::UpgradeV4ToV5Offline(
     }
 
     // Offline readers are excluded by contract and the supervisor lock excludes
-    // a writer. Publish the new immutable header only after both directories and
-    // every ring fence are complete. A crash before the final CRC leaves a
-    // rejectable image rather than a falsely valid rolling upgrade.
+    // a writer. Publish the Security Domain and current immutable header only
+    // after both directories and every ring fence are complete.
+    const SecurityDomainId security_domain = CurrentSecurityDomainId();
+    if (security_domain.value == 0 ||
+        segment.backing_owner_user_id() >
+            std::numeric_limits<uint32_t>::max() ||
+        segment.backing_owner_group_id() >
+            std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "upgrade Security Domain or owner identity is invalid");
+    }
     sb->layout_version = kRegionLayoutVersion;
+    sb->security_domain_id = security_domain.value;
+    sb->owner_user_id = static_cast<uint32_t>(segment.backing_owner_user_id());
+    sb->owner_group_id = static_cast<uint32_t>(segment.backing_owner_group_id());
+    sb->access_mode = segment.backing_permissions();
+    sb->minimum_reader_version = kSecurityDomainRegionLayoutVersion;
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     return segment.Close();
@@ -726,6 +843,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::CopyUpgradeV4ToV5Offline(
     RegionAttachOptions source_options;
     source_options.name = options.source_name;
     source_options.read_only = true;
+    source_options.allow_unscoped_legacy_read_only = true;
     MINO_ASSIGN_OR_RETURN(SharedMemoryRegion source,
                           SharedMemoryRegion::Attach(source_options));
     MINO_RETURN_IF_ERROR(ValidateOfflineV4Source(*source.superblock()));

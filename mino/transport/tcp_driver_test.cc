@@ -17,17 +17,21 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "mino/bridge/wire_frame.h"
+#include "mino/security/test_tls_credentials.h"
 
 namespace mino::transport {
 
@@ -199,6 +203,7 @@ TcpDriverOptions TestOptions() {
         .idle_timeout_ms = 500,
         .partial_frame_timeout_ms = 250,
         .io_poll_max_ms = 5,
+        .tls_factory = {},
     };
 }
 
@@ -209,6 +214,166 @@ DriverConfig TestConfig() {
         .max_queued_sends = 32,
     };
 }
+
+enum class ScriptedTlsMode { kWriteWantsRead, kReadWantsWrite };
+
+class ScriptedTlsState final {
+public:
+    explicit ScriptedTlsState(ScriptedTlsMode mode) noexcept : mode(mode) {}
+
+    void Record(char operation) {
+        std::lock_guard lock(mutex);
+        calls.push_back(operation);
+        cv.notify_all();
+    }
+
+    bool WaitForCalls(size_t count,
+                      std::chrono::milliseconds timeout = 1000ms) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout,
+                           [&] { return calls.size() >= count; });
+    }
+
+    std::vector<char> Calls() const {
+        std::lock_guard lock(mutex);
+        return calls;
+    }
+
+    void EnterCreateAndWait() {
+        std::unique_lock lock(mutex);
+        create_entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_create; });
+    }
+
+    bool WaitForCreate(std::chrono::milliseconds timeout = 1000ms) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout, [&] { return create_entered; });
+    }
+
+    void ReleaseCreate() {
+        std::lock_guard lock(mutex);
+        release_create = true;
+        cv.notify_all();
+    }
+
+    void WaitOnReadRetryIfRequested() {
+        std::unique_lock lock(mutex);
+        if (!block_read_retry) return;
+        read_retry_entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_read_retry; });
+    }
+
+    void ReleaseReadRetry() {
+        std::lock_guard lock(mutex);
+        release_read_retry = true;
+        cv.notify_all();
+    }
+
+    const ScriptedTlsMode mode;
+    std::atomic<bool> crossed_operations{false};
+    bool block_server_create = false;
+    bool block_read_retry = false;
+
+private:
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<char> calls;
+    bool create_entered = false;
+    bool release_create = false;
+    bool read_retry_entered = false;
+    bool release_read_retry = false;
+};
+
+class ScriptedTlsChannel final : public security::TlsChannel {
+public:
+    explicit ScriptedTlsChannel(std::shared_ptr<ScriptedTlsState> state)
+        : state_(std::move(state)) {}
+
+    Result<security::TlsIoResult> Handshake() noexcept override {
+        return security::TlsIoResult{};
+    }
+
+    Result<security::TlsIoResult> Read(
+        std::span<std::byte>) noexcept override {
+        state_->Record('R');
+        if (pending_ == 'W') return Crossed();
+        if (pending_ == 'R') {
+            state_->WaitOnReadRetryIfRequested();
+            pending_ = 0;
+            if (state_->mode == ScriptedTlsMode::kReadWantsWrite) {
+                return security::TlsIoResult{.peer_closed = true};
+            }
+            pending_ = 'R';
+            return security::TlsIoResult{
+                .need = security::TlsIoNeed::kRead};
+        }
+        pending_ = 'R';
+        return security::TlsIoResult{
+            .need = state_->mode == ScriptedTlsMode::kReadWantsWrite
+                        ? security::TlsIoNeed::kWrite
+                        : security::TlsIoNeed::kRead};
+    }
+
+    Result<security::TlsIoResult> Write(
+        std::span<const std::byte> input) noexcept override {
+        state_->Record('W');
+        if (pending_ == 'R') return Crossed();
+        if (pending_ == 'W') {
+            pending_ = 0;
+            return security::TlsIoResult{.bytes = input.size()};
+        }
+        if (state_->mode == ScriptedTlsMode::kWriteWantsRead) {
+            pending_ = 'W';
+            return security::TlsIoResult{
+                .need = security::TlsIoNeed::kRead};
+        }
+        return security::TlsIoResult{.bytes = input.size()};
+    }
+
+    bool handshake_complete() const noexcept override { return true; }
+    bool has_buffered_read() const noexcept override {
+        return pending_ == 'W';
+    }
+    Result<security::AuthenticatedPeer> peer() const noexcept override {
+        return security::AuthenticatedPeer{
+            .node_id = NodeId{1},
+            .security_domain = SecurityDomainId{1},
+            .credential_generation = 1,
+        };
+    }
+
+private:
+    Result<security::TlsIoResult> Crossed() noexcept {
+        state_->crossed_operations.store(true, std::memory_order_release);
+        return Status::Error(StatusCode::kInternal,
+                             "fake TLS operation was crossed");
+    }
+
+    std::shared_ptr<ScriptedTlsState> state_;
+    char pending_ = 0;
+};
+
+class ScriptedTlsFactory final : public security::TlsChannelFactory {
+public:
+    explicit ScriptedTlsFactory(std::shared_ptr<ScriptedTlsState> state)
+        : state_(std::move(state)) {}
+
+    Status Prepare() override { return Status::Ok(); }
+
+    Result<std::unique_ptr<security::TlsChannel>> Create(
+        int, security::TlsRole role) override {
+        if (role == security::TlsRole::kServer && state_->block_server_create) {
+            state_->EnterCreateAndWait();
+        }
+        return std::unique_ptr<security::TlsChannel>(
+            new ScriptedTlsChannel(state_));
+    }
+
+private:
+    std::shared_ptr<ScriptedTlsState> state_;
+};
 
 struct DriverPair {
     std::unique_ptr<TcpDriver> server;
@@ -388,6 +553,364 @@ TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
     options.max_control_send_messages = 0;
     EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
               StatusCode::kInvalidArgument);
+}
+
+TEST(TcpDriverTest, TlsWriteWantReadRetriesWriteBeforeAnyRead) {
+    RawListener listener = ListenRaw();
+    auto state = std::make_shared<ScriptedTlsState>(
+        ScriptedTlsMode::kWriteWantsRead);
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    options.tls_factory = std::make_shared<ScriptedTlsFactory>(state);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    auto driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    const std::vector<std::byte> body = FrameBody(64, 8001);
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    ASSERT_TRUE(state->WaitForCalls(1));
+    std::this_thread::sleep_for(20ms);
+    EXPECT_EQ(state->Calls(), std::vector<char>({'W'}));
+    EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
+
+    const std::byte readiness{0x01};
+    ASSERT_EQ(SendRawNoSignal(peer.get(), std::span(&readiness, 1)), 1);
+    ASSERT_TRUE(state->WaitForCalls(2));
+    const auto calls = state->Calls();
+    ASSERT_GE(calls.size(), 2u);
+    EXPECT_EQ(calls[0], 'W');
+    EXPECT_EQ(calls[1], 'W');
+    EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
+}
+
+TEST(TcpDriverTest, TlsReadWantWriteRetriesReadBeforeAnyWrite) {
+    RawListener listener = ListenRaw();
+    auto state = std::make_shared<ScriptedTlsState>(
+        ScriptedTlsMode::kReadWantsWrite);
+    state->block_read_retry = true;
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    options.tls_factory = std::make_shared<ScriptedTlsFactory>(state);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    auto driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    const std::byte readiness{0x02};
+    ASSERT_EQ(SendRawNoSignal(peer.get(), std::span(&readiness, 1)), 1);
+    ASSERT_TRUE(state->WaitForCalls(1));
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id,
+        .payload = FrameBody(64, 8002),
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    state->ReleaseReadRetry();
+    ASSERT_TRUE(state->WaitForCalls(2));
+    const auto calls = state->Calls();
+    ASSERT_GE(calls.size(), 2u);
+    EXPECT_EQ(calls[0], 'R');
+    EXPECT_EQ(calls[1], 'R');
+    EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
+}
+
+TEST(TcpDriverTest, AcceptedTlsChannelCreationDoesNotHoldDriverMutex) {
+    auto state = std::make_shared<ScriptedTlsState>(
+        ScriptedTlsMode::kWriteWantsRead);
+    state->block_server_create = true;
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    options.tls_factory = std::make_shared<ScriptedTlsFactory>(state);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    auto driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = driver->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    ScopedFd peer = ConnectRaw(endpoint);
+    ASSERT_TRUE(state->WaitForCreate());
+
+    auto stats = std::async(std::launch::async, [&] { return driver->stats(); });
+    const auto wait_status = stats.wait_for(200ms);
+    state->ReleaseCreate();
+    EXPECT_EQ(wait_status, std::future_status::ready);
+    EXPECT_EQ(stats.get().listeners, 1u);
+}
+
+TEST(TcpDriverTest, MutualTlsGatesAcceptAndCredentialRotationAffectsNewConnections) {
+    const std::array principals = {
+        security::testing::TestPrincipal{
+            NodeId{101}, security::SecurityDomainId{77}},
+        security::testing::TestPrincipal{
+            NodeId{202}, security::SecurityDomainId{77}},
+        security::testing::TestPrincipal{
+            NodeId{303}, security::SecurityDomainId{77}},
+    };
+    auto generated = security::testing::GenerateTlsCredentials(principals);
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    auto client_provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[0]));
+    auto server_provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[1]));
+    ASSERT_TRUE(client_provider.ok()) << client_provider.status().ToString();
+    ASSERT_TRUE(server_provider.ok()) << server_provider.status().ToString();
+    auto client_factory =
+        security::CreateOpenSslTlsChannelFactory(*client_provider);
+    auto server_factory =
+        security::CreateOpenSslTlsChannelFactory(*server_provider);
+    ASSERT_TRUE(client_factory.ok()) << client_factory.status().ToString();
+    ASSERT_TRUE(server_factory.ok()) << server_factory.status().ToString();
+
+    TcpDriverOptions client_options = TestOptions();
+    TcpDriverOptions server_options = TestOptions();
+    client_options.tls_factory = *client_factory;
+    server_options.tls_factory = *server_factory;
+    client_options.idle_timeout_ms = 2000;
+    server_options.idle_timeout_ms = 2000;
+    auto client_result = TcpDriver::Create(client_options);
+    auto server_result = TcpDriver::Create(server_options);
+    ASSERT_TRUE(client_result.ok()) << client_result.status().ToString();
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    auto client = std::move(*client_result);
+    auto server = std::move(*server_result);
+    ASSERT_TRUE(client->Start(TestConfig()).ok());
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    auto first_client = client->Connect({
+        .remote_endpoint = endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(first_client.ok()) << first_client.status().ToString();
+    auto first_server = server->Accept({
+        .listener_id = listener->id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(first_server.ok()) << first_server.status().ToString();
+    auto first_client_peer = client->AuthenticatedPeer(first_client->id);
+    auto first_server_peer = server->AuthenticatedPeer(first_server->id);
+    ASSERT_TRUE(first_client_peer.ok())
+        << first_client_peer.status().ToString();
+    ASSERT_TRUE(first_server_peer.ok())
+        << first_server_peer.status().ToString();
+    EXPECT_EQ(first_client_peer->node_id, NodeId{202});
+    EXPECT_EQ(first_server_peer->node_id, NodeId{101});
+    EXPECT_EQ(first_client_peer->credential_generation, 1u);
+
+    const std::vector<std::byte> body = FrameBody(128, 9001);
+    ASSERT_TRUE(client->SendUntracked({
+        .connection_id = first_client->id,
+        .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData,
+    }).ok());
+    auto received = server->Poll({
+        .max_messages = 1,
+        .max_bytes = 4096,
+        .timeout_ms = 1000,
+        .connection_id = first_server->id,
+    });
+    ASSERT_TRUE(received.ok())
+        << received.status().ToString()
+        << " client_queued=" << client->stats().queued_send_bytes
+        << " server_active=" << server->stats().active_connections
+        << " server_ready=" << server->stats().ready_receive_messages;
+    ASSERT_EQ(received->messages.size(), 1u);
+    EXPECT_EQ(received->messages.front().payload, body);
+
+    ASSERT_TRUE((*client_provider)
+                    ->Rotate(std::move((*generated)[2]))
+                    .ok());
+    auto second_client = client->Connect({
+        .remote_endpoint = endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_client.ok()) << second_client.status().ToString();
+    auto second_server = server->Accept({
+        .listener_id = listener->id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(second_server.ok()) << second_server.status().ToString();
+    auto second_client_peer = client->AuthenticatedPeer(second_client->id);
+    auto second_server_peer = server->AuthenticatedPeer(second_server->id);
+    ASSERT_TRUE(second_client_peer.ok())
+        << second_client_peer.status().ToString();
+    ASSERT_TRUE(second_server_peer.ok())
+        << second_server_peer.status().ToString();
+    EXPECT_EQ(second_client_peer->node_id, NodeId{202});
+    EXPECT_EQ(second_client_peer->credential_generation, 2u);
+    EXPECT_EQ(second_server_peer->node_id, NodeId{303});
+    auto unchanged = server->AuthenticatedPeer(first_server->id);
+    ASSERT_TRUE(unchanged.ok()) << unchanged.status().ToString();
+    EXPECT_EQ(unchanged->node_id, NodeId{101});
+}
+
+TEST(TcpDriverTest, TlsHandshakeTimeoutClosesSilentPeer) {
+    const std::array principals = {
+        security::testing::TestPrincipal{
+            NodeId{101}, SecurityDomainId{77}},
+    };
+    auto generated = security::testing::GenerateTlsCredentials(principals);
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    auto provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[0]));
+    ASSERT_TRUE(provider.ok()) << provider.status().ToString();
+    auto factory = security::CreateOpenSslTlsChannelFactory(*provider);
+    ASSERT_TRUE(factory.ok()) << factory.status().ToString();
+
+    TcpDriverOptions options = TestOptions();
+    options.tls_factory = *factory;
+    options.tls_handshake_timeout_ms = 50;
+    options.idle_timeout_ms = 1000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    auto server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    ScopedFd raw = ConnectRaw(endpoint);
+    ASSERT_GE(raw.get(), 0);
+    ASSERT_TRUE(WaitForConnectionCount(*server, 1));
+    EXPECT_TRUE(WaitForConnectionCount(*server, 0, 2000ms));
+}
+
+TEST(TcpDriverTest, TlsHandshakePeerCloseIsCleanlyReaped) {
+    const std::array principals = {
+        security::testing::TestPrincipal{
+            NodeId{101}, SecurityDomainId{77}},
+    };
+    auto generated = security::testing::GenerateTlsCredentials(principals);
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    auto provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[0]));
+    ASSERT_TRUE(provider.ok()) << provider.status().ToString();
+    auto factory = security::CreateOpenSslTlsChannelFactory(*provider);
+    ASSERT_TRUE(factory.ok()) << factory.status().ToString();
+
+    TcpDriverOptions options = TestOptions();
+    options.tls_factory = *factory;
+    options.tls_handshake_timeout_ms = 1000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    auto server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+    {
+        ScopedFd raw = ConnectRaw(endpoint);
+        ASSERT_GE(raw.get(), 0);
+        ASSERT_TRUE(WaitForConnectionCount(*server, 1));
+    }
+    EXPECT_TRUE(WaitForConnectionCount(*server, 0, 2000ms));
+}
+
+TEST(TcpDriverTest, TlsBidirectionalLargeFramesSurviveSocketBackpressure) {
+    const std::array principals = {
+        security::testing::TestPrincipal{
+            NodeId{101}, SecurityDomainId{77}},
+    };
+    auto generated = security::testing::GenerateTlsCredentials(principals);
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    auto provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[0]));
+    ASSERT_TRUE(provider.ok()) << provider.status().ToString();
+    auto factory = security::CreateOpenSslTlsChannelFactory(*provider);
+    ASSERT_TRUE(factory.ok()) << factory.status().ToString();
+
+    TcpDriverOptions options = TestOptions();
+    options.max_frame_body_bytes = 2u * 1024u * 1024u;
+    options.max_total_send_buffer_bytes = 32u * 1024u * 1024u;
+    options.max_connection_send_buffer_bytes = 32u * 1024u * 1024u;
+    options.max_ready_receive_bytes = 32u * 1024u * 1024u;
+    options.max_ready_receive_messages = 32;
+    options.max_control_send_buffer_bytes = 4u * 1024u * 1024u;
+    options.idle_timeout_ms = 10'000;
+    options.partial_frame_timeout_ms = 10'000;
+    options.tls_factory = *factory;
+    DriverPair pair = ConnectPair(options);
+    ASSERT_NE(pair.server, nullptr);
+    ASSERT_NE(pair.client, nullptr);
+
+    constexpr size_t kFrameCount = 16;
+    constexpr size_t kPayloadBytes = 1024u * 1024u;
+    std::vector<std::vector<std::byte>> client_frames;
+    std::vector<std::vector<std::byte>> server_frames;
+    client_frames.reserve(kFrameCount);
+    server_frames.reserve(kFrameCount);
+    for (size_t index = 0; index < kFrameCount; ++index) {
+        client_frames.push_back(FrameBody(kPayloadBytes, 10'000 + index));
+        server_frames.push_back(FrameBody(kPayloadBytes, 20'000 + index));
+        ASSERT_TRUE(pair.client->SendUntracked({
+            .connection_id = pair.client_connection.id,
+            .payload = client_frames.back(),
+            .traffic_class = UntrackedTrafficClass::kData,
+        }).ok());
+        ASSERT_TRUE(pair.server->SendUntracked({
+            .connection_id = pair.server_connection.id,
+            .payload = server_frames.back(),
+            .traffic_class = UntrackedTrafficClass::kData,
+        }).ok());
+    }
+
+    for (size_t index = 0; index < kFrameCount; ++index) {
+        auto at_server = pair.server->Poll({
+            .max_messages = 1,
+            .max_bytes = options.max_frame_body_bytes,
+            .timeout_ms = 5000,
+            .connection_id = pair.server_connection.id,
+        });
+        ASSERT_TRUE(at_server.ok())
+            << at_server.status().ToString()
+            << " index=" << index
+            << " client_queued=" << pair.client->stats().queued_send_bytes
+            << " server_queued=" << pair.server->stats().queued_send_bytes
+            << " server_ready=" << pair.server->stats().ready_receive_messages
+            << " client_ready=" << pair.client->stats().ready_receive_messages;
+        ASSERT_EQ(at_server->messages.size(), 1u);
+        EXPECT_EQ(at_server->messages.front().payload, client_frames[index]);
+
+        auto at_client = pair.client->Poll({
+            .max_messages = 1,
+            .max_bytes = options.max_frame_body_bytes,
+            .timeout_ms = 5000,
+            .connection_id = pair.client_connection.id,
+        });
+        ASSERT_TRUE(at_client.ok()) << at_client.status().ToString();
+        ASSERT_EQ(at_client->messages.size(), 1u);
+        EXPECT_EQ(at_client->messages.front().payload, server_frames[index]);
+    }
+    EXPECT_TRUE(WaitForQueuedSendBytes(*pair.client, 0));
+    EXPECT_TRUE(WaitForQueuedSendBytes(*pair.server, 0));
 }
 
 TEST(TcpDriverTest, RemoteAcceptedCompletesOnlyAfterExplicitConfirmation) {

@@ -1,6 +1,41 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "monitoring",
+    srcs = ["monitoring.cc"],
+    hdrs = ["monitoring.h"],
+    deps = [
+        ":local_bus",
+        ":remote_bridge",
+        "//mino/capacity",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/observability",
+        "//mino/security:tls",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:large_object_pool",
+        "//mino/storage:recorder",
+    ],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "monitoring_test",
+    srcs = ["monitoring_test.cc"],
+    deps = [
+        ":monitoring",
+        "//mino/schema:compiler",
+        "//mino/schema:layout",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/security:test_tls_credentials",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "remote_bridge",
     srcs = ["remote_bridge.cc"],
     hdrs = ["remote_bridge.h"],
@@ -12,9 +47,20 @@ cc_library(
         "//mino/common:status",
         "//mino/registry",
         "//mino/schema:registry",
+        "//mino/security:tls",
         "//mino/storage:schema_store",
+        "//mino/transport:fabric_driver",
+        "//mino/transport:rdma_driver",
         "//mino/transport:tcp_driver",
     ],
+)
+
+cc_library(
+    name = "remote_bridge_test_helper",
+    testonly = True,
+    srcs = ["remote_bridge_test_helper.cc"],
+    hdrs = ["remote_bridge_test_helper.h"],
+    deps = [":remote_bridge"],
 )
 
 cc_test(
@@ -22,6 +68,7 @@ cc_test(
     srcs = ["remote_bridge_test.cc"],
     deps = [
         ":remote_bridge",
+        ":remote_bridge_test_helper",
         "//mino/capacity",
         "//mino/common:status",
         "//mino/schema:compiler",
@@ -43,8 +90,34 @@ cc_library(
         "//mino/registry",
         "//mino/runtime:bus",
         "//mino/schema:descriptor",
+        "//mino/security:security_domain",
         "//mino/shm/channel:broadcast",
         "//mino/transport:transport_driver",
         "//mino/transport:transport_switcher",
+        "//mino/upgrade",
+    ],
+)
+
+cc_library(
+    name = "upgrade_supervisor",
+    srcs = ["upgrade_supervisor.cc"],
+    hdrs = ["upgrade_supervisor.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/upgrade",
+    ],
+)
+
+cc_library(
+    name = "upgrade_adapter",
+    srcs = ["upgrade_adapter.cc"],
+    hdrs = ["upgrade_adapter.h"],
+    deps = [
+        ":local_bus",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/shm/region",
+        "//mino/upgrade",
     ],
 )

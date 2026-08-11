@@ -1,6 +1,7 @@
 // Copyright 2026 The Mino Authors
 
 #include "mino/runtime/deployment/remote_bridge.h"
+#include "mino/runtime/deployment/remote_bridge_test_helper.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -40,6 +41,28 @@ public:
     Status DecodeValidatePublish(const bridge::WireFrame&) override {
         return Status::Ok();
     }
+};
+
+class AllowAllTopics final : public bridge::BridgeTopicAuthorizer {
+public:
+    Status AuthorizeInbound(const security::AuthenticatedPeer&,
+                            TopicId) const noexcept override {
+        return Status::Ok();
+    }
+};
+
+class FakeAuthorizerClock final : public CoordinatorTopicAuthorizerClock {
+public:
+    explicit FakeAuthorizerClock(uint64_t now_ns) noexcept : now_ns_(now_ns) {}
+    uint64_t NowNs() const noexcept override {
+        return now_ns_.load(std::memory_order_acquire);
+    }
+    void Set(uint64_t now_ns) noexcept {
+        now_ns_.store(now_ns, std::memory_order_release);
+    }
+
+private:
+    std::atomic<uint64_t> now_ns_;
 };
 
 ProcessIdentity Process(NodeId node, uint64_t value) {
@@ -116,6 +139,30 @@ std::filesystem::path StoreRoot() {
                    std::to_string(sequence.fetch_add(1)));
 }
 
+registry::TopicMetadata AuthorizedTopic() {
+    schema::CanonicalDigest digest{};
+    digest[0] = std::byte{1};
+    registry::TopicMetadata topic;
+    topic.name = "deployment/authorized";
+    topic.channel_kind = registry::ChannelKind::kBroadcast;
+    topic.schema = schema::SchemaIdentity(1, digest, 1, 1);
+    topic.capacity = 16;
+    topic.max_publishers = 1;
+    topic.max_subscribers = 1;
+    topic.acl.entries = {{
+        .node_id = NodeId{101},
+        .security_domain_id = SecurityDomainId{77},
+        .permissions = static_cast<uint32_t>(
+                           registry::TopicPermission::kPublish) |
+                       static_cast<uint32_t>(
+                           registry::TopicPermission::kBridge),
+    }};
+    topic.region_version = 1;
+    topic.channel_version = 1;
+    topic.acl_version = 1;
+    return topic;
+}
+
 RemoteBridgeConfig Config(const std::filesystem::path& root) {
     const std::array<std::byte, 4> loopback = {
         std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1}};
@@ -124,6 +171,9 @@ RemoteBridgeConfig Config(const std::filesystem::path& root) {
 
     RemoteBridgeConfig config;
     config.schema_store_root = root;
+
+    config.connection.topic_authorizer =
+        std::make_shared<AllowAllTopics>();
     config.connection.mode = bridge::BridgeConnectionMode::kConnect;
     if (endpoint.ok()) config.connection.remote_endpoint = *endpoint;
     config.connection.local_identity = Fence(NodeId{101}, 1001);
@@ -149,6 +199,117 @@ RemoteBridgeConfig Config(const std::filesystem::path& root) {
     return config;
 }
 
+TEST(RemoteBridgeTest, ProductionConfigurationRejectsPlaintextAndMissingCoordinator) {
+    SinkIngress ingress;
+    auto descriptor_auth = std::make_shared<AcceptingAuth>();
+    auto coordinator_created = registry::Coordinator::CreateForTesting();
+    ASSERT_TRUE(coordinator_created.ok());
+    auto coordinator = std::shared_ptr<registry::Coordinator>(
+        std::move(*coordinator_created));
+    RemoteBridgeConfig plaintext = Config(StoreRoot());
+    auto rejected = RemoteBridge::Create(std::move(plaintext), &ingress,
+                                         descriptor_auth, coordinator);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kPermissionDenied);
+
+    auto denied = RemoteBridge::Create(Config(StoreRoot()), &ingress,
+                                       descriptor_auth, nullptr);
+    ASSERT_FALSE(denied.ok());
+    EXPECT_EQ(denied.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST(RemoteBridgeTest, CoordinatorAuthorizerRequiresActivePublishAndBridgeAcl) {
+    auto coordinator_created = registry::Coordinator::CreateForTesting();
+    ASSERT_TRUE(coordinator_created.ok())
+        << coordinator_created.status().ToString();
+    auto coordinator = std::shared_ptr<registry::Coordinator>(
+        std::move(*coordinator_created));
+    const auto endpoint = Config(StoreRoot()).connection.remote_endpoint;
+    ASSERT_TRUE(endpoint.has_value());
+    ASSERT_TRUE(coordinator
+                    ->RegisterNode(
+                        registry::NodeRegistration{
+                            .node_id = NodeId{101},
+                            .process_identity = Process(NodeId{101}, 1001),
+                            .endpoints = {*endpoint},
+                            .security_domain_id = SecurityDomainId{77},
+                            .trust_domain = "test-domain",
+                            .health = registry::NodeHealth::kHealthy,
+                            .lease_epoch = 1,
+                            .lease_duration_ns = 10,
+                            .config_version = 1,
+                        },
+                        100)
+                    .ok());
+    auto topic = coordinator->CreateTopic(AuthorizedTopic());
+    ASSERT_TRUE(topic.ok()) << topic.status().ToString();
+    const registry::TopicMetadata& metadata = (*topic)->metadata;
+    ASSERT_TRUE(coordinator
+                    ->ActivateTopic(
+                        metadata.topic_id,
+                        registry::ActivationReadinessProof{
+                            .topic_id = metadata.topic_id,
+                            .config_version = metadata.config_version,
+                            .schema = metadata.schema,
+                            .region_version = metadata.region_version,
+                            .channel_version = metadata.channel_version,
+                            .acl_version = metadata.acl_version,
+                            .schema_ready = true,
+                            .region_ready = true,
+                            .channel_ready = true,
+                            .acl_ready = true,
+                        })
+                    .ok());
+    auto clock = std::make_shared<FakeAuthorizerClock>(109);
+    CoordinatorTopicAuthorizer authorizer(coordinator, clock);
+    const security::AuthenticatedPeer peer{
+        .node_id = NodeId{101},
+        .security_domain = SecurityDomainId{77},
+        .credential_generation = 1,
+    };
+    EXPECT_TRUE(authorizer.AuthorizeInbound(peer, metadata.topic_id).ok());
+    clock->Set(110);
+    EXPECT_EQ(authorizer.AuthorizeInbound(peer, metadata.topic_id).code(),
+              StatusCode::kPermissionDenied);
+    const registry::NodeLeaseOwner owner{
+        .node_id = peer.node_id,
+        .process_identity = Process(NodeId{101}, 1001),
+        .lease_epoch = 1,
+    };
+    ASSERT_TRUE(coordinator
+                    ->HeartbeatNode(owner, registry::NodeHealth::kHealthy, 110)
+                    .ok());
+    EXPECT_TRUE(authorizer.AuthorizeInbound(peer, metadata.topic_id).ok());
+    ASSERT_TRUE(coordinator
+                    ->HeartbeatNode(owner, registry::NodeHealth::kUnavailable,
+                                    111)
+                    .ok());
+    clock->Set(111);
+    EXPECT_EQ(authorizer.AuthorizeInbound(peer, metadata.topic_id).code(),
+              StatusCode::kPermissionDenied);
+    ASSERT_TRUE(coordinator
+                    ->HeartbeatNode(owner, registry::NodeHealth::kDegraded, 112)
+                    .ok());
+    clock->Set(112);
+    EXPECT_EQ(authorizer.AuthorizeInbound(peer, metadata.topic_id).code(),
+              StatusCode::kPermissionDenied);
+    ASSERT_TRUE(coordinator
+                    ->HeartbeatNode(owner, registry::NodeHealth::kHealthy, 113)
+                    .ok());
+    clock->Set(113);
+    EXPECT_TRUE(authorizer.AuthorizeInbound(peer, metadata.topic_id).ok());
+
+    security::AuthenticatedPeer wrong_domain = peer;
+    wrong_domain.security_domain = SecurityDomainId{88};
+    EXPECT_EQ(authorizer.AuthorizeInbound(wrong_domain, metadata.topic_id).code(),
+              StatusCode::kPermissionDenied);
+    EXPECT_EQ(authorizer.AuthorizeInbound(peer, TopicId{9999}).code(),
+              StatusCode::kPermissionDenied);
+    EXPECT_EQ(authorizer.denied_total(), 5u);
+    coordinator.reset();
+    EXPECT_TRUE(authorizer.AuthorizeInbound(peer, metadata.topic_id).ok());
+}
+
 TEST(RemoteBridgeTest, ComposesOwnedProductionDependenciesFailClosed) {
     const std::filesystem::path root = StoreRoot();
     std::error_code ignored;
@@ -156,7 +317,8 @@ TEST(RemoteBridgeTest, ComposesOwnedProductionDependenciesFailClosed) {
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
 
-    auto created = RemoteBridge::Create(Config(root), &ingress, auth);
+    auto created = testing::RemoteBridgeTestFactory::Create(
+        Config(root), &ingress, auth);
     ASSERT_TRUE(created.ok()) << created.status().ToString();
     EXPECT_EQ((*created)->manager().state(),
               bridge::BridgeConnectionState::kStopped);
@@ -164,6 +326,14 @@ TEST(RemoteBridgeTest, ComposesOwnedProductionDependenciesFailClosed) {
     EXPECT_EQ((*created)->schema_store().size(), 0u);
     EXPECT_EQ((*created)->RegisterLocalDescriptor({}).status().code(),
               StatusCode::kInvalidArgument);
+    ASSERT_TRUE((*created)->Start(100).ok());
+    auto pumped = (*created)->Pump(bridge::BridgePumpBudget{.now_ns = 100});
+    ASSERT_TRUE(pumped.ok()) << pumped.status().ToString();
+    const RemoteBridgeOperationalStats stats = (*created)->OperationalStats();
+    EXPECT_EQ(stats.configured_connections, 1u);
+    EXPECT_EQ(stats.connected_connections, 0u);
+    EXPECT_GE(stats.reconnect_failures, 1u);
+    ASSERT_TRUE((*created)->Shutdown().ok());
 
     created->reset();
     std::filesystem::remove_all(root, ignored);
@@ -183,7 +353,8 @@ TEST(RemoteBridgeTest, HydratesRegistryFromDurableSchemaStore) {
 
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
-    auto created = RemoteBridge::Create(Config(root), &ingress, auth);
+    auto created = testing::RemoteBridgeTestFactory::Create(
+        Config(root), &ingress, auth);
     ASSERT_TRUE(created.ok()) << created.status().ToString();
     EXPECT_EQ((*created)->schema_store().size(), 1u);
     EXPECT_EQ((*created)->schema_registry().size(), 1u);
@@ -205,7 +376,8 @@ TEST(RemoteBridgeTest,
     config.connection.max_egress_frames = 2;
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
-    auto created = RemoteBridge::Create(config, &ingress, auth);
+    auto created =
+        testing::RemoteBridgeTestFactory::Create(config, &ingress, auth);
     ASSERT_TRUE(created.ok()) << created.status().ToString();
     auto bridge = std::move(*created);
     ASSERT_EQ(bridge->tcp_lane_count(), 2u);
@@ -263,15 +435,21 @@ TEST(RemoteBridgeTest, RejectsInvalidTcpLaneConfiguration) {
 
     RemoteBridgeConfig zero = Config(root);
     zero.tcp_lane_count = 0;
-    EXPECT_EQ(RemoteBridge::Create(zero, &ingress, auth).status().code(),
+    EXPECT_EQ(testing::RemoteBridgeTestFactory::Create(zero, &ingress, auth)
+                  .status()
+                  .code(),
               StatusCode::kInvalidArgument);
     RemoteBridgeConfig excessive = Config(root);
     excessive.tcp_lane_count = bridge::kMaxBridgeLaneCount + 1;
-    EXPECT_EQ(RemoteBridge::Create(excessive, &ingress, auth).status().code(),
+    EXPECT_EQ(testing::RemoteBridgeTestFactory::Create(excessive, &ingress, auth)
+                  .status()
+                  .code(),
               StatusCode::kInvalidArgument);
     RemoteBridgeConfig conflicting = Config(root);
     conflicting.connection.lane_count = 2;
-    EXPECT_EQ(RemoteBridge::Create(conflicting, &ingress, auth).status().code(),
+    EXPECT_EQ(testing::RemoteBridgeTestFactory::Create(conflicting, &ingress, auth)
+                  .status()
+                  .code(),
               StatusCode::kInvalidArgument);
 }
 
@@ -280,8 +458,10 @@ TEST(RemoteBridgeTest, CapacityScalesOnlyConnectionLocalLaneState) {
     RemoteBridgeConfig single = Config(root);
     RemoteBridgeConfig four = single;
     four.tcp_lane_count = 4;
-    auto single_estimate = EstimateRemoteBridgeResources(single);
-    auto four_estimate = EstimateRemoteBridgeResources(four);
+    auto single_estimate =
+        testing::RemoteBridgeTestFactory::EstimateResources(single);
+    auto four_estimate =
+        testing::RemoteBridgeTestFactory::EstimateResources(four);
     ASSERT_TRUE(single_estimate.ok()) << single_estimate.status().ToString();
     ASSERT_TRUE(four_estimate.ok()) << four_estimate.status().ToString();
     EXPECT_EQ(single_estimate->bridge_connections, 1u);
@@ -306,7 +486,8 @@ TEST(RemoteBridgeTest, RejectsIncompatibleCompositionLimits) {
     config.schema_negotiation.max_descriptor_bytes = 8192;
     config.schema_negotiation.max_control_frame_bytes = 16 * 1024;
 
-    auto created = RemoteBridge::Create(std::move(config), &ingress, auth);
+    auto created = testing::RemoteBridgeTestFactory::Create(
+        std::move(config), &ingress, auth);
     ASSERT_FALSE(created.ok());
     EXPECT_EQ(created.status().code(), StatusCode::kInvalidArgument);
 }
@@ -315,7 +496,8 @@ TEST(RemoteBridgeTest, CapacityAdmissionCommitsAndReleasesEstimatedResources) {
     const std::filesystem::path first_root = StoreRoot();
     const std::filesystem::path second_root = StoreRoot();
     RemoteBridgeConfig config = Config(first_root);
-    auto estimate = EstimateRemoteBridgeResources(config);
+    auto estimate =
+        testing::RemoteBridgeTestFactory::EstimateResources(config);
     ASSERT_TRUE(estimate.ok()) << estimate.status().ToString();
     capacity::NodeBudget budget;
     budget.limit = *estimate;
@@ -326,13 +508,13 @@ TEST(RemoteBridgeTest, CapacityAdmissionCommitsAndReleasesEstimatedResources) {
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
 
-    auto first = RemoteBridge::Create(std::move(config), &ingress, auth,
-                                      controller);
+    auto first = testing::RemoteBridgeTestFactory::Create(
+        std::move(config), &ingress, auth, controller);
     ASSERT_TRUE(first.ok()) << first.status().ToString();
     EXPECT_EQ(controller->Snapshot().committed, *estimate);
 
-    auto denied = RemoteBridge::Create(Config(second_root), &ingress, auth,
-                                       controller);
+    auto denied = testing::RemoteBridgeTestFactory::Create(
+        Config(second_root), &ingress, auth, controller);
     ASSERT_FALSE(denied.ok());
     EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
     EXPECT_TRUE(controller->Snapshot().pending.empty());
@@ -363,8 +545,8 @@ TEST(RemoteBridgeTest, CompositionFailureRollsBackPendingCapacity) {
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
 
-    auto failed = RemoteBridge::Create(Config(root), &ingress, auth, controller,
-                                       charge);
+    auto failed = testing::RemoteBridgeTestFactory::Create(
+        Config(root), &ingress, auth, controller, charge);
     ASSERT_FALSE(failed.ok());
     EXPECT_TRUE(controller->Snapshot().pending.empty());
     EXPECT_TRUE(controller->Snapshot().committed.empty());
@@ -377,11 +559,13 @@ TEST(RemoteBridgeTest, RejectsMissingAuthenticationAndIngress) {
     SinkIngress ingress;
     auto auth = std::make_shared<AcceptingAuth>();
 
-    EXPECT_EQ(RemoteBridge::Create(Config(root), &ingress, nullptr)
+    EXPECT_EQ(testing::RemoteBridgeTestFactory::Create(Config(root), &ingress,
+                                                       nullptr)
                   .status()
                   .code(),
               StatusCode::kInvalidArgument);
-    EXPECT_EQ(RemoteBridge::Create(Config(root), nullptr, auth)
+    EXPECT_EQ(testing::RemoteBridgeTestFactory::Create(Config(root), nullptr,
+                                                       auth)
                   .status()
                   .code(),
               StatusCode::kInvalidArgument);

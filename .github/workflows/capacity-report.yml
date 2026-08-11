@@ -1,0 +1,111 @@
+name: D6-15 Production Capacity Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_config:
+        description: Absolute path to the strict budget-node deployment TOML on the controlled runner
+        required: true
+        type: string
+      peer_deployment_config:
+        description: Optional absolute path to a second route-target deployment TOML
+        required: false
+        default: ""
+        type: string
+      coordinator_snapshot:
+        description: Absolute path to the atomic Coordinator production Topic snapshot JSON
+        required: true
+        type: string
+      production_inventory:
+        description: Absolute path to the reviewed non-empty production Topic inventory JSON
+        required: true
+        type: string
+      node_budget:
+        description: Absolute path to the reviewed node capacity budget JSON
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d6-15-capacity-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Complete production Topic capacity report
+    runs-on: [self-hosted, linux, x64, mino-capacity]
+    timeout-minutes: 30
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      REPORT_DIR: ${{ runner.temp }}/mino-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout exact clean source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Verify controlled inputs and clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -r "${{ inputs.deployment_config }}"
+          test -r "${{ inputs.coordinator_snapshot }}"
+          test -r "${{ inputs.production_inventory }}"
+          test -r "${{ inputs.node_budget }}"
+          if [[ -n "${{ inputs.peer_deployment_config }}" ]]; then
+            test -r "${{ inputs.peer_deployment_config }}"
+          fi
+          git --no-pager diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Build strict validator, report runner, and contract tests
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //tools/deployment:capacity_report_test --test_output=errors
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //tools/deployment:mino_deploy \
+            //tools/deployment:capacity_report
+
+      - name: Generate fail-closed qualification artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${REPORT_DIR}"
+          config_args=(--deployment-config "${{ inputs.deployment_config }}")
+          if [[ -n "${{ inputs.peer_deployment_config }}" ]]; then
+            config_args+=(--deployment-config "${{ inputs.peer_deployment_config }}")
+          fi
+          bazel-bin/tools/deployment/capacity_report qualify \
+            --repo "${GITHUB_WORKSPACE}" \
+            --expected-commit "${GITHUB_SHA}" \
+            "${config_args[@]}" \
+            --deployment-validator "${GITHUB_WORKSPACE}/bazel-bin/tools/deployment/mino_deploy" \
+            --coordinator-snapshot "${{ inputs.coordinator_snapshot }}" \
+            --inventory "${{ inputs.production_inventory }}" \
+            --budget "${{ inputs.node_budget }}" \
+            --contract-schema "${GITHUB_WORKSPACE}/docs/operations/capacity-report.schema.json" \
+            --output "${REPORT_DIR}/capacity-report.json"
+
+      - name: Verify exact commit, input hashes, and report SHA
+        if: always()
+        run: |
+          bazel-bin/tools/deployment/capacity_report verify \
+            --artifact "${REPORT_DIR}/capacity-report.json" \
+            --require-qualified \
+            --expected-commit "${GITHUB_SHA}"
+
+      - name: Upload complete D6-15 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d6-15-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REPORT_DIR }}/capacity-report.json
+          if-no-files-found: error
+          retention-days: 180

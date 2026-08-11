@@ -17,6 +17,7 @@
 #include "mino/common/status.h"
 #include "mino/platform/process_identity.h"
 #include "mino/schema/descriptor.h"
+#include "mino/security/security_domain.h"
 #include "mino/shm/channel/queue_full_policy.h"
 #include "mino/transport/transport_driver.h"
 
@@ -29,6 +30,7 @@ inline constexpr size_t kMaxTrustDomainBytes = 255;
 inline constexpr size_t kMaxTopicCount = 65'536;
 inline constexpr size_t kMaxTopicNameBytes = 255;
 inline constexpr size_t kMaxStaticRoutes = 4096;
+inline constexpr size_t kMaxTopicAclEntries = 4096;
 inline constexpr size_t kMaxAcceptedSchemasPerTopic = 16;
 inline constexpr uint32_t kMaxTopicCapacity = 1u << 30;
 inline constexpr uint32_t kMaxTopicPublishers = 65'536;
@@ -66,6 +68,7 @@ struct NodeRegistration {
     NodeId node_id;
     ProcessIdentity process_identity;
     std::vector<transport::EndpointDescriptor> endpoints;
+    SecurityDomainId security_domain_id;
     std::string trust_domain;
     NodeHealth health = NodeHealth::kHealthy;
     uint64_t lease_epoch = 0;
@@ -77,6 +80,7 @@ struct NodeMetadata {
     NodeId node_id;
     ProcessIdentity process_identity;
     std::vector<transport::EndpointDescriptor> endpoints;
+    SecurityDomainId security_domain_id;
     std::string trust_domain;
     NodeHealth health = NodeHealth::kHealthy;
     NodeLeaseState lease_state = NodeLeaseState::kActive;
@@ -147,6 +151,37 @@ struct StaticRouteEntry {
         default;
 };
 
+enum class TopicPermission : uint32_t {
+    kPublish = 1u << 0,
+    kSubscribe = 1u << 1,
+    kBridge = 1u << 2,
+    kRecord = 1u << 3,
+    kReplay = 1u << 4,
+};
+
+inline constexpr uint32_t kAllTopicPermissions =
+    static_cast<uint32_t>(TopicPermission::kPublish) |
+    static_cast<uint32_t>(TopicPermission::kSubscribe) |
+    static_cast<uint32_t>(TopicPermission::kBridge) |
+    static_cast<uint32_t>(TopicPermission::kRecord) |
+    static_cast<uint32_t>(TopicPermission::kReplay);
+
+struct TopicAclEntry {
+    NodeId node_id;
+    SecurityDomainId security_domain_id;
+    uint32_t permissions = 0;
+
+    friend bool operator==(const TopicAclEntry&, const TopicAclEntry&) = default;
+};
+
+struct TopicAcl {
+    // No wildcard and no implicit same-domain grant: an empty or missing entry
+    // denies access. This is intentional fail-closed behavior.
+    std::vector<TopicAclEntry> entries;
+
+    friend bool operator==(const TopicAcl&, const TopicAcl&) = default;
+};
+
 struct TopicMetadata {
     TopicId topic_id;
     std::string name;
@@ -166,6 +201,7 @@ struct TopicMetadata {
     uint32_t partition_count = 1;
     RecordBackpressureTopology record_topology =
         RecordBackpressureTopology::kIsolated;
+    TopicAcl acl;
     // Versions of the concrete resources to which lifecycle proofs bind.
     uint64_t region_version = 0;
     uint64_t channel_version = 0;
@@ -288,6 +324,9 @@ Status ValidateNodeRegistration(const NodeRegistration& registration,
 Status ValidateTopicMetadata(const TopicMetadata& metadata,
                              const CoordinatorLimits& limits,
                              bool creating_candidate = false);
+Status ValidateTopicPermission(const TopicMetadata& metadata,
+                               SecurityDomainId security_domain_id,
+                               NodeId node_id, TopicPermission permission);
 bool SchemaIdentityEqual(const schema::SchemaIdentity& lhs,
                          const schema::SchemaIdentity& rhs) noexcept;
 

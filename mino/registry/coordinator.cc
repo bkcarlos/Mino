@@ -33,6 +33,20 @@ bool SameRoutes(const TopicMetadata& lhs, const TopicMetadata& rhs) noexcept {
            lhs.static_routes == rhs.static_routes;
 }
 
+bool SameAcl(const TopicMetadata& lhs, const TopicMetadata& rhs) noexcept {
+    return lhs.acl == rhs.acl;
+}
+
+void CanonicalizeAcl(TopicMetadata* metadata) {
+    std::sort(metadata->acl.entries.begin(), metadata->acl.entries.end(),
+              [](const TopicAclEntry& lhs, const TopicAclEntry& rhs) {
+                  if (lhs.security_domain_id != rhs.security_domain_id) {
+                      return lhs.security_domain_id < rhs.security_domain_id;
+                  }
+                  return lhs.node_id < rhs.node_id;
+              });
+}
+
 bool ProofMatches(const TopicMetadata& metadata,
                   const ActivationReadinessProof& proof) noexcept {
     return proof.topic_id == metadata.topic_id &&
@@ -270,6 +284,9 @@ Status Coordinator::ValidateStaticRouteNodesLocked(
             return Status::Error(StatusCode::kNotFound,
                                  "static route target is not registered");
         }
+        MINO_RETURN_IF_ERROR(ValidateTopicPermission(
+            metadata, node.value()->security_domain_id, route.target_node,
+            TopicPermission::kSubscribe));
         if (route.preferred_transport.has_value()) {
             const bool found_transport = std::any_of(
                 node.value()->endpoints.begin(), node.value()->endpoints.end(),
@@ -289,6 +306,7 @@ Status Coordinator::ValidateStaticRouteNodesLocked(
 Result<std::shared_ptr<const TopicSnapshot>> Coordinator::CreateTopic(
     TopicMetadata candidate, capacity::ResourceVector additional_resources) {
     try {
+        CanonicalizeAcl(&candidate);
         MINO_RETURN_IF_ERROR(
             ValidateTopicMetadata(candidate, limits_, true));
         capacity::ResourceVector topic_unit;
@@ -440,6 +458,7 @@ Coordinator::ListTopics() const {
 Status Coordinator::UpdateTopic(TopicMetadata replacement,
                                 uint64_t expected_config_version) {
     try {
+        CanonicalizeAcl(&replacement);
         MINO_RETURN_IF_ERROR(ValidateTopicMetadata(replacement, limits_));
         if (expected_config_version == std::numeric_limits<uint64_t>::max() ||
             replacement.config_version != expected_config_version + 1) {
@@ -485,6 +504,21 @@ Status Coordinator::UpdateTopic(TopicMetadata replacement,
             validated->max_subscribers < entry.snapshot->usage.subscribers) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "new limits are below active registrations");
+        }
+        const bool acl_changed = !SameAcl(*validated, current);
+        if (acl_changed && current.state != TopicState::kCreating) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "Topic ACL changes require an inactive replacement to revoke "
+                "existing access");
+        }
+        const uint64_t expected_acl_version =
+            acl_changed ? current.acl_version + 1 : current.acl_version;
+        if ((acl_changed &&
+             current.acl_version == std::numeric_limits<uint64_t>::max()) ||
+            validated->acl_version != expected_acl_version) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "ACL version does not match ACL change");
         }
         const bool routes_changed = !SameRoutes(*validated, current);
         const uint64_t expected_route_version =
@@ -575,6 +609,139 @@ Status Coordinator::DrainTopic(TopicId topic_id) {
     }
 }
 
+Result<std::vector<std::shared_ptr<const TopicSnapshot>>>
+Coordinator::BeginUpgradeDrain(std::span<const TopicId> topic_ids) {
+    try {
+        if (topic_ids.empty()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "upgrade drain topic set is empty");
+        }
+        std::lock_guard lock(mutex_);
+        std::vector<TopicEntry*> entries;
+        std::vector<std::shared_ptr<const TopicSnapshot>> replacements;
+        entries.reserve(topic_ids.size());
+        replacements.reserve(topic_ids.size());
+        for (size_t index = 0; index < topic_ids.size(); ++index) {
+            if (topic_ids[index].value == 0 ||
+                std::find(topic_ids.begin(), topic_ids.begin() + index,
+                          topic_ids[index]) != topic_ids.begin() + index) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "upgrade drain topic set is invalid or duplicated");
+            }
+            auto found = topics_.find(topic_ids[index]);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "upgrade source topic not found");
+            }
+            const TopicState state = found->second.snapshot->metadata.state;
+            if (state != TopicState::kActive && state != TopicState::kDraining) {
+                return Status::Error(StatusCode::kUnsupported,
+                                     "upgrade source topic is not active or draining");
+            }
+            TopicSnapshot next = *found->second.snapshot;
+            if (state == TopicState::kActive) {
+                if (next.metadata.config_version ==
+                    std::numeric_limits<uint64_t>::max()) {
+                    return Status::Error(StatusCode::kResourceExhausted,
+                                         "topic config version exhausted");
+                }
+                next.metadata.state = TopicState::kDraining;
+                ++next.metadata.config_version;
+            }
+            entries.push_back(&found->second);
+            replacements.push_back(
+                std::make_shared<const TopicSnapshot>(std::move(next)));
+        }
+        for (size_t index = 0; index < entries.size(); ++index) {
+            entries[index]->snapshot = replacements[index];
+        }
+        return replacements;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<std::vector<std::shared_ptr<const TopicSnapshot>>>
+Coordinator::UpgradeUsageSnapshot(std::span<const TopicId> topic_ids) const {
+    try {
+        if (topic_ids.empty()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "upgrade usage topic set is empty");
+        }
+        std::lock_guard lock(mutex_);
+        std::vector<std::shared_ptr<const TopicSnapshot>> snapshots;
+        snapshots.reserve(topic_ids.size());
+        for (size_t index = 0; index < topic_ids.size(); ++index) {
+            if (topic_ids[index].value == 0 ||
+                std::find(topic_ids.begin(), topic_ids.begin() + index,
+                          topic_ids[index]) != topic_ids.begin() + index) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "upgrade usage topic set is invalid or duplicated");
+            }
+            const auto found = topics_.find(topic_ids[index]);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "upgrade topic not found");
+            }
+            snapshots.push_back(found->second.snapshot);
+        }
+        return snapshots;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Status Coordinator::CancelUpgradeDrain(
+    std::span<const TopicId> topic_ids) {
+    try {
+        if (topic_ids.empty()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "upgrade cancel topic set is empty");
+        }
+        std::lock_guard lock(mutex_);
+        std::vector<std::pair<TopicEntry*, std::shared_ptr<const TopicSnapshot>>>
+            replacements;
+        replacements.reserve(topic_ids.size());
+        for (size_t index = 0; index < topic_ids.size(); ++index) {
+            if (topic_ids[index].value == 0 ||
+                std::find(topic_ids.begin(), topic_ids.begin() + index,
+                          topic_ids[index]) != topic_ids.begin() + index) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "upgrade cancel topic set is invalid or duplicated");
+            }
+            auto found = topics_.find(topic_ids[index]);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "upgrade source topic not found");
+            }
+            const TopicState state = found->second.snapshot->metadata.state;
+            if (state != TopicState::kDraining && state != TopicState::kActive) {
+                return Status::Error(StatusCode::kUnsupported,
+                                     "upgrade source topic cannot return to active");
+            }
+            TopicSnapshot next = *found->second.snapshot;
+            if (state == TopicState::kDraining) {
+                if (next.metadata.config_version ==
+                    std::numeric_limits<uint64_t>::max()) {
+                    return Status::Error(StatusCode::kResourceExhausted,
+                                         "topic config version exhausted");
+                }
+                next.metadata.state = TopicState::kActive;
+                ++next.metadata.config_version;
+            }
+            replacements.emplace_back(
+                &found->second,
+                std::make_shared<const TopicSnapshot>(std::move(next)));
+        }
+        for (auto& [entry, replacement] : replacements) {
+            entry->snapshot = std::move(replacement);
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
 Status Coordinator::RetireTopic(
     TopicId topic_id, const DrainCompletionProof& completion) {
     try {
@@ -636,8 +803,87 @@ Status Coordinator::DeleteTopic(TopicId topic_id) {
     }
 }
 
-Status Coordinator::ValidateOwnerLocked(const NodeLeaseOwner& owner,
-                                        uint64_t now_ns) const {
+Status Coordinator::RetireAndDeleteUpgradeTopics(
+    std::span<const DrainCompletionProof> completions) {
+    try {
+        if (completions.empty()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "upgrade retirement proof set is empty");
+        }
+        std::lock_guard lock(mutex_);
+        struct Pending {
+            TopicEntry* entry = nullptr;
+            std::shared_ptr<const TopicSnapshot> deleted;
+        };
+        std::vector<Pending> pending;
+        pending.reserve(completions.size());
+        bool all_deleted = true;
+        for (size_t index = 0; index < completions.size(); ++index) {
+            const DrainCompletionProof& proof = completions[index];
+            if (proof.topic_id.value == 0 ||
+                std::find_if(completions.begin(), completions.begin() + index,
+                             [&](const DrainCompletionProof& earlier) {
+                                 return earlier.topic_id == proof.topic_id;
+                             }) != completions.begin() + index) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "upgrade retirement proof set is invalid or duplicated");
+            }
+            auto found = topics_.find(proof.topic_id);
+            if (found == topics_.end()) {
+                return Status::Error(StatusCode::kNotFound,
+                                     "upgrade source topic not found");
+            }
+            const TopicMetadata& metadata = found->second.snapshot->metadata;
+            if (metadata.state == TopicState::kDeleted) {
+                pending.push_back(Pending{.entry = &found->second,
+                                          .deleted = found->second.snapshot});
+                continue;
+            }
+            all_deleted = false;
+            if (metadata.state != TopicState::kDraining || !proof.complete() ||
+                !ProofMatches(metadata, proof)) {
+                return Status::Error(
+                    proof.complete() ? StatusCode::kAlreadyExists
+                                     : StatusCode::kUnavailable,
+                    "upgrade drain completion proof is incomplete, stale, or mismatched");
+            }
+            const TopicUsageCounts& usage = found->second.snapshot->usage;
+            if (!usage.empty() || TopicHasParticipantsLocked(proof.topic_id) ||
+                TopicHasPinsLocked(proof.topic_id)) {
+                return Status::Error(
+                    StatusCode::kWouldBlock,
+                    "upgrade source still has participants, readers, or exact pin tokens");
+            }
+            if (metadata.config_version >
+                std::numeric_limits<uint64_t>::max() - 2) {
+                return Status::Error(StatusCode::kResourceExhausted,
+                                     "topic config version exhausted");
+            }
+            TopicSnapshot deleted = *found->second.snapshot;
+            deleted.metadata.state = TopicState::kDeleted;
+            deleted.metadata.config_version += 2;
+            pending.push_back(Pending{
+                .entry = &found->second,
+                .deleted =
+                    std::make_shared<const TopicSnapshot>(std::move(deleted)),
+            });
+        }
+        if (all_deleted) return Status::Ok();
+        for (Pending& item : pending) {
+            if (item.entry->snapshot->metadata.state == TopicState::kDeleted) {
+                continue;
+            }
+            item.entry->snapshot = std::move(item.deleted);
+            item.entry->capacity_lease.Reset();
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<SecurityDomainId> Coordinator::ValidateOwnerLocked(
+    const NodeLeaseOwner& owner, uint64_t now_ns) const {
     auto node = nodes_->Get(owner.node_id);
     if (!node.ok() || node.value()->process_identity != owner.process_identity ||
         node.value()->lease_epoch != owner.lease_epoch) {
@@ -649,7 +895,7 @@ Status Coordinator::ValidateOwnerLocked(const NodeLeaseOwner& owner,
         return Status::Error(StatusCode::kUnavailable,
                              "registration owner lease is expired");
     }
-    return Status::Ok();
+    return node.value()->security_domain_id;
 }
 
 Status Coordinator::RegisterPublisher(
@@ -700,7 +946,12 @@ Status Coordinator::RegisterPublisher(
             return Status::Error(StatusCode::kUnavailable,
                                  "new publishers require an active topic");
         }
-        MINO_RETURN_IF_ERROR(ValidateOwnerLocked(registration.owner, now_ns));
+        MINO_ASSIGN_OR_RETURN(
+            const SecurityDomainId owner_domain,
+            ValidateOwnerLocked(registration.owner, now_ns));
+        MINO_RETURN_IF_ERROR(ValidateTopicPermission(
+            topic->second.snapshot->metadata, owner_domain,
+            registration.owner.node_id, TopicPermission::kPublish));
         TopicUsageCounts usage = topic->second.snapshot->usage;
         if (usage.publishers >=
                 topic->second.snapshot->metadata.max_publishers ||
@@ -846,7 +1097,12 @@ Status Coordinator::RegisterSubscriber(
             return Status::Error(StatusCode::kUnavailable,
                                  "topic does not accept subscribers");
         }
-        MINO_RETURN_IF_ERROR(ValidateOwnerLocked(registration.owner, now_ns));
+        MINO_ASSIGN_OR_RETURN(
+            const SecurityDomainId owner_domain,
+            ValidateOwnerLocked(registration.owner, now_ns));
+        MINO_RETURN_IF_ERROR(ValidateTopicPermission(
+            topic->second.snapshot->metadata, owner_domain,
+            registration.owner.node_id, TopicPermission::kSubscribe));
         TopicUsageCounts usage = topic->second.snapshot->usage;
         if (usage.subscribers >=
                 topic->second.snapshot->metadata.max_subscribers ||
@@ -989,7 +1245,24 @@ Status Coordinator::AcquireTopicPin(
             return Status::Error(StatusCode::kUnavailable,
                                  "topic state does not accept this pin kind");
         }
-        MINO_RETURN_IF_ERROR(ValidateOwnerLocked(registration.owner, now_ns));
+        MINO_ASSIGN_OR_RETURN(
+            const SecurityDomainId owner_domain,
+            ValidateOwnerLocked(registration.owner, now_ns));
+        TopicPermission permission = TopicPermission::kBridge;
+        switch (registration.kind) {
+            case TopicPinKind::kBridge:
+                permission = TopicPermission::kBridge;
+                break;
+            case TopicPinKind::kRecorder:
+                permission = TopicPermission::kRecord;
+                break;
+            case TopicPinKind::kReplay:
+                permission = TopicPermission::kReplay;
+                break;
+        }
+        MINO_RETURN_IF_ERROR(ValidateTopicPermission(
+            found->second.snapshot->metadata, owner_domain,
+            registration.owner.node_id, permission));
         if (total_topic_pins_ >= limits_.max_topic_pins) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "topic pin capacity reached");

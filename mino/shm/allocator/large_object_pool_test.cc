@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -36,6 +37,120 @@ namespace {
 constexpr uint64_t kPoolSize = 1u << 20;         // 1 MiB
 constexpr uint32_t kMaxObject = 256u * 1024u;    // 256 KiB
 constexpr uint32_t kSegmentSize = 64u * 1024u;   // 64 KiB
+
+class MockRegistrationProvider final : public MemoryRegistrationProvider {
+public:
+    struct Record {
+        RegisteredMemory memory;
+        uint64_t scope_id = 0;
+    };
+
+    MemoryRegistrationProviderClass provider_class() const noexcept override {
+        return MemoryRegistrationProviderClass::kMock;
+    }
+    std::string name() const override { return "large-pool-test-mock"; }
+    bool Supports(MemoryRegistrationKind) const noexcept override {
+        return true;
+    }
+    Result<RegisteredMemory> Register(
+        const MemoryRegistrationRequest& request) override {
+        ++register_calls;
+        if (fail_register) {
+            fail_register = false;
+            return Status::Error(StatusCode::kUnavailable,
+                                 "injected registration failure");
+        }
+        if (request.address == nullptr || request.bytes == 0 ||
+            request.scope_id == 0 || !request.owner.valid()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "invalid mock registration request");
+        }
+        RegisteredMemory memory{
+            .registration_id = next_id++,
+            .bytes = request.bytes,
+            .device_key = 0xCAFE,
+            .kind = request.kind,
+            .owner = request.owner,
+            .physically_contiguous = physical_contiguous,
+        };
+        records.emplace(memory.registration_id,
+                        Record{.memory = memory, .scope_id = request.scope_id});
+        return memory;
+    }
+    Status Deregister(const RegisteredMemory& registration) override {
+        ++deregister_calls;
+        if (fail_deregister) {
+            fail_deregister = false;
+            return Status::Error(StatusCode::kUnavailable,
+                                 "injected deregistration failure");
+        }
+        if (records.erase(registration.registration_id) == 0) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "mock registration not found");
+        }
+        return Status::Ok();
+    }
+    Result<MemoryRegistrationRecoveryResult> RecoverStale(
+        const MemoryRegistrationRecoveryRequest& request) override {
+        ++recovery_calls;
+        MemoryRegistrationRecoveryResult result;
+        for (auto iterator = records.begin(); iterator != records.end();) {
+            const Record& record = iterator->second;
+            if (record.scope_id != request.scope_id ||
+                (record.memory.owner.process_id == request.current_process_id &&
+                 record.memory.owner.process_epoch ==
+                     request.current_process_epoch)) {
+                ++iterator;
+                continue;
+            }
+            ++result.registrations_released;
+            result.bytes_released += record.memory.bytes;
+            iterator = records.erase(iterator);
+        }
+        return result;
+    }
+
+    bool fail_register = false;
+    bool fail_deregister = false;
+    bool physical_contiguous = true;
+    uint64_t register_calls = 0;
+    uint64_t deregister_calls = 0;
+    uint64_t recovery_calls = 0;
+    uint64_t next_id = 1;
+    std::map<uint64_t, Record> records;
+};
+
+LargeObjectPoolOptions RegisteredOptions(
+    MockRegistrationProvider* provider, uint64_t process_epoch = 1) {
+    return LargeObjectPoolOptions{
+        .purpose = LargeObjectPoolPurpose::kRdmaRegistered,
+        .huge_pages = {},
+        .numa = {},
+        .registration_provider = provider,
+        .registration_scope_id = 0xD608,
+        .registration_owner = {.process_id = 7,
+                               .process_epoch = process_epoch,
+                               .lease_id = 1},
+        .registration_quota_bytes = 4u * kSegmentSize,
+        .minimum_registered_object_bytes = kSegmentSize,
+    };
+}
+
+LargeObjectAllocationRequest RegisteredRequest(
+    uint32_t bytes, uint64_t process_epoch = 1) {
+    return LargeObjectAllocationRequest{
+        .object_size = bytes,
+        .type_id = TypeId{0xD608},
+        .purpose = LargeObjectPoolPurpose::kRdmaRegistered,
+        .alignment = 64,
+        .contiguity = LargeObjectContiguity::kVirtual,
+        .registration = LargeObjectRegistration::kRdma,
+        .lifetime = LargeObjectLifetime::kLease,
+        .lease = {.process_id = 7,
+                  .process_epoch = process_epoch,
+                  .lease_id = 99},
+    };
+}
 
 class LargeObjectPoolTest : public ::testing::Test {
 protected:
@@ -357,6 +472,272 @@ TEST_F(LargeObjectPoolTest, ConcurrentAllocationClaimsUniqueRuns) {
         ASSERT_TRUE(pool_.Reclaim(handle).ok());
     }
     EXPECT_EQ(handles.size(), pool_.segment_count());
+}
+
+TEST_F(LargeObjectPoolTest, HugePageFallbackIsObservableAndStrictFails) {
+    std::memset(region_.get(), 0, kPoolSize);
+    LargeObjectPoolOptions options{
+        .purpose = LargeObjectPoolPurpose::kHugePage,
+        .huge_pages = {.requested = true,
+                       .actual = false,
+                       .strict = false,
+                       .actual_page_size = 4096,
+                       .fallback_reason =
+                           HugePageFallbackReason::kInsufficientHugePages,
+                       .fallback_errno = 12},
+        .numa = {},
+        .registration_provider = nullptr,
+        .registration_scope_id = 0,
+        .registration_owner = {},
+        .registration_quota_bytes = 0,
+        .minimum_registered_object_bytes = 64u * 1024u,
+        .recover_stale_registrations = true,
+    };
+    auto fallback = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                            kSegmentSize, options);
+    ASSERT_TRUE(fallback.ok()) << fallback.status().ToString();
+    EXPECT_TRUE(fallback->huge_pages_requested());
+    EXPECT_FALSE(fallback->huge_pages_actual());
+    EXPECT_EQ(fallback->huge_page_fallback_reason(),
+              HugePageFallbackReason::kInsufficientHugePages);
+    auto handle = fallback->Allocate({
+        .object_size = kSegmentSize,
+        .type_id = TypeId{1},
+        .purpose = LargeObjectPoolPurpose::kHugePage,
+        .alignment = 64,
+        .contiguity = LargeObjectContiguity::kVirtual,
+        .registration = LargeObjectRegistration::kNone,
+        .lifetime = LargeObjectLifetime::kAllocation,
+        .lease = {},
+    });
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    EXPECT_EQ(fallback->metrics().huge_page_fallback_allocations, 1u);
+
+    options.huge_pages.strict = true;
+    EXPECT_EQ(LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                      kSegmentSize, options)
+                  .status()
+                  .code(),
+              StatusCode::kUnavailable);
+}
+
+TEST_F(LargeObjectPoolTest, RegisteredPoolRequiresProviderAndRejectsSmallObjects) {
+    std::memset(region_.get(), 0, kPoolSize);
+    LargeObjectPoolOptions unavailable{
+        .purpose = LargeObjectPoolPurpose::kDma,
+        .huge_pages = {},
+        .numa = {},
+        .registration_provider = nullptr,
+        .registration_scope_id = 1,
+        .registration_owner = {.process_id = 1,
+                               .process_epoch = 1,
+                               .lease_id = 1},
+        .registration_quota_bytes = kSegmentSize,
+        .minimum_registered_object_bytes = kSegmentSize,
+    };
+    EXPECT_EQ(LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                      kSegmentSize, unavailable)
+                  .status()
+                  .code(),
+              StatusCode::kUnsupported);
+
+    MockRegistrationProvider provider;
+    auto options = RegisteredOptions(&provider);
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    EXPECT_EQ(created->Allocate(kSegmentSize, TypeId{1}).status().code(),
+              StatusCode::kInvalidArgument);
+    auto small = RegisteredRequest(kSegmentSize - 1);
+    EXPECT_EQ(created->Allocate(small).status().code(),
+              StatusCode::kInvalidArgument);
+    auto wrong = RegisteredRequest(kSegmentSize);
+    wrong.purpose = LargeObjectPoolPurpose::kNormal;
+    EXPECT_EQ(created->Allocate(wrong).status().code(),
+              StatusCode::kInvalidArgument);
+    auto unregistered = RegisteredRequest(kSegmentSize);
+    unregistered.registration = LargeObjectRegistration::kNone;
+    EXPECT_EQ(created->Allocate(unregistered).status().code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(provider.register_calls, 0u);
+}
+
+TEST_F(LargeObjectPoolTest, RegistrationPinLeaseAndQuotaGateReclaim) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    auto options = RegisteredOptions(&provider);
+    options.registration_quota_bytes = 2u * kSegmentSize;
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    const auto request = RegisteredRequest(100u * 1024u);
+    auto handle = created->Allocate(request);
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    EXPECT_EQ(created->metrics().registration_bytes, 2u * kSegmentSize);
+    EXPECT_EQ(created->Allocate(request).status().code(),
+              StatusCode::kResourceExhausted);
+    ASSERT_TRUE(created->Retire(*handle).ok());
+    EXPECT_EQ(created->Reclaim(*handle).code(), StatusCode::kWouldBlock);
+    ASSERT_TRUE(created->Unpin(*handle, request.lease).ok());
+    EXPECT_EQ(created->Unpin(*handle, request.lease).code(),
+              StatusCode::kInvalidArgument);
+    ASSERT_TRUE(created->Reclaim(*handle).ok());
+    EXPECT_EQ(created->metrics().registration_bytes, 0u);
+    EXPECT_EQ(provider.deregister_calls, 1u);
+}
+
+TEST_F(LargeObjectPoolTest, ReleaseLeaseDeregistersBeforeReclaim) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    auto options = RegisteredOptions(&provider);
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    const auto request = RegisteredRequest(kSegmentSize);
+    auto handle = created->Allocate(request);
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    auto released = created->ReleaseLease(request.lease);
+    ASSERT_TRUE(released.ok()) << released.status().ToString();
+    EXPECT_EQ(*released, 1u);
+    EXPECT_TRUE(provider.records.empty());
+    ASSERT_TRUE(created->Retire(*handle).ok());
+    ASSERT_TRUE(created->Reclaim(*handle).ok());
+}
+
+TEST_F(LargeObjectPoolTest, RegistrationFailureRollsBackExtent) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    provider.fail_register = true;
+    auto options = RegisteredOptions(&provider);
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    const auto before = created->metrics();
+    EXPECT_EQ(created->Allocate(RegisteredRequest(kSegmentSize)).status().code(),
+              StatusCode::kUnavailable);
+    const auto after = created->metrics();
+    EXPECT_EQ(after.free_bytes, before.free_bytes);
+    EXPECT_EQ(after.registration_bytes, 0u);
+    EXPECT_EQ(after.registration_failures, 1u);
+}
+
+TEST_F(LargeObjectPoolTest, DeregistrationFailurePreventsExtentReuse) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    auto options = RegisteredOptions(&provider);
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    const auto request = RegisteredRequest(kSegmentSize);
+    auto handle = created->Allocate(request);
+    ASSERT_TRUE(handle.ok());
+    ASSERT_TRUE(created->Unpin(*handle, request.lease).ok());
+    ASSERT_TRUE(created->Retire(*handle).ok());
+    provider.fail_deregister = true;
+    EXPECT_EQ(created->Reclaim(*handle).code(), StatusCode::kUnavailable);
+    EXPECT_TRUE(created->InspectPlan(*handle).ok());
+    ASSERT_TRUE(created->Reclaim(*handle).ok());
+    EXPECT_FALSE(created->InspectPlan(*handle).ok());
+}
+
+TEST_F(LargeObjectPoolTest, AttachRecoversOldProcessRegistrations) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    auto first_options = RegisteredOptions(&provider, 1);
+    auto first = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                         kSegmentSize, first_options);
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    auto stale = first->Allocate(RegisteredRequest(kSegmentSize, 1));
+    ASSERT_TRUE(stale.ok()) << stale.status().ToString();
+    ASSERT_EQ(provider.records.size(), 1u);
+    auto observer = LargeObjectPool::Attach(region_.get(), kPoolSize);
+    ASSERT_TRUE(observer.ok()) << observer.status().ToString();
+    auto observer_plan = observer->InspectPlan(*stale);
+    ASSERT_TRUE(observer_plan.ok()) << observer_plan.status().ToString();
+    EXPECT_EQ(observer->ClearObjectForRecovery(
+                  observer_plan->segments.front().segment_index,
+                  static_cast<uint32_t>(ObjectState::kAllocated))
+                  .code(),
+              StatusCode::kUnavailable);
+
+    auto second_options = RegisteredOptions(&provider, 2);
+    auto attached = LargeObjectPool::Attach(region_.get(), kPoolSize, 0,
+                                            second_options);
+    ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+    EXPECT_TRUE(provider.records.empty());
+    EXPECT_EQ(attached->metrics().registrations_recovered, 1u);
+    EXPECT_EQ(attached->metrics().registration_recovery_bytes, kSegmentSize);
+    auto stale_plan = attached->InspectPlan(*stale);
+    ASSERT_TRUE(stale_plan.ok()) << stale_plan.status().ToString();
+    ASSERT_TRUE(attached->ClearObjectForRecovery(
+        stale_plan->segments.front().segment_index,
+        static_cast<uint32_t>(ObjectState::kAllocated)).ok());
+}
+
+TEST_F(LargeObjectPoolTest, ProviderMustConfirmPhysicalContiguity) {
+    std::memset(region_.get(), 0, kPoolSize);
+    MockRegistrationProvider provider;
+    provider.physical_contiguous = false;
+    auto options = RegisteredOptions(&provider);
+    auto created = LargeObjectPool::Create(region_.get(), kPoolSize, kMaxObject,
+                                           kSegmentSize, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto request = RegisteredRequest(kSegmentSize);
+    request.contiguity = LargeObjectContiguity::kPhysical;
+    EXPECT_EQ(created->Allocate(request).status().code(), StatusCode::kCorruption);
+    EXPECT_EQ(created->metrics().reserved_extent_bytes, 0u);
+    EXPECT_TRUE(provider.records.empty());
+}
+
+TEST_F(LargeObjectPoolTest, ExplicitAlignmentSelectsAlignedExtent) {
+    constexpr uint64_t kAlignedPoolSize = 4u * 1024u * 1024u;
+    struct AlignedRegionDeleter {
+        void operator()(std::byte* pointer) const {
+            ::operator delete[](pointer,
+                                std::align_val_t(2u * 1024u * 1024u));
+        }
+    };
+    auto memory = std::unique_ptr<std::byte[], AlignedRegionDeleter>(
+        new (std::align_val_t(2u * 1024u * 1024u))
+            std::byte[kAlignedPoolSize]);
+    std::memset(memory.get(), 0, kAlignedPoolSize);
+    auto created = LargeObjectPool::Create(memory.get(), kAlignedPoolSize,
+                                           kMaxObject, kSegmentSize);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto handle = created->Allocate({
+        .object_size = kSegmentSize,
+        .type_id = TypeId{8},
+        .purpose = LargeObjectPoolPurpose::kNormal,
+        .alignment = 128u * 1024u,
+        .contiguity = LargeObjectContiguity::kVirtual,
+        .registration = LargeObjectRegistration::kNone,
+        .lifetime = LargeObjectLifetime::kAllocation,
+        .lease = {},
+    });
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+    auto plan = created->InspectPlan(*handle);
+    ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+    ASSERT_EQ(plan->segments.size(), 1u);
+    const uintptr_t payload = reinterpret_cast<uintptr_t>(
+        memory.get() + plan->segments[0].payload_offset);
+    EXPECT_EQ(payload % (128u * 1024u), 0u);
+}
+
+TEST_F(LargeObjectPoolTest, ExtentsCoalesceAndMetricsExposeFragmentation) {
+    auto first = pool_.Allocate(kSegmentSize, TypeId{1});
+    auto second = pool_.Allocate(kSegmentSize, TypeId{2});
+    auto third = pool_.Allocate(kSegmentSize, TypeId{3});
+    ASSERT_TRUE(first.ok() && second.ok() && third.ok());
+    ASSERT_TRUE(pool_.Retire(*first).ok());
+    ASSERT_TRUE(pool_.Reclaim(*first).ok());
+    ASSERT_TRUE(pool_.Retire(*second).ok());
+    ASSERT_TRUE(pool_.Reclaim(*second).ok());
+    const auto fragmented = pool_.metrics();
+    EXPECT_GE(fragmented.largest_free_extent_bytes, 2u * kSegmentSize);
+    auto coalesced = pool_.Allocate(2u * kSegmentSize, TypeId{4});
+    ASSERT_TRUE(coalesced.ok()) << coalesced.status().ToString();
+    EXPECT_EQ(coalesced->offset, first->offset);
+    EXPECT_GE(pool_.metrics().reserved_extent_bytes, 3u * kSegmentSize);
 }
 
 }  // namespace

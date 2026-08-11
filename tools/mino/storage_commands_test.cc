@@ -190,6 +190,7 @@ SessionFixture CreateSession(std::string_view name) {
                             .topic_id = 10,
                             .topic_name = "camera.front",
                             .config_version = 1,
+                            .partition_maps = {},
                             .schema_snapshot = {schema},
                         })
                         .ok());

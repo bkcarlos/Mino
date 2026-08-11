@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -459,99 +460,149 @@ Result<LoadedSession> LoadSession(const std::filesystem::path& root,
                           .partitions = {}};
     size_t partition_count = 0;
     for (const storage::TopicTableEntry& topic : session.manifest.topics) {
-        const std::filesystem::path relative_partitions =
-            std::filesystem::path("topics") /
-            std::to_string(topic.topic_id) / "partitions";
-        const Status safe_partitions = ValidatePathBelowRoot(
-            root, relative_partitions, false, true);
-        if (!safe_partitions.ok()) return safe_partitions;
-        const std::filesystem::path partitions = root / relative_partitions;
-        struct stat info {};
-        if (::lstat(partitions.c_str(), &info) != 0) {
-            if (errno == ENOENT) continue;
-            return IoStatus("cannot inspect partitions directory", partitions);
-        }
-        if (S_ISLNK(info.st_mode)) {
-            return Status::Error(StatusCode::kPermissionDenied,
-                                 "symbolic-link partitions directory is forbidden");
-        }
-        if (!S_ISDIR(info.st_mode)) {
-            return Corruption("partitions path is not a directory");
-        }
+        auto load_partition_set = [&](const std::filesystem::path& relative,
+                                      uint64_t expected_generation,
+                                      bool required) -> Status {
+            const Status safe =
+                ValidatePathBelowRoot(root, relative, false, true);
+            if (!safe.ok()) return safe;
+            const std::filesystem::path partitions = root / relative;
+            struct stat info {};
+            if (::lstat(partitions.c_str(), &info) != 0) {
+                if (errno == ENOENT && !required) return Status::Ok();
+                return IoStatus("cannot inspect partitions directory", partitions);
+            }
+            if (S_ISLNK(info.st_mode)) {
+                return Status::Error(
+                    StatusCode::kPermissionDenied,
+                    "symbolic-link partitions directory is forbidden");
+            }
+            if (!S_ISDIR(info.st_mode)) {
+                return Corruption("partitions path is not a directory");
+            }
 
-        std::error_code error;
-        std::filesystem::directory_iterator iterator(partitions, error);
-        const std::filesystem::directory_iterator end;
-        while (!error && iterator != end) {
-            if (++partition_count > kMaximumSegments) {
-                return Status::Error(StatusCode::kResourceExhausted,
-                                     "session has too many partitions");
-            }
-            const std::filesystem::directory_entry entry = *iterator;
-            const std::filesystem::file_status entry_status =
-                entry.symlink_status(error);
-            if (error) break;
-            if (std::filesystem::is_symlink(entry_status)) {
-                return Status::Error(StatusCode::kPermissionDenied,
-                                     "symbolic-link partition is forbidden");
-            }
-            if (!std::filesystem::is_directory(entry_status)) {
-                return Corruption("partitions directory contains a non-directory");
-            }
-            Result<uint32_t> directory_id =
-                PartitionDirectoryId(entry.path().filename().string());
-            if (!directory_id.ok()) return directory_id.status();
-            Result<PartitionManifestSnapshot> partition =
-                ReadPartitionManifest(entry.path());
-            if (!partition.ok()) return partition.status();
-            if (partition->partition.recording_id !=
-                    session.manifest.session.recording_id ||
-                partition->partition.owner_epoch !=
-                    session.manifest.session.owner_epoch ||
-                partition->partition.topic_id != topic.topic_id ||
-                partition->partition.partition_id != *directory_id ||
-                partition->partition.config_version > topic.config_version) {
-                return Corruption(
-                    "partition manifest identity differs from its session path");
-            }
-            const std::filesystem::path snapshot_path =
-                entry.path() / "snapshot.mino";
-            struct stat snapshot_info {};
-            bool has_snapshot = false;
-            if (::lstat(snapshot_path.c_str(), &snapshot_info) == 0) {
-                if (S_ISLNK(snapshot_info.st_mode)) {
-                    return Status::Error(
-                        StatusCode::kPermissionDenied,
-                        "symbolic-link snapshot file is forbidden");
+            std::error_code error;
+            std::filesystem::directory_iterator iterator(partitions, error);
+            const std::filesystem::directory_iterator end;
+            while (!error && iterator != end) {
+                if (++partition_count > kMaximumSegments) {
+                    return Status::Error(StatusCode::kResourceExhausted,
+                                         "session has too many partitions");
                 }
-                if (!S_ISREG(snapshot_info.st_mode)) {
-                    return Corruption("snapshot path is not a regular file");
+                const std::filesystem::directory_entry entry = *iterator;
+                const std::filesystem::file_status entry_status =
+                    entry.symlink_status(error);
+                if (error) break;
+                if (std::filesystem::is_symlink(entry_status)) {
+                    return Status::Error(StatusCode::kPermissionDenied,
+                                         "symbolic-link partition is forbidden");
                 }
-                has_snapshot = true;
-            } else if (errno != ENOENT) {
-                return IoStatus("cannot inspect snapshot file", snapshot_path);
+                if (!std::filesystem::is_directory(entry_status)) {
+                    return Corruption(
+                        "partitions directory contains a non-directory");
+                }
+                Result<uint32_t> directory_id =
+                    PartitionDirectoryId(entry.path().filename().string());
+                if (!directory_id.ok()) return directory_id.status();
+                Result<PartitionManifestSnapshot> partition =
+                    ReadPartitionManifest(entry.path());
+                if (!partition.ok()) return partition.status();
+                if (partition->partition.recording_id !=
+                        session.manifest.session.recording_id ||
+                    partition->partition.owner_epoch !=
+                        session.manifest.session.owner_epoch ||
+                    partition->partition.topic_id != topic.topic_id ||
+                    partition->partition.partition_id != *directory_id ||
+                    partition->partition.partition_generation !=
+                        expected_generation ||
+                    partition->partition.config_version > topic.config_version) {
+                    return Corruption(
+                        "partition manifest identity differs from its session path");
+                }
+                if (!topic.partition_maps.empty()) {
+                    const auto map = std::find_if(
+                        topic.partition_maps.begin(), topic.partition_maps.end(),
+                        [expected_generation](const storage::TopicPartitionMap& value) {
+                            return value.generation == expected_generation;
+                        });
+                    if (map == topic.partition_maps.end() ||
+                        map->map_version !=
+                            partition->partition.partition_map_version ||
+                        map->partition_count !=
+                            partition->partition.partition_count ||
+                        map->strategy !=
+                            partition->partition.partition_strategy ||
+                        map->hash_algorithm_version !=
+                            partition->partition.hash_algorithm_version ||
+                        map->hash_seed != partition->partition.hash_seed) {
+                        return Corruption(
+                            "partition map differs from the topic manifest");
+                    }
+                }
+                const std::filesystem::path snapshot_path =
+                    entry.path() / "snapshot.mino";
+                struct stat snapshot_info {};
+                bool has_snapshot = false;
+                if (::lstat(snapshot_path.c_str(), &snapshot_info) == 0) {
+                    if (S_ISLNK(snapshot_info.st_mode)) {
+                        return Status::Error(
+                            StatusCode::kPermissionDenied,
+                            "symbolic-link snapshot file is forbidden");
+                    }
+                    if (!S_ISREG(snapshot_info.st_mode)) {
+                        return Corruption(
+                            "snapshot path is not a regular file");
+                    }
+                    has_snapshot = true;
+                } else if (errno != ENOENT) {
+                    return IoStatus("cannot inspect snapshot file", snapshot_path);
+                }
+                session.partitions.push_back(LoadedPartition{
+                    entry.path(), std::move(*partition), has_snapshot});
+                iterator.increment(error);
             }
-            session.partitions.push_back(LoadedPartition{
-                entry.path(), std::move(*partition), has_snapshot});
-            iterator.increment(error);
-        }
-        if (error) {
-            return Status::Error(StatusCode::kUnavailable,
-                                 "cannot enumerate partitions: " +
-                                     error.message());
+            return error
+                ? Status::Error(StatusCode::kUnavailable,
+                                "cannot enumerate partitions: " + error.message())
+                : Status::Ok();
+        };
+
+        const std::filesystem::path topic_relative =
+            std::filesystem::path("topics") / std::to_string(topic.topic_id);
+        const bool legacy_required = topic.partition_maps.empty() ||
+            std::any_of(topic.partition_maps.begin(), topic.partition_maps.end(),
+                        [](const storage::TopicPartitionMap& map) {
+                            return map.generation == 1;
+                        });
+        MINO_RETURN_IF_ERROR(load_partition_set(
+            topic_relative / "partitions", 1, legacy_required));
+        for (const storage::TopicPartitionMap& map : topic.partition_maps) {
+            if (map.generation == 1) continue;
+            std::ostringstream generation_name;
+            generation_name << std::setfill('0') << std::setw(20)
+                            << map.generation;
+            MINO_RETURN_IF_ERROR(load_partition_set(
+                topic_relative / "generations" / generation_name.str() /
+                    "partitions",
+                map.generation, true));
         }
     }
     std::sort(session.partitions.begin(), session.partitions.end(),
               [](const LoadedPartition& left, const LoadedPartition& right) {
-                  return std::pair(left.manifest.partition.topic_id,
-                                   left.manifest.partition.partition_id) <
-                         std::pair(right.manifest.partition.topic_id,
-                                   right.manifest.partition.partition_id);
+                  return std::tuple(
+                             left.manifest.partition.topic_id,
+                             left.manifest.partition.partition_generation,
+                             left.manifest.partition.partition_id) <
+                         std::tuple(
+                             right.manifest.partition.topic_id,
+                             right.manifest.partition.partition_generation,
+                             right.manifest.partition.partition_id);
               });
     for (size_t index = 1; index < session.partitions.size(); ++index) {
         const auto& previous = session.partitions[index - 1].manifest.partition;
         const auto& current = session.partitions[index].manifest.partition;
         if (previous.topic_id == current.topic_id &&
+            previous.partition_generation == current.partition_generation &&
             previous.partition_id == current.partition_id) {
             return Corruption("session contains a duplicate partition identity");
         }
@@ -623,8 +674,15 @@ std::string_view ReasonName(SegmentRecoveryReason reason) {
 void PrintSegmentReport(const std::filesystem::path& path,
                         const SegmentRecoveryReport& report,
                         std::ostream& out) {
+    const size_t gaps = static_cast<size_t>(std::count_if(
+        report.records.begin(), report.records.end(),
+        [](const storage::SegmentRecordOffset& record) {
+            return (record.flags & storage::kRecordFlagGap) != 0;
+        }));
     out << path.string() << ": " << DispositionName(report.disposition)
+        << " health=" << (report.clean() ? "healthy" : "degraded")
         << " records=" << report.records_scanned
+        << " gaps=" << gaps
         << " bytes=" << report.file_size
         << " topic=" << report.segment_header.topic_id
         << " partition=" << report.segment_header.partition_id;
@@ -645,34 +703,65 @@ const storage::TopicTableEntry* FindTopic(const LoadedSession& session,
 
 const LoadedPartition* FindPartition(const LoadedSession& session,
                                      uint32_t topic_id,
+                                     uint64_t partition_generation,
                                      uint32_t partition_id) {
     const auto found = std::find_if(
         session.partitions.begin(), session.partitions.end(),
-        [topic_id, partition_id](const LoadedPartition& partition) {
+        [topic_id, partition_generation,
+         partition_id](const LoadedPartition& partition) {
             return partition.manifest.partition.topic_id == topic_id &&
+                   partition.manifest.partition.partition_generation ==
+                       partition_generation &&
                    partition.manifest.partition.partition_id == partition_id;
         });
     return found == session.partitions.end() ? nullptr : &*found;
 }
 
-std::optional<std::filesystem::path> InferSessionRoot(
+std::optional<std::filesystem::path> PartitionRootFor(
     const std::filesystem::path& segment_path) {
     const std::filesystem::path absolute =
         std::filesystem::absolute(segment_path).lexically_normal();
-    std::filesystem::path partition;
     if (absolute.filename() == "snapshot.mino") {
-        partition = absolute.parent_path();
-    } else {
-        const std::filesystem::path segments = absolute.parent_path();
-        if (segments.filename() != "segments") return std::nullopt;
-        partition = segments.parent_path();
+        return absolute.parent_path();
     }
-    const std::filesystem::path partitions = partition.parent_path();
-    const std::filesystem::path topic = partitions.parent_path();
+    const std::filesystem::path segments = absolute.parent_path();
+    if (segments.filename() != "segments") return std::nullopt;
+    return segments.parent_path();
+}
+
+uint64_t InferPartitionGeneration(
+    const std::filesystem::path& segment_path) {
+    const auto partition = PartitionRootFor(segment_path);
+    if (!partition.has_value() ||
+        partition->parent_path().filename() != "partitions") {
+        return 0;
+    }
+    const std::filesystem::path owner =
+        partition->parent_path().parent_path();
+    if (owner.parent_path().filename() != "generations") return 1;
+    const std::string text = owner.filename().string();
+    uint64_t generation = 0;
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), generation);
+    return error == std::errc{} && end == text.data() + text.size() &&
+                   generation != 0
+               ? generation
+               : 0;
+}
+
+std::optional<std::filesystem::path> InferSessionRoot(
+    const std::filesystem::path& segment_path) {
+    const auto partition = PartitionRootFor(segment_path);
+    if (!partition.has_value()) return std::nullopt;
+    const std::filesystem::path partitions = partition->parent_path();
+    if (partitions.filename() != "partitions") return std::nullopt;
+    std::filesystem::path topic = partitions.parent_path();
+    if (topic.parent_path().filename() == "generations") {
+        topic = topic.parent_path().parent_path();
+    }
     const std::filesystem::path topics = topic.parent_path();
     const std::filesystem::path session = topics.parent_path();
-    if (partitions.filename() != "partitions" ||
-        topics.filename() != "topics" || session.empty()) {
+    if (topics.filename() != "topics" || session.empty()) {
         return std::nullopt;
     }
     return session;
@@ -696,8 +785,10 @@ Status ValidateAgainstSession(const std::filesystem::path& segment_path,
     const storage::TopicTableEntry* topic =
         FindTopic(*session, initial.segment_header.topic_id);
     if (topic == nullptr) return Corruption("segment topic is absent from manifest");
+    const uint64_t partition_generation =
+        InferPartitionGeneration(segment_path);
     const LoadedPartition* partition = FindPartition(
-        *session, initial.segment_header.topic_id,
+        *session, initial.segment_header.topic_id, partition_generation,
         initial.segment_header.partition_id);
     if (partition == nullptr) {
         return Corruption("segment partition is absent from manifest");
@@ -780,6 +871,54 @@ Status ValidateAgainstSession(const std::filesystem::path& segment_path,
     return Status::Ok();
 }
 
+void PrintVerifiedPartitionHealth(const std::filesystem::path& segment_path,
+                                  const SegmentRecoveryReport& report,
+                                  std::ostream& out) {
+    const auto root = InferSessionRoot(segment_path);
+    if (!root.has_value()) return;
+    Result<LoadedSession> session = LoadSession(*root, false);
+    if (!session.ok()) return;
+    const uint64_t generation = InferPartitionGeneration(segment_path);
+    const LoadedPartition* partition = FindPartition(
+        *session, report.segment_header.topic_id, generation,
+        report.segment_header.partition_id);
+    if (partition == nullptr) return;
+
+    uint64_t latest_sequence = 0;
+    uint64_t gap_count = 0;
+    bool healthy = true;
+    for (const storage::SegmentManifestEntry& segment :
+         partition->manifest.segments) {
+        if (segment.state == storage::SegmentPersistentState::kDeleted) continue;
+        latest_sequence =
+            std::max(latest_sequence, segment.last_ingestion_sequence);
+        Result<SegmentRecoveryReport> scanned = storage::ScanSegment(
+            partition->root / segment.relative_path);
+        if (!scanned.ok() || !scanned->clean()) {
+            healthy = false;
+            continue;
+        }
+        gap_count += static_cast<uint64_t>(std::count_if(
+            scanned->records.begin(), scanned->records.end(),
+            [](const storage::SegmentRecordOffset& record) {
+                return (record.flags & storage::kRecordFlagGap) != 0;
+            }));
+    }
+    const uint64_t durable_sequence =
+        partition->manifest.checkpoint.has_value()
+            ? partition->manifest.checkpoint->durable_sequence
+            : 0;
+    const uint64_t lag = latest_sequence >= durable_sequence
+                             ? latest_sequence - durable_sequence
+                             : 0;
+    out << "partition_health: topic=" << report.segment_header.topic_id
+        << " generation=" << generation
+        << " partition=" << report.segment_header.partition_id
+        << " health=" << (healthy ? "healthy" : "corrupt")
+        << " durable_lag_records=" << lag
+        << " gaps=" << gap_count << '\n';
+}
+
 int CmdInspect(const std::vector<std::string>& args, std::ostream& out,
                std::ostream& err) {
     if (args.size() != 2) {
@@ -808,11 +947,58 @@ int CmdInspect(const std::vector<std::string>& args, std::ostream& out,
         << "segment_bytes: " << segment_bytes << '\n';
     for (const storage::TopicTableEntry& topic : session->manifest.topics) {
         out << "topic: " << topic.topic_name << " (id=" << topic.topic_id
-            << ") schemas=" << topic.schema_snapshot.size() << '\n';
+            << ") schemas=" << topic.schema_snapshot.size()
+            << " partition_maps=" << topic.partition_maps.size() << '\n';
+        for (const storage::TopicPartitionMap& map : topic.partition_maps) {
+            out << "  map: version=" << map.map_version
+                << " generation=" << map.generation
+                << " state=" << storage::TopicPartitionMapStateName(map.state)
+                << " strategy="
+                << storage::TopicPartitionStrategyName(map.strategy)
+                << " count=" << map.partition_count
+                << " hash_version=" << map.hash_algorithm_version
+                << " hash_seed=" << map.hash_seed << '\n';
+        }
         for (const LoadedPartition& partition : session->partitions) {
             if (partition.manifest.partition.topic_id != topic.topic_id) continue;
+            uint64_t latest_sequence = 0;
+            uint64_t gap_count = 0;
+            bool healthy = true;
+            for (const storage::SegmentManifestEntry& segment :
+                 partition.manifest.segments) {
+                if (segment.state == storage::SegmentPersistentState::kDeleted) {
+                    continue;
+                }
+                latest_sequence =
+                    std::max(latest_sequence, segment.last_ingestion_sequence);
+                Result<SegmentRecoveryReport> scanned = storage::ScanSegment(
+                    partition.root / segment.relative_path);
+                if (!scanned.ok() || !scanned->clean()) {
+                    healthy = false;
+                    continue;
+                }
+                gap_count += static_cast<uint64_t>(std::count_if(
+                    scanned->records.begin(), scanned->records.end(),
+                    [](const storage::SegmentRecordOffset& record) {
+                        return (record.flags & storage::kRecordFlagGap) != 0;
+                    }));
+            }
+            const uint64_t durable_sequence =
+                partition.manifest.checkpoint.has_value()
+                    ? partition.manifest.checkpoint->durable_sequence
+                    : 0;
+            const uint64_t lag = latest_sequence >= durable_sequence
+                                     ? latest_sequence - durable_sequence
+                                     : 0;
             out << "  partition: " << partition.manifest.partition.partition_id
-                << " generation=" << partition.manifest.generation
+                << " generation="
+                << partition.manifest.partition.partition_generation
+                << " map_version="
+                << partition.manifest.partition.partition_map_version
+                << " manifest_generation=" << partition.manifest.generation
+                << " health=" << (healthy ? "healthy" : "corrupt")
+                << " durable_lag_records=" << lag
+                << " gaps=" << gap_count
                 << " segments=" << partition.manifest.segments.size()
                 << " snapshot="
                 << (partition.has_snapshot ? "current" : "none") << '\n';
@@ -847,6 +1033,7 @@ int CmdVerify(const std::vector<std::string>& args, std::ostream& out,
             ValidateAgainstSession(path, *scanned, &validated);
         if (!cross_checked.ok()) return Fail("verify", cross_checked, err);
         PrintSegmentReport(path, validated, out);
+        PrintVerifiedPartitionHealth(path, validated, out);
         invalid = invalid || !validated.clean();
     }
     return invalid ? kStorageExitInvalidData : kStorageExitSuccess;
@@ -1012,6 +1199,26 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
             } else {
                 options.filter.topic_names.emplace_back(*value);
             }
+        } else if (flag == "--partition") {
+            Result<std::string_view> value = FlagValue(args, &index);
+            if (!value.ok()) return Fail("replay", value.status(), err);
+            Result<uint32_t> id =
+                ParseUnsigned<uint32_t>(*value, "partition");
+            if (!id.ok()) return Fail("replay", id.status(), err);
+            options.filter.partition_ids.push_back(*id);
+        } else if (flag == "--generation") {
+            Result<std::string_view> value = FlagValue(args, &index);
+            if (!value.ok()) return Fail("replay", value.status(), err);
+            Result<uint64_t> generation =
+                ParseUnsigned<uint64_t>(*value, "partition generation");
+            if (!generation.ok() || *generation == 0) {
+                return Fail("replay",
+                            generation.ok()
+                                ? Invalid("partition generation must be non-zero")
+                                : generation.status(),
+                            err);
+            }
+            options.filter.partition_generations.push_back(*generation);
         } else if (flag == "--node") {
             Result<std::string_view> value = FlagValue(args, &index);
             if (!value.ok()) return Fail("replay", value.status(), err);
@@ -1063,6 +1270,8 @@ int CmdReplay(const std::vector<std::string>& args, std::ostream& out,
     if (segment_paths.size() > kMaximumSegments ||
         options.filter.topic_ids.size() + options.filter.topic_names.size() >
             kMaximumSegments ||
+        options.filter.partition_ids.size() > kMaximumSegments ||
+        options.filter.partition_generations.size() > kMaximumSegments ||
         options.filter.node_ids.size() > kMaximumSegments) {
         return Fail("replay", Invalid("replay input exceeds bounded limits"), err);
     }
@@ -1232,6 +1441,10 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
     std::optional<uint64_t> config_version;
     std::optional<uint64_t> created_at_ns;
     std::optional<uint64_t> writer_id;
+    std::optional<uint64_t> partition_map_version;
+    uint64_t partition_hash_seed = storage::kDefaultPartitionHashSeed;
+    storage::TopicPartitionStrategy partition_strategy =
+        storage::TopicPartitionStrategy::kManual;
     uint32_t partition_count = 1;
     bool validate_only = false;
     std::vector<RecordTopic> topics;
@@ -1250,7 +1463,9 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
             topics.push_back(std::move(*topic));
         } else if (flag == "--recording-id" || flag == "--owner-id" ||
                    flag == "--owner-epoch" || flag == "--config-version" ||
-                   flag == "--created-at-ns" || flag == "--writer-id") {
+                   flag == "--created-at-ns" || flag == "--writer-id" ||
+                   flag == "--partition-map-version" ||
+                   flag == "--partition-hash-seed") {
             Result<uint64_t> parsed = ParseUnsigned<uint64_t>(*value, flag);
             if (!parsed.ok()) return Fail("record", parsed.status(), err);
             std::optional<uint64_t>* destination = nullptr;
@@ -1259,7 +1474,12 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
             else if (flag == "--owner-epoch") destination = &owner_epoch;
             else if (flag == "--config-version") destination = &config_version;
             else if (flag == "--created-at-ns") destination = &created_at_ns;
-            else destination = &writer_id;
+            else if (flag == "--partition-map-version")
+                destination = &partition_map_version;
+            else if (flag == "--partition-hash-seed") {
+                partition_hash_seed = *parsed;
+                continue;
+            } else destination = &writer_id;
             if (destination->has_value()) {
                 return Fail("record", Invalid("duplicate flag: " + flag), err);
             }
@@ -1268,6 +1488,11 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
             Result<uint32_t> parsed = ParseUnsigned<uint32_t>(*value, flag);
             if (!parsed.ok()) return Fail("record", parsed.status(), err);
             partition_count = *parsed;
+        } else if (flag == "--partition-strategy") {
+            Result<storage::TopicPartitionStrategy> parsed =
+                storage::ParseTopicPartitionStrategy(*value);
+            if (!parsed.ok()) return Fail("record", parsed.status(), err);
+            partition_strategy = *parsed;
         } else {
             return Fail("record", Invalid("unknown flag: " + flag), err);
         }
@@ -1316,8 +1541,16 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
                     err);
     }
     if (!writer_id.has_value()) writer_id = *owner_id;
-    if (*writer_id == 0) {
-        return Fail("record", Invalid("writer ID must be non-zero"), err);
+    if (!partition_map_version.has_value()) {
+        partition_map_version = *config_version;
+    }
+    if (*writer_id == 0 || *partition_map_version == 0 ||
+        partition_count - 1 >
+            std::numeric_limits<uint64_t>::max() - *writer_id) {
+        return Fail(
+            "record",
+            Invalid("writer/map version must be non-zero and writer range bounded"),
+            err);
     }
     std::sort(topics.begin(), topics.end(),
               [](const RecordTopic& left, const RecordTopic& right) {
@@ -1360,6 +1593,15 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
             .topic_id = topic.id,
             .topic_name = topic.name,
             .config_version = *config_version,
+            .partition_maps = {storage::TopicPartitionMap{
+                .map_version = *partition_map_version,
+                .generation = 1,
+                .partition_count = partition_count,
+                .strategy = partition_strategy,
+                .state = storage::TopicPartitionMapState::kActive,
+                .hash_algorithm_version = storage::kStablePartitionHashVersion,
+                .hash_seed = partition_hash_seed,
+            }},
             .schema_snapshot = {},
         });
         if (!added.ok()) return Fail("record", added, err);
@@ -1380,8 +1622,17 @@ int CmdRecord(const std::vector<std::string>& args, std::ostream& out,
                         .recording_id = *recording_id,
                         .topic_id = topic.id,
                         .partition_id = partition_id,
-                        .writer_id = *writer_id,
+                        .writer_id = *writer_id + partition_id,
                         .owner_epoch = *owner_epoch,
+                        .partition_map_version = *partition_map_version,
+                        .partition_generation = 1,
+                        .partition_count = partition_count,
+                        .partition_strategy = partition_strategy,
+                        .partition_map_state =
+                            storage::TopicPartitionMapState::kActive,
+                        .hash_algorithm_version =
+                            storage::kStablePartitionHashVersion,
+                        .hash_seed = partition_hash_seed,
                         .config_version = *config_version,
                     });
             if (!partition.ok()) return Fail("record", partition.status(), err);
@@ -1400,9 +1651,10 @@ void PrintStorageUsage(std::ostream& err) {
            "  storage verify <segment> [<segment> ...]\n"
            "  storage repair <segment> [--apply --standalone]\n"
            "  replay <session_root> [--validate-only] [--topic <name|id>] "
-           "[--segment <tracked>] ...\n"
+           "[--partition N] [--generation N] [--segment <tracked>] ...\n"
            "  record create <session_root> --recording-id N --owner-id N "
-           "--owner-epoch N --config-version N --topic <id>:<name> ...\n"
+           "--owner-epoch N --config-version N --topic <id>:<name> "
+           "[--partitions N --partition-strategy key|hash|source|manual] ...\n"
            "  record run <session_root>\n";
 }
 

@@ -35,6 +35,10 @@ struct ReplayFilter {
     // all topics. Unknown names fail Create rather than silently replaying none.
     std::vector<uint32_t> topic_ids;
     std::vector<std::string> topic_names;
+    // Empty means all partitions/generations. Supplying one partition ID is the
+    // single-partition replay path; sequence ranges then act as deterministic seek.
+    std::vector<uint32_t> partition_ids;
+    std::vector<uint64_t> partition_generations;
     std::vector<uint64_t> node_ids;
     ReplayValueRange ingestion_timestamp_ns;
     ReplayValueRange observed_timestamp_ns;
@@ -136,6 +140,7 @@ struct ReplayMessageMetadata {
     uint64_t publish_timestamp_ns = 0;
     uint64_t original_source_sequence = 0;
     uint64_t original_ingestion_sequence = 0;
+    uint64_t original_partition_generation = 0;
     uint64_t original_node_id = 0;
     uint64_t original_publisher_id = 0;
     uint64_t original_publisher_epoch = 0;
@@ -166,8 +171,10 @@ public:
 struct ReplayOrderKey {
     uint64_t ingestion_timestamp_ns = 0;
     uint32_t topic_id = 0;
+    uint64_t partition_generation = 0;
     uint32_t partition_id = 0;
     uint64_t ingestion_sequence = 0;
+    uint64_t writer_id = 0;
     uint64_t node_id = 0;
     uint64_t publisher_id = 0;
     uint64_t publisher_epoch = 0;
@@ -175,8 +182,10 @@ struct ReplayOrderKey {
     uint64_t observed_timestamp_ns = 0;
 };
 
-// Total, deterministic ordering for simultaneously eligible partition heads.
-// Receive time is primary; the remaining recorded identity fields break ties.
+// Total, deterministic playback ordering for simultaneously eligible partition
+// heads: ingestion_timestamp, topic, generation, partition, ingestion_sequence,
+// writer, then source identity. This is a reproducible merge order only; it does
+// not invent a historical global commit order across independent partitions.
 struct ReplayOrderLess {
     bool operator()(const ReplayOrderKey& left,
                     const ReplayOrderKey& right) const noexcept;

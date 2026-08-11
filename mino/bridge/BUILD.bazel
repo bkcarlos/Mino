@@ -63,6 +63,7 @@ cc_library(
         ":wire_frame",
         "//mino/common:result",
         "//mino/registry",
+        "//mino/security:tls",
         "//mino/transport:transport_driver",
     ],
 )
@@ -83,6 +84,7 @@ cc_library(
         "//mino/observability",
         "//mino/runtime:bus",
         "//mino/schema:canonical",
+        "//mino/security:tls",
         "//mino/transport:transport_driver",
     ],
 )
@@ -141,6 +143,7 @@ cc_test(
         "//mino/registry",
         "//mino/runtime:bus",
         "//mino/schema:canonical",
+        "//mino/security:test_tls_credentials",
         "//mino/transport:tcp_driver",
         "//mino/transport:transport_switcher",
         "@googletest//:gtest_main",

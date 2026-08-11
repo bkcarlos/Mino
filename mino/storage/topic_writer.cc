@@ -448,6 +448,12 @@ uint64_t TopicWriter::duplicate_count() const {
     return duplicate_count_;
 }
 
+SegmentWriterFailureKind TopicWriter::failure_kind() const {
+    std::lock_guard lock(mutex_);
+    return segment_writer_ == nullptr ? SegmentWriterFailureKind::kNone
+                                      : segment_writer_->failure_kind();
+}
+
 size_t TopicWriter::SourceKeyHash::operator()(const SourceKey& key) const
     noexcept {
     size_t hash = static_cast<size_t>(key.node_id ^ (key.node_id >> 32));

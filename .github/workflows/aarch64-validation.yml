@@ -1,0 +1,153 @@
+name: AArch64 Validation
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - "mino/**"
+      - "benchmarks/**"
+      - "tests/aarch64/**"
+      - "tests/litmus/**"
+      - "tools/ci/aarch64*"
+      - ".github/workflows/aarch64-validation.yml"
+      - "BUILD.bazel"
+      - "MODULE.bazel*"
+      - ".bazelrc"
+  push:
+    branches: [master, main]
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      cpu_governor:
+        description: Governor preconfigured on every qualification CPU
+        required: true
+        default: performance
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aarch64-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cross-qemu-smoke:
+    name: Hosted cross-build + QEMU smoke (non-qualification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install AArch64 cross compiler and QEMU user-mode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++-aarch64-linux-gnu qemu-user binutils
+
+      - name: Cross-build and execute functional smoke
+        run: |
+          python3 tools/ci/aarch64_cross_smoke.py \
+            --output-dir="${RUNNER_TEMP}/mino-aarch64-cross-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Assert smoke cannot be qualification evidence
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / (
+              "mino-aarch64-cross-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          )
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["outcome"] == "passed"
+          assert manifest["qualification_eligible"] is False
+          assert "QEMU" in manifest["execution"]
+          PY
+
+      - name: Upload non-qualification smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aarch64-cross-qemu-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-aarch64-cross-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  native-qualification:
+    name: Native Linux AArch64 V-13 qualification
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 120
+    env:
+      CC: gcc-12
+      CXX: g++-12
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Verify runner prerequisites without mutating host policy
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+          command -v bazel
+          command -v gcc-12
+          command -v g++-12
+          command -v lsblk
+          command -v findmnt
+          git --no-pager diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Run fail-closed qualification matrix and release benchmarks
+        run: |
+          python3 tools/ci/aarch64_validation.py \
+            --expected-commit="${GITHUB_SHA}" \
+            --native-attestation=physical-aarch64 \
+            --expected-governor="${{ inputs.cpu_governor || 'performance' }}" \
+            --bazel-config=gcc12 \
+            --output-dir="${RUNNER_TEMP}/mino-aarch64-qualification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Verify complete qualification manifest
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / (
+              "mino-aarch64-qualification-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          )
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["schema"] == "mino.aarch64.qualification_manifest.v1"
+          assert manifest["expected_commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["host"]["commit"] == os.environ["GITHUB_SHA"].lower()
+          assert manifest["host"]["uname_machine"] == "aarch64"
+          assert manifest["host"]["source_state"] == "clean"
+          assert manifest["host"]["qemu_indicators"] == []
+          assert manifest["preflight"]["passed"] is True
+          assert manifest["qualification_eligible"] is True
+          assert manifest["artifacts_complete"] is True
+          assert manifest["outcome"] == "passed"
+          assert manifest["sla"]["passed"] is True
+          assert len(manifest["tests"]) == 7
+          assert {item["name"] for item in manifest["benchmarks"]} == {
+              "allocator", "channel", "bridge", "storage", "telemetry"
+          }
+          PY
+
+      - name: Upload native qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aarch64-native-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-aarch64-qualification-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 180

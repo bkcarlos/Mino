@@ -386,6 +386,16 @@ private:
         };
         plan->topic = routing->topic;
         plan->targets.reserve(routing->routes->routes.size());
+        const auto local_node = std::lower_bound(
+            nodes->nodes.begin(), nodes->nodes.end(), local_node_,
+            [](const registry::NodeMetadata& candidate, NodeId target) {
+                return candidate.node_id < target;
+            });
+        if (local_node == nodes->nodes.end() ||
+            local_node->node_id != local_node_) {
+            return Status::Error(StatusCode::kNotFound,
+                                 "local source node is not registered");
+        }
 
         for (const registry::StaticRouteEntry& route :
              routing->routes->routes) {
@@ -403,6 +413,14 @@ private:
                 return Status::Error(StatusCode::kUnavailable,
                                      "route target node is unavailable");
             }
+            // The metadata ACL is mandatory and cannot be bypassed by a custom
+            // deployment validator. The injected validator may only add policy.
+            MINO_RETURN_IF_ERROR(registry::ValidateTopicPermission(
+                routing->topic->metadata, local_node->security_domain_id,
+                local_node_, registry::TopicPermission::kPublish));
+            MINO_RETURN_IF_ERROR(registry::ValidateTopicPermission(
+                routing->topic->metadata, node->security_domain_id,
+                route.target_node, registry::TopicPermission::kSubscribe));
             MINO_RETURN_IF_ERROR(access_validator_->Validate(
                 routing->topic->metadata, local_node_, route.target_node));
             MINO_RETURN_IF_ERROR(schema_validator_->Validate(

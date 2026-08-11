@@ -47,6 +47,7 @@ registry::NodeRegistration Node(NodeId node, uint64_t epoch) {
         .process_identity = Identity(node, epoch),
         .endpoints = {Endpoint(static_cast<uint8_t>(node.value),
                                static_cast<uint16_t>(5000 + node.value))},
+        .security_domain_id = SecurityDomainId{1},
         .trust_domain = "switcher-test",
         .health = registry::NodeHealth::kHealthy,
         .lease_epoch = epoch,
@@ -250,7 +251,9 @@ protected:
     TopicId CreateTopic(registry::RoutePolicy policy,
                         std::vector<registry::StaticRouteEntry> routes = {},
                         registry::Reliability reliability =
-                            registry::Reliability::kBestEffort) {
+                            registry::Reliability::kBestEffort,
+                        uint32_t source_permissions =
+                            registry::kAllTopicPermissions) {
         registry::TopicMetadata topic{
             .topic_id = {},
             .name = "switcher/topic" + std::to_string(next_topic_name_++),
@@ -268,6 +271,19 @@ protected:
             .partition_count = 1,
             .record_topology =
                 registry::RecordBackpressureTopology::kIsolated,
+            .acl = registry::TopicAcl{
+                .entries = {
+                    {.node_id = NodeId{1},
+                     .security_domain_id = SecurityDomainId{1},
+                     .permissions = source_permissions},
+                    {.node_id = NodeId{2},
+                     .security_domain_id = SecurityDomainId{1},
+                     .permissions = registry::kAllTopicPermissions},
+                    {.node_id = NodeId{3},
+                     .security_domain_id = SecurityDomainId{1},
+                     .permissions = registry::kAllTopicPermissions},
+                },
+            },
             .region_version = 1,
             .channel_version = 1,
             .acl_version = 1,
@@ -402,6 +418,21 @@ TEST_F(TransportSwitcherTest, StaticRemoteRouteChecksDynamicDriverConstraints) {
     auto invalid_health = switcher_->Resolve(Request(topic));
     ASSERT_FALSE(invalid_health.ok());
     EXPECT_EQ(invalid_health.status().code(), StatusCode::kUnavailable);
+}
+
+TEST_F(TransportSwitcherTest, MetadataAclCannotBeBypassedByCustomValidator) {
+    RegisterNetworkDriver();
+    const TopicId topic = CreateTopic(
+        registry::RoutePolicy::kStatic,
+        {{.target_node = NodeId{2}, .preferred_transport = std::nullopt}},
+        registry::Reliability::kBestEffort,
+        static_cast<uint32_t>(registry::TopicPermission::kSubscribe));
+
+    const Status denied = switcher_->RefreshTopic(topic);
+    EXPECT_EQ(denied.code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(access_->calls(), 0u);
+    EXPECT_EQ(switcher_->Resolve(Request(topic)).status().code(),
+              StatusCode::kUnavailable);
 }
 
 TEST_F(TransportSwitcherTest, LocalTargetUsesShmBindingBeforeNetwork) {

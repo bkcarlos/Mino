@@ -92,6 +92,24 @@ public:
     bool read_only() const noexcept { return read_only_; }
     const std::string& name() const noexcept { return name_; }
 
+    // Credential and mode snapshots captured with fstat before the backing is
+    // mapped. Region Attach uses both marker and data identities so a permissive
+    // or replaced object is rejected before lifecycle metadata can be changed.
+    uint64_t marker_owner_user_id() const noexcept {
+        return marker_owner_user_id_;
+    }
+    uint64_t marker_owner_group_id() const noexcept {
+        return marker_owner_group_id_;
+    }
+    uint32_t marker_permissions() const noexcept { return marker_permissions_; }
+    uint64_t backing_owner_user_id() const noexcept {
+        return backing_owner_user_id_;
+    }
+    uint64_t backing_owner_group_id() const noexcept {
+        return backing_owner_group_id_;
+    }
+    uint32_t backing_permissions() const noexcept { return backing_permissions_; }
+
     Status Close();
 
     // Atomically publishes UNLINKING before deleting the exact recorded
@@ -110,6 +128,12 @@ private:
     HugePageFallbackReason huge_page_fallback_reason_ =
         HugePageFallbackReason::kNone;
     int huge_page_fallback_errno_ = 0;
+    uint64_t marker_owner_user_id_ = 0;
+    uint64_t marker_owner_group_id_ = 0;
+    uint32_t marker_permissions_ = 0;
+    uint64_t backing_owner_user_id_ = 0;
+    uint64_t backing_owner_group_id_ = 0;
+    uint32_t backing_permissions_ = 0;
     std::string name_;
 };
 

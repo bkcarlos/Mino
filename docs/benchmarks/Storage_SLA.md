@@ -25,6 +25,8 @@
 8. Replay 默认进入独立 namespace；写入 live namespace 必须显式授权。
 9. Retention 永不删除 OPEN Segment；先关闭新 Pin，再等待现存 Pin/Lease 清零，最后 unlink 并同步目录。
 10. ENOSPC/EIO/EROFS 后 Writer 进入 sticky ERROR，不自动恢复，不静默丢失。
+11. Topic Partition 只保证来源内/Partition 内顺序；跨 Partition Replay 的时间戳加稳定 tie-break 是确定性播放顺序，不是历史全序。
+12. Partition count、strategy 或 hash seed 不允许原地修改，只能创建新 generation，完成 route fence、buffer/writer drain 守恒证明后 cutover；旧 generation 保留供 recovery、retention 和 replay。
 
 对应验证：`//mino/storage:storage_fault_test`、`//mino/storage:recorder_test`、`//mino/storage:segment_recovery_test`、`//mino/storage:replay_engine_test`。
 
@@ -126,7 +128,24 @@ tools/ci/run_storage_fault_campaign.py --rounds=100 --seed=42 \
   --out=storage-fault-campaign
 ```
 
-## 8. 重新资格认证条件
+## 8. Topic Partition / V-24 资格
+
+`//benchmarks:storage_partition_benchmark` 固定执行 1/2/4/8/16 partitions，
+输出单 Writer 实测阈值、scaling、imbalance、p50/p99 latency、stable map 身份
+和逐 partition record 守恒计数。正式 V-24 由
+`benchmarks/storage_partition_qualification.py` 在多个并发进程、多个完整轮次
+上执行；runner 独立探测 CPU/governor、NVMe 型号、ext4 与 mount options，校验
+clean exact commit、JSON 完整性、`errors=0`、record 守恒、stable map、
+imbalance、p99、throughput，并按版本化 policy 判定 single-writer threshold 与
+scaling efficiency。
+
+只有目标硬件、完整哈希证据和全部 SLA 检查同时通过时才允许
+`qualification_eligible=true/outcome=passed`。真实非目标硬件的有效结果只能是
+`outcome=nonqualified`；dirty tree、伪硬件声明、缺 partition、JSON/log 哈希篡改
+或任一检查失败均 fail closed 为 `failed`。完整方法和 artifact schema 见
+`docs/benchmarks/Storage_Partition_Qualification.md`。
+
+## 9. 重新资格认证条件
 
 以下任一变化都必须重新运行 benchmark、fault campaign 和 sanitizer 矩阵：
 

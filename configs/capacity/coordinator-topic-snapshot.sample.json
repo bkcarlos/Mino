@@ -1,0 +1,73 @@
+{
+  "schema": "mino.coordinator.topic-snapshot.v1",
+  "generated_unix_ns": 1776038400000000000,
+  "topics": [
+    {
+      "topic_id": 101,
+      "name": "telemetry/events",
+      "state": "active",
+      "channel_kind": "broadcast",
+      "capacity": 1024,
+      "max_publishers": 8,
+      "max_subscribers": 32,
+      "partition_count": 2,
+      "record_topology": "isolated",
+      "schema": {
+        "type_id": 4097,
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "major": 1,
+        "minor": 2
+      },
+      "accepted_schemas": [
+        {
+          "type_id": 4097,
+          "digest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "major": 1,
+          "minor": 1
+        }
+      ],
+      "route": {
+        "policy": "static",
+        "version": 7,
+        "targets": [1001]
+      },
+      "usage": {
+        "publishers": 2,
+        "subscribers": 6,
+        "bridges": 1,
+        "recorders": 1,
+        "replay_pins": 0
+      }
+    },
+    {
+      "topic_id": 102,
+      "name": "control/commands",
+      "state": "active",
+      "channel_kind": "mpmc",
+      "capacity": 256,
+      "max_publishers": 4,
+      "max_subscribers": 16,
+      "partition_count": 1,
+      "record_topology": "strong_consistent",
+      "schema": {
+        "type_id": 4098,
+        "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+        "major": 3,
+        "minor": 0
+      },
+      "accepted_schemas": [],
+      "route": {
+        "policy": "discovery",
+        "version": 3,
+        "targets": []
+      },
+      "usage": {
+        "publishers": 1,
+        "subscribers": 3,
+        "bridges": 0,
+        "recorders": 0,
+        "replay_pins": 0
+      }
+    }
+  ]
+}

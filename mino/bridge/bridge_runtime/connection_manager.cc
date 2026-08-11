@@ -180,6 +180,12 @@ BridgeConnectionManager::Create(
             options.route_driver_generation == 0) {
             return Invalid("bridge node or route driver identity is incomplete");
         }
+        if (options.require_authenticated_peer &&
+            (options.expected_peer_security_domain.value == 0 ||
+             options.topic_authorizer == nullptr)) {
+            return Invalid(
+                "authenticated bridge security domain or Topic ACL is missing");
+        }
         if (options.listen_backlog == 0 ||
             options.connect_timeout_ms > transport::kMaxOperationTimeoutMs ||
             options.handshake_timeout_ns == 0 ||
@@ -349,6 +355,7 @@ Status BridgeConnectionManager::BeginConnection(
     remote_session_epoch_ = 0;
     handshake_started_ns_ = now_ns;
     discovery_sent_ = false;
+    authenticated_peer_.reset();
     adopted_discovery_.reset();
     next_probe_ns_ = SaturatingAdd(now_ns,
                                    options_.health_probe_interval_ns);
@@ -386,8 +393,38 @@ Status BridgeConnectionManager::AdoptAcceptedConnection(
             "accepted bridge peer identity or lane fencing failed");
     }
     MINO_RETURN_IF_ERROR(BeginConnection(std::move(connection), now_ns));
+    const Status authenticated = AuthenticateTransportPeer();
+    if (!authenticated.ok()) {
+        (void)driver_->Close(connection_id_);
+        connection_id_ = transport::kInvalidConnectionId;
+        authenticated_peer_.reset();
+        state_ = BridgeConnectionState::kWaiting;
+        return authenticated;
+    }
     ++stats_.accepted_connections;
     adopted_discovery_ = peer_discovery;
+    return Status::Ok();
+}
+
+Status BridgeConnectionManager::AuthenticateTransportPeer() noexcept {
+    if (!options_.require_authenticated_peer) return Status::Ok();
+    if (authenticated_peer_.has_value()) return Status::Ok();
+    auto peer = driver_->AuthenticatedPeer(connection_id_);
+    if (!peer.ok()) {
+        if (peer.status().code() == StatusCode::kWouldBlock) {
+            return peer.status();
+        }
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "bridge transport did not authenticate the expected peer");
+    }
+    if (peer->node_id != options_.expected_peer.node_id ||
+        peer->security_domain != options_.expected_peer_security_domain) {
+        return Status::Error(
+            StatusCode::kPermissionDenied,
+            "bridge certificate principal does not match expected peer");
+    }
+    authenticated_peer_ = *peer;
     return Status::Ok();
 }
 
@@ -474,6 +511,20 @@ Status BridgeConnectionManager::CompleteHandshake(uint64_t remote_epoch,
     pipeline_options.remote_session_epoch = remote_epoch;
     pipeline_options.lane_index = options_.lane_index;
     pipeline_options.lane_count = options_.lane_count;
+    if (options_.topic_authorizer != nullptr) {
+        if (authenticated_peer_.has_value()) {
+            pipeline_options.authenticated_peer = *authenticated_peer_;
+        } else {
+            // Explicit lower-level plaintext tests still carry a complete policy
+            // subject, but no production RemoteBridge can enter this branch.
+            pipeline_options.authenticated_peer = security::AuthenticatedPeer{
+                .node_id = options_.expected_peer.node_id,
+                .security_domain = options_.expected_peer_security_domain,
+                .credential_generation = 1,
+            };
+        }
+        pipeline_options.topic_authorizer = options_.topic_authorizer.get();
+    }
     if (pipeline_ == nullptr) {
         MINO_ASSIGN_OR_RETURN(
             pipeline_,
@@ -482,7 +533,8 @@ Status BridgeConnectionManager::CompleteHandshake(uint64_t remote_epoch,
     } else {
         MINO_RETURN_IF_ERROR(pipeline_->RebindConnection(
             connection_id_, local_session_epoch_, remote_epoch,
-            pipeline_options.local_dedup_state_lost, now_ns));
+            pipeline_options.local_dedup_state_lost, now_ns,
+            pipeline_options.authenticated_peer));
     }
     remote_session_epoch_ = remote_epoch;
     // Remain handshaking until BridgePipeline receives the peer's fully fenced
@@ -533,8 +585,10 @@ void BridgeConnectionManager::LoseConnection(
     connection_id_ = transport::kInvalidConnectionId;
     remote_session_epoch_ = 0;
     discovery_sent_ = false;
+    authenticated_peer_.reset();
     adopted_discovery_.reset();
     ++stats_.disconnects;
+    ++stats_.connection_failures;
     if (protocol_failure) ++stats_.protocol_failures;
     result->connection_lost = true;
     ScheduleRetry(now_ns);
@@ -582,6 +636,7 @@ Result<BridgeConnectionPumpResult> BridgeConnectionManager::Pump(
             }
             if (!opened.ok()) {
                 if (!IsWouldBlock(opened.status())) {
+                    ++stats_.connection_failures;
                     last_failure_ = opened.status();
                     if (options_.mode == BridgeConnectionMode::kListen &&
                         opened.status().code() == StatusCode::kNotFound) {
@@ -606,6 +661,16 @@ Result<BridgeConnectionPumpResult> BridgeConnectionManager::Pump(
 
         if (state_ == BridgeConnectionState::kHandshaking &&
             remote_session_epoch_ == 0) {
+            const Status authenticated = AuthenticateTransportPeer();
+            if (!authenticated.ok()) {
+                if (IsWouldBlock(authenticated)) {
+                    result.state = state_;
+                    return result;
+                }
+                LoseConnection(authenticated, now, true, &result);
+                result.state = state_;
+                return result;
+            }
             if (!discovery_sent_) {
                 const Status sent = SendDiscoveryHello();
                 if (!sent.ok() && !IsWouldBlock(sent)) {

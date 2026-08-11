@@ -21,6 +21,18 @@
 - 负面：四级模式与采样传播增加配置与协议面（flags 位 + PerfTraceContext）；Sidecar 溢出时需要丢弃策略与指标。
 - 跟进：Off/Counter/Sampled 开销对比与 Clock Jump 测试（详设 26 章 V-23）。
 
+## V-23 开销口径
+
+≤1%/≤2% 指标定义为 **相同真实 publish operation 上的增量数据路径开销**：
+
+```text
+overhead(mode) = (publish_ns(mode) / publish_ns(compile_off) - 1) × 100%
+```
+
+`publish` 必须执行同一生产数据面 operation，至少包含生产 `SpscChannel` 的 `Reserve`、固定 `IndexSlot` 字段填充、`Commit`、`Poll`、业务字段读取与 `Ack`。Compile-off baseline 只移除 Telemetry 调用；不得增加虚假工作、搬入 Telemetry 工作或缩减其他 mode 的 operation。动态 policy epoch 可在固定 256-operation 边界同步，切换生效延迟必须有界且 epoch 检查必须留在计时区；批内每条消息仍绑定同一个完整不可变 policy snapshot。Counters-only 必须计入消息数、Payload 字节与 Wire 字节更新以及计时区内的周期 flush；Sampled 必须计入稳定决策、采样消息的时钟、Trace Context、Histogram 与有界 Sidecar 入队。按照本 ADR 的异步 Exporter 决策，Sidecar 消费/导出不属于数据路径计时，但生产者入队属于。
+
+纳秒级空循环会把不可再分的原子读/分支放大为数百个百分点，因此仅作为单独的 micro-op 物理下限诊断，不作为 ≤1%/≤2% 验收分母。V-23 必须防 DCE，报告绝对 ns/op 与配对 overhead，执行预热、时钟/noop 校准、多个独立进程和多轮 AB/BA 配对，并给出跨进程均值的 95% 置信区间。验收以置信上界不超过目标为通过，任何 Counter 不守恒、采样率异常、非预期 drop 或 worker 失败均使结果无效。
+
 ---
 
 ## 评审记录

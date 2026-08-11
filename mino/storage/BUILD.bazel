@@ -154,10 +154,32 @@ cc_test(
 )
 
 cc_library(
+    name = "topic_partition",
+    srcs = ["topic_partition.cc"],
+    hdrs = ["topic_partition.h"],
+    deps = [
+        ":recorder_buffer_pool",
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "topic_partition_test",
+    srcs = ["topic_partition_test.cc"],
+    deps = [
+        ":topic_partition",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "recording_manifest",
     srcs = ["recording_manifest.cc"],
     hdrs = ["recording_manifest.h"],
     deps = [
+        ":topic_partition",
         "//mino/bridge:crc32c",
         "//mino/common:result",
         "//mino/common:status",
@@ -324,6 +346,7 @@ cc_library(
         ":schema_store",
         ":segment_recovery",
         ":snapshot_store",
+        ":topic_partition",
         ":topic_writer",
         "//mino/capacity",
         "//mino/common:ids",

@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "suite_id": "mino-d6-17-operations",
+  "modes": {
+    "quick": {
+      "total_budget_seconds": 1200,
+      "qualification": false
+    },
+    "qualification": {
+      "total_budget_seconds": 5400,
+      "qualification": true
+    }
+  },
+  "required_scenarios": [
+    "tls-credential-invalid",
+    "acl-denied",
+    "bridge-disconnect-reconnect",
+    "subscriber-lease-expired",
+    "schema-mismatch",
+    "storage-paused-enospc",
+    "exporter-failure",
+    "capacity-rejection",
+    "upgrade-cutover-interrupted"
+  ],
+  "scenarios": [
+    {
+      "id": "tls-credential-invalid",
+      "title": "TLS credential preflight fails closed",
+      "runbook_anchor": "certificate-rotation",
+      "alert_ids": ["MinoTlsHandshakeFailures", "MinoTlsCertificateExpiring"],
+      "fault_kind": "expected-process-failure",
+      "real_execution": "Builds and invokes mino-deploy preflight against real directories and an empty owner-only private-key file.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 180,
+          "steps": [
+            {
+              "name": "invalid-private-key-preflight",
+              "argv": ["{python}", "tools/operations/credential_preflight_drill.py", "--workspace", "{workspace}", "--bazel", "{bazel}"],
+              "expected_exit_codes": [4],
+              "expected_failure": true,
+              "required_output_regex": "DRILL_EXPECTED_FAILURE scenario=tls-credential-invalid observed_exit=4"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 420,
+          "steps": [
+            {
+              "name": "invalid-private-key-preflight",
+              "argv": ["{python}", "tools/operations/credential_preflight_drill.py", "--workspace", "{workspace}", "--bazel", "{bazel}"],
+              "expected_exit_codes": [4],
+              "expected_failure": true,
+              "required_output_regex": "DRILL_EXPECTED_FAILURE scenario=tls-credential-invalid observed_exit=4"
+            },
+            {
+              "name": "untrusted-ca-and-san",
+              "argv": ["{bazel}", "test", "//mino/security:tls_test", "--test_timeout=180", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=TlsTest.RejectsCertificateWithoutPrincipalSan:TlsTest.RejectsPeerSignedByUntrustedCa"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "acl-denied",
+      "title": "ACL rejection occurs before allocation or publication",
+      "runbook_anchor": "region-and-acl-denial",
+      "alert_ids": ["MinoAclDeniedSpike"],
+      "fault_kind": "asserted-contained-failure",
+      "real_execution": "Runs the real TCP Bridge pipeline and verifies PermissionDenied before retention, dedup, and ingress allocation.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 180,
+          "steps": [
+            {
+              "name": "bridge-topic-acl-denial",
+              "argv": ["{bazel}", "test", "//mino/bridge:bridge_pipeline_test", "--test_timeout=120", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgePipelineTest.TopicAclDeniesBeforePendingRetentionDedupAndIngressAllocation"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 240,
+          "steps": [
+            {
+              "name": "bridge-and-registry-acl-denial",
+              "argv": ["{bazel}", "test", "//mino/bridge:bridge_pipeline_test", "//mino/registry:registry_test", "--test_timeout=180", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgePipelineTest.TopicAclDeniesBeforePendingRetentionDedupAndIngressAllocation:TopicAclTest.RegistrationAndPinsDenyMissingPermissions"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "bridge-disconnect-reconnect",
+      "title": "Bridge disconnect reconnects and fences stale epochs",
+      "runbook_anchor": "bridge-disconnection",
+      "alert_ids": ["MinoBridgeDisconnected", "MinoBridgeReconnectFailures"],
+      "fault_kind": "in-process-link-interruption",
+      "real_execution": "Closes a real loopback TCP connection, queues traffic, reconnects, fences a stale epoch, and verifies delivery without retransmit residue.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 240,
+          "steps": [
+            {
+              "name": "tcp-reconnect",
+              "argv": ["{bazel}", "test", "//mino/bridge:connection_manager_test", "--test_timeout=180", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgeConnectionManagerTest.ReconnectsFencesStaleEpochAndRecoversQueuedMessages"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 360,
+          "steps": [
+            {
+              "name": "tcp-reconnect-and-hwm",
+              "argv": ["{bazel}", "test", "//mino/bridge:connection_manager_test", "//mino/bridge:bridge_pipeline_test", "--test_timeout=300", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgeConnectionManagerTest.ReconnectsFencesStaleEpochAndRecoversQueuedMessages:BridgePipelineTest.ReconnectUsesPeerHwmWithoutDuplicatePublication:BridgePipelineTest.ReceiverRestartSignalsDegradedAndReplaysPendingData"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "subscriber-lease-expired",
+      "title": "Expired dead subscriber lease is evicted exactly",
+      "runbook_anchor": "subscriber-lease-expiration",
+      "alert_ids": ["MinoLeaseExpirations", "MinoLeaseHeartbeatStale"],
+      "fault_kind": "real-shared-memory-process-lifecycle",
+      "real_execution": "Uses fork, process signals, MAP_SHARED broadcast state, lease boundaries, and real acknowledgement cleanup.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 240,
+          "steps": [
+            {
+              "name": "dead-subscriber-lease",
+              "argv": ["{bazel}", "test", "//mino/runtime:runtime_recovery_stress_test", "--test_timeout=180", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=RuntimeRecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks:RuntimeRecoveryStressTest.DeadSubscriberLeaseBoundaryIsExact"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 420,
+          "steps": [
+            {
+              "name": "lease-and-sigstop-safety",
+              "argv": ["{bazel}", "test", "//mino/runtime:runtime_recovery_stress_test", "--test_timeout=360", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=RuntimeRecoveryStressTest.DeadBroadcastSubscriberLeaseClearsRealAcks:RuntimeRecoveryStressTest.DeadSubscriberLeaseBoundaryIsExact:RuntimeRecoveryStressTest.SigstopLiveOwnerIsNeverRecovered"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "schema-mismatch",
+      "title": "Bridge schema mismatch closes and reconnects fail closed",
+      "runbook_anchor": "schema-incident",
+      "alert_ids": ["MinoBridgeReconnectFailures"],
+      "fault_kind": "protocol-schema-mismatch",
+      "real_execution": "Runs the real Bridge connection manager, schema negotiator, persistence path, and TCP reconnect scheduling.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 180,
+          "steps": [
+            {
+              "name": "peer-schema-mismatch",
+              "argv": ["{bazel}", "test", "//mino/bridge:connection_manager_test", "--test_timeout=120", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgeConnectionManagerTest.PeerSchemaMismatchClosesConnectionAndSchedulesReconnect"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 300,
+          "steps": [
+            {
+              "name": "peer-schema-mismatch-and-transaction",
+              "argv": ["{bazel}", "test", "//mino/bridge:connection_manager_test", "//mino/bridge:bridge_pipeline_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=BridgeConnectionManagerTest.PeerSchemaMismatchClosesConnectionAndSchedulesReconnect:BridgePipelineTest.SchemaAnnouncementTransactionallyReleasesBufferedBatch"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "storage-paused-enospc",
+      "title": "Storage pause remains bounded and ENOSPC is recoverable",
+      "runbook_anchor": "storage-disk-failure",
+      "alert_ids": ["MinoStorageWriteFailures", "MinoStorageBacklog"],
+      "fault_kind": "filesystem-io-hook-and-blocking-sync",
+      "real_execution": "Uses real SegmentWriter files, injected errno ENOSPC/EIO/EROFS, blocking sync, bounded RecorderBufferPool, scan, and repair.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 240,
+          "steps": [
+            {
+              "name": "paused-disk-and-enospc",
+              "argv": ["{bazel}", "test", "//mino/storage:storage_fault_test", "--test_timeout=180", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=StorageFaultTest.WriterIoFaultsAreStickyAndRecoveryLosesNoCommit:StorageFaultTest.PausedDiskKeepsBufferingBoundedAndAppliesPolicy"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 600,
+          "steps": [
+            {
+              "name": "paused-disk-enospc-and-sigkill",
+              "argv": ["{bazel}", "test", "//mino/storage:storage_fault_test", "--test_timeout=540", "--test_output=streamed", "--nocache_test_results", "--test_env=MINO_STORAGE_FAULT_ROUNDS=3", "--test_env=MINO_STORAGE_FAULT_SEED=617", "--test_arg=--gtest_filter=StorageFaultTest.WriterIoFaultsAreStickyAndRecoveryLosesNoCommit:StorageFaultTest.PausedDiskKeepsBufferingBoundedAndAppliesPolicy:StorageFaultTest.SigkillAtRecordWritesRepairsToLastCompleteCommit"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "exporter-failure",
+      "title": "Exporter failure is bounded and isolated",
+      "runbook_anchor": "monitoring-and-exporter-failure",
+      "alert_ids": ["MinoMonitoringDown", "MinoMonitoringSnapshotStale", "MinoOtlpQueueNearCapacity", "MinoOtlpDropsOrFailures"],
+      "fault_kind": "bounded-real-export-pipeline",
+      "real_execution": "Runs the production exporter encoding and bounded transactional queue with a failing sink; producer isolation is asserted.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 180,
+          "steps": [
+            {
+              "name": "exporter-failure-isolation",
+              "argv": ["{bazel}", "test", "//mino/observability:exporter_test", "--test_timeout=120", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=OtlpJsonExporterTest.AbortsWhenBoundedSinkIsFull:ExportPipelineTest.FullQueueAndExporterFailureNeverReachProducer"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 300,
+          "steps": [
+            {
+              "name": "exporter-and-http-monitoring",
+              "argv": ["{bazel}", "test", "//mino/observability:exporter_test", "//mino/observability:prometheus_http_endpoint_test", "//mino/observability:monitoring_drill_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "capacity-rejection",
+      "title": "Capacity rejects atomically without consuming emergency reserve",
+      "runbook_anchor": "capacity-exhaustion",
+      "alert_ids": ["MinoCapacityHeadroomLow", "MinoCapacityRejections", "MinoQueueNearCapacity"],
+      "fault_kind": "real-capacity-admission",
+      "real_execution": "Runs the production capacity controller across multi-resource atomic admission, emergency reserve, and concurrent contention.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 180,
+          "steps": [
+            {
+              "name": "typed-capacity-rejection",
+              "argv": ["{bazel}", "test", "//mino/capacity:capacity_test", "--test_timeout=120", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=CapacityTest.MultiModuleRequestRejectsAtomicallyWithTypedReason:CapacityTest.EmergencyReserveIsDataPlaneHeadroomOnly"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 300,
+          "steps": [
+            {
+              "name": "capacity-rejection-and-contention",
+              "argv": ["{bazel}", "test", "//mino/capacity:capacity_test", "//mino/capacity:module_integration_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "upgrade-cutover-interrupted",
+      "title": "Interrupted cutover resumes idempotently or rolls back with proof",
+      "runbook_anchor": "rolling-upgrade",
+      "alert_ids": [],
+      "fault_kind": "durable-cutover-persistence-interruption",
+      "real_execution": "Runs the upgrade CLI durable manifest drill and the orchestrator cutpoint integration against real files, fsync, rename, and resume.",
+      "modes": {
+        "quick": {
+          "budget_seconds": 300,
+          "steps": [
+            {
+              "name": "durable-cli-cutover-drill",
+              "argv": ["{bazel}", "test", "//tools/deployment:rolling_upgrade_drill_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "rolling-upgrade drill passed"
+            }
+          ]
+        },
+        "qualification": {
+          "budget_seconds": 600,
+          "steps": [
+            {
+              "name": "durable-cli-cutover-drill",
+              "argv": ["{bazel}", "test", "//tools/deployment:rolling_upgrade_drill_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "rolling-upgrade drill passed"
+            },
+            {
+              "name": "cutover-crash-resume-conservation",
+              "argv": ["{bazel}", "test", "//mino/upgrade:rolling_upgrade_integration_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results", "--test_arg=--gtest_filter=RollingUpgradeIntegrationTest.PublisherDrainCutoverCrashResumeHasNoDuplicateOrUnexplainedLoss"],
+              "expected_exit_codes": [0],
+              "expected_failure": false,
+              "required_output_regex": "PASSED"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

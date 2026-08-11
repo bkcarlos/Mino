@@ -17,11 +17,15 @@ using mino::shared_memory_internal::SharedMemoryTestPoint;
 std::string g_action;
 int g_publication_count = 0;
 
-void FaultHook(SharedMemoryTestPoint point) {
+bool FaultHook(SharedMemoryTestPoint point) {
+    if (g_action == "fail-marker-map" &&
+        point == SharedMemoryTestPoint::kBeforeMarkerMap) {
+        return true;
+    }
     if (g_action == "stop-after-marker" &&
         point == SharedMemoryTestPoint::kAfterCreatingMarker) {
         ::raise(SIGSTOP);
-        return;
+        return false;
     }
     if (g_action == "crash-after-marker" &&
         point == SharedMemoryTestPoint::kAfterCreatingMarker) {
@@ -40,6 +44,7 @@ void FaultHook(SharedMemoryTestPoint point) {
         point == SharedMemoryTestPoint::kAfterUnlinkingPublished) {
         ::_exit(70);
     }
+    return false;
 }
 
 }  // namespace

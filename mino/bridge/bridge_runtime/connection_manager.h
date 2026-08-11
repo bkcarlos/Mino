@@ -19,6 +19,7 @@
 #include "mino/common/result.h"
 #include "mino/observability/tracing.h"
 #include "mino/runtime/bus.h"
+#include "mino/security/tls.h"
 #include "mino/transport/transport_driver.h"
 
 namespace mino::bridge {
@@ -71,6 +72,12 @@ struct BridgeConnectionManagerOptions {
     // peer fencing field exactly matches expected_peer.
     BridgeNodeIdentityFence local_identity;
     BridgeNodeIdentityFence expected_peer;
+    // Production remote bridges require the verified certificate principal to
+    // match both expected_peer.node_id and this nonzero security domain before
+    // SessionDiscovery is sent or accepted.
+    bool require_authenticated_peer = false;
+    security::SecurityDomainId expected_peer_security_domain;
+    std::shared_ptr<const BridgeTopicAuthorizer> topic_authorizer;
     // Identity of the local route-driver registration captured by RouteHandle.
     uint64_t route_driver_id = 0;
     uint64_t route_driver_generation = 0;
@@ -106,6 +113,7 @@ struct BridgeConnectionManagerStats {
     uint64_t completed_handshakes = 0;
     uint64_t reconnects = 0;
     uint64_t disconnects = 0;
+    uint64_t connection_failures = 0;
     uint64_t protocol_failures = 0;
     uint64_t health_probes = 0;
     uint64_t discarded_egress_frames = 0;
@@ -195,6 +203,7 @@ private:
     Status OpenListener() noexcept;
     Status BeginConnection(transport::ConnectionInfo connection,
                            uint64_t now_ns) noexcept;
+    Status AuthenticateTransportPeer() noexcept;
     Status SendDiscoveryHello() noexcept;
     Result<std::optional<SessionDiscovery>> PollDiscoveryHello() noexcept;
     Status CompleteHandshake(uint64_t remote_epoch,
@@ -235,6 +244,7 @@ private:
     uint64_t current_backoff_ns_ = 0;
     uint64_t next_probe_ns_ = 0;
     bool discovery_sent_ = false;
+    std::optional<security::AuthenticatedPeer> authenticated_peer_;
     std::optional<SessionDiscovery> adopted_discovery_;
     bool ever_active_ = false;
     bool driver_started_by_manager_ = false;

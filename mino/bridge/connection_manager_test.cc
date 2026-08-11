@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "mino/schema/canonical.h"
+#include "mino/security/test_tls_credentials.h"
 #include "mino/transport/tcp_driver.h"
 
 namespace mino::bridge {
@@ -175,6 +176,14 @@ public:
     std::vector<WireFrame> frames;
 };
 
+class AllowAllTopics final : public BridgeTopicAuthorizer {
+public:
+    Status AuthorizeInbound(const security::AuthenticatedPeer&,
+                            TopicId) const noexcept override {
+        return Status::Ok();
+    }
+};
+
 class CountingTelemetrySink final : public observability::TraceEventSink {
 public:
     bool TryRecordEvent(const observability::SampleKey&,
@@ -210,13 +219,51 @@ ManagerPair MakePair(bool listener_rejects_connector = false,
                      uint16_t connector_lane_index = 0,
                      uint16_t connector_lane_count = 1,
                      uint16_t listener_lane_index = 0,
-                     uint16_t listener_lane_count = 1) {
+                     uint16_t listener_lane_count = 1,
+                     bool enable_tls = false,
+                     bool connector_expects_wrong_domain = false) {
     ManagerPair pair;
     const uint16_t port = FreePort();
     EXPECT_NE(port, 0);
     const transport::EndpointDescriptor endpoint = Loopback(port);
-    auto connector_driver = transport::TcpDriver::Create(TcpOptions());
-    auto listener_driver = transport::TcpDriver::Create(TcpOptions());
+    transport::TcpDriverOptions connector_tcp = TcpOptions();
+    transport::TcpDriverOptions listener_tcp = TcpOptions();
+    if (enable_tls) {
+        const std::array principals = {
+            security::testing::TestPrincipal{
+                NodeId{101}, security::SecurityDomainId{77}},
+            security::testing::TestPrincipal{
+                NodeId{202}, security::SecurityDomainId{77}},
+        };
+        auto generated =
+            security::testing::GenerateTlsCredentials(principals);
+        EXPECT_TRUE(generated.ok()) << generated.status().ToString();
+        if (!generated.ok()) return pair;
+        auto connector_provider =
+            security::StaticTlsCredentialProvider::Create(
+                std::move((*generated)[0]));
+        auto listener_provider =
+            security::StaticTlsCredentialProvider::Create(
+                std::move((*generated)[1]));
+        EXPECT_TRUE(connector_provider.ok())
+            << connector_provider.status().ToString();
+        EXPECT_TRUE(listener_provider.ok())
+            << listener_provider.status().ToString();
+        if (!connector_provider.ok() || !listener_provider.ok()) return pair;
+        auto connector_factory =
+            security::CreateOpenSslTlsChannelFactory(*connector_provider);
+        auto listener_factory =
+            security::CreateOpenSslTlsChannelFactory(*listener_provider);
+        EXPECT_TRUE(connector_factory.ok())
+            << connector_factory.status().ToString();
+        EXPECT_TRUE(listener_factory.ok())
+            << listener_factory.status().ToString();
+        if (!connector_factory.ok() || !listener_factory.ok()) return pair;
+        connector_tcp.tls_factory = *connector_factory;
+        listener_tcp.tls_factory = *listener_factory;
+    }
+    auto connector_driver = transport::TcpDriver::Create(connector_tcp);
+    auto listener_driver = transport::TcpDriver::Create(listener_tcp);
     EXPECT_TRUE(connector_driver.ok());
     EXPECT_TRUE(listener_driver.ok());
     if (!connector_driver.ok() || !listener_driver.ok()) return pair;
@@ -231,18 +278,32 @@ ManagerPair MakePair(bool listener_rejects_connector = false,
     const BridgeNodeIdentityFence expected_connector =
         listener_rejects_connector ? Fence(NodeId{101}, 99)
                                    : connector_identity;
+    BridgeConnectionManagerOptions connector_options = ManagerOptions(
+        BridgeConnectionMode::kConnect, endpoint, connector_identity,
+        listener_identity, true, &pair.connector_telemetry,
+        connector_lane_index, connector_lane_count);
+    BridgeConnectionManagerOptions listener_options = ManagerOptions(
+        BridgeConnectionMode::kListen, endpoint, listener_identity,
+        expected_connector, true, &pair.listener_telemetry,
+        listener_lane_index, listener_lane_count);
+    if (enable_tls) {
+        auto authorizer = std::make_shared<AllowAllTopics>();
+        connector_options.require_authenticated_peer = true;
+        connector_options.expected_peer_security_domain =
+            security::SecurityDomainId{
+                connector_expects_wrong_domain ? 88u : 77u};
+        connector_options.topic_authorizer = authorizer;
+        listener_options.require_authenticated_peer = true;
+        listener_options.expected_peer_security_domain =
+            security::SecurityDomainId{77};
+        listener_options.topic_authorizer = std::move(authorizer);
+    }
     auto connector = BridgeConnectionManager::Create(
-        ManagerOptions(BridgeConnectionMode::kConnect, endpoint,
-                       connector_identity, listener_identity, true,
-                       &pair.connector_telemetry, connector_lane_index,
-                       connector_lane_count),
-        pair.connector_driver, &pair.connector_ingress);
+        std::move(connector_options), pair.connector_driver,
+        &pair.connector_ingress);
     auto listener = BridgeConnectionManager::Create(
-        ManagerOptions(BridgeConnectionMode::kListen, endpoint,
-                       listener_identity, expected_connector, true,
-                       &pair.listener_telemetry, listener_lane_index,
-                       listener_lane_count),
-        pair.listener_driver, &pair.listener_ingress);
+        std::move(listener_options), pair.listener_driver,
+        &pair.listener_ingress);
     EXPECT_TRUE(connector.ok()) << connector.status().ToString();
     EXPECT_TRUE(listener.ok()) << listener.status().ToString();
     if (connector.ok()) pair.connector = std::move(*connector);
@@ -554,6 +615,50 @@ TEST(BridgeConnectionManagerTest, RejectsAdoptionWithWrongLaneTuple) {
 }
 
 TEST(BridgeConnectionManagerTest,
+     MutualTlsPrincipalBindsNodeDomainAndSessionDiscovery) {
+    ManagerPair pair = MakePair(false, 0, 1, 0, 1, true, false);
+    ASSERT_NE(pair.connector, nullptr);
+    ASSERT_NE(pair.listener, nullptr);
+    const Status connected = PumpUntil(&pair, [&] { return Ready(pair); });
+    ASSERT_TRUE(connected.ok()) << connected.ToString();
+
+    auto connector_peer = pair.connector_driver->AuthenticatedPeer(
+        pair.connector->connection_id());
+    auto listener_peer = pair.listener_driver->AuthenticatedPeer(
+        pair.listener->connection_id());
+    ASSERT_TRUE(connector_peer.ok())
+        << connector_peer.status().ToString();
+    ASSERT_TRUE(listener_peer.ok()) << listener_peer.status().ToString();
+    EXPECT_EQ(connector_peer->node_id, NodeId{202});
+    EXPECT_EQ(listener_peer->node_id, NodeId{101});
+    EXPECT_EQ(connector_peer->security_domain,
+              security::SecurityDomainId{77});
+    EXPECT_EQ(listener_peer->security_domain,
+              security::SecurityDomainId{77});
+
+    ASSERT_TRUE(QueueReliable(pair.connector.get(), 1, std::byte{0x51}).ok());
+    const Status delivered = PumpUntil(&pair, [&] {
+        return pair.listener_ingress.frames.size() == 1;
+    });
+    ASSERT_TRUE(delivered.ok()) << delivered.ToString();
+}
+
+TEST(BridgeConnectionManagerTest,
+     CertificateDomainMismatchFailsBeforeSessionDiscovery) {
+    ManagerPair pair = MakePair(false, 0, 1, 0, 1, true, true);
+    ASSERT_NE(pair.connector, nullptr);
+    ASSERT_NE(pair.listener, nullptr);
+    const Status rejected = PumpUntil(&pair, [&] {
+        return pair.connector->stats().protocol_failures != 0;
+    });
+    ASSERT_TRUE(rejected.ok()) << rejected.ToString();
+    EXPECT_EQ(pair.connector->last_failure().code(),
+              StatusCode::kPermissionDenied);
+    EXPECT_EQ(pair.connector->pipeline(), nullptr);
+    EXPECT_NE(pair.connector->state(), BridgeConnectionState::kActive);
+}
+
+TEST(BridgeConnectionManagerTest,
      AutomaticallyConnectsDiscoversEpochAndPublishesOverTcp) {
     ManagerPair pair = MakePair();
     ASSERT_NE(pair.connector, nullptr);
@@ -762,6 +867,7 @@ TEST(BridgeRuntimeDispatcherTest,
         .node_id = local_node,
         .process_identity = Identity(local_node, 8),
         .endpoints = {*endpoint},
+        .security_domain_id = SecurityDomainId{77},
         .trust_domain = "bridge-bus-test",
         .health = registry::NodeHealth::kHealthy,
         .lease_epoch = 1,
@@ -819,6 +925,11 @@ TEST(BridgeRuntimeDispatcherTest,
         .partition_count = 1,
         .record_topology =
             registry::RecordBackpressureTopology::kIsolated,
+        .acl = registry::TopicAcl{
+            .entries = {{.node_id = local_node,
+                         .security_domain_id = SecurityDomainId{77},
+                         .permissions = registry::kAllTopicPermissions}},
+        },
         .region_version = 1,
         .channel_version = 1,
         .acl_version = 1,

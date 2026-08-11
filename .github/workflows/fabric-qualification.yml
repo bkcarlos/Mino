@@ -1,0 +1,288 @@
+name: Physical IPCF NTB CXL Fabric Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_address:
+        description: Host A routable baseline address
+        required: true
+        type: string
+      client_address:
+        description: Host B routable identity address
+        required: true
+        type: string
+      base_port:
+        description: Four consecutive pre-authorized ports (TCP plus IPCF/NTB/CXL)
+        required: true
+        default: "46106"
+        type: string
+      fabric_domain:
+        description: Provisioned Fabric domain ID
+        required: true
+        type: string
+      fabric_channel:
+        description: First of three provisioned channel IDs for IPCF/NTB/CXL
+        required: true
+        type: string
+      host_a_node:
+        description: Registry Node ID for host A
+        required: true
+        type: string
+      host_b_node:
+        description: Registry Node ID for host B
+        required: true
+        type: string
+      host_a_security_domain:
+        description: Security Domain for host A
+        required: true
+        type: string
+      host_b_security_domain:
+        description: Security Domain for host B (must differ)
+        required: true
+        type: string
+      host_a_device:
+        description: Multi-kind physical provider device name on host A
+        required: true
+        type: string
+      host_b_device:
+        description: Multi-kind physical provider device name on host B
+        required: true
+        type: string
+      host_a_device_path:
+        description: Real /sys/devices evidence directory on host A
+        required: true
+        type: string
+      host_b_device_path:
+        description: Real /sys/devices evidence directory on host B
+        required: true
+        type: string
+      host_a_link_state_path:
+        description: Real active sysfs link-state file on host A
+        required: true
+        type: string
+      host_b_link_state_path:
+        description: Real active sysfs link-state file on host B
+        required: true
+        type: string
+      host_a_plugin:
+        description: Absolute approved IPCF/NTB/CXL provider plugin on host A
+        required: true
+        type: string
+      host_b_plugin:
+        description: Absolute approved IPCF/NTB/CXL provider plugin on host B
+        required: true
+        type: string
+
+      iterations:
+        description: RTT iterations per payload and transport kind
+        required: true
+        default: "1000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mino-physical-fabric
+  cancel-in-progress: false
+
+env:
+  QUALIFICATION_SESSION_NONCE: fabric-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+  INPUT_SERVER_ADDRESS: ${{ inputs.server_address }}
+  INPUT_CLIENT_ADDRESS: ${{ inputs.client_address }}
+  INPUT_BASE_PORT: ${{ inputs.base_port }}
+  INPUT_FABRIC_DOMAIN: ${{ inputs.fabric_domain }}
+  INPUT_FABRIC_CHANNEL: ${{ inputs.fabric_channel }}
+  INPUT_HOST_A_NODE: ${{ inputs.host_a_node }}
+  INPUT_HOST_B_NODE: ${{ inputs.host_b_node }}
+  INPUT_HOST_A_SECURITY_DOMAIN: ${{ inputs.host_a_security_domain }}
+  INPUT_HOST_B_SECURITY_DOMAIN: ${{ inputs.host_b_security_domain }}
+  INPUT_HOST_A_DEVICE: ${{ inputs.host_a_device }}
+  INPUT_HOST_B_DEVICE: ${{ inputs.host_b_device }}
+  INPUT_HOST_A_DEVICE_PATH: ${{ inputs.host_a_device_path }}
+  INPUT_HOST_B_DEVICE_PATH: ${{ inputs.host_b_device_path }}
+  INPUT_HOST_A_LINK_STATE_PATH: ${{ inputs.host_a_link_state_path }}
+  INPUT_HOST_B_LINK_STATE_PATH: ${{ inputs.host_b_link_state_path }}
+  INPUT_HOST_A_PLUGIN: ${{ inputs.host_a_plugin }}
+  INPUT_HOST_B_PLUGIN: ${{ inputs.host_b_plugin }}
+  INPUT_ITERATIONS: ${{ inputs.iterations }}
+
+jobs:
+  server:
+    name: Fabric qualification server (physical host A)
+    runs-on: [self-hosted, linux, x64, mino-fabric-a]
+    environment: physical-fabric
+    timeout-minutes: 120
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      APPROVED_PROVIDER_SHA256: ${{ vars.FABRIC_PROVIDER_SHA256 }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+      - name: Build tests and physical matrix
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //mino/platform:fabric_provider_test \
+            //mino/transport:fabric_driver_test --test_output=errors
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks/transport:transport_matrix_benchmark
+      - name: Verify clean exact checkout including untracked files
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Run physical host A complete IPCF NTB CXL matrix
+        run: |
+          python3 benchmarks/transport/fabric_qualification.py \
+            --benchmark="${GITHUB_WORKSPACE}/bazel-bin/benchmarks/transport/transport_matrix_benchmark" \
+            --plugin="${INPUT_HOST_A_PLUGIN}" \
+            --approved-plugin-sha256="${APPROVED_PROVIDER_SHA256}" \
+            --device="${INPUT_HOST_A_DEVICE}" \
+            --device-path="${INPUT_HOST_A_DEVICE_PATH}" \
+            --link-state-path="${INPUT_HOST_A_LINK_STATE_PATH}" \
+            --kinds=ipcf,ntb,cxl \
+            --role=server \
+            --server-address="${INPUT_SERVER_ADDRESS}" \
+            --client-address="${INPUT_CLIENT_ADDRESS}" \
+            --base-port="${INPUT_BASE_PORT}" \
+            --fabric-domain="${INPUT_FABRIC_DOMAIN}" \
+            --fabric-channel="${INPUT_FABRIC_CHANNEL}" \
+            --host-a-node="${INPUT_HOST_A_NODE}" \
+            --host-b-node="${INPUT_HOST_B_NODE}" \
+            --host-a-security-domain="${INPUT_HOST_A_SECURITY_DOMAIN}" \
+            --host-b-security-domain="${INPUT_HOST_B_SECURITY_DOMAIN}" \
+            --iterations="${INPUT_ITERATIONS}" \
+            --expected-commit="${GITHUB_SHA}" \
+            --run-id="${GITHUB_RUN_ID}" \
+            --run-attempt="${GITHUB_RUN_ATTEMPT}" \
+            --session-nonce="${QUALIFICATION_SESSION_NONCE}" \
+            --sla-policy=benchmarks/transport/transport_qualification_sla.json \
+            --output-dir="${RUNNER_TEMP}/mino-fabric-a-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Upload host A role artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fabric-qualification-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-fabric-a-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 180
+
+  client:
+    name: Fabric qualification client (physical host B)
+    runs-on: [self-hosted, linux, x64, mino-fabric-b]
+    environment: physical-fabric
+    timeout-minutes: 120
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      APPROVED_PROVIDER_SHA256: ${{ vars.FABRIC_PROVIDER_SHA256 }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+      - name: Build tests and physical matrix
+        run: |
+          bazel test --lockfile_mode=error --config=gcc12 \
+            //mino/platform:fabric_provider_test \
+            //mino/transport:fabric_driver_test --test_output=errors
+          bazel build --lockfile_mode=error --config=gcc12 --config=release \
+            //benchmarks/transport:transport_matrix_benchmark
+      - name: Verify clean exact checkout including untracked files
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Allow host A to enter blocking TCP accept
+        run: sleep 30
+      - name: Run physical host B complete IPCF NTB CXL matrix
+        run: |
+          python3 benchmarks/transport/fabric_qualification.py \
+            --benchmark="${GITHUB_WORKSPACE}/bazel-bin/benchmarks/transport/transport_matrix_benchmark" \
+            --plugin="${INPUT_HOST_B_PLUGIN}" \
+            --approved-plugin-sha256="${APPROVED_PROVIDER_SHA256}" \
+            --device="${INPUT_HOST_B_DEVICE}" \
+            --device-path="${INPUT_HOST_B_DEVICE_PATH}" \
+            --link-state-path="${INPUT_HOST_B_LINK_STATE_PATH}" \
+            --kinds=ipcf,ntb,cxl \
+            --role=client \
+            --server-address="${INPUT_SERVER_ADDRESS}" \
+            --client-address="${INPUT_CLIENT_ADDRESS}" \
+            --base-port="${INPUT_BASE_PORT}" \
+            --fabric-domain="${INPUT_FABRIC_DOMAIN}" \
+            --fabric-channel="${INPUT_FABRIC_CHANNEL}" \
+            --host-a-node="${INPUT_HOST_A_NODE}" \
+            --host-b-node="${INPUT_HOST_B_NODE}" \
+            --host-a-security-domain="${INPUT_HOST_A_SECURITY_DOMAIN}" \
+            --host-b-security-domain="${INPUT_HOST_B_SECURITY_DOMAIN}" \
+            --iterations="${INPUT_ITERATIONS}" \
+            --expected-commit="${GITHUB_SHA}" \
+            --run-id="${GITHUB_RUN_ID}" \
+            --run-attempt="${GITHUB_RUN_ATTEMPT}" \
+            --session-nonce="${QUALIFICATION_SESSION_NONCE}" \
+            --sla-policy=benchmarks/transport/transport_qualification_sla.json \
+            --output-dir="${RUNNER_TEMP}/mino-fabric-b-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Upload host B role artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fabric-qualification-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mino-fabric-b-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 180
+
+  final:
+    name: Finalize complete IPCF NTB CXL evidence
+    if: always()
+    needs: [server, client]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact finalizer and SLA policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 1
+      - name: Verify clean exact finalizer checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Download host A role artifact
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fabric-qualification-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/server
+      - name: Download host B role artifact
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fabric-qualification-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/client
+      - name: Fail-closed cross-check and write all-kind final manifest
+        run: |
+          python3 benchmarks/transport/transport_qualification.py \
+            --qualification=fabric \
+            --server-root=evidence/server \
+            --client-root=evidence/client \
+            --policy=benchmarks/transport/transport_qualification_sla.json \
+            --expected-commit="${GITHUB_SHA}" \
+            --expected-run-id="${GITHUB_RUN_ID}" \
+            --expected-run-attempt="${GITHUB_RUN_ATTEMPT}" \
+            --expected-kinds=ipcf,ntb,cxl \
+            --out=evidence/final/manifest.json
+      - name: Archive both role artifacts and final manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fabric-qualification-final-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 180

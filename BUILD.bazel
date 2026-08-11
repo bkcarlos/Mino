@@ -5,3 +5,5 @@
 # //benchmarks/... 与 //tests/litmus。
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files([".dockerignore"])

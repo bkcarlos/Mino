@@ -26,6 +26,44 @@ TEST(ShardedCounterTest, AggregatesConcurrentDedicatedShards) {
     EXPECT_EQ(counter.Value(), 100'000u);
 }
 
+TEST(ShardedCounterTest, LocalShardPublishesConservedSnapshotsWithoutRmw) {
+    ShardedCounter<2> counter;
+    auto first = counter.BindLocalShard(0);
+    auto second = counter.BindLocalShard(1);
+    for (uint64_t value = 1; value <= 10'000; ++value) {
+        first.Increment();
+        second.Add(2);
+        if ((value % 127) == 0) {
+            EXPECT_EQ(counter.Value(), value * 3);
+        }
+    }
+    EXPECT_EQ(first.value(), 10'000u);
+    EXPECT_EQ(second.value(), 20'000u);
+    EXPECT_EQ(counter.Value(), 30'000u);
+}
+
+TEST(ShardedCounterTest, LocalBatchConservesAtSnapshotBoundary) {
+    ShardedCounter<1> counter;
+    {
+        auto batch = counter.BindLocalBatch(0, 256);
+        for (uint64_t value = 0; value < 1'000; ++value) batch.Increment();
+        EXPECT_EQ(counter.Value(), 768u);
+        EXPECT_EQ(batch.pending(), 232u);
+        batch.Flush();
+        EXPECT_EQ(counter.Value(), 1'000u);
+        batch.Add(7);
+    }
+    EXPECT_EQ(counter.Value(), 1'007u);
+
+    auto explicit_boundary = counter.BindLocalBatch(0);
+    for (uint64_t value = 0; value < 513; ++value) {
+        explicit_boundary.Accumulate(2);
+    }
+    EXPECT_EQ(counter.Value(), 1'007u);
+    explicit_boundary.Flush();
+    EXPECT_EQ(counter.Value(), 2'033u);
+}
+
 TEST(LogHistogramTest, UsesDocumentedPowerOfTwoBuckets) {
     ShardedLogHistogram<2> histogram;
     constexpr uint64_t kValues[] = {0, 1, 2, 3, 4, 7, 8, UINT64_MAX};

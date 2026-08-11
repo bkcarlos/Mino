@@ -52,6 +52,7 @@ registry::NodeRegistration BenchmarkNode() {
         .node_id = node_id,
         .process_identity = identity,
         .endpoints = {endpoint},
+        .security_domain_id = SecurityDomainId{1},
         .trust_domain = "benchmark",
         .health = registry::NodeHealth::kHealthy,
         .lease_epoch = 1,
@@ -81,6 +82,12 @@ registry::TopicMetadata BenchmarkTopic() {
         .max_subscribers = 1,
         .partition_count = 1,
         .record_topology = registry::RecordBackpressureTopology::kIsolated,
+        .acl = registry::TopicAcl{
+            .entries = {{.node_id = NodeId{1},
+                         .security_domain_id = SecurityDomainId{1},
+                         .permissions = static_cast<uint32_t>(
+                             registry::TopicPermission::kRecord)}},
+        },
         .region_version = 1,
         .channel_version = 1,
         .acl_version = 1,

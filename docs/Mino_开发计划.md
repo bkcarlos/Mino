@@ -12,11 +12,11 @@
 |---|---|
 | 设计文档 | 架构设计 v1、详细设计 v0.5，已完成评审修订 |
 | ADR 状态 | 0001~0014 共 14 篇，全部 ACCEPTED |
-| 代码 | D0~D5 核心实现、单元/集成测试、可观测性、扩展 Fuzz、验证 Benchmark 与 CI 编排已落地；D6 性能优化与产品化继续推进 |
+| 代码 | D0~D6 计划内实现、单元/集成测试、故障注入、Benchmark 与资格 CI 编排已落地；发布候选资格结果独立跟踪 |
 | 验证登记 | 27 项（V-01~V-27），P0 优先级 14 项、P1 优先级 11 项、P2 优先级 2 项 |
 | 关键不变量 | 32 项（INV-01~INV-32），贯穿测试与验收 |
 
-**结论**：D0~D5 的计划内实现已落地。Region ID 分配/Attach 契约、D2 多场景恢复长压、D4 强制断链与非空 Schema 双机 probe、D5 多持久化阶段 SIGKILL、可观测性、Frame/Segment/Handle Fuzz 及 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark 均已补齐。阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪；D0 GitHub 五配置已有历史归档，D4 当前提交真实物理双机验证已关闭，D2 当前提交长时间恢复压力测试、D5 当前提交 100 轮多场景故障 campaign，以及新增 Benchmark 的资格环境实跑仍是待关闭门禁。
+**结论**：D0~D6 的计划内代码与资格自动化已落地，阶段任务的“实现完成”与当前发布候选的“资格验证完成”分别跟踪。D6 已补齐 NUMA、大对象池、Topic Partition、RDMA/Fabric、Trust Domain/ACL、TLS、部署、生产指标接入、容量报告、真实 Region/Registry 滚动升级控制面、运维演练和 AArch64 资格框架。当前普通无缓存全仓测试为 137/137，Release 全仓 315 targets 构建通过；V-23 在真实 SPSC publish 基线上开发测量的 Counters/Sampled 95% 上界分别为 -0.020%/1.146%，满足 ≤1%/≤2% 原型目标。上述结果基于未提交工作树，只是开发证据，不替代 clean exact-commit qualification。D4 的历史物理双机证据绑定 commit `b02eabf`；当前候选已修改 Bridge/TCP/TLS/ACL 路径，必须重新执行物理双机资格。
 
 ### 1.2 阶段映射
 
@@ -49,9 +49,10 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 当前发布候选的剩余门禁：
 
 1. **D2 长时间恢复验证**：多场景 campaign 已覆盖 Publisher crash、Subscriber kill、慢 Subscriber、Lease 边界和 PID incarnation，并额外确定性执行 13 个持久化切点 SIGKILL 与 SIGSTOP-live/SIGCONT；class、cutpoint、interruption attempted/completed、完整日志 hash、commit/clean qualification 均 fail-closed。仍需对当前提交执行 fixed 与 run-derived seed 并保存 manifest。
-2. **D4 物理双机验证（已关闭）**：commit `b02eabf` 在 `192.168.31.54` 与 `192.168.31.66` 两台不同物理主机完成 v4 probe；[GitHub run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 的两份独立 hermetic build 字节一致，非空 Schema/Descriptor 持久化、连接后强制断链、两次自动重连、Session Epoch 变化、可靠帧重传/去重与双向 ACK 全部通过，fail-closed final manifest 归档于 `docs/validation/physical_two_host_31291274125_manifest.json`。
+2. **D4 当前候选物理双机复验**：commit `b02eabf` 的历史 v4 probe 已在 `192.168.31.54` 与 `192.168.31.66` 两台物理主机通过，[GitHub run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 及 final manifest 归档于 `docs/validation/physical_two_host_31291274125_manifest.json`。当前候选后续修改了 Bridge、TCP、mTLS、ACL 和 RemoteBridge 生产组装，旧 manifest 不替代当前 commit 的 clean exact-commit 双机复验。
 3. **D5 故障恢复验证**：多场景 runner 已覆盖 Record、Sync、Schema Store、Recording Manifest、Checkpoint/Seal 与 orphan quarantine 的真实 SIGKILL 切点；仍需对当前提交执行每场景 100 轮并归档 manifest。短写、EINTR、ENOSPC、EIO、EROFS 与磁盘暂停继续由常规 fault suite 覆盖。
-4. **扩展资格验证**：执行并归档 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark，以及 Frame/Segment/Handle ASAN/UBSAN Fuzz campaign。
+4. **扩展资格验证**：在 clean exact-commit 资格环境执行并归档 V-14/V-15/V-16/V-17/V-18/V-23/V-27 Benchmark，以及 Frame/Segment/Handle ASAN/UBSAN Fuzz campaign；开发机 `MEASURED` 结果不关闭登记。
+5. **D6 资格矩阵**：执行 72h soak、安全评审、真实容器/SBOM、生产容量报告、原生 AArch64、物理多 NUMA、真实 HugePage+设备注册、Storage Partition scaling，以及 RDMA/Fabric 双物理主机 final manifest。
 
 ---
 
@@ -274,7 +275,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D4-09 | 可靠传输与去重 ✅ | Sequence/ACK/Session Epoch、逐来源 HWM、重传/重连、重复抑制、Receiver restart `kDegraded`（`//mino/bridge:reliability`） | D4-07 | 5d |
 | D4-10 | 远端对象重建 ✅ | Schema/Topic 校验 → Canonical Decode → Slab/Journal → SPSC 原子发布，支持显式 N/N-1 binding（`//mino/bridge:remote_object_reconstructor`） | D4-07 | 3d |
 | D4-11 | Publisher/Subscriber 门面 API ✅ | Bus 入口、按 ID/名称创建、参与者 RAII、Transport Switcher/Bridge Dispatcher 集成（`//mino/runtime:bus`）；`//mino/runtime/deployment:remote_bridge` 提供 TCP、Schema Registry/Store、Negotiator 与自动重连 Connection Manager 的生产组装根 | D4-03 | 3d |
-| D4-12 | 双节点集成测试与物理双机资格验证 ✅ | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；commit `b02eabf` 已在两台不同物理主机完成非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重和双向 ACK，[run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 与 final manifest 均为 fail-closed passed | 全部 | 持续 |
+| D4-12 | 双节点集成测试 ✅；当前候选物理双机资格待复验 | `fork()` 双进程真实 TCP/IP、断链 HWM 恢复、Receiver restart、错误帧拒绝、N/N-1（`//mino/bridge:bridge_two_node_test`）；commit `b02eabf` 的历史双物理主机证据已归档，但当前候选修改了 Bridge/TCP/mTLS/ACL 路径，需生成新的 clean exact-commit final manifest | 全部 | 持续 |
 
 ### 6.2 并行工作流
 
@@ -295,7 +296,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 - [x] 同机端到端 Pub/Sub 通过
 - [x] 跨地址空间双节点 TCP/IP 端到端通过（`fork()` 双进程 loopback）
-- [x] 已扩展的物理双机 v4 probe 在 commit `b02eabf` 的两台不同物理主机（server `192.168.31.54`、client `192.168.31.66`）完成 TCP、非空 Schema/Descriptor 持久化、连接后强制断链、两次重连、Session Epoch、重传/去重与双向 ACK 验证；[GitHub run 31291274125](https://github.com/bkcarlos/Mino/actions/runs/31291274125) 全绿，fail-closed final manifest 已归档为 `docs/validation/physical_two_host_31291274125_manifest.json`
+- [ ] 当前发布候选完成扩展物理双机 probe：历史 commit `b02eabf` 已通过并归档，但当前候选修改了 Bridge/TCP/mTLS/ACL/RemoteBridge 路径，必须重新验证非空 Schema、强制断链、重连、Session Epoch、重传/去重与双向 ACK，并归档新的 commit-matched final manifest
 - [x] 断链重连后按策略恢复，去重窗口正常工作（V-19）
 - [x] 错误帧被校验拒绝且不导致越界（INV-31）
 - [x] N/N-1 Schema 互通通过
@@ -365,37 +366,37 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 
 **目标**：达到 SLA 性能目标，完成安全、部署、监控和运维能力建设。
 
-**入口条件**：D5 全部退出条件满足。
+**入口条件**：D6 实现允许与 D5 qualification 并行；M6 发布关闭仍要求 D5 全部退出条件满足。
 
 ### 8.1 性能优化（P5）
 
 | # | 任务 | 产出 | 依赖 | 预估 |
 |---|---|---|---|---|
 | D6-01 | 位图分片 + 每核缓存 ✅ | ShardedBitmap word/mask hinted scan + 进程本地每线程 cursor magazine；不预占空闲 Slot、不修改 SHM ABI，支持配置/Drain/命中回退统计与高竞争 benchmark（`//mino/shm/allocator:central_slab`、`//benchmarks/allocator:allocator_benchmark`） | D5 | 5d |
-| D6-02 | NUMA 感知分配 | NUMA Node 绑定、本地 Class 优先 | D5 | 5d |
+| D6-02 | NUMA 感知分配 ✅（物理多 NUMA 资格待执行） | 原生拓扑/cpuset 发现、`mbind`、local/node/stripe 策略、本地 Shard 优先、线程迁移失效与 fail-closed qualification runner；单 NUMA 环境只允许 nonqualified SKIPPED | D5 | 5d |
 | D6-03 | 批量发布/消费 ✅ | `Publisher<T>::PublishBatch` 与 `Subscriber<T>::TryPollBatch/PollBatch`，支持 SPSC/MPSC/Broadcast、部分失败计数、连续前缀 ACK、析构安全 ACK 与 Broadcast 独立 Pin；单消息 API/SHM ABI 不变 | D5 | 3d |
 | D6-04 | 网络批量收发 ✅ | TCP queued frame 使用 `sendmsg(iovec[])` 聚集写并精确处理 partial write/completion；SegmentWriter 对非 per-record 策略使用有界 `writev`，保持 Hook、Sync、rotation 与 durable counter 语义 | D5 | 3d |
 | D6-05 | UDP Driver ✅ | 小数据报保持原始单包；大消息使用 36B 大端 v1 Fragment Header，支持 Message/Fragment ID、CRC、乱序/重复重组、每连接/全局 bytes/messages 配额、fragment 上限、超时与 Close/Shutdown 清理（`//mino/transport:udp_driver`，详设 16.6） | D4-04 | 5d |
-| D6-06 | RDMA Driver | Buffer 注册/Pin/回收独立协议 | D4-04 | 8d |
-| D6-07 | Fabric Driver（IPCF/NTB/CXL） | FabricWindowDriver 实现（详设 15.3、16.7） | D4-04 | 8d |
-| D6-08 | 大对象专用池优化 | Huge Page、DMA/RDMA Buffer 隔离 | D1-10 | 3d |
-| D6-09 | Topic Partition | 单 Writer 瓶颈后的分区扩展（详设 17.8） | D5-06 | 5d |
+| D6-06 | RDMA Driver ✅（真实设备资格待执行） | 有界 SQ/RQ/CQ、MR Pin/Lease/Quota、认证 Principal、Bridge ACK completion、动态 device provider 与双端 fail-closed finalizer | D4-04 | 8d |
+| D6-07 | Fabric Driver（IPCF/NTB/CXL）✅（真实设备资格待执行） | 大端 Window/Commit/Doorbell 协议、cache maintenance、generation/session fencing、受控 Fabric attestation 与 IPCF/NTB/CXL 完整资格矩阵 | D4-04 | 8d |
+| D6-08 | 大对象专用池优化 ✅（HugePage+设备注册资格待执行） | 普通/HugePage/DMA/RDMA 用途隔离、extent coalesce、NUMA、Registration Provider、Pin/Lease/Quota/恢复与物理资格 runner | D1-10 | 3d |
+| D6-09 | Topic Partition ✅（V-24 目标硬件资格待执行） | 稳定 key/hash/source/manual 映射、每分区单 Writer 与预算隔离、Manifest v2、恢复/Retention/确定性 Merge Replay、1/2/4/8/16 scaling runner | D5-06 | 5d |
 | D6-10 | 长稳测试 ✅（框架完成，资格待执行） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/long-soak-validation.yml`；统一 allocator/channel/bridge/storage/observability workload，采样 RSS/Slab/Queue/FD，按 24h 归一化并对 <5% 门禁 fail-closed | 全部 | 持续 |
 
 ### 8.2 产品化（P6）
 
 | # | 任务 | 产出 | 依赖 | 预估 |
 |---|---|---|---|---|
-| D6-11 | Trust Domain 隔离与 ACL | Region 权限、Security Domain、Attach 校验（详设 22.1） | D5 | 5d |
-| D6-12 | TLS/认证 | Bridge 双向认证、Topic ACL（详设 22.2） | D4-06 | 5d |
-| D6-13 | 部署工具 | 节点启动脚本、配置生成、容器镜像 | D5 | 3d |
-| D6-14 | 监控与告警 | Prometheus Endpoint、OTLP Exporter、告警规则（详设 21.5.8） | D5 | 5d |
-| D6-15 | 容量规划 ✅ | `//mino/capacity:capacity` 提供节点多维资源预算、数据面 emergency reserve、原子 Reserve/Commit/Rollback、RAII Lease、headroom/rejection/JSON；已接入 Registry Topic/参与者、RemoteBridge、Recorder 与 RecorderService（详设 20.4） | D5 | 3d |
-| D6-16 | 滚动升级 | New Region + Drain/Cutover 流程与工具（详设 18.4） | D5 | 5d |
-| D6-17 | 运维手册 + 故障演练 | 手册文档、至少一轮实操演练 | 全部 | 5d |
-| D6-18 | AArch64 验证（V-13） | 与 x86-64 相同 ABI/Litmus/性能矩阵 | D6-01 | 5d |
+| D6-11 | Trust Domain 隔离与 ACL ✅（安全评审待关闭） | Region v6 Owner/Mode/Security Domain Attach 校验、`(domain,node)` Topic ACL；不可信域强制一域一 UID/GID/namespace，SecurityDomainId 仅防误附加 | D5 | 5d |
+| D6-12 | TLS/认证 ✅（物理双机与安全评审待关闭） | Hermetic OpenSSL TLS 1.3 mTLS、证书 Principal、轮换代缓存、非阻塞精确重试、证书/Registry/ACL 联合绑定，生产 RemoteBridge 禁止明文降级 | D4-06 | 5d |
+| D6-13 | 部署工具 ✅（镜像资格待执行） | 严格配置/生成/preflight、真实 `mino-node` supervisor、非 root/read-only 容器、runtime secret mount、SBOM/provenance 与 container smoke | D5 | 3d |
+| D6-14 | 监控与告警 ✅（真实环境演练待关闭） | 有界 Prometheus HTTP Endpoint、OTLP Pipeline、业务模块真实 Stats 接入、低基数告警规则、HTTP 指标和 firing/recovery 演练测试 | D5 | 5d |
+| D6-15 | 容量规划 ✅（生产 Inventory 报告待执行） | 多维预算、emergency reserve、原子 Reservation/RAII Lease、模块接入；capacity report 严格覆盖配置/Coordinator/报告 Topic 集合并生成 commit/config/hardware/hash artifact | D5 | 3d |
+| D6-16 | 滚动升级 ✅（真实环境实操待关闭） | 真实双 Region、Coordinator Drain/Retire、LocalBus Probe、durable Routing Catalog/CAS、Unix Supervisor、Cutover crash recovery 与恰好一次集成测试 | D5 | 5d |
+| D6-17 | 运维手册 + 故障演练 ✅（qualification 实操待执行） | 完整 Runbook、9 场景 watchdog/fail-closed runner；dirty quick drill 9/9 通过但明确不作为资格证据 | 全部 | 5d |
+| D6-18 | AArch64 验证（V-13）✅（原生物理 ARM64 待执行） | 原生 ABI/Litmus/核心测试/Release Benchmark runner、artifact schema、self-hosted workflow 与非资格 cross/QEMU smoke | D6-01 | 5d |
 
-**当前进度**：D6 首批实现已完成 D6-01、D6-03、D6-04、D6-05、D6-10 验证框架和 D6-15，共 6/18 项；D6-10 的 72 小时资格结果、正式 SLA、安全评审、滚动升级及演练仍按 DoD 独立关闭。
+**当前进度**：D6-01~D6-18 的计划内代码、测试、文档和对应 qualification runner 已全部落地（实现 18/18）；这不表示 M6 已关闭。当前未提交工作树的普通无缓存全仓测试 137/137、Release build 315 targets 通过，30 秒 soak 的 RSS/Slab/FD 稳定且零 Telemetry drop，V-23 开发测量满足 ≤1%/≤2%。72 小时 soak、目标硬件 SLA、物理多 NUMA、真实 RDMA/Fabric/HugePage、Storage Partition、原生 AArch64、当前 commit 双机 mTLS、安全评审、生产容量报告、镜像/SBOM和真实运维演练仍按 DoD 独立关闭。
 
 ### 8.3 退出条件（DoD）
 
@@ -478,7 +479,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D5 | V-10（Segment Commit）、V-16（Writer 线程模型）、V-17（Sync 策略）、V-18（Buffer 容量）、V-23（Telemetry 开销） |
 | D6 | V-13（AArch64）、V-20（Trust Domain）、V-22（Rollout）、V-24（Partition 阈值）、V-25（UDP/RDMA/Fabric） |
 
-实现状态补充：V-14/V-15/V-16/V-17/V-18/V-27 的统一 benchmark 与 V-23 Telemetry benchmark 已落地；结果模板保持 `PENDING`，必须在资格环境执行并以包含 commit、命令、构建配置、环境信息和日志/JSON SHA-256 的 artifact 关闭。验证代码存在不等于验证登记已关闭。
+实现状态补充：V-14/V-15/V-16/V-17/V-18/V-27 的统一 benchmark 与按 ADR-0009 真实 SPSC publish 基线重构的 V-23 Telemetry benchmark 已落地；开发机已产生 `MEASURED` 结果且 V-23 达到原型预算，但当前工作树 dirty、结果未绑定最终提交，因此登记仍保持 `PENDING`。必须在 clean exact-commit 资格环境执行，并以包含 commit、命令、构建配置、环境信息和日志/JSON SHA-256 的 artifact 关闭。验证代码或开发测量存在不等于验证登记已关闭。
 
 ---
 

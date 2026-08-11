@@ -37,6 +37,8 @@ struct SessionRecoveryOptions {
 struct DurableBoundaryReport {
     uint32_t topic_id = 0;
     uint32_t partition_id = 0;
+    uint64_t partition_generation = 1;
+    uint64_t partition_map_version = 1;
     uint64_t manifest_generation = 0;
     uint64_t durable_segment_id = 0;
     uint64_t durable_offset = 0;

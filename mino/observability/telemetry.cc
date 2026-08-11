@@ -7,13 +7,6 @@
 namespace mino::observability {
 namespace {
 
-uint64_t Mix(uint64_t value) noexcept {
-    value += 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31);
-}
-
 bool ValidMode(PerfTelemetryMode mode) noexcept {
     switch (mode) {
         case PerfTelemetryMode::kOff:
@@ -27,16 +20,22 @@ bool ValidMode(PerfTelemetryMode mode) noexcept {
 
 }  // namespace
 
-uint64_t StableSampleHash(const SampleKey& key) noexcept {
-    uint64_t hash = Mix(key.topic_id);
-    hash = Mix(hash ^ key.source_identity);
-    return Mix(hash ^ key.sequence);
+
+
+uint32_t SampleProjectionCutoff(uint32_t sample_rate_ppm) noexcept {
+    if (sample_rate_ppm == 0) return 0;
+    if (sample_rate_ppm >= 1'000'000) return UINT32_MAX;
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(sample_rate_ppm) << 32) / 1'000'000u);
 }
 
 bool IsSampled(const SampleKey& key, uint32_t sample_rate_ppm) noexcept {
     if (sample_rate_ppm == 0) return false;
     if (sample_rate_ppm >= 1'000'000) return true;
-    return StableSampleHash(key) % 1'000'000ULL < sample_rate_ppm;
+    const uint64_t prefix =
+        StableSamplePrefix(key.topic_id, key.source_identity);
+    return StableSampleProjection(prefix, key.sequence) <
+           SampleProjectionCutoff(sample_rate_ppm);
 }
 
 bool PolicyShouldTrace(const PerfTelemetryPolicy& policy,
@@ -96,6 +95,40 @@ bool TelemetryControl::TryLoadPolicy(PerfTelemetryPolicy* policy,
         }
     }
     return false;
+}
+
+bool TelemetryControl::Refresh(TelemetryThreadCache* cache) const noexcept {
+    if (cache == nullptr) return false;
+    PerfTelemetryPolicy policy;
+    for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+        const uint64_t before = sequence_.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) continue;
+        policy.mode = mode_.load(std::memory_order_relaxed);
+        policy.sample_rate_ppm =
+            sample_rate_ppm_.load(std::memory_order_relaxed);
+        policy.slow_threshold_ns =
+            slow_threshold_ns_.load(std::memory_order_relaxed);
+        policy.max_events_per_second =
+            max_events_per_second_.load(std::memory_order_relaxed);
+        const uint64_t after = sequence_.load(std::memory_order_acquire);
+        if (before != after) continue;
+        cache->policy_ = policy;
+        cache->policy_epoch_ = after;
+        cache->sample_cutoff_ =
+            SampleProjectionCutoff(policy.sample_rate_ppm);
+        cache->fast_actions_ =
+            policy.mode == PerfTelemetryMode::kOff
+                ? 0
+                : (policy.mode == PerfTelemetryMode::kCountersOnly
+                       ? kTelemetryCount
+                       : static_cast<uint8_t>(
+                             kTelemetryCount |
+                             kTelemetryNeedsTraceDecision));
+        cache->sample_all_ = policy.sample_rate_ppm >= 1'000'000;
+        cache->initialized_ = true;
+        return true;
+    }
+    return cache->initialized_;
 }
 
 PerfTelemetryPolicy TelemetryControl::policy() const noexcept {

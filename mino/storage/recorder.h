@@ -62,8 +62,17 @@ struct RecorderTopicConfig {
     std::string topic_name;
     uint64_t config_version = 0;
     uint32_t partition_count = 1;
+    uint64_t partition_map_version = 1;
+    uint64_t partition_generation = 1;
+    TopicPartitionStrategy partition_strategy = TopicPartitionStrategy::kManual;
+    uint16_t partition_hash_version = kStablePartitionHashVersion;
+    uint64_t partition_hash_seed = kDefaultPartitionHashSeed;
     RecordingPolicy policy{};
     RecorderBufferPoolOptions buffer_pool_options{};
+    // Zero preserves the legacy interpretation that buffer_pool_options is a
+    // per-partition budget. Non-zero is a topic-wide conserved byte budget split
+    // deterministically across independent partition pools.
+    size_t total_buffer_byte_limit = 0;
     SegmentWriterOptions segment_options{};
     SnapshotStoreOptions snapshot_options{};
     // Zero derives a stable, non-zero writer ID from the session/topic/partition.
@@ -83,7 +92,11 @@ enum class RecorderEnqueueDisposition : uint8_t {
 };
 
 struct RecorderEnqueueRequest {
+    // Used only by the manual strategy. Key/hash/source strategies route through
+    // the active persisted map and ignore this compatibility field.
     uint32_t partition_id = 0;
+    std::span<const std::byte> partition_key;
+    std::optional<uint64_t> partition_hash;
     RecorderRecordMetadata metadata{};
     std::span<const std::byte> payload;
     uint64_t user_tag = 0;
@@ -101,6 +114,8 @@ struct RecorderEnqueueResult {
     // The configured acknowledgement reached before Enqueue returned. Snapshot
     // mode has no RecordAckLevel and leaves this absent.
     std::optional<RecordAckLevel> acknowledged;
+    uint32_t partition_id = 0;
+    uint64_t partition_generation = 0;
     std::vector<DiscardedBuffer> discarded;
     std::vector<RecordingGapDebt> gap_debts;
 };
@@ -133,6 +148,9 @@ struct RecorderMetrics {
     uint64_t gap_debts = 0;
     uint64_t duplicate_records = 0;
     uint64_t writer_failures = 0;
+    uint64_t write_failures = 0;
+    uint64_t sync_failures = 0;
+    uint64_t pending_bytes = 0;
     uint64_t pump_calls = 0;
     uint64_t flush_calls = 0;
 };
@@ -140,6 +158,8 @@ struct RecorderMetrics {
 struct RecorderPartitionStatus {
     TopicId topic_id{};
     uint32_t partition_id = 0;
+    uint64_t partition_generation = 0;
+    uint64_t partition_map_version = 0;
     RecordingMode recording_mode = RecordingMode::kBestEffort;
     bool has_snapshot = false;
     TopicWriterState writer_state = TopicWriterState::kCreated;
@@ -208,6 +228,8 @@ public:
             std::chrono::nanoseconds::zero()) noexcept {
         return Enqueue(RecorderEnqueueRequest{
             .partition_id = partition_id,
+            .partition_key = {},
+            .partition_hash = std::nullopt,
             .metadata = metadata,
             .payload = payload,
             .user_tag = user_tag,
