@@ -71,6 +71,7 @@ cc_test(
     name = "mpsc_channel_test",
     timeout = "long",
     srcs = ["mpsc_channel_test.cc"],
+    tags = ["exclusive"],
     deps = [
         ":index_slot",
         ":mpsc",
