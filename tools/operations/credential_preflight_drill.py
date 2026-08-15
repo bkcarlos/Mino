@@ -63,6 +63,7 @@ def main(argv: list[str]) -> int:
         if not deploy.is_file():
             raise ProbeError(f"built mino_deploy is missing: {deploy}")
 
+        namespace_name = "mino-drill-domain-17"
         generated = checked(
             [
                 str(deploy),
@@ -77,6 +78,12 @@ def main(argv: list[str]) -> int:
                 "17",
                 "--region-id",
                 "617",
+                "--service-uid",
+                str(os.geteuid()),
+                "--service-gid",
+                str(os.getegid()),
+                "--namespace",
+                namespace_name,
             ],
             workspace,
         )
@@ -91,17 +98,39 @@ def main(argv: list[str]) -> int:
             ca = secrets / "ca.pem"
             certificate = secrets / "tls.crt"
             private_key = secrets / "tls.key"
+            isolation_policy = secrets / "security-domains.toml"
+            namespace_attestation = secrets / "security-domain.namespace"
             ca.write_text("drill trust anchor placeholder\n", encoding="ascii")
             certificate.write_text("drill certificate placeholder\n", encoding="ascii")
             private_key.touch(mode=0o600)
-            os.chmod(ca, 0o600)
-            os.chmod(certificate, 0o600)
-            os.chmod(private_key, 0o600)
+            isolation_policy.write_text(
+                "schema_version = 1\n\n"
+                "[[domains]]\n"
+                "security_domain_id = 17\n"
+                "trusted = false\n"
+                f"uid = {os.geteuid()}\n"
+                f"gid = {os.getegid()}\n"
+                f'namespace = "{namespace_name}"\n',
+                encoding="ascii",
+            )
+            namespace_attestation.write_text(namespace_name + "\n", encoding="ascii")
+            for credential in (
+                ca,
+                certificate,
+                private_key,
+                isolation_policy,
+                namespace_attestation,
+            ):
+                os.chmod(credential, 0o600)
 
             replacements = {
                 "/run/secrets/mino/ca.pem": str(ca),
                 "/run/secrets/mino/tls.crt": str(certificate),
                 "/run/secrets/mino/tls.key": str(private_key),
+                "/etc/mino/security-domains.toml": str(isolation_policy),
+                "/run/secrets/mino/security-domain.namespace": str(
+                    namespace_attestation
+                ),
                 "/var/lib/mino/data": str(data),
                 "/run/mino": str(runtime),
                 "/var/lib/mino/schemas": str(schemas),

@@ -318,7 +318,7 @@
               "argv": ["{bazel}", "test", "//tools/deployment:rolling_upgrade_drill_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
               "expected_exit_codes": [0],
               "expected_failure": false,
-              "required_output_regex": "rolling-upgrade drill passed"
+              "required_output_regex": "rolling-upgrade CLI drill passed"
             }
           ]
         },
@@ -330,7 +330,7 @@
               "argv": ["{bazel}", "test", "//tools/deployment:rolling_upgrade_drill_test", "--test_timeout=240", "--test_output=streamed", "--nocache_test_results"],
               "expected_exit_codes": [0],
               "expected_failure": false,
-              "required_output_regex": "rolling-upgrade drill passed"
+              "required_output_regex": "rolling-upgrade CLI drill passed"
             },
             {
               "name": "cutover-crash-resume-conservation",
