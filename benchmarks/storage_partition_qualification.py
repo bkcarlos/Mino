@@ -233,7 +233,7 @@ def collect_storage(mount: dict[str, Any], cwd: Path) -> dict[str, Any]:
             raise QualificationError(f"lsblk has no row for mount source {source}")
         leaf = current
         seen: set[str] = set()
-        while str(current.get("pkname", "")):
+        while current.get("pkname"):
             parent_name = str(current.get("pkname"))
             if parent_name in seen or parent_name not in by_name:
                 raise QualificationError("lsblk parent chain is incomplete or cyclic")

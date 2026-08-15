@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from typing import Any
 
 from benchmarks import storage_partition_qualification as qualification
@@ -176,6 +177,43 @@ class StoragePartitionQualificationContractTest(unittest.TestCase):
             qualification.derive_outcome([], True, matches, True),
             ("nonqualified", False),
         )
+
+    def test_storage_probe_stops_at_null_parent_for_partition_mount(self):
+        lsblk = {
+            "blockdevices": [
+                {
+                    "name": "/dev/nvme0n1",
+                    "pkname": None,
+                    "type": "disk",
+                    "model": "Samsung SSD 980 PRO 2TB",
+                    "serial": "test-serial",
+                    "tran": "nvme",
+                    "rota": False,
+                    "children": [
+                        {
+                            "name": "/dev/nvme0n1p1",
+                            "pkname": "/dev/nvme0n1",
+                            "type": "part",
+                            "model": None,
+                            "serial": None,
+                            "tran": "nvme",
+                            "rota": False,
+                        }
+                    ],
+                }
+            ]
+        }
+        with mock.patch.object(
+            qualification, "run_text", return_value=json.dumps(lsblk)
+        ):
+            storage = qualification.collect_storage(
+                {"source": "/dev/nvme0n1p1"}, Path(".")
+            )
+        self.assertEqual(storage["probe_error"], "")
+        self.assertEqual(storage["device"], "/dev/nvme0n1p1")
+        self.assertEqual(storage["parent_device"], "/dev/nvme0n1")
+        self.assertEqual(storage["transport"], "nvme")
+        self.assertFalse(storage["rotational"])
 
     def test_dirty_worktree_including_untracked_file_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
