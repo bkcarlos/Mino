@@ -2166,15 +2166,13 @@ private:
         std::unordered_map<ConnectionId, std::deque<ReadyMessageEntry*>>
             compacted_index;
         compacted_index.reserve(ready_messages_by_connection_.size());
-        size_t compacted_messages = 0;
         for (const ReadyMessageEntry& entry : ready_messages_) {
             if (!entry.message.has_value()) continue;
             compacted.push_back(ReadyMessageEntry{.message = *entry.message});
             ReadyMessageEntry* const ready = &compacted.back();
             compacted_index[ready->message->connection_id].push_back(ready);
-            ++compacted_messages;
         }
-        assert(compacted_messages == ready_receive_messages_);
+        assert(compacted.size() == ready_receive_messages_);
         ready_messages_.swap(compacted);
         ready_messages_by_connection_.swap(compacted_index);
     }
