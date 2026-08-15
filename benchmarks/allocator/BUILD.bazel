@@ -20,8 +20,8 @@ py_test(
         "large_object_pool_qualification_sla.json",
         "//docs/validation:Large_object_pool_qualification_artifact.schema.json",
     ],
-    deps = [":large_object_pool_qualification_lib"],
     python_version = "PY3",
+    deps = [":large_object_pool_qualification_lib"],
 )
 
 py_binary(

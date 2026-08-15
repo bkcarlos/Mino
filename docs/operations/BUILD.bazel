@@ -2,7 +2,10 @@ package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "operations_files",
-    srcs = glob(["*.md", "*.json"]),
+    srcs = glob([
+        "*.md",
+        "*.json",
+    ]),
 )
 
 exports_files([

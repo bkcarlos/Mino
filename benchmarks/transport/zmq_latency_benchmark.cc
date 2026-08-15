@@ -211,7 +211,7 @@ bool SetSocketOptions(void* socket, std::string* error) {
     const int keepalive = 1;
     const int heartbeat_interval = 1000;
     const int heartbeat_timeout = 10'000;
-    for (const auto [option, value] : {
+    for (const auto& [option, value] : {
              std::pair{ZMQ_LINGER, linger},
              std::pair{ZMQ_IMMEDIATE, immediate},
              std::pair{ZMQ_SNDHWM, hwm},

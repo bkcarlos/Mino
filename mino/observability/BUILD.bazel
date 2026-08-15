@@ -25,11 +25,11 @@ cc_library(
         "telemetry.h",
         "tracing.h",
     ],
-    deps = ["//mino/common:status"],
     linkopts = select({
         "@platforms//os:linux": ["-pthread"],
         "//conditions:default": [],
     }),
+    deps = ["//mino/common:status"],
 )
 
 cc_test(

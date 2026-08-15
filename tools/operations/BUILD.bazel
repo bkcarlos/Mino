@@ -11,10 +11,10 @@ py_binary(
     name = "drill_runner",
     srcs = ["drill_runner.py"],
     data = [
+        ":credential_preflight_drill.py",
         "//configs/alerts:mino.rules.yml",
         "//configs/drills:operations_drills.json",
         "//docs/operations:operations_files",
-        ":credential_preflight_drill.py",
     ],
     main = "drill_runner.py",
     python_version = "PY3",

@@ -47,8 +47,11 @@ def _common_test_options(timeout_seconds: int) -> list[str]:
 
 
 def _mpmc_command(bazel: str, remaining_seconds: int) -> list[str]:
-    fixed_phase_reserve = min(60, max(1, remaining_seconds // 20))
-    timed_phase_seconds = max(0, remaining_seconds - fixed_phase_reserve)
+    # Leave room for a cold Bazel analysis/build, the fixed conservation phase,
+    # and test shutdown instead of assigning nearly the entire suite deadline to
+    # TimedHighContention and then killing an otherwise successful test.
+    command_reserve = min(300, max(30, remaining_seconds // 10))
+    timed_phase_seconds = max(0, remaining_seconds - command_reserve)
     return [
         bazel,
         "test",
@@ -435,6 +438,11 @@ def _seed(raw: str) -> int:
 
 
 def _self_test() -> None:
+    short_mpmc = _mpmc_command("bazel", 299)
+    assert "--test_env=MPMC_STRESS_DURATION_SEC=269" in short_mpmc
+    long_mpmc = _mpmc_command("bazel", 3600)
+    assert "--test_env=MPMC_STRESS_DURATION_SEC=3300" in long_mpmc
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         workspace = root / "workspace"

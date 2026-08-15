@@ -10,15 +10,15 @@ py_library(
 py_binary(
     name = "fabric_qualification",
     srcs = ["fabric_qualification.py"],
-    deps = [":transport_qualification_lib"],
     python_version = "PY3",
+    deps = [":transport_qualification_lib"],
 )
 
 py_binary(
     name = "rdma_qualification",
     srcs = ["rdma_qualification.py"],
-    deps = [":transport_qualification_lib"],
     python_version = "PY3",
+    deps = [":transport_qualification_lib"],
 )
 
 py_binary(
@@ -35,8 +35,8 @@ py_test(
         "transport_qualification_sla.json",
         "//docs/validation:Transport_qualification_artifact.schema.json",
     ],
-    deps = [":transport_qualification_lib"],
     python_version = "PY3",
+    deps = [":transport_qualification_lib"],
 )
 
 # Direct ZeroMQ comparison only. This target intentionally does not depend on
@@ -52,7 +52,7 @@ cc_binary(
     ],
     deps = [
         "//mino/bridge:reliability",
-        "@libzmq//:libzmq",
+        "@libzmq",
     ],
 )
 
@@ -83,6 +83,6 @@ cc_binary(
         "//mino/bridge:wire_frame",
         "//mino/common:status",
         "//mino/transport:tcp_driver",
-        "@libzmq//:libzmq",
+        "@libzmq",
     ],
 )

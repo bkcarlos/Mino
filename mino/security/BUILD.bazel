@@ -10,9 +10,9 @@ cc_library(
     srcs = ["tls.cc"],
     hdrs = ["tls.h"],
     deps = [
+        ":security_domain",
         "//mino/common:ids",
         "//mino/common:result",
-        ":security_domain",
         "//mino/common:status",
         "@openssl//:ssl",
     ],

@@ -4,6 +4,10 @@ cc_library(
     name = "monitoring",
     srcs = ["monitoring.cc"],
     hdrs = ["monitoring.h"],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":local_bus",
         ":remote_bridge",
@@ -16,10 +20,6 @@ cc_library(
         "//mino/shm/allocator:large_object_pool",
         "//mino/storage:recorder",
     ],
-    linkopts = select({
-        "@platforms//os:linux": ["-pthread"],
-        "//conditions:default": [],
-    }),
 )
 
 cc_test(

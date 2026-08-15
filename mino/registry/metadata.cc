@@ -345,11 +345,11 @@ Status ValidateTopicMetadata(const TopicMetadata& metadata,
                  !ValidTransportKind(*route.preferred_transport))) {
                 return Invalid("static route target or transport is invalid");
             }
-            const uint32_t subscribe =
+            constexpr uint32_t subscribe =
                 static_cast<uint32_t>(TopicPermission::kSubscribe);
             const bool acl_allows_target = std::any_of(
                 metadata.acl.entries.begin(), metadata.acl.entries.end(),
-                [route, subscribe](const TopicAclEntry& entry) {
+                [route](const TopicAclEntry& entry) {
                     return entry.node_id == route.target_node &&
                            (entry.permissions & subscribe) == subscribe;
                 });

@@ -193,7 +193,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] SPSC 长时间回绕无 ABA、无重复/漏消费（INV-01，`spsc_channel_test` 10000 次回绕 + `spsc_channel_xproc_test` fork 双进程 20000 条 ~312 次回绕零丢失零重复）
 - [x] MPSC 1/2/8/32/128 Publisher 并发正确，Producer Kill 后队列不永久阻塞（INV-17；`MpscChannelTest.PublisherConcurrencyMatrix` + `mpsc_channel_xproc_test`）
 - [x] Broadcast 1/2/8/16 Subscriber 独立 Cursor 推进，ACK 责任不受 ID 复用影响（INV-05、INV-18；`BroadcastThreadTest.SubscriberConcurrencyMatrix` + Membership/Lease 竞态测试）
-- [ ] 当前发布候选执行新版 Publisher/Subscriber 多场景随机 campaign ≥1 小时，fixed 与 run-derived seed 均满足五类场景、13 个确定性 SIGKILL 切点、SIGSTOP-live、守恒、ACK/Lease/Journal 清理、allocator 容量恢复及 commit/clean qualification，并归档完整 hash manifest（旧版 `runtime_recovery_stress_long_test` 历史运行不替代新版门禁）
+- [x] 当前发布候选执行新版 Publisher/Subscriber 多场景随机 campaign ≥1 小时，fixed 与 run-derived seed 均满足五类场景、13 个确定性 SIGKILL 切点、SIGSTOP-live、守恒、ACK/Lease/Journal 清理、allocator 容量恢复及 commit/clean qualification，并归档完整 hash manifest（`e53e1711beac6e72e8eb2a5a364ce55d99721eb3`：fixed seed `920009` 实跑 7,239.603 秒，run-derived seed `202608150048` 实跑 7,233.613 秒，均 `outcome=passed`、`qualification_eligible=true`；manifest SHA-256 分别为 `4c496e5c5e9dd1bdaa90e35263ade775bb9d7262cb9f59f2bd0d882acdf50cbf`、`d4db943f52ae47e0cdddebe44e7c10db0219d80e5227c2495a814281d83baa2e`）
 - [x] ASAN/UBSAN/TSAN 全部通过（2026-08-01 修复后全仓无缓存回归各 59/59；D2 新增 JournalChannelRecoveryCoordinator、Broadcast era-bound ACK 与三态 Lease 回归）
 - [x] TLA+ 模型不变量与 INV 对应（`docs/formal/`，V-03、V-04、INV-32；固定 `.cfg` 与 CI 已落地；TLC v1.7.4 实跑通过：MPSC 55,672、Broadcast 1,241、Lease 106,304 个 distinct states）
 
@@ -358,7 +358,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 - [x] Ingestion Sequence 无无法解释的永久空洞（INV-23；Gap/Tombstone + `topic_writer_test`）
 - [x] Replay 可按 Topic/时间/Sequence 过滤回放（`replay_engine_test` + Storage CLI 测试）
 - [x] **正式 SLA 文档发布**（`docs/benchmarks/Storage_SLA.md`）
-- [ ] 当前发布候选在 clean、commit-matched qualification 下完成新版六场景、每场景 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、逐场景计数、命令、日志 SHA-256、watchdog 结果和 GitHub run provenance 的 manifest
+- [x] 当前发布候选在 clean、commit-matched qualification 下完成新版六场景、每场景 100 轮 SIGKILL 恢复 campaign，并归档包含 commit、seed、逐场景计数、命令、日志 SHA-256、watchdog 结果和 GitHub run provenance 的 manifest（`e53e1711beac6e72e8eb2a5a364ce55d99721eb3`：GitHub Actions run `31859685079` attempt `1`、seed `3`、六场景 100 轮、3,400/3,400 cases、`outcome=passed`、`qualification_eligible=true`；artifact `extended-storage-fault-31859685079-1` 已上传，manifest SHA-256 `2b39302be9da185249b95619dcacfd02fb0380fe4c9c9f43943adc3920997274`）
 
 ---
 
@@ -381,7 +381,7 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D6-07 | Fabric Driver（IPCF/NTB/CXL）✅（真实设备资格待执行） | 大端 Window/Commit/Doorbell 协议、cache maintenance、generation/session fencing、受控 Fabric attestation 与 IPCF/NTB/CXL 完整资格矩阵 | D4-04 | 8d |
 | D6-08 | 大对象专用池优化 ✅（HugePage+设备注册资格待执行） | 普通/HugePage/DMA/RDMA 用途隔离、extent coalesce、NUMA、Registration Provider、Pin/Lease/Quota/恢复与物理资格 runner | D1-10 | 3d |
 | D6-09 | Topic Partition ✅（V-24 目标硬件资格待执行） | 稳定 key/hash/source/manual 映射、每分区单 Writer 与预算隔离、Manifest v2、恢复/Retention/确定性 Merge Replay、1/2/4/8/16 scaling runner | D5-06 | 5d |
-| D6-10 | 长稳测试 ✅（框架完成，资格待执行） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/long-soak-validation.yml`；统一 allocator/channel/bridge/storage/observability workload，采样 RSS/Slab/Queue/FD，按 24h 归一化并对 <5% 门禁 fail-closed | 全部 | 持续 |
+| D6-10 | 长稳测试 ✅（72 小时资格已通过） | `//benchmarks/soak_probe:soak_probe` + `tools/ci/run_long_soak.py` + `.github/workflows/long-soak-validation.yml`；当前发布候选完成 259,200.027 秒 clean exact-commit qualification，RSS/Slab 线性与首尾增长均为 0%/24h，四项 `<5%` 门禁通过 | 全部 | 持续 |
 
 ### 8.2 产品化（P6）
 
@@ -396,16 +396,29 @@ D0 (ADR ACCEPTED + Bazel 骨架)
 | D6-17 | 运维手册 + 故障演练 ✅（qualification 实操待执行） | 完整 Runbook、9 场景 watchdog/fail-closed runner；dirty quick drill 9/9 通过但明确不作为资格证据 | 全部 | 5d |
 | D6-18 | AArch64 验证（V-13）✅（原生物理 ARM64 待执行） | 原生 ABI/Litmus/核心测试/Release Benchmark runner、artifact schema、self-hosted workflow 与非资格 cross/QEMU smoke | D6-01 | 5d |
 
-**当前进度**：D6-01~D6-18 的计划内代码、测试、文档和对应 qualification runner 已全部落地（实现 18/18）；这不表示 M6 已关闭。当前未提交工作树的普通无缓存全仓测试 137/137、Release build 315 targets 通过，30 秒 soak 的 RSS/Slab/FD 稳定且零 Telemetry drop，V-23 开发测量满足 ≤1%/≤2%。72 小时 soak、目标硬件 SLA、物理多 NUMA、真实 RDMA/Fabric/HugePage、Storage Partition、原生 AArch64、当前 commit 双机 mTLS、安全评审、生产容量报告、镜像/SBOM和真实运维演练仍按 DoD 独立关闭。
+**当前进度**：D6-01~D6-18 的计划内代码、测试、文档和对应 qualification runner 已全部落地（实现 18/18）；这不表示 M6 已关闭。普通无缓存全仓测试 137/137、Release build 315 targets 通过，V-23 开发测量满足 ≤1%/≤2%；当前发布候选 `e53e1711beac6e72e8eb2a5a364ce55d99721eb3` 的 72 小时 soak 已通过并完成独立 manifest 复核，D5 六场景×100 已由 GitHub Actions 完成 provenance 与 artifact 归档。目标硬件 SLA、物理多 NUMA、真实 RDMA/Fabric/HugePage、Storage Partition、原生 AArch64、当前 commit 双机 mTLS、安全评审、生产容量报告、镜像/SBOM和真实运维演练仍按 DoD 独立关闭。
 
 ### 8.3 退出条件（DoD）
 
 - [ ] P4 发布的正式 SLA 在目标硬件上达标
-- [ ] 长稳测试 ≥72 小时通过
+- [x] 长稳测试 ≥72 小时通过（`e53e1711beac6e72e8eb2a5a364ce55d99721eb3`，2026-08-12 00:48:27 UTC 至 2026-08-15 00:48:27 UTC，259,200.027 秒，4,319 samples，29,472,172,755 operations，平均 113,731 ops/s；RSS `22,200,320 B`、Slab `20,480 B`、FD `3` 全程不变，Telemetry dropped `0`，四项增长门禁均为 `0%/24h`，`outcome=passed`、`qualification_eligible=true`、`artifact_complete=true`；manifest SHA-256 `77e3dd6518b9f9d5e4cf9e914bd38df042df829da17461e01b12827a7248b968`）
 - [ ] Trust Domain 隔离与 ACL 通过安全评审
 - [ ] 滚动升级和故障演练完成至少一轮实操
 - [ ] 监控告警规则在演练中验证有效
 - [ ] 容量规划报告覆盖全部生产 Topic
+
+### 8.4 当前发布候选资格结果（2026-08-15）
+
+| 门禁 | 结果 | 关键证据 | 关闭状态 |
+|---|---|---|---|
+| D2 Runtime recovery fixed | PASS | seed `920009`；7,239.603 秒；五类场景 attempted/completed 完全一致；13 个持久化切点均含 SIGKILL；manifest SHA-256 `4c496e5c5e9dd1bdaa90e35263ade775bb9d7262cb9f59f2bd0d882acdf50cbf` | 已关闭 |
+| D2 Runtime recovery run-derived | PASS | seed `202608150048`；7,233.613 秒；五类场景 attempted/completed 完全一致；13 个持久化切点均含 SIGKILL；manifest SHA-256 `d4db943f52ae47e0cdddebe44e7c10db0219d80e5227c2495a814281d83baa2e` | 已关闭 |
+| D5 Storage SIGKILL matrix | PASS | GitHub Actions run `31859685079` attempt `1`；seed `3`；六场景×100 轮；3,400/3,400 cases；artifact `extended-storage-fault-31859685079-1`；manifest SHA-256 `2b39302be9da185249b95619dcacfd02fb0380fe4c9c9f43943adc3920997274` | 已关闭 |
+| D6 72 小时 soak | PASS | 259,200.027 秒；4,319 samples；29,472,172,755 operations；RSS/Slab 四项增长均 `0%/24h`；manifest SHA-256 `77e3dd6518b9f9d5e4cf9e914bd38df042df829da17461e01b12827a7248b968` | 已关闭 |
+
+上述结果全部绑定 clean exact commit `e53e1711beac6e72e8eb2a5a364ce55d99721eb3`。72 小时与 D2 的本地证据当前保存在 `.cache/mino-long-soak-72h-e53e171/`、`.cache/recovery-stress-e53e171-runtime-fixed/` 与 `.cache/recovery-stress-e53e171-runtime-run-derived/`；`.cache/` 不进入 Git，正式发布归档仍应将原始 manifest、日志和逐样本文件上传到受保留策略保护的 artifact store，并按表中 SHA-256 复核。D5 的 GitHub artifact 已按 workflow 的 90 天策略归档。
+
+补充软件门禁：commit `e53e1711` 的 Extended Fuzz（run `31496213551`）、Schema Extended（run `31496213528`）和 Formal Validation（run `31496213565`）均通过；Extended Long-Running run `31859685079` 的 Subscriber/Broadcast、Bridge reconnect 与 Storage job 通过。MPMC TSAN job 暴露 timed phase 逐 token 留存导致内存随时长增长以及 runner 未预留 Bazel/校验收尾时间的问题；修复后本地 30 秒 target 与 300 秒 runner 均通过，300 秒运行的 timed phase 为 269 秒、处理 166,536,832 tokens，远程一小时复核需在包含该修复的新 commit 上执行。
 
 ---
 

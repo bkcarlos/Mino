@@ -61,7 +61,7 @@ sh_test(
     size = "small",
     srcs = ["rolling_upgrade_drill.sh"],
     args = ["$(location //tools/mino:mino)"],
-    data = ["//tools/mino:mino"],
+    data = ["//tools/mino"],
 )
 
 py_test(
@@ -87,12 +87,12 @@ py_test(
     name = "node_supervisor_smoke_test",
     size = "small",
     srcs = ["node_supervisor_smoke.py"],
-    main = "node_supervisor_smoke.py",
     data = [
         ":mino_deploy",
         ":mino_node",
         "//configs:node.container-recorder.toml",
     ],
+    main = "node_supervisor_smoke.py",
 )
 
 py_test(

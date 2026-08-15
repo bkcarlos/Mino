@@ -34,10 +34,10 @@
 //   - Sequence conservation (fixed-count phase): the multiset of dequeued
 //     sequence numbers equals the multiset of reserved ones — every position
 //     is reserved exactly once and consumed exactly once.
-//   - No data loss / no duplication (both phases): every enqueued token is
-//     consumed exactly once.
-//   - Data integrity (both phases): the token read from a slot is exactly the
-//     token the reserving producer wrote into it.
+//   - No data loss / no duplication: the fixed phase checks every token; the
+//     timed phase checks bounded per-producer count/sum/xor/min/max signatures.
+//   - Data integrity: producer and counter fields remain consistent with the
+//     committed per-producer ranges.
 
 #include "mino/shm/channel/mpmc_ring.h"
 
@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -108,6 +109,79 @@ struct TokenLedger {
 
     std::vector<std::vector<uint64_t>> consumed;
     std::vector<std::mutex> consumed_mu;
+};
+
+struct AggregateTokenLedger {
+    struct State {
+        uint64_t count = 0;
+        uint64_t sum = 0;
+        uint64_t xor_value = 0;
+        uint64_t min = std::numeric_limits<uint64_t>::max();
+        uint64_t max = 0;
+    };
+
+    explicit AggregateTokenLedger(uint64_t producers)
+        : states(producers), state_mu(producers) {}
+
+    void Record(uint64_t token) {
+        const uint64_t producer = token >> 56;
+        const uint64_t counter = token & 0x00FFFFFFFFFFFFFFULL;
+        ASSERT_LT(producer, states.size());
+        std::lock_guard<std::mutex> lock(state_mu[producer]);
+        State& state = states[producer];
+        ++state.count;
+        state.sum += counter;
+        state.xor_value ^= counter;
+        state.min = std::min(state.min, counter);
+        state.max = std::max(state.max, counter);
+    }
+
+    static uint64_t ExpectedSum(uint64_t count) {
+        uint64_t lhs = count;
+        uint64_t rhs = count - 1;
+        if ((lhs & 1u) == 0) {
+            lhs /= 2;
+        } else {
+            rhs /= 2;
+        }
+        return lhs * rhs;
+    }
+
+    static uint64_t ExpectedXor(uint64_t count) {
+        switch (count & 3u) {
+            case 0:
+                return 0;
+            case 1:
+                return count - 1;
+            case 2:
+                return 1;
+            default:
+                return count;
+        }
+    }
+
+    void Verify(const std::vector<uint64_t>& total_enqueued) const {
+        ASSERT_EQ(states.size(), total_enqueued.size());
+        for (uint64_t p = 0; p < states.size(); ++p) {
+            const State& state = states[p];
+            const uint64_t expected = total_enqueued[p];
+            ASSERT_EQ(state.count, expected)
+                << "producer " << p << ": consumed count mismatch";
+            EXPECT_EQ(state.sum, ExpectedSum(expected))
+                << "producer " << p << ": consumed sum mismatch";
+            EXPECT_EQ(state.xor_value, ExpectedXor(expected))
+                << "producer " << p << ": consumed xor mismatch";
+            if (expected > 0) {
+                EXPECT_EQ(state.min, 0u)
+                    << "producer " << p << ": first counter is missing";
+                EXPECT_EQ(state.max, expected - 1)
+                    << "producer " << p << ": final counter is missing";
+            }
+        }
+    }
+
+    std::vector<State> states;
+    std::vector<std::mutex> state_mu;
 };
 
 // One shared ring plus per-run state, torn down with the fixture.
@@ -268,7 +342,7 @@ TEST(MpmcRingStressTest, TimedHighContention) {
     std::atomic<uint64_t> full_events{0};
     std::atomic<uint64_t> empty_events{0};
 
-    TokenLedger token_ledger(num_producers);
+    AggregateTokenLedger token_ledger(num_producers);
     std::vector<std::atomic<uint64_t>> enqueued_per_producer(num_producers);
     for (auto& counter : enqueued_per_producer) {
         counter.store(0, std::memory_order_relaxed);
