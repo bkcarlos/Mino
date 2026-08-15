@@ -39,7 +39,7 @@ jobs:
       STORAGE_DIRECTORY: ${{ inputs.storage_directory || '/code/Mino/.cache' }}
       QUALIFICATION_ROUNDS: ${{ inputs.rounds || '3' }}
       QUALIFICATION_PROCESSES: ${{ inputs.processes || '2' }}
-      EVIDENCE_DIRECTORY: ${{ runner.temp }}/mino-storage-partition-${{ github.run_id }}-${{ github.run_attempt }}
+      EVIDENCE_DIRECTORY: ${{ github.workspace }}/.cache/mino-storage-partition-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout exact clean source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
