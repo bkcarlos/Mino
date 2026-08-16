@@ -348,7 +348,10 @@ TEST(TopicWriterTest,
     ASSERT_EQ(segments.size(), 1u);
     EXPECT_EQ(segments[0].state, SegmentPersistentState::kOpen);
     EXPECT_EQ(segments[0].first_ingestion_sequence, 1u);
-    EXPECT_EQ(segments[0].last_ingestion_sequence, 4u);
+    // kWritten only requires segment bytes to reach the write boundary. The
+    // OPEN manifest may lag until a durable, seal, or rotation boundary; crash
+    // recovery reconciles it by scanning the complete segment records.
+    EXPECT_EQ(segments[0].last_ingestion_sequence, 1u);
     const std::vector<Record> records =
         ReadRecords(fixture.root / segments[0].relative_path);
     ASSERT_EQ(records.size(), 4u);

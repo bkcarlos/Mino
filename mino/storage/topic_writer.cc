@@ -791,8 +791,6 @@ Status TopicWriter::FlushCurrentLocked(
     if (segment_writer_ == nullptr) return Status::Ok();
     Status status = segment_writer_->Flush(now_ns);
     if (!status.ok()) return status;
-    status = UpdateOpenManifestLocked();
-    if (!status.ok()) return status;
 
     while (written_ack_count_ < active_acks_.size()) {
         const PendingAck& ack = active_acks_[written_ack_count_++];
@@ -874,8 +872,10 @@ Status TopicWriter::PublishDurabilityLocked(
     const size_t durable_count = static_cast<size_t>(durable_records);
     if (durable_count <= durable_ack_count_) return Status::Ok();
 
+    Status status = UpdateOpenManifestLocked();
+    if (!status.ok()) return status;
     const PendingAck& last_durable = active_acks_[durable_count - 1];
-    Status status = partition_manifest_->UpdateCheckpoint(DurableCheckpoint{
+    status = partition_manifest_->UpdateCheckpoint(DurableCheckpoint{
         .segment_id = active_segment_->segment_id,
         .durable_offset = segment_writer_->durable_bytes(),
         .durable_sequence = last_durable.ingestion_sequence,
