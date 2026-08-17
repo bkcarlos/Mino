@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package mino.benchmarks.pipeline;
+
+// Semantic message shared by the Protobuf + ZeroMQ comparison backend.
+// The DDS IDL and Mino typed-runtime forms carry the same fields.
+message AutonomyPipelineFrame {
+  uint64 sample_id = 1;
+  uint64 origin_timestamp_ns = 2;
+  uint64 perception_timestamp_ns = 3;
+  uint64 prediction_timestamp_ns = 4;
+  uint64 planning_timestamp_ns = 5;
+  uint64 control_timestamp_ns = 6;
+  uint64 guardian_timestamp_ns = 7;
+  uint32 completed_stage_mask = 8;
+  uint32 profile = 9;
+  uint32 object_count = 10;
+  uint32 trajectory_point_count = 11;
+  double ego_speed_mps = 12;
+  double steering_angle_rad = 13;
+  double acceleration_mps2 = 14;
+  double brake_percentage = 15;
+  bool emergency_stop = 16;
+  fixed64 payload_checksum = 17;
+  bytes payload = 18;
+}

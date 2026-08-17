@@ -14,9 +14,13 @@ bazel_dep(name = "tomlplusplus", version = "3.4.0")
 # @openssl//:ssl (and its transitive :crypto), never a host-installed library.
 bazel_dep(name = "openssl", version = "3.5.5.bcr.4")
 
-# Benchmark-only ZeroMQ comparison. Production transport code does not depend
-# on libzmq; BCR builds the pinned source release hermetically with CMake.
+# Benchmark-only comparison dependencies. Production transport and schema code
+# do not depend on ZeroMQ, Protobuf, Fast CDR, Fast DDS, or Cyclone DDS.
 bazel_dep(name = "libzmq", version = "4.3.5.bcr.5")
+bazel_dep(name = "protobuf", version = "29.0-rc3")
+bazel_dep(name = "fastcdr", version = "2.3.5.bcr.0")
+bazel_dep(name = "fastdds", version = "3.4.2.bcr.1")
+bazel_dep(name = "cyclonedds", version = "11.0.1")
 
 # Opt-in hermetic Clang/LLVM toolchain. It is deliberately not registered
 # globally: --config=hermetic selects it while host GCC/Apple Clang remain the

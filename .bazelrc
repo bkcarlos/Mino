@@ -62,6 +62,20 @@ build --copt=-fno-omit-frame-pointer
 # Do not fail builds on output paths differing between machines.
 build --strip=never
 
+# Comparison-only third-party sources are not maintained by Mino and currently
+# emit GCC 15 warnings under the repository-wide -Werror policy. Keep warnings
+# visible while limiting the exception to the explicit pipeline benchmark
+# config; all Mino production sources retain warning-as-error.
+build:pipeline_comparison --per_file_copt=external/.*@-Wno-error
+build:pipeline_comparison --host_per_file_copt=external/.*@-Wno-error
+# Fast DDS 3.4.x uses std::allocator::construct/destroy, removed in C++20.
+# Compile only that external source archive as C++17; Mino and benchmark code
+# remain C++20 and consume its public headers from the normal target config.
+build:pipeline_comparison --per_file_copt=external/fastdds.*/.*@-std=c++17
+build:pipeline_comparison --host_per_file_copt=external/fastdds.*/.*@-std=c++17
+build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error=missing-requires
+build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/protobuf_zmq_pipeline.cc@-Wno-error=missing-requires
+
 ###############################################################################
 # debug (default-friendly)
 ###############################################################################

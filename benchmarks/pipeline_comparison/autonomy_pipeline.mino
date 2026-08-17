@@ -1,0 +1,27 @@
+syntax = "v1";
+package mino.benchmarks.pipeline;
+option schema_version = "1.0";
+
+// Canonical semantic Mino schema. The first implementation uses an equivalent
+// fixed-capacity C++ SHM type for each payload profile because generated `bytes`
+// fields require a graph allocation journal and child-slab lifecycle.
+message AutonomyPipelineFrame {
+  required uint64 sample_id = 1;
+  required uint64 origin_timestamp_ns = 2;
+  required uint64 perception_timestamp_ns = 3;
+  required uint64 prediction_timestamp_ns = 4;
+  required uint64 planning_timestamp_ns = 5;
+  required uint64 control_timestamp_ns = 6;
+  required uint64 guardian_timestamp_ns = 7;
+  required uint32 completed_stage_mask = 8;
+  required uint32 profile = 9;
+  required uint32 object_count = 10;
+  required uint32 trajectory_point_count = 11;
+  required double ego_speed_mps = 12;
+  required double steering_angle_rad = 13;
+  required double acceleration_mps2 = 14;
+  required double brake_percentage = 15;
+  required bool emergency_stop = 16;
+  required fixed64 payload_checksum = 17;
+  required bytes payload = 18 [max_bytes = 1048576];
+}

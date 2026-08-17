@@ -1,0 +1,309 @@
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("//tools/minoc:minoc.bzl", "mino_cc_codegen")
+
+package(default_visibility = ["//visibility:public"])
+
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+PIPELINE_COPTS = [
+    "-std=c++20",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-DMINO_PIPELINE_COMPILATION_MODE=\\\"$(COMPILATION_MODE)\\\"",
+]
+
+exports_files([
+    "README.md",
+    "REGENERATION.md",
+    "RESULTS_20260816.md",
+    "RESULTS_TWO_HOST_20260816.md",
+    "autonomy_pipeline.idl",
+    "autonomy_pipeline.mino",
+])
+
+mino_cc_codegen(
+    name = "autonomy_pipeline_mino_codegen",
+    src = "autonomy_pipeline.mino",
+    out_descriptor = "mino_generated/autonomy_pipeline.descriptor",
+    out_header = "mino_generated/autonomy_pipeline.generated.h",
+    out_source = "mino_generated/autonomy_pipeline.generated.cc",
+)
+
+cc_library(
+    name = "autonomy_pipeline_mino_generated",
+    srcs = ["mino_generated/autonomy_pipeline.generated.cc"],
+    hdrs = ["mino_generated/autonomy_pipeline.generated.h"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:registry",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+cc_library(
+    name = "pipeline_common",
+    srcs = ["pipeline_common.cc"],
+    hdrs = ["pipeline_common.h"],
+    copts = PIPELINE_COPTS,
+)
+
+cc_test(
+    name = "pipeline_common_test",
+    srcs = ["pipeline_common_test.cc"],
+    copts = PIPELINE_COPTS,
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":pipeline_common",
+        "@googletest//:gtest_main",
+    ],
+)
+
+proto_library(
+    name = "autonomy_pipeline_proto",
+    srcs = ["autonomy_pipeline.proto"],
+    tags = ["manual"],
+)
+
+cc_proto_library(
+    name = "autonomy_pipeline_cc_proto",
+    tags = ["manual"],
+    deps = [":autonomy_pipeline_proto"],
+)
+
+cc_binary(
+    name = "protobuf_zmq_pipeline",
+    srcs = ["protobuf_zmq_pipeline.cc"],
+    copts = PIPELINE_COPTS,
+    tags = ["manual"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":autonomy_pipeline_cc_proto",
+        ":pipeline_common",
+        "@libzmq",
+        "@protobuf//:protobuf",
+    ],
+)
+
+cc_binary(
+    name = "mino_tcp_pipeline",
+    srcs = ["mino_tcp_pipeline.cc"],
+    copts = PIPELINE_COPTS,
+    data = [":autonomy_pipeline_mino_codegen"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":pipeline_common",
+        "//mino/bridge:wire_frame",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:descriptor",
+        "//mino/schema:dynamic_value",
+        "//mino/schema:wire",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/transport:tcp_driver",
+        "//mino/transport:transport_driver",
+    ],
+)
+
+cc_binary(
+    name = "mino_shm_tcp_bridge",
+    srcs = ["mino_shm_tcp_bridge.cc"],
+    copts = PIPELINE_COPTS,
+    data = [":autonomy_pipeline_mino_codegen"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":autonomy_pipeline_mino_generated",
+        ":pipeline_common",
+        "//mino/bridge:wire_frame",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:shared_memory",
+        "//mino/runtime:allocation_journal",
+        "//mino/runtime:publisher",
+        "//mino/runtime:runtime_types",
+        "//mino/runtime:shm_shared_ptr",
+        "//mino/runtime:subscriber",
+        "//mino/schema:descriptor",
+        "//mino/schema:dynamic_value",
+        "//mino/schema:wire",
+        "//mino/schema/codegen:artifact_codec",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/channel:spsc",
+        "//mino/transport:tcp_driver",
+        "//mino/transport:transport_driver",
+    ],
+)
+
+cc_binary(
+    name = "mino_shm_pipeline",
+    srcs = ["mino_shm_pipeline.cc"],
+    copts = PIPELINE_COPTS,
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":autonomy_pipeline_mino_generated",
+        ":pipeline_common",
+        "//mino/common:ids",
+        "//mino/common:status",
+        "//mino/platform:shared_memory",
+        "//mino/runtime:allocation_journal",
+        "//mino/runtime:publisher",
+        "//mino/runtime:runtime_types",
+        "//mino/runtime:shm_shared_ptr",
+        "//mino/runtime:subscriber",
+        "//mino/shm/allocator:bitmap",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:class_table",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_library(
+    name = "autonomy_pipeline_fastdds_type",
+    srcs = [
+        "generated/AutonomyPipelineFrameCdrAux.ipp",
+        "generated/AutonomyPipelineFramePubSubTypes.cxx",
+    ],
+    hdrs = [
+        "generated/AutonomyPipelineFrame.hpp",
+        "generated/AutonomyPipelineFrameCdrAux.hpp",
+        "generated/AutonomyPipelineFramePubSubTypes.hpp",
+    ],
+    copts = PIPELINE_COPTS,
+    tags = ["manual"],
+    deps = [
+        "@fastcdr//:fastcdr",
+        "@fastdds//:fastdds",
+    ],
+)
+
+cc_binary(
+    name = "fastdds_pipeline",
+    srcs = ["fastdds_pipeline.cc"],
+    copts = PIPELINE_COPTS,
+    tags = ["manual"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":autonomy_pipeline_fastdds_type",
+        ":pipeline_common",
+        "@fastdds//:fastdds",
+    ],
+)
+
+genrule(
+    name = "autonomy_pipeline_cyclonedds_idl_gen",
+    srcs = ["autonomy_pipeline.idl"],
+    outs = [
+        "cyclonedds_generated/autonomy_pipeline.c",
+        "cyclonedds_generated/autonomy_pipeline.h",
+    ],
+    cmd = "mkdir -p $(RULEDIR)/cyclonedds_generated && $(location @cyclonedds//:idlc) -l c -f cdrstream-desc -o$(RULEDIR)/cyclonedds_generated $(location autonomy_pipeline.idl)",
+    tags = ["manual"],
+    tools = ["@cyclonedds//:idlc"],
+)
+
+cc_library(
+    name = "autonomy_pipeline_cyclonedds_type",
+    srcs = ["cyclonedds_generated/autonomy_pipeline.c"],
+    hdrs = ["cyclonedds_generated/autonomy_pipeline.h"],
+    includes = ["cyclonedds_generated"],
+    tags = ["manual"],
+    deps = ["@cyclonedds//:ddsc"],
+)
+
+cc_binary(
+    name = "cyclonedds_pipeline",
+    srcs = ["cyclonedds_pipeline.cc"],
+    copts = PIPELINE_COPTS,
+    tags = ["manual"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":autonomy_pipeline_cyclonedds_type",
+        ":pipeline_common",
+        "@cyclonedds//:ddsc",
+    ],
+)
+
+py_library(
+    name = "pipeline_comparison_runner_lib",
+    srcs = ["pipeline_comparison_runner.py"],
+    imports = ["."],
+)
+
+py_binary(
+    name = "pipeline_comparison_runner",
+    srcs = ["pipeline_comparison_runner.py"],
+    main = "pipeline_comparison_runner.py",
+    python_version = "PY3",
+)
+
+py_test(
+    name = "pipeline_comparison_runner_test",
+    srcs = ["pipeline_comparison_runner_test.py"],
+    main = "pipeline_comparison_runner_test.py",
+    python_version = "PY3",
+    deps = [":pipeline_comparison_runner_lib"],
+)
+
+py_library(
+    name = "pipeline_network_runner_lib",
+    srcs = ["pipeline_network_runner.py"],
+    imports = ["."],
+    deps = [":pipeline_comparison_runner_lib"],
+)
+
+py_binary(
+    name = "pipeline_network_runner",
+    srcs = ["pipeline_network_runner.py"],
+    main = "pipeline_network_runner.py",
+    python_version = "PY3",
+    deps = [":pipeline_comparison_runner_lib"],
+)
+
+py_library(
+    name = "mino_hybrid_runner_lib",
+    srcs = ["mino_hybrid_runner.py"],
+    imports = ["."],
+    deps = [
+        ":pipeline_comparison_runner_lib",
+        ":pipeline_network_runner_lib",
+    ],
+)
+
+py_binary(
+    name = "mino_hybrid_runner",
+    srcs = ["mino_hybrid_runner.py"],
+    main = "mino_hybrid_runner.py",
+    python_version = "PY3",
+    deps = [
+        ":pipeline_comparison_runner_lib",
+        ":pipeline_network_runner_lib",
+    ],
+)
+
+py_test(
+    name = "mino_hybrid_runner_test",
+    srcs = ["mino_hybrid_runner_test.py"],
+    main = "mino_hybrid_runner_test.py",
+    python_version = "PY3",
+    deps = [":mino_hybrid_runner_lib"],
+)
+
+py_test(
+    name = "pipeline_network_runner_test",
+    srcs = ["pipeline_network_runner_test.py"],
+    main = "pipeline_network_runner_test.py",
+    python_version = "PY3",
+    deps = [
+        ":pipeline_comparison_runner_lib",
+        ":pipeline_network_runner_lib",
+    ],
+)

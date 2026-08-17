@@ -1,0 +1,32 @@
+// Canonical Fast DDS IDL input for the benchmark-only typed DDS backend.
+// Generate with Fast DDS-Gen 4.2.0 for Fast DDS 3.4.x.
+module mino {
+module benchmarks {
+module pipeline {
+
+@topic
+@final
+struct AutonomyPipelineFrame {
+    unsigned long long sample_id;
+    unsigned long long origin_timestamp_ns;
+    unsigned long long perception_timestamp_ns;
+    unsigned long long prediction_timestamp_ns;
+    unsigned long long planning_timestamp_ns;
+    unsigned long long control_timestamp_ns;
+    unsigned long long guardian_timestamp_ns;
+    unsigned long completed_stage_mask;
+    unsigned long profile;
+    unsigned long object_count;
+    unsigned long trajectory_point_count;
+    double ego_speed_mps;
+    double steering_angle_rad;
+    double acceleration_mps2;
+    double brake_percentage;
+    boolean emergency_stop;
+    unsigned long long payload_checksum;
+    sequence<octet, 1048576> payload;
+};
+
+};
+};
+};
