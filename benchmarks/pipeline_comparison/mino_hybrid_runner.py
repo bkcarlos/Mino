@@ -28,6 +28,13 @@ DEFAULT_BRIDGE_BINARY = "bazel-bin/benchmarks/pipeline_comparison/mino_shm_tcp_b
 POLL_SECONDS = 0.05
 
 
+@dataclass(frozen=True)
+class SetupRecord:
+    host: network.RoleHost
+    shm_name: str
+    runtime_dir: Path
+
+
 @dataclass
 class ProcessRecord:
     name: str
@@ -127,27 +134,41 @@ def _setup_segments(
     boot_ids: Mapping[str, str],
     shm_names: Mapping[str, str],
     run_id: str,
-) -> tuple[list[str], list[tuple[network.RoleHost, str, Path]]]:
+) -> tuple[list[str], list[SetupRecord]]:
     errors: list[str] = []
-    setups: list[tuple[network.RoleHost, str, Path]] = []
+    setups: list[SetupRecord] = []
     token = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+    deadline = time.monotonic() + args.deadline_seconds
     for index, (boot_id, host) in enumerate(_representatives(topology, boot_ids).items()):
         runtime = Path("/tmp") / f"mino-hybrid-{token}-setup-{index}"
         try:
-            network._remote_mkdir(host, runtime, 10)
+            network._remote_mkdir(
+                host,
+                runtime,
+                network._deadline_timeout(
+                    deadline, 10, "creating hybrid setup runtimes"
+                ),
+            )
+            setup = SetupRecord(host, shm_names[boot_id], runtime)
+            setups.append(setup)
             command = [
                 str(host.workdir / args.shm_binary_relative),
                 *_common_arguments(args, "perception", run_id, runtime, runtime / "setup.json", len(set(boot_ids.values())) == 1),
                 "--operation", "setup",
-                "--shm-name", shm_names[boot_id],
+                "--shm-name", setup.shm_name,
                 "--channel-capacity", str(args.channel_capacity),
             ]
-            completed = _remote_control(host, command, min(args.deadline_seconds, 60))
+            completed = _remote_control(
+                host,
+                command,
+                network._deadline_timeout(
+                    deadline, 60, "initializing hybrid SHM segments"
+                ),
+            )
             (runtime / "setup.stdout.log").write_text(completed.stdout, encoding="utf-8") if host.local else None
             if completed.returncode != 0:
                 errors.append(f"SHM setup failed for {host.ssh_host}: {completed.stderr.strip()}")
                 break
-            setups.append((host, shm_names[boot_id], runtime))
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
             errors.append(f"SHM setup failed for {host.ssh_host}: {exc}")
             break
@@ -156,27 +177,49 @@ def _setup_segments(
 
 def _cleanup_segments(
     args: argparse.Namespace,
-    setups: Sequence[tuple[network.RoleHost, str, Path]],
+    setups: Sequence[SetupRecord],
     run_id: str,
     same_host: bool,
 ) -> list[str]:
     errors: list[str] = []
-    for host, shm_name, runtime in reversed(setups):
+    cleanup_deadline = time.monotonic() + network.CLEANUP_DEADLINE_SECONDS
+    for setup in reversed(setups):
         command = [
-            str(host.workdir / args.shm_binary_relative),
-            *_common_arguments(args, "perception", run_id, runtime, runtime / "cleanup.json", same_host),
+            str(setup.host.workdir / args.shm_binary_relative),
+            *_common_arguments(args, "perception", run_id, setup.runtime_dir, setup.runtime_dir / "cleanup.json", same_host),
             "--operation", "cleanup",
-            "--shm-name", shm_name,
+            "--shm-name", setup.shm_name,
             "--channel-capacity", str(args.channel_capacity),
         ]
         try:
-            completed = _remote_control(host, command, min(args.deadline_seconds, 30))
+            completed = _remote_control(
+                setup.host,
+                command,
+                network._deadline_timeout(
+                    cleanup_deadline, 30, "cleaning hybrid SHM segments"
+                ),
+            )
             if completed.returncode != 0:
-                errors.append(f"SHM cleanup failed for {host.ssh_host}: {completed.stderr.strip()}")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f"SHM cleanup failed for {host.ssh_host}: {exc}")
-        if not args.keep_remote_runtime:
-            network._remote_cleanup(host, runtime, 10)
+                detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+                errors.append(f"SHM cleanup failed for {setup.host.ssh_host}: {detail}")
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            errors.append(f"SHM cleanup failed for {setup.host.ssh_host}: {exc}")
+
+    if not args.keep_remote_runtime:
+        runtime_deadline = time.monotonic() + network.CLEANUP_DEADLINE_SECONDS
+        for setup in reversed(setups):
+            try:
+                network._remote_cleanup(
+                    setup.host,
+                    setup.runtime_dir,
+                    network._deadline_timeout(
+                        runtime_deadline, 10, "removing hybrid setup runtimes"
+                    ),
+                )
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                errors.append(
+                    f"setup runtime cleanup failed for {setup.host.ssh_host}: {exc}"
+                )
     return errors
 
 
@@ -300,37 +343,59 @@ def _launcher(process: ProcessRecord) -> list[str]:
     ]
 
 
-def _remote_pid(process: ProcessRecord) -> Optional[int]:
+def _remote_pid(process: ProcessRecord, deadline: float) -> Optional[int]:
     if process.host.local:
         return None
     try:
-        content = network._remote_read(process.host, process.runtime_dir / "process.pid", 2)
-    except (OSError, subprocess.TimeoutExpired):
+        content = network._remote_read(
+            process.host,
+            process.runtime_dir / "process.pid",
+            network._deadline_timeout(deadline, 2, "reading a hybrid process pid"),
+        )
+    except (OSError, subprocess.TimeoutExpired, network.DeadlineExpired):
         return None
     text = content.strip() if content else ""
     return int(text) if text.isascii() and text.isdecimal() and 1 < int(text) <= 2_147_483_647 else None
 
 
 def terminate_processes(processes: Sequence[ProcessRecord]) -> None:
-    remote = [(process, pid) for process in processes if (pid := _remote_pid(process)) is not None]
-    for process, pid in remote:
-        try:
-            network._remote_run(process.host, ["/bin/kill", "-TERM", "--", f"-{pid}"], 3)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    deadline = time.monotonic() + network.CLEANUP_DEADLINE_SECONDS
     active = [process.process for process in processes if process.process is not None and process.process.poll() is None]
     for child in active:
         try:
             os.killpg(child.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    deadline = time.monotonic() + 1.0
-    while any(child.poll() is None for child in active) and time.monotonic() < deadline:
-        time.sleep(0.02)
+
+    remote: list[tuple[ProcessRecord, int]] = []
+    for process in processes:
+        pid = _remote_pid(process, deadline)
+        if pid is not None:
+            remote.append((process, pid))
     for process, pid in remote:
         try:
-            network._remote_run(process.host, ["/bin/kill", "-KILL", "--", f"-{pid}"], 3)
-        except (OSError, subprocess.TimeoutExpired):
+            network._remote_run(
+                process.host,
+                ["/bin/kill", "-TERM", "--", f"-{pid}"],
+                network._deadline_timeout(deadline, 3, "terminating hybrid processes"),
+            )
+        except (OSError, subprocess.TimeoutExpired, network.DeadlineExpired):
+            pass
+
+    grace_deadline = min(deadline, time.monotonic() + 1.0)
+    while any(child.poll() is None for child in active):
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.02, remaining))
+    for process, pid in remote:
+        try:
+            network._remote_run(
+                process.host,
+                ["/bin/kill", "-KILL", "--", f"-{pid}"],
+                network._deadline_timeout(deadline, 3, "killing hybrid processes"),
+            )
+        except (OSError, subprocess.TimeoutExpired, network.DeadlineExpired):
             pass
     for child in active:
         if child.poll() is None:
@@ -338,6 +403,14 @@ def terminate_processes(processes: Sequence[ProcessRecord]) -> None:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+    for child in active:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            child.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            break
 
 
 def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], run_id: str) -> list[str]:
@@ -346,7 +419,14 @@ def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], ru
     completed = False
     try:
         for process in processes:
-            network._remote_mkdir(process.host, process.runtime_dir, min(10, args.deadline_seconds))
+            network._remote_mkdir(
+                process.host,
+                process.runtime_dir,
+                network._deadline_timeout(
+                    deadline, 10, "setting up hybrid runtimes"
+                ),
+            )
+            network._deadline_timeout(deadline, 10, "launching hybrid processes")
             process.stdout_handle = process.stdout_path.open("wb")
             process.stderr_handle = process.stderr_path.open("wb")
             process.process = subprocess.Popen(
@@ -356,7 +436,11 @@ def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], ru
             )
             # Give a listening bridge a small deterministic opportunity to bind before its connector.
             if process.name.endswith("-sink"):
-                time.sleep(0.05)
+                time.sleep(
+                    network._deadline_timeout(
+                        deadline, 0.05, "launching hybrid bridge connectors"
+                    )
+                )
 
         pending = {process.name: process for process in processes}
         while pending:
@@ -364,23 +448,43 @@ def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], ru
                 if process.process is not None and process.process.poll() is not None:
                     errors.append(f"{name} exited with {process.process.returncode} before readiness")
                     return errors
-                content = network._remote_read(process.host, process.runtime_dir / process.ready_name, 5)
+                content = network._remote_read(
+                    process.host,
+                    process.runtime_dir / process.ready_name,
+                    network._deadline_timeout(
+                        deadline, 5, "waiting for hybrid readiness"
+                    ),
+                )
                 if content == run_id + "\n":
                     del pending[name]
                 elif content is not None:
                     errors.append(f"{name} readiness run-id mismatch")
                     return errors
-            if time.monotonic() >= deadline:
-                errors.append("deadline expired waiting for hybrid readiness")
-                return errors
-            time.sleep(POLL_SECONDS)
+            if pending:
+                time.sleep(
+                    network._deadline_timeout(
+                        deadline, POLL_SECONDS, "waiting for hybrid readiness"
+                    )
+                )
 
         # All transport endpoints and consumers are ready; source starts last.
         for process in processes:
             if process.name != "perception":
-                network._remote_write_start(process.host, process.runtime_dir / "start", run_id, 10)
+                network._remote_write_start(
+                    process.host,
+                    process.runtime_dir / "start",
+                    run_id,
+                    network._deadline_timeout(
+                        deadline, 10, "starting hybrid processes"
+                    ),
+                )
         perception = next(process for process in processes if process.name == "perception")
-        network._remote_write_start(perception.host, perception.runtime_dir / "start", run_id, 10)
+        network._remote_write_start(
+            perception.host,
+            perception.runtime_dir / "start",
+            run_id,
+            network._deadline_timeout(deadline, 10, "starting hybrid processes"),
+        )
 
         active = list(processes)
         while active:
@@ -394,10 +498,12 @@ def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], ru
                     errors.append(f"{process.name} exited with {code}")
             if errors:
                 return errors
-            if time.monotonic() >= deadline:
-                errors.append("deadline expired waiting for hybrid processes")
-                return errors
-            time.sleep(POLL_SECONDS)
+            if active:
+                time.sleep(
+                    network._deadline_timeout(
+                        deadline, POLL_SECONDS, "waiting for hybrid processes"
+                    )
+                )
         completed = True
     except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
         errors.append(f"hybrid orchestration failed: {exc}")
@@ -421,12 +527,20 @@ def collect_and_validate(
 ) -> tuple[list[str], Optional[dict[str, Any]]]:
     errors: list[str] = []
     sink: Optional[dict[str, Any]] = None
+    collection_deadline = time.monotonic() + args.deadline_seconds
     for process in processes:
         if process.result_remote is None or process.result_local is None:
             continue
         try:
-            copied = network._remote_copy(process.host, process.result_remote, process.result_local, min(30, args.deadline_seconds))
-        except (OSError, subprocess.TimeoutExpired):
+            copied = network._remote_copy(
+                process.host,
+                process.result_remote,
+                process.result_local,
+                network._deadline_timeout(
+                    collection_deadline, 30, "collecting hybrid result JSON"
+                ),
+            )
+        except (OSError, subprocess.TimeoutExpired, RuntimeError):
             copied = False
         if not copied:
             errors.append(f"{process.name}: could not collect result JSON")
@@ -466,6 +580,32 @@ def collect_and_validate(
     return errors, sink
 
 
+def _cleanup_process_runtimes(
+    processes: Sequence[ProcessRecord], keep_remote_runtime: bool
+) -> list[str]:
+    if keep_remote_runtime:
+        return []
+    errors: list[str] = []
+    deadline = time.monotonic() + network.CLEANUP_DEADLINE_SECONDS
+    cleaned: set[tuple[str, Path]] = set()
+    for process in processes:
+        key = (process.host.ssh_host, process.runtime_dir)
+        if key in cleaned:
+            continue
+        cleaned.add(key)
+        try:
+            network._remote_cleanup(
+                process.host,
+                process.runtime_dir,
+                network._deadline_timeout(
+                    deadline, 10, "removing hybrid process runtimes"
+                ),
+            )
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            errors.append(f"{process.name}: remote cleanup failed: {exc}")
+    return errors
+
+
 def _process_records(processes: Sequence[ProcessRecord], output: Path) -> list[dict[str, Any]]:
     return [{
         "name": process.name,
@@ -499,7 +639,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     edges: list[dict[str, Any]] = []
     boot_ids: dict[str, str] = {}
     shm_names: dict[str, str] = {}
-    setups: list[tuple[network.RoleHost, str, Path]] = []
+    setups: list[SetupRecord] = []
     sink: Optional[dict[str, Any]] = None
     same_host = False
     try:
@@ -518,40 +658,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         terminate_processes(processes)
     finally:
         errors.extend(_cleanup_segments(args, setups, run_id, same_host))
-        if not args.keep_remote_runtime:
-            for process in processes:
-                network._remote_cleanup(process.host, process.runtime_dir, 10)
+        errors.extend(
+            _cleanup_process_runtimes(processes, args.keep_remote_runtime)
+        )
 
-    manifest = {
-        "schema": MANIFEST_SCHEMA,
-        "outcome": "passed" if not errors else "failed",
-        "errors": errors,
-        "run_id": run_id,
-        "backend": "mino_hybrid",
-        "profile": args.profile,
-        "clock_mode": "same-host" if same_host else "independent-hosts",
-        "one_way_latency_valid": same_host and not errors,
-        "host_identity_source": "Linux boot ID read through each role execution path",
-        "config": {
-            "messages": args.messages,
-            "warmup_messages": args.warmup_messages,
-            "publish_interval_us": args.publish_interval_us,
-            "deadline_seconds": args.deadline_seconds,
-            "port_base": args.port_base,
-            "channel_capacity": args.channel_capacity,
-            "schema_descriptor_relative": args.schema_descriptor_relative,
-        },
-        "boot_ids": boot_ids,
-        "shm_segments": shm_names,
-        "edges": edges,
-        "started_utc": started_utc,
-        "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-        "processes": _process_records(processes, output),
-        "sink_metrics": sink,
-    }
-    temporary = output / ".manifest.tmp"
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, output / "manifest.json")
+    try:
+        manifest = {
+            "schema": MANIFEST_SCHEMA,
+            "outcome": "passed" if not errors else "failed",
+            "errors": errors,
+            "run_id": run_id,
+            "backend": "mino_hybrid",
+            "profile": args.profile,
+            "clock_mode": "same-host" if same_host else "independent-hosts",
+            "one_way_latency_valid": same_host and not errors,
+            "host_identity_source": "Linux boot ID read through each role execution path",
+            "config": {
+                "messages": args.messages,
+                "warmup_messages": args.warmup_messages,
+                "publish_interval_us": args.publish_interval_us,
+                "deadline_seconds": args.deadline_seconds,
+                "port_base": args.port_base,
+                "channel_capacity": args.channel_capacity,
+                "schema_descriptor_relative": args.schema_descriptor_relative,
+            },
+            "boot_ids": boot_ids,
+            "shm_segments": shm_names,
+            "edges": edges,
+            "started_utc": started_utc,
+            "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "processes": _process_records(processes, output),
+            "sink_metrics": sink,
+        }
+        network._write_json_atomic(output / "manifest.json", manifest)
+    except (OSError, network.ConfigurationError) as exc:
+        print(f"Mino hybrid output error: {exc}", file=sys.stderr)
+        return 1
     return 0 if not errors else 1
 
 

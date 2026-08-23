@@ -800,25 +800,11 @@ uint64_t TotalFrames(const CommonOptions& options) {
 void RunSource(const CommonOptions& options, ZmqPipelineSockets* sockets,
                uint64_t absolute_deadline_ns, RunStatistics* statistics) {
     const uint64_t total = TotalFrames(options);
-    uint64_t measured_schedule_start_ns = 0;
+    const uint64_t schedule_start_ns = NowNs();
     for (uint64_t sample_id = 0; sample_id < total; ++sample_id) {
+        PaceSource(schedule_start_ns, sample_id, options.publish_interval_us,
+                   absolute_deadline_ns);
         const bool measured = sample_id >= options.warmup_messages;
-        if (options.publish_interval_us != 0) {
-            if (!measured) {
-                if (sample_id != 0) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(
-                        options.publish_interval_us));
-                }
-            } else {
-                if (sample_id == options.warmup_messages) {
-                    measured_schedule_start_ns = NowNs();
-                }
-                const uint64_t measured_index =
-                    sample_id - options.warmup_messages;
-                PaceSource(measured_schedule_start_ns, measured_index + 1,
-                           options.publish_interval_us, absolute_deadline_ns);
-            }
-        }
         SemanticFrame frame =
             InitializeSourceFrame(sample_id, options.profile, measured);
         std::string error;

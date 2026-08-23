@@ -47,9 +47,9 @@ using bridge::FrameType;
 using bridge::WireFrame;
 using bridge::WireFrameCodec;
 using bridge::WireFrameLimits;
-using schema::CanonicalWireCodec;
 using schema::DynamicMessage;
 using schema::DynamicValue;
+using schema::PreparedCanonicalWireCodec;
 using schema::SchemaDescriptor;
 using transport::ConnectionId;
 using transport::EndpointDescriptor;
@@ -315,7 +315,11 @@ class PipelineSchema final {
                 "schema descriptor does not contain the autonomy pipeline type");
         }
         descriptor_ = artifact->types.front().descriptor;
-        descriptors_.push_back(descriptor_);
+        auto prepared = PreparedCanonicalWireCodec::Create(descriptor_);
+        if (!prepared.ok()) {
+            ThrowStatus("prepare canonical wire codec", prepared.status());
+        }
+        prepared_codec_.emplace(std::move(*prepared));
     }
 
     const SchemaDescriptor& descriptor() const noexcept { return *descriptor_; }
@@ -349,49 +353,50 @@ class PipelineSchema final {
         auto bytes = DynamicValue::Bytes(payload);
         if (!bytes.ok()) ThrowStatus("create dynamic payload", bytes.status());
         Set(message, 18, std::move(*bytes));
-        return TakeOrThrow(
-            "CanonicalWireCodec::Encode",
-            CanonicalWireCodec::Encode(*descriptor_, message, descriptors_));
+        return TakeOrThrow("CanonicalWireCodec::Encode",
+                           prepared_codec_->Encode(message));
     }
 
-    SemanticFrame Decode(std::span<const std::byte> bytes) const {
-        DynamicMessage message = TakeOrThrow(
-            "CanonicalWireCodec::Decode",
-            CanonicalWireCodec::Decode(*descriptor_, bytes, descriptors_));
+    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) const {
+        if (frame == nullptr) {
+            throw std::invalid_argument("semantic decode destination is null");
+        }
+        DynamicMessage message = TakeOrThrow("CanonicalWireCodec::Decode",
+                                             prepared_codec_->Decode(bytes));
         if (!message.unknown_fields().fields().empty()) {
             throw std::runtime_error(
                 "canonical pipeline message contains unknown fields");
         }
-        SemanticFrame frame;
-        frame.sample_id = Unsigned(message, 1);
-        frame.origin_timestamp_ns = Unsigned(message, 2);
-        frame.perception_timestamp_ns = Unsigned(message, 3);
-        frame.prediction_timestamp_ns = Unsigned(message, 4);
-        frame.planning_timestamp_ns = Unsigned(message, 5);
-        frame.control_timestamp_ns = Unsigned(message, 6);
-        frame.guardian_timestamp_ns = Unsigned(message, 7);
-        frame.completed_stage_mask = NarrowU32(Unsigned(message, 8), 8);
-        frame.profile = NarrowU32(Unsigned(message, 9), 9);
-        frame.object_count = NarrowU32(Unsigned(message, 10), 10);
-        frame.trajectory_point_count =
+        frame->sample_id = Unsigned(message, 1);
+        frame->origin_timestamp_ns = Unsigned(message, 2);
+        frame->perception_timestamp_ns = Unsigned(message, 3);
+        frame->prediction_timestamp_ns = Unsigned(message, 4);
+        frame->planning_timestamp_ns = Unsigned(message, 5);
+        frame->control_timestamp_ns = Unsigned(message, 6);
+        frame->guardian_timestamp_ns = Unsigned(message, 7);
+        frame->completed_stage_mask = NarrowU32(Unsigned(message, 8), 8);
+        frame->profile = NarrowU32(Unsigned(message, 9), 9);
+        frame->object_count = NarrowU32(Unsigned(message, 10), 10);
+        frame->trajectory_point_count =
             NarrowU32(Unsigned(message, 11), 11);
-        frame.ego_speed_mps = Float64(message, 12);
-        frame.steering_angle_rad = Float64(message, 13);
-        frame.acceleration_mps2 = Float64(message, 14);
-        frame.brake_percentage = Float64(message, 15);
-        frame.emergency_stop = Boolean(message, 16);
-        frame.payload_checksum = Unsigned(message, 17);
+        frame->ego_speed_mps = Float64(message, 12);
+        frame->steering_angle_rad = Float64(message, 13);
+        frame->acceleration_mps2 = Float64(message, 14);
+        frame->brake_percentage = Float64(message, 15);
+        frame->emergency_stop = Boolean(message, 16);
+        frame->payload_checksum = Unsigned(message, 17);
         const DynamicValue& payload = Field(message, 18);
         if (payload.bytes() == nullptr ||
             payload.bytes()->value.size() > kLargePayloadBytes) {
             throw std::runtime_error(
                 "canonical payload has the wrong dynamic type or size");
         }
-        frame.payload.reserve(payload.bytes()->value.size());
-        for (std::byte byte : payload.bytes()->value) {
-            frame.payload.push_back(static_cast<uint8_t>(byte));
+        const auto& payload_bytes = payload.bytes()->value;
+        frame->payload.resize(payload_bytes.size());
+        if (!payload_bytes.empty()) {
+            std::memcpy(frame->payload.data(), payload_bytes.data(),
+                        payload_bytes.size());
         }
-        return frame;
     }
 
   private:
@@ -444,7 +449,7 @@ class PipelineSchema final {
     }
 
     std::shared_ptr<const SchemaDescriptor> descriptor_;
-    std::vector<std::shared_ptr<const SchemaDescriptor>> descriptors_;
+    std::optional<PreparedCanonicalWireCodec> prepared_codec_;
 };
 
 std::vector<std::byte> EncodeU64Pair(uint64_t first, uint64_t second) {
@@ -512,9 +517,9 @@ class MinoTcpPipeline final {
              transport::UntrackedTrafficClass::kData);
     }
 
-    SemanticFrame ReceiveData(size_t edge, uint64_t expected_id,
-                              const PipelineSchema& schema,
-                              uint64_t deadline_ns, size_t* encoded_size) {
+    void ReceiveData(size_t edge, uint64_t expected_id,
+                     const PipelineSchema& schema, uint64_t deadline_ns,
+                     size_t* encoded_size, SemanticFrame* semantic) {
         if (!input_connection_.has_value()) {
             throw std::logic_error("pipeline role has no TCP input connection");
         }
@@ -536,7 +541,7 @@ class MinoTcpPipeline final {
             throw std::runtime_error(
                 "Mino TCP WireFrame header does not match this pipeline run");
         }
-        return schema.Decode(frame.payload);
+        schema.Decode(frame.payload, semantic);
     }
 
     void Complete(uint64_t total_frames, uint64_t deadline_ns) {
@@ -885,9 +890,11 @@ void RunForwarder(const CommonOptions& options, const BackendOptions& backend,
     const size_t input_edge = *InputEdge(options.role);
     const size_t output_edge = *OutputEdge(options.role);
     const uint64_t total = TotalFrames(options);
+    SemanticFrame frame;
+    frame.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
-        SemanticFrame frame = transport->ReceiveData(
-            input_edge, expected_id, schema, deadline_ns, nullptr);
+        transport->ReceiveData(input_edge, expected_id, schema, deadline_ns,
+                               nullptr, &frame);
         ValidateSequenceAndPhase(options, frame, expected_id, statistics);
         std::string error;
         if (!ApplyConfiguredStage(backend, options.role, &frame, &error)) {
@@ -912,10 +919,12 @@ void RunSink(const CommonOptions& options, const BackendOptions& backend,
     statistics->latencies_ns.reserve(static_cast<size_t>(std::min(
         options.messages, kMaximumInitialLatencyReserve)));
     const uint64_t total = TotalFrames(options);
+    SemanticFrame frame;
+    frame.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         size_t encoded_size = 0;
-        SemanticFrame frame = transport->ReceiveData(
-            input_edge, expected_id, schema, deadline_ns, &encoded_size);
+        transport->ReceiveData(input_edge, expected_id, schema, deadline_ns,
+                               &encoded_size, &frame);
         ValidateSequenceAndPhase(options, frame, expected_id, statistics);
         std::string error;
         if (!ApplyConfiguredStage(backend, Role::kCanbus, &frame, &error)) {
@@ -951,7 +960,8 @@ std::string BackendDetails(const BackendOptions& backend,
     return "{\"transport\":\"production TcpDriver plaintext benchmark mode\","
            "\"wire_frame\":\"WireFrameCodec v1 with payload CRC\","
            "\"schema_codec\":\"CanonicalWireCodec\","
-           "\"schema_source\":\"minoc descriptor artifact\",
+           "\"canonical_descriptor_closure\":\"startup-prepared\","
+           "\"schema_source\":\"minoc descriptor artifact\","
            "\"compilation_mode\":\"" + std::string(CompilationMode()) +
            "\",\"schema_short_id\":" + std::to_string(identity.short_id()) +
            ",\"schema_version\":" +

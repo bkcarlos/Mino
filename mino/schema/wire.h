@@ -55,6 +55,35 @@ public:
         const WireLimits& limits = {}) noexcept;
 };
 
+// Authenticates and owns an immutable descriptor closure once, then reuses its
+// resolver for repeated canonical messages. Create is the only construction
+// path; Encode and Decode preserve CanonicalWireCodec wire and limit semantics.
+class PreparedCanonicalWireCodec {
+public:
+    static Result<PreparedCanonicalWireCodec> Create(
+        std::shared_ptr<const SchemaDescriptor> root,
+        std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors = {},
+        const WireLimits& limits = {}) noexcept;
+
+    PreparedCanonicalWireCodec(const PreparedCanonicalWireCodec&) noexcept =
+        default;
+    PreparedCanonicalWireCodec& operator=(
+        const PreparedCanonicalWireCodec&) noexcept = default;
+
+    Result<std::vector<std::byte>> Encode(
+        const DynamicMessage& message) const noexcept;
+    Result<DynamicMessage> Decode(
+        std::span<const std::byte> bytes) const noexcept;
+
+private:
+    class State;
+
+    explicit PreparedCanonicalWireCodec(
+        std::shared_ptr<const State> state) noexcept;
+
+    std::shared_ptr<const State> state_;
+};
+
 }  // namespace mino::schema
 
 #endif  // MINO_SCHEMA_WIRE_H_

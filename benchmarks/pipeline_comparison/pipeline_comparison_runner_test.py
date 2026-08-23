@@ -232,15 +232,21 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
 
     def test_validate_worker_result_rejects_loss_wrong_profile_and_percentiles(self) -> None:
         valid = self.valid_result()
+        self.assertEqual(valid, self.validate(valid))
+
+        mutations = []
         loss = copy.deepcopy(valid)
         loss["counts"]["lost"] = 1
+        mutations.append((loss, "counts.lost must be zero"))
         wrong_profile = copy.deepcopy(valid)
         wrong_profile["profile"] = "large"
+        mutations.append((wrong_profile, "profile must be 'small'"))
         percentiles = copy.deepcopy(valid)
         percentiles["latency_ns"]["p95"] = 5
-        for document in (loss, wrong_profile, percentiles):
-            with self.subTest(document=document):
-                with self.assertRaises(ValueError):
+        mutations.append((percentiles, "latency percentiles must be monotonic"))
+        for document, error in mutations:
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(ValueError, error):
                     self.validate(document)
 
     def test_timeout_terminates_spawned_process_group(self) -> None:
@@ -300,6 +306,7 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
             "configuration": {
                 "messages": 3,
                 "warmup_messages": 0,
+                "publish_interval_us": 0,
                 "deadline_seconds": 2,
                 "clock_mode": "same-host",
                 "run_id": "run-1",
@@ -317,7 +324,7 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
             },
             "latency_ns": {"samples": 3, "p50": 10, "p95": 20, "p99": 30, "p99_9": 40, "max": 50},
             "elapsed_ns": 100,
-            "throughput_messages_per_second": 30.0,
+            "throughput_messages_per_second": 30_000_000.0,
             "payload_bytes": 256,
             "encoded_bytes": 320,
             "outcome": "success",
@@ -335,6 +342,7 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
             expected_run_id="run-1",
             expected_messages=3,
             expected_warmup_messages=0,
+            expected_publish_interval_us=0,
             expected_deadline_seconds=2,
         )
 

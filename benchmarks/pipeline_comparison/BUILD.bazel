@@ -19,6 +19,7 @@ PIPELINE_COPTS = [
 
 exports_files([
     "README.md",
+    "PERFORMANCE_FOLLOWUP.md",
     "REGENERATION.md",
     "RESULTS_20260816.md",
     "RESULTS_TWO_HOST_20260816.md",

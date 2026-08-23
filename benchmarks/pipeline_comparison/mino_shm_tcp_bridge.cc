@@ -69,9 +69,9 @@ using bridge::FrameType;
 using bridge::WireFrame;
 using bridge::WireFrameCodec;
 using bridge::WireFrameLimits;
-using schema::CanonicalWireCodec;
 using schema::DynamicMessage;
 using schema::DynamicValue;
+using schema::PreparedCanonicalWireCodec;
 using schema::SchemaDescriptor;
 using transport::ConnectionId;
 using transport::EndpointDescriptor;
@@ -719,7 +719,11 @@ class PipelineSchema final {
                     "schema descriptor digest does not match generated type");
             }
         }
-        descriptors_.push_back(descriptor_);
+        auto prepared = PreparedCanonicalWireCodec::Create(descriptor_);
+        if (!prepared.ok()) {
+            ThrowStatus("prepare canonical wire codec", prepared.status());
+        }
+        prepared_codec_.emplace(std::move(*prepared));
     }
 
     const SchemaDescriptor& descriptor() const noexcept { return *descriptor_; }
@@ -754,50 +758,51 @@ class PipelineSchema final {
         auto bytes = DynamicValue::Bytes(payload);
         if (!bytes.ok()) ThrowStatus("create dynamic payload", bytes.status());
         Set(message, 18, std::move(*bytes));
-        return TakeOrThrow(
-            "CanonicalWireCodec::Encode",
-            CanonicalWireCodec::Encode(*descriptor_, message, descriptors_));
+        return TakeOrThrow("CanonicalWireCodec::Encode",
+                           prepared_codec_->Encode(message));
     }
 
-    SemanticFrame Decode(std::span<const std::byte> bytes) const {
-        DynamicMessage message = TakeOrThrow(
-            "CanonicalWireCodec::Decode",
-            CanonicalWireCodec::Decode(*descriptor_, bytes, descriptors_));
+    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) const {
+        if (frame == nullptr) {
+            throw std::invalid_argument("semantic decode destination is null");
+        }
+        DynamicMessage message = TakeOrThrow("CanonicalWireCodec::Decode",
+                                             prepared_codec_->Decode(bytes));
         if (!message.unknown_fields().fields().empty() ||
             message.fields().size() != 18) {
             throw std::runtime_error(
                 "canonical pipeline message has unknown or missing fields");
         }
-        SemanticFrame frame;
-        frame.sample_id = Unsigned(message, 1);
-        frame.origin_timestamp_ns = Unsigned(message, 2);
-        frame.perception_timestamp_ns = Unsigned(message, 3);
-        frame.prediction_timestamp_ns = Unsigned(message, 4);
-        frame.planning_timestamp_ns = Unsigned(message, 5);
-        frame.control_timestamp_ns = Unsigned(message, 6);
-        frame.guardian_timestamp_ns = Unsigned(message, 7);
-        frame.completed_stage_mask = NarrowU32(Unsigned(message, 8), 8);
-        frame.profile = NarrowU32(Unsigned(message, 9), 9);
-        frame.object_count = NarrowU32(Unsigned(message, 10), 10);
-        frame.trajectory_point_count =
+        frame->sample_id = Unsigned(message, 1);
+        frame->origin_timestamp_ns = Unsigned(message, 2);
+        frame->perception_timestamp_ns = Unsigned(message, 3);
+        frame->prediction_timestamp_ns = Unsigned(message, 4);
+        frame->planning_timestamp_ns = Unsigned(message, 5);
+        frame->control_timestamp_ns = Unsigned(message, 6);
+        frame->guardian_timestamp_ns = Unsigned(message, 7);
+        frame->completed_stage_mask = NarrowU32(Unsigned(message, 8), 8);
+        frame->profile = NarrowU32(Unsigned(message, 9), 9);
+        frame->object_count = NarrowU32(Unsigned(message, 10), 10);
+        frame->trajectory_point_count =
             NarrowU32(Unsigned(message, 11), 11);
-        frame.ego_speed_mps = Float64(message, 12);
-        frame.steering_angle_rad = Float64(message, 13);
-        frame.acceleration_mps2 = Float64(message, 14);
-        frame.brake_percentage = Float64(message, 15);
-        frame.emergency_stop = Boolean(message, 16);
-        frame.payload_checksum = Unsigned(message, 17);
+        frame->ego_speed_mps = Float64(message, 12);
+        frame->steering_angle_rad = Float64(message, 13);
+        frame->acceleration_mps2 = Float64(message, 14);
+        frame->brake_percentage = Float64(message, 15);
+        frame->emergency_stop = Boolean(message, 16);
+        frame->payload_checksum = Unsigned(message, 17);
         const DynamicValue& payload = Field(message, 18);
         if (payload.bytes() == nullptr ||
             payload.bytes()->value.size() > kLargePayloadBytes) {
             throw std::runtime_error(
                 "canonical payload has the wrong dynamic type or size");
         }
-        frame.payload.reserve(payload.bytes()->value.size());
-        for (std::byte byte : payload.bytes()->value) {
-            frame.payload.push_back(static_cast<uint8_t>(byte));
+        const auto& payload_bytes = payload.bytes()->value;
+        frame->payload.resize(payload_bytes.size());
+        if (!payload_bytes.empty()) {
+            std::memcpy(frame->payload.data(), payload_bytes.data(),
+                        payload_bytes.size());
         }
-        return frame;
     }
 
   private:
@@ -850,7 +855,7 @@ class PipelineSchema final {
     }
 
     std::shared_ptr<const SchemaDescriptor> descriptor_;
-    std::vector<std::shared_ptr<const SchemaDescriptor>> descriptors_;
+    std::optional<PreparedCanonicalWireCodec> prepared_codec_;
 };
 
 EndpointDescriptor MakeEndpoint(std::string_view address, uint16_t port) {
@@ -911,7 +916,8 @@ class BridgeTransport final {
         Send(body, deadline_ns, transport::UntrackedTrafficClass::kData);
     }
 
-    SemanticFrame ReceiveData(uint64_t expected_id, uint64_t deadline_ns) {
+    void ReceiveData(uint64_t expected_id, uint64_t deadline_ns,
+                     SemanticFrame* semantic) {
         std::vector<std::byte> body = Receive(deadline_ns);
         WireFrame frame = TakeOrThrow(
             "WireFrameCodec::Decode", WireFrameCodec::Decode(body, limits_));
@@ -923,12 +929,11 @@ class BridgeTransport final {
             throw std::runtime_error(
                 "bridge data WireFrame header does not match expected sample");
         }
-        SemanticFrame semantic = schema_.Decode(frame.payload);
-        if (frame.header.timestamp_ns != semantic.origin_timestamp_ns) {
+        schema_.Decode(frame.payload, semantic);
+        if (frame.header.timestamp_ns != semantic->origin_timestamp_ns) {
             throw std::runtime_error(
                 "WireFrame timestamp does not match canonical message origin");
         }
-        return semantic;
     }
 
     void SendCompletion(uint64_t total_frames, uint64_t deadline_ns) {
@@ -1205,9 +1210,12 @@ void ValidateSampleAndPhase(const Options& options,
     }
 }
 
-SemanticFrame GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
-                                  const CentralSlabAllocator& allocator,
-                                  Profile expected_profile) {
+void GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
+                         const CentralSlabAllocator& allocator,
+                         Profile expected_profile, SemanticFrame* frame) {
+    if (frame == nullptr) {
+        throw std::invalid_argument("semantic destination is null");
+    }
     const FrameAccessor accessor(source);
     if (!accessor.valid()) {
         throw std::runtime_error("generated Mino root object is invalid");
@@ -1245,27 +1253,25 @@ SemanticFrame GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
             "generated Mino payload child does not belong to root graph");
     }
 
-    SemanticFrame frame;
-    frame.sample_id = accessor.sample_id();
-    frame.origin_timestamp_ns = accessor.origin_timestamp_ns();
-    frame.perception_timestamp_ns = accessor.perception_timestamp_ns();
-    frame.prediction_timestamp_ns = accessor.prediction_timestamp_ns();
-    frame.planning_timestamp_ns = accessor.planning_timestamp_ns();
-    frame.control_timestamp_ns = accessor.control_timestamp_ns();
-    frame.guardian_timestamp_ns = accessor.guardian_timestamp_ns();
-    frame.completed_stage_mask = accessor.completed_stage_mask();
-    frame.profile = accessor.profile();
-    frame.object_count = accessor.object_count();
-    frame.trajectory_point_count = accessor.trajectory_point_count();
-    frame.ego_speed_mps = accessor.ego_speed_mps();
-    frame.steering_angle_rad = accessor.steering_angle_rad();
-    frame.acceleration_mps2 = accessor.acceleration_mps2();
-    frame.brake_percentage = accessor.brake_percentage();
-    frame.emergency_stop = accessor.emergency_stop();
-    frame.payload_checksum = accessor.payload_checksum();
-    const auto* payload_bytes = static_cast<const uint8_t*>(child->data);
-    frame.payload.assign(payload_bytes, payload_bytes + payload.length);
-    return frame;
+    frame->sample_id = accessor.sample_id();
+    frame->origin_timestamp_ns = accessor.origin_timestamp_ns();
+    frame->perception_timestamp_ns = accessor.perception_timestamp_ns();
+    frame->prediction_timestamp_ns = accessor.prediction_timestamp_ns();
+    frame->planning_timestamp_ns = accessor.planning_timestamp_ns();
+    frame->control_timestamp_ns = accessor.control_timestamp_ns();
+    frame->guardian_timestamp_ns = accessor.guardian_timestamp_ns();
+    frame->completed_stage_mask = accessor.completed_stage_mask();
+    frame->profile = accessor.profile();
+    frame->object_count = accessor.object_count();
+    frame->trajectory_point_count = accessor.trajectory_point_count();
+    frame->ego_speed_mps = accessor.ego_speed_mps();
+    frame->steering_angle_rad = accessor.steering_angle_rad();
+    frame->acceleration_mps2 = accessor.acceleration_mps2();
+    frame->brake_percentage = accessor.brake_percentage();
+    frame->emergency_stop = accessor.emergency_stop();
+    frame->payload_checksum = accessor.payload_checksum();
+    frame->payload.resize(payload.length);
+    std::memcpy(frame->payload.data(), child->data, payload.length);
 }
 
 void PopulateGeneratedFrame(const SemanticFrame& source,
@@ -1389,13 +1395,15 @@ void RunSourceBridge(const Options& options, BridgeTransport* transport,
     }
     const Deadline runtime_deadline = RuntimeDeadline(deadline_ns);
     const uint64_t total = TotalFrames(options);
+    SemanticFrame semantic;
+    semantic.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         Result<BorrowedMessage<Frame>> polled =
             subscriber.Poll(runtime_deadline);
         if (!polled.ok()) ThrowStatus("Subscriber::Poll", polled.status());
         BorrowedMessage<Frame> borrowed = std::move(*polled);
-        SemanticFrame semantic = GeneratedToSemantic(
-            *borrowed, borrowed.metadata().payload, allocator, options.profile);
+        GeneratedToSemantic(*borrowed, borrowed.metadata().payload, allocator,
+                            options.profile, &semantic);
         ValidateSampleAndPhase(options, semantic, expected_id);
         transport->SendData(semantic, deadline_ns);
         const Status ack = std::move(borrowed).Ack();
@@ -1441,9 +1449,10 @@ void RunSinkBridge(const Options& options, BridgeTransport* transport,
     }
     const Deadline runtime_deadline = RuntimeDeadline(deadline_ns);
     const uint64_t total = TotalFrames(options);
+    SemanticFrame semantic;
+    semantic.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
-        SemanticFrame semantic =
-            transport->ReceiveData(expected_id, deadline_ns);
+        transport->ReceiveData(expected_id, deadline_ns, &semantic);
         ValidateSampleAndPhase(options, semantic, expected_id);
         PublishBounded(&publisher, semantic, runtime_deadline);
     }

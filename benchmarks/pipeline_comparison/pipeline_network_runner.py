@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -54,10 +55,26 @@ DEFAULT_DESCRIPTOR = (
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 POLL_SECONDS = 0.05
+CLEANUP_DEADLINE_SECONDS = 10.0
 
 
 class ConfigurationError(ValueError):
     pass
+
+
+class DeadlineExpired(RuntimeError):
+    pass
+
+
+def _deadline_timeout(deadline: float, cap: float, operation: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeadlineExpired(f"deadline expired {operation}")
+    return min(cap, remaining)
+
+
+def _has_control_character(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
 
 
 @dataclass(frozen=True)
@@ -217,12 +234,24 @@ def load_topology(path: Path) -> dict[str, RoleHost]:
         ssh_host = entry["ssh_host"]
         data_address = entry["data_address"]
         workdir = entry["workdir"]
-        if not isinstance(ssh_host, str) or not ssh_host or "\0" in ssh_host:
+        if (
+            not isinstance(ssh_host, str)
+            or not ssh_host
+            or ssh_host.startswith("-")
+            or any(character.isspace() for character in ssh_host)
+            or _has_control_character(ssh_host)
+        ):
             raise ConfigurationError(f"roles.{role}.ssh_host is invalid")
         if not isinstance(data_address, str) or not data_address or "\0" in data_address:
             raise ConfigurationError(f"roles.{role}.data_address is invalid")
-        if not isinstance(workdir, str) or not Path(workdir).is_absolute():
-            raise ConfigurationError(f"roles.{role}.workdir must be absolute")
+        if (
+            not isinstance(workdir, str)
+            or _has_control_character(workdir)
+            or not Path(workdir).is_absolute()
+        ):
+            raise ConfigurationError(
+                f"roles.{role}.workdir must be an absolute path without control characters"
+            )
         if ssh_host == "local" and Path(workdir).resolve() != REPOSITORY_ROOT:
             raise ConfigurationError(
                 f"roles.{role}.workdir must be {str(REPOSITORY_ROOT)!r} for local"
@@ -248,9 +277,12 @@ def read_boot_ids(
 ) -> dict[str, str]:
     """Read each role's Linux boot ID through the same execution path as workers."""
     result: dict[str, str] = {}
+    deadline = time.monotonic() + timeout
     for role in ROLES:
         completed = _remote_run(
-            topology[role], ["cat", "/proc/sys/kernel/random/boot_id"], timeout
+            topology[role],
+            ["cat", "/proc/sys/kernel/random/boot_id"],
+            _deadline_timeout(deadline, timeout, "qualifying remote clock hosts"),
         )
         boot_id = completed.stdout.strip() if completed.returncode == 0 else ""
         if not boot_id or any(character.isspace() for character in boot_id):
@@ -261,17 +293,36 @@ def read_boot_ids(
 
 
 def prepare_output(path: Path) -> Path:
-    result = path.expanduser().resolve()
-    if result.exists():
-        if not result.is_dir():
-            raise ConfigurationError("output path exists and is not a directory")
+    try:
+        result = path.expanduser().resolve()
+        if result.exists():
+            if not result.is_dir():
+                raise ConfigurationError("output path exists and is not a directory")
+            try:
+                next(result.iterdir())
+            except StopIteration:
+                return result
+            raise ConfigurationError("output directory must be empty")
+        result.mkdir(parents=True)
+        return result
+    except OSError as exc:
+        raise ConfigurationError(f"cannot prepare output directory: {exc}") from exc
+
+
+def _write_json_atomic(path: Path, document: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError as exc:
         try:
-            next(result.iterdir())
-        except StopIteration:
-            return result
-        raise ConfigurationError("output directory must be empty")
-    result.mkdir(parents=True)
-    return result
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ConfigurationError(f"cannot write {path.name}: {exc}") from exc
 
 
 def _ssh_prefix(host: RoleHost) -> list[str]:
@@ -382,10 +433,10 @@ def _remote_copy(host: RoleHost, source: Path, destination: Path, timeout: float
 
 
 def _remote_cleanup(host: RoleHost, path: Path, timeout: float) -> None:
-    try:
-        _remote_run(host, ["rm", "-rf", "--", str(path)], timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    completed = _remote_run(host, ["rm", "-rf", "--", str(path)], timeout)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise RuntimeError(f"cannot remove runtime for {host.role}: {detail}")
 
 
 def _sha256(path: Path) -> Optional[str]:
@@ -556,14 +607,16 @@ def create_workers(
     return workers
 
 
-def _remote_process_group(worker: Worker) -> Optional[int]:
+def _remote_process_group(worker: Worker, deadline: float) -> Optional[int]:
     if worker.host.local:
         return None
     try:
         content = _remote_read(
-            worker.host, worker.runtime_dir / f"worker-{worker.host.role}.pid", 2
+            worker.host,
+            worker.runtime_dir / f"worker-{worker.host.role}.pid",
+            _deadline_timeout(deadline, 2, "reading a remote worker pid"),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, DeadlineExpired):
         return None
     if content is None:
         return None
@@ -574,26 +627,21 @@ def _remote_process_group(worker: Worker) -> Optional[int]:
     return pid if 1 < pid <= 2_147_483_647 else None
 
 
-def _signal_remote_process_group(worker: Worker, pid: int, name: str) -> None:
+def _signal_remote_process_group(
+    worker: Worker, pid: int, name: str, deadline: float
+) -> None:
     try:
         _remote_run(
             worker.host,
             ["/bin/kill", f"-{name}", "--", f"-{pid}"],
-            3,
+            _deadline_timeout(deadline, 3, f"sending remote {name}"),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, DeadlineExpired):
         pass
 
 
 def terminate_workers(workers: Sequence[Worker]) -> None:
-    remote_groups = [
-        (worker, pid)
-        for worker in workers
-        if (pid := _remote_process_group(worker)) is not None
-    ]
-    for worker, pid in remote_groups:
-        _signal_remote_process_group(worker, pid, "TERM")
-
+    deadline = time.monotonic() + CLEANUP_DEADLINE_SECONDS
     active = [
         worker.process
         for worker in workers
@@ -604,11 +652,23 @@ def terminate_workers(workers: Sequence[Worker]) -> None:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    deadline = time.monotonic() + 1.0
-    while any(process.poll() is None for process in active) and time.monotonic() < deadline:
-        time.sleep(0.02)
+
+    remote_groups: list[tuple[Worker, int]] = []
+    for worker in workers:
+        pid = _remote_process_group(worker, deadline)
+        if pid is not None:
+            remote_groups.append((worker, pid))
     for worker, pid in remote_groups:
-        _signal_remote_process_group(worker, pid, "KILL")
+        _signal_remote_process_group(worker, pid, "TERM", deadline)
+
+    grace_deadline = min(deadline, time.monotonic() + 1.0)
+    while any(process.poll() is None for process in active):
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.02, remaining))
+    for worker, pid in remote_groups:
+        _signal_remote_process_group(worker, pid, "KILL", deadline)
     for process in active:
         if process.poll() is None:
             try:
@@ -616,10 +676,13 @@ def terminate_workers(workers: Sequence[Worker]) -> None:
             except ProcessLookupError:
                 pass
     for process in active:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            process.wait(timeout=1.0)
+            process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
-            pass
+            break
 
 
 def launch_and_wait(
@@ -632,7 +695,12 @@ def launch_and_wait(
     deadline = time.monotonic() + args.deadline_seconds
     try:
         for worker in workers:
-            _remote_mkdir(worker.host, worker.runtime_dir, min(10, args.deadline_seconds))
+            _remote_mkdir(
+                worker.host,
+                worker.runtime_dir,
+                _deadline_timeout(deadline, 10, "setting up remote runtimes"),
+            )
+            _deadline_timeout(deadline, 10, "launching remote workers")
             worker.stdout_handle = worker.stdout_path.open("wb")
             worker.stderr_handle = worker.stderr_path.open("wb")
             worker.process = subprocess.Popen(
@@ -654,25 +722,39 @@ def launch_and_wait(
                 ready = worker.runtime_dir / (
                     f"{BACKEND_WORKER_NAMES[args.backend]}-{role}.ready"
                 )
-                content = _remote_read(worker.host, ready, 5)
+                content = _remote_read(
+                    worker.host,
+                    ready,
+                    _deadline_timeout(
+                        deadline, 5, "waiting for remote readiness"
+                    ),
+                )
                 if content == run_id + "\n":
                     del pending[role]
                 elif content is not None:
                     errors.append(f"{role} readiness run-id mismatch")
                     return errors
-            if time.monotonic() >= deadline:
-                errors.append("deadline expired waiting for remote readiness")
-                return errors
-            time.sleep(POLL_SECONDS)
+            if pending:
+                time.sleep(
+                    _deadline_timeout(
+                        deadline, POLL_SECONDS, "waiting for remote readiness"
+                    )
+                )
 
         # Start consumers first. Per-role runtime directories prevent a source
         # start from racing a downstream process on the same physical host.
         for worker in reversed(workers[1:]):
             _remote_write_start(
-                worker.host, worker.runtime_dir / "start", run_id, 10
+                worker.host,
+                worker.runtime_dir / "start",
+                run_id,
+                _deadline_timeout(deadline, 10, "starting remote workers"),
             )
         _remote_write_start(
-            workers[0].host, workers[0].runtime_dir / "start", run_id, 10
+            workers[0].host,
+            workers[0].runtime_dir / "start",
+            run_id,
+            _deadline_timeout(deadline, 10, "starting remote workers"),
         )
 
         pending_workers = list(workers)
@@ -687,10 +769,12 @@ def launch_and_wait(
                     errors.append(f"{worker.host.role} exited with {code}")
             if errors:
                 return errors
-            if time.monotonic() >= deadline:
-                errors.append("deadline expired waiting for remote workers")
-                return errors
-            time.sleep(POLL_SECONDS)
+            if pending_workers:
+                time.sleep(
+                    _deadline_timeout(
+                        deadline, POLL_SECONDS, "waiting for remote workers"
+                    )
+                )
         completed = True
     except (OSError, subprocess.TimeoutExpired, ConfigurationError, RuntimeError) as exc:
         errors.append(f"orchestration failed: {exc}")
@@ -712,25 +796,39 @@ def collect_results(
     workers: Sequence[Worker],
 ) -> list[str]:
     errors: list[str] = []
+    collection_deadline = time.monotonic() + args.deadline_seconds
     for worker in workers:
         try:
             copied = _remote_copy(
                 worker.host,
                 worker.remote_result,
                 worker.local_result,
-                min(30, args.deadline_seconds),
+                _deadline_timeout(
+                    collection_deadline, 30, "collecting remote result JSON"
+                ),
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, RuntimeError):
             copied = False
         if not copied:
             errors.append(f"{worker.host.role}: could not collect result JSON")
     if not args.keep_remote_runtime:
+        cleanup_deadline = time.monotonic() + CLEANUP_DEADLINE_SECONDS
         cleaned: set[tuple[str, Path]] = set()
         for worker in workers:
             key = (worker.host.ssh_host, worker.runtime_dir)
-            if key not in cleaned:
-                _remote_cleanup(worker.host, worker.runtime_dir, 10)
-                cleaned.add(key)
+            if key in cleaned:
+                continue
+            cleaned.add(key)
+            try:
+                _remote_cleanup(
+                    worker.host,
+                    worker.runtime_dir,
+                    _deadline_timeout(
+                        cleanup_deadline, 10, "cleaning remote runtimes"
+                    ),
+                )
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                errors.append(f"{worker.host.role}: remote cleanup failed: {exc}")
     return errors
 
 
@@ -848,54 +946,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         errors.append(f"orchestration failed: {exc}")
         terminate_workers(workers)
 
-    records = []
-    for worker in workers:
-        records.append(
-            {
-                "role": worker.host.role,
-                "ssh_host": worker.host.ssh_host,
-                "data_address": worker.host.data_address,
-                "boot_id": boot_ids.get(worker.host.role),
-                "workdir": str(worker.host.workdir),
-                "command": worker.command,
-                "launcher_exit_code": (
-                    worker.process.poll() if worker.process is not None else None
-                ),
-                "stdout": _artifact(worker.stdout_path, output),
-                "stderr": _artifact(worker.stderr_path, output),
-                "result": _artifact(worker.local_result, output),
-            }
-        )
-    manifest = {
-        "schema": MANIFEST_SCHEMA,
-        "outcome": "passed" if not errors else "failed",
-        "errors": errors,
-        "run_id": run_id,
-        "backend": args.backend,
-        "profile": args.profile,
-        "clock_mode": "same-host" if same_host else "independent-hosts",
-        "one_way_latency_valid": same_host and not errors,
-        "host_identity_source": "Linux boot ID read through each role execution path",
-        "config": {
-            "messages": args.messages,
-            "warmup_messages": args.warmup_messages,
-            "publish_interval_us": args.publish_interval_us,
-            "deadline_seconds": args.deadline_seconds,
-            "domain_id": args.domain_id,
-            "history_depth": args.history_depth,
-            "port_base": args.port_base,
-            "zmq_hwm": args.zmq_hwm,
-        },
-        "started_utc": started_utc,
-        "finished_utc": dt.datetime.now(dt.timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
-        "workers": records,
-        "sink_metrics": sink,
-    }
-    temporary = output / ".manifest.tmp"
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, output / "manifest.json")
+    try:
+        records = []
+        for worker in workers:
+            records.append(
+                {
+                    "role": worker.host.role,
+                    "ssh_host": worker.host.ssh_host,
+                    "data_address": worker.host.data_address,
+                    "boot_id": boot_ids.get(worker.host.role),
+                    "workdir": str(worker.host.workdir),
+                    "command": worker.command,
+                    "launcher_exit_code": (
+                        worker.process.poll() if worker.process is not None else None
+                    ),
+                    "stdout": _artifact(worker.stdout_path, output),
+                    "stderr": _artifact(worker.stderr_path, output),
+                    "result": _artifact(worker.local_result, output),
+                }
+            )
+        manifest = {
+            "schema": MANIFEST_SCHEMA,
+            "outcome": "passed" if not errors else "failed",
+            "errors": errors,
+            "run_id": run_id,
+            "backend": args.backend,
+            "profile": args.profile,
+            "clock_mode": "same-host" if same_host else "independent-hosts",
+            "one_way_latency_valid": same_host and not errors,
+            "host_identity_source": "Linux boot ID read through each role execution path",
+            "config": {
+                "messages": args.messages,
+                "warmup_messages": args.warmup_messages,
+                "publish_interval_us": args.publish_interval_us,
+                "deadline_seconds": args.deadline_seconds,
+                "domain_id": args.domain_id,
+                "history_depth": args.history_depth,
+                "port_base": args.port_base,
+                "zmq_hwm": args.zmq_hwm,
+            },
+            "started_utc": started_utc,
+            "finished_utc": dt.datetime.now(dt.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "workers": records,
+            "sink_metrics": sink,
+        }
+        _write_json_atomic(output / "manifest.json", manifest)
+    except (OSError, ConfigurationError) as exc:
+        print(f"network pipeline output error: {exc}", file=sys.stderr)
+        return 1
     return 0 if not errors else 1
 
 

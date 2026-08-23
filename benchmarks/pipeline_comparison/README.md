@@ -40,6 +40,9 @@ Protobuf are comparison-only dependencies.
   `RESULTS_TWO_HOST_20260816.md`; it covers all three payload profiles with
   Mino TCP, Mino hybrid, Protobuf+ZeroMQ, Fast DDS, and Cyclone DDS. These are
   one-round capability/smoke observations, not a publication-grade comparison.
+- The required post-optimization validation campaigns, acceptance criteria,
+  profiling checklist, and prioritized optimization backlog are maintained in
+  `PERFORMANCE_FOLLOWUP.md`.
 
 ## Real schema and generation contract
 

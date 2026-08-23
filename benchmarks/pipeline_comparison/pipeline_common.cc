@@ -143,7 +143,7 @@ std::string_view OptionValue(int* index, int argc, char** argv,
         }
         return inline_value;
     }
-    if (*index + 1 >= argc) {
+    if (*index + 1 >= argc || argv[*index + 1] == nullptr) {
         throw std::runtime_error(std::string(option) + " requires a value");
     }
     ++(*index);
@@ -366,6 +366,34 @@ bool IsSafeToken(std::string_view token) {
     });
 }
 
+class OwnedFd final {
+  public:
+    explicit OwnedFd(int descriptor) noexcept : descriptor_(descriptor) {}
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+
+    ~OwnedFd() {
+        const int descriptor = Release();
+        if (descriptor >= 0) (void)close(descriptor);
+    }
+
+    int get() const noexcept { return descriptor_; }
+
+    void Close(const char* operation) {
+        const int descriptor = Release();
+        if (descriptor >= 0 && close(descriptor) != 0) {
+            throw std::system_error(errno, std::generic_category(), operation);
+        }
+    }
+
+  private:
+    int Release() noexcept {
+        return std::exchange(descriptor_, -1);
+    }
+
+    int descriptor_;
+};
+
 void WriteAll(int descriptor, std::string_view content) {
     size_t written = 0;
     while (written < content.size()) {
@@ -380,6 +408,27 @@ void WriteAll(int descriptor, std::string_view content) {
     }
 }
 
+void SyncParentDirectory(const std::filesystem::path& destination) {
+    std::filesystem::path parent = destination.parent_path();
+    if (parent.empty()) parent = ".";
+
+    int flags = O_RDONLY | O_CLOEXEC;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    const int descriptor = open(parent.c_str(), flags);
+    if (descriptor < 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "open artifact parent directory");
+    }
+    OwnedFd directory(descriptor);
+    if (fsync(directory.get()) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "fsync artifact parent directory");
+    }
+    directory.Close("close artifact parent directory");
+}
+
 void AtomicWrite(const std::filesystem::path& destination,
                  std::string_view content) {
     static std::atomic<uint64_t> sequence{0};
@@ -392,19 +441,16 @@ void AtomicWrite(const std::filesystem::path& destination,
         throw std::system_error(errno, std::generic_category(),
                                 "open temporary artifact");
     }
+    OwnedFd artifact(descriptor);
     try {
-        WriteAll(descriptor, content);
-        if (fsync(descriptor) != 0) {
+        WriteAll(artifact.get(), content);
+        if (fsync(artifact.get()) != 0) {
             throw std::system_error(errno, std::generic_category(),
                                     "fsync temporary artifact");
         }
-        if (close(descriptor) != 0) {
-            throw std::system_error(errno, std::generic_category(),
-                                    "close temporary artifact");
-        }
+        artifact.Close("close temporary artifact");
     } catch (...) {
         const int saved_errno = errno;
-        close(descriptor);
         unlink(temporary.c_str());
         errno = saved_errno;
         throw;
@@ -415,6 +461,7 @@ void AtomicWrite(const std::filesystem::path& destination,
         throw std::system_error(saved_errno, std::generic_category(),
                                 "rename artifact");
     }
+    SyncParentDirectory(destination);
 }
 
 std::string CountFailure(const ResultCounts& counts) {
@@ -561,6 +608,26 @@ uint64_t StablePayloadChecksum(std::span<const uint8_t> payload) {
     return checksum;
 }
 
+struct PayloadInspection {
+    uint64_t checksum = kFnvOffsetBasis;
+    std::optional<size_t> first_mismatch;
+};
+
+PayloadInspection InspectDeterministicPayload(
+    uint64_t sample_id, Profile profile, std::span<const uint8_t> payload) {
+    PayloadInspection inspection;
+    for (size_t index = 0; index < payload.size(); ++index) {
+        const uint8_t value = payload[index];
+        inspection.checksum ^= value;
+        inspection.checksum *= kFnvPrime;
+        if (!inspection.first_mismatch.has_value() &&
+            value != DeterministicPayloadByte(sample_id, profile, index)) {
+            inspection.first_mismatch = index;
+        }
+    }
+    return inspection;
+}
+
 bool ValidateDeterministicPayload(uint64_t sample_id, Profile profile,
                                   std::span<const uint8_t> payload,
                                   std::string* error) {
@@ -571,13 +638,12 @@ bool ValidateDeterministicPayload(uint64_t sample_id, Profile profile,
                         std::to_string(payload.size()),
                     error);
     }
-    for (size_t index = 0; index < payload.size(); ++index) {
-        if (payload[index] !=
-            DeterministicPayloadByte(sample_id, profile, index)) {
-            return Fail("payload byte mismatch at index " +
-                            std::to_string(index),
-                        error);
-        }
+    const PayloadInspection inspection =
+        InspectDeterministicPayload(sample_id, profile, payload);
+    if (inspection.first_mismatch.has_value()) {
+        return Fail("payload byte mismatch at index " +
+                        std::to_string(*inspection.first_mismatch),
+                    error);
     }
     return true;
 }
@@ -631,12 +697,24 @@ bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error) {
     if (frame.emergency_stop != expected.emergency_stop) {
         return Fail("emergency_stop mismatch", error);
     }
-    const uint64_t checksum = StablePayloadChecksum(frame.payload);
-    if (frame.payload_checksum != checksum) {
+    const PayloadInspection payload =
+        InspectDeterministicPayload(frame.sample_id, *profile, frame.payload);
+    if (frame.payload_checksum != payload.checksum) {
         return Fail("payload checksum mismatch", error);
     }
-    return ValidateDeterministicPayload(frame.sample_id, *profile, frame.payload,
-                                        error);
+    const size_t expected_size = ProfilePayloadBytes(*profile);
+    if (frame.payload.size() != expected_size) {
+        return Fail("payload size mismatch: expected " +
+                        std::to_string(expected_size) + ", got " +
+                        std::to_string(frame.payload.size()),
+                    error);
+    }
+    if (payload.first_mismatch.has_value()) {
+        return Fail("payload byte mismatch at index " +
+                        std::to_string(*payload.first_mismatch),
+                    error);
+    }
+    return true;
 }
 
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
@@ -778,6 +856,15 @@ CommonOptions ParseCommonOptions(int argc, char** argv) {
         throw std::invalid_argument("invalid argc/argv");
     }
     CommonOptions options;
+    std::array<bool, 10> seen{};
+    const auto require_unique = [&](size_t option_index,
+                                    std::string_view option) {
+        if (seen[option_index]) {
+            throw std::runtime_error(std::string(option) +
+                                     " may be specified only once");
+        }
+        seen[option_index] = true;
+    };
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) {
             throw std::invalid_argument("argv contains a null argument");
@@ -793,6 +880,7 @@ CommonOptions ParseCommonOptions(int argc, char** argv) {
         };
 
         if (const auto value = parse_value("--role")) {
+            require_unique(0, "--role");
             const std::optional<Role> parsed = ParseRole(*value);
             if (!parsed.has_value()) {
                 throw std::runtime_error(
@@ -803,6 +891,7 @@ CommonOptions ParseCommonOptions(int argc, char** argv) {
             continue;
         }
         if (const auto value = parse_value("--profile")) {
+            require_unique(1, "--profile");
             const std::optional<Profile> parsed = ParseProfile(*value);
             if (!parsed.has_value()) {
                 throw std::runtime_error(
@@ -812,25 +901,30 @@ CommonOptions ParseCommonOptions(int argc, char** argv) {
             continue;
         }
         if (const auto value = parse_value("--messages")) {
+            require_unique(2, "--messages");
             options.messages = ParseUnsigned(*value, "--messages");
             continue;
         }
         if (const auto value = parse_value("--warmup-messages")) {
+            require_unique(3, "--warmup-messages");
             options.warmup_messages =
                 ParseUnsigned(*value, "--warmup-messages");
             continue;
         }
         if (const auto value = parse_value("--publish-interval-us")) {
+            require_unique(4, "--publish-interval-us");
             options.publish_interval_us =
                 ParseUnsigned(*value, "--publish-interval-us");
             continue;
         }
         if (const auto value = parse_value("--deadline-seconds")) {
+            require_unique(5, "--deadline-seconds");
             options.deadline_seconds =
                 ParseUnsigned(*value, "--deadline-seconds");
             continue;
         }
         if (const auto value = parse_value("--clock-mode")) {
+            require_unique(6, "--clock-mode");
             if (*value == "same-host") {
                 options.clock_mode = ClockMode::kSameHost;
             } else if (*value == "independent-hosts") {
@@ -842,14 +936,17 @@ CommonOptions ParseCommonOptions(int argc, char** argv) {
             continue;
         }
         if (const auto value = parse_value("--run-id")) {
+            require_unique(7, "--run-id");
             options.run_id = std::string(*value);
             continue;
         }
         if (const auto value = parse_value("--runtime-dir")) {
+            require_unique(8, "--runtime-dir");
             options.runtime_dir = std::filesystem::path(*value);
             continue;
         }
         if (const auto value = parse_value("--output")) {
+            require_unique(9, "--output");
             options.output = std::filesystem::path(*value);
             continue;
         }
@@ -1053,7 +1150,12 @@ void WriteSinkResult(const std::filesystem::path& output,
         if (!effective_error.empty()) effective_error += "; ";
         effective_error += "invalid throughput";
     } else if (throughput == 0.0 && result.elapsed_ns != 0) {
-        throughput = static_cast<double>(result.counts.received) *
+        uint64_t throughput_samples = result.counts.received;
+        if (result.options.clock_mode == ClockMode::kIndependentHosts) {
+            throughput_samples =
+                result.counts.received < 2 ? 0 : result.counts.received - 1;
+        }
+        throughput = static_cast<double>(throughput_samples) *
                      static_cast<double>(kNanosecondsPerSecond) /
                      static_cast<double>(result.elapsed_ns);
     }

@@ -32,6 +32,14 @@ Status Resource(std::string_view message) {
     return Status::Error(StatusCode::kResourceExhausted, message);
 }
 
+Status ValidateWireLimits(const WireLimits& limits) {
+    if (limits.max_frame_bytes == 0 || limits.max_depth == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "wire limits must be non-zero");
+    }
+    return Status::Ok();
+}
+
 bool IsValidUtf8(std::span<const std::byte> bytes) noexcept {
     size_t i = 0;
     while (i < bytes.size()) {
@@ -807,6 +815,22 @@ Result<DynamicMessage> DecodeMessage(const SchemaDescriptor& descriptor,
 
 }  // namespace
 
+class PreparedCanonicalWireCodec::State {
+public:
+    State(std::shared_ptr<const SchemaDescriptor> root_descriptor,
+          std::vector<std::shared_ptr<const SchemaDescriptor>> descriptor_closure,
+          WireLimits wire_limits)
+        : root(std::move(root_descriptor)),
+          descriptors(std::move(descriptor_closure)),
+          limits(std::move(wire_limits)),
+          resolver(*root, descriptors) {}
+
+    const std::shared_ptr<const SchemaDescriptor> root;
+    const std::vector<std::shared_ptr<const SchemaDescriptor>> descriptors;
+    const WireLimits limits;
+    const DescriptorResolver resolver;
+};
+
 uint64_t ZigZagEncode(int64_t value) noexcept {
     return (static_cast<uint64_t>(value) << 1) ^
            static_cast<uint64_t>(-(value < 0));
@@ -867,10 +891,7 @@ Result<std::vector<std::byte>> CanonicalWireCodec::Encode(
     std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
     const WireLimits& limits) noexcept {
     try {
-        if (limits.max_frame_bytes == 0 || limits.max_depth == 0) {
-            return Status::Error(StatusCode::kInvalidArgument,
-                                 "wire limits must be non-zero");
-        }
+        MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
         DescriptorResolver resolver(descriptor, descriptors);
         CodecContext context{resolver, limits, 0};
@@ -890,14 +911,66 @@ Result<DynamicMessage> CanonicalWireCodec::Decode(
     std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
     const WireLimits& limits) noexcept {
     try {
-        if (limits.max_frame_bytes == 0 || limits.max_depth == 0) {
-            return Status::Error(StatusCode::kInvalidArgument,
-                                 "wire limits must be non-zero");
-        }
+        MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
         DescriptorResolver resolver(descriptor, descriptors);
         CodecContext context{resolver, limits, 0};
         return DecodeMessage(descriptor, bytes, 0, context);
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+PreparedCanonicalWireCodec::PreparedCanonicalWireCodec(
+    std::shared_ptr<const State> state) noexcept
+    : state_(std::move(state)) {}
+
+Result<PreparedCanonicalWireCodec> PreparedCanonicalWireCodec::Create(
+    std::shared_ptr<const SchemaDescriptor> root,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
+    const WireLimits& limits) noexcept {
+    try {
+        if (root == nullptr) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "prepared wire codec root must not be null");
+        }
+        MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
+        MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(*root, descriptors));
+        std::vector<std::shared_ptr<const SchemaDescriptor>> owned_descriptors(
+            descriptors.begin(), descriptors.end());
+        std::shared_ptr<const State> state(new State(
+            std::move(root), std::move(owned_descriptors), limits));
+        return PreparedCanonicalWireCodec(std::move(state));
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+Result<std::vector<std::byte>> PreparedCanonicalWireCodec::Encode(
+    const DynamicMessage& message) const noexcept {
+    try {
+        CodecContext context{state_->resolver, state_->limits, 0};
+        std::vector<std::byte> output;
+        Status status =
+            EncodeMessage(*state_->root, message, 0, context, output);
+        if (!status.ok()) return status;
+        return output;
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+Result<DynamicMessage> PreparedCanonicalWireCodec::Decode(
+    std::span<const std::byte> bytes) const noexcept {
+    try {
+        CodecContext context{state_->resolver, state_->limits, 0};
+        return DecodeMessage(*state_->root, bytes, 0, context);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {

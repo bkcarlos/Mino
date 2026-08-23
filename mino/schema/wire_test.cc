@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "mino/common/status.h"
@@ -120,6 +121,25 @@ message Payload {
     auto encoded_again = CanonicalWireCodec::Encode(*descriptor, *decoded);
     ASSERT_TRUE(encoded_again.ok());
     EXPECT_EQ(*encoded_again, *encoded);
+
+    auto prepared = PreparedCanonicalWireCodec::Create(descriptor);
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    descriptor.reset();
+    const PreparedCanonicalWireCodec& codec = *prepared;
+    for (size_t iteration = 0; iteration < 2; ++iteration) {
+        auto prepared_encoded = codec.Encode(message);
+        ASSERT_TRUE(prepared_encoded.ok())
+            << prepared_encoded.status().ToString();
+        EXPECT_EQ(*prepared_encoded, *encoded);
+
+        auto prepared_decoded = codec.Decode(*prepared_encoded);
+        ASSERT_TRUE(prepared_decoded.ok())
+            << prepared_decoded.status().ToString();
+        auto prepared_roundtrip = codec.Encode(*prepared_decoded);
+        ASSERT_TRUE(prepared_roundtrip.ok())
+            << prepared_roundtrip.status().ToString();
+        EXPECT_EQ(*prepared_roundtrip, *encoded);
+    }
 }
 
 TEST(CanonicalWireTest, RejectsMalformedCanonicalInputs) {
@@ -217,6 +237,52 @@ TEST(CanonicalWireTest, RequiresExactAuthenticatedDescriptorClosure) {
     auto rejected_duplicate = CanonicalWireCodec::Decode(*root, {}, duplicate);
     ASSERT_FALSE(rejected_duplicate.ok());
     EXPECT_EQ(rejected_duplicate.status().code(), StatusCode::kSchemaMismatch);
+}
+
+TEST(PreparedCanonicalWireCodecTest, RejectsInvalidCreationInputs) {
+    static_assert(
+        !std::is_default_constructible_v<PreparedCanonicalWireCodec>);
+
+    auto null_root = PreparedCanonicalWireCodec::Create(nullptr);
+    ASSERT_FALSE(null_root.ok());
+    EXPECT_EQ(null_root.status().code(), StatusCode::kInvalidArgument);
+
+    auto descriptor =
+        CompileOne("package p; message M { optional uint32 id = 1; }");
+    ASSERT_NE(descriptor, nullptr);
+
+    WireLimits limits;
+    limits.max_frame_bytes = 0;
+    auto invalid_frame =
+        PreparedCanonicalWireCodec::Create(descriptor, {}, limits);
+    ASSERT_FALSE(invalid_frame.ok());
+    EXPECT_EQ(invalid_frame.status().code(), StatusCode::kInvalidArgument);
+
+    limits = WireLimits{};
+    limits.max_depth = 0;
+    auto invalid_depth =
+        PreparedCanonicalWireCodec::Create(descriptor, {}, limits);
+    ASSERT_FALSE(invalid_depth.ok());
+    EXPECT_EQ(invalid_depth.status().code(), StatusCode::kInvalidArgument);
+
+    CompileOptions options;
+    options.allow_implicit_schema_version = true;
+    auto compiled = SchemaCompiler::Compile(
+        "package p; message Child {} message Root { Child child = 1; }",
+        options);
+    ASSERT_TRUE(compiled.ok()) << compiled.status().ToString();
+    std::shared_ptr<const SchemaDescriptor> root;
+    for (const auto& type : compiled->types()) {
+        if (type->aggregate().full_name() == "p.Root") {
+            root = type;
+            break;
+        }
+    }
+    ASSERT_NE(root, nullptr);
+
+    auto invalid_closure = PreparedCanonicalWireCodec::Create(root, {});
+    ASSERT_FALSE(invalid_closure.ok());
+    EXPECT_EQ(invalid_closure.status().code(), StatusCode::kSchemaMismatch);
 }
 
 TEST(CanonicalWireTest, EnforcesContainerAndDepthLimitsBeforeAllocation) {

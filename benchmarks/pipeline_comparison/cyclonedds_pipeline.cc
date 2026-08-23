@@ -38,6 +38,7 @@ constexpr int32_t kMaximumHistoryDepth = 4096;
 constexpr size_t kMaximumPayloadBytes = kLargePayloadBytes;
 constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;
 constexpr uint64_t kMatchingPollNanoseconds = 10'000'000ull;
+constexpr uint64_t kWriteBlockingNanoseconds = 1'000'000ull;
 constexpr uint64_t kMaximumInitialLatencyReserve = 1'000'000;
 
 struct BackendOptions {
@@ -47,7 +48,7 @@ struct BackendOptions {
 
 struct RunStatistics {
     uint64_t measured_completed = 0;
-    uint64_t encoded_bytes_total = 0;
+    uint64_t encoded_bytes_per_message = 0;
     uint64_t duplicate = 0;
     uint64_t out_of_order = 0;
     uint64_t corrupt = 0;
@@ -264,11 +265,11 @@ BackendOptions ParseBackendOptions(int argc, char** argv) {
 
 class Qos final {
   public:
-    Qos(int32_t history_depth, uint64_t deadline_seconds, bool writer)
-        : value_(dds_create_qos()) {
+    Qos(int32_t history_depth, bool writer) : value_(dds_create_qos()) {
         if (value_ == nullptr) throw std::bad_alloc();
-        dds_qset_reliability(value_, DDS_RELIABILITY_RELIABLE,
-                             DDS_SECS(deadline_seconds));
+        dds_qset_reliability(
+            value_, DDS_RELIABILITY_RELIABLE,
+            static_cast<dds_duration_t>(kWriteBlockingNanoseconds));
         dds_qset_durability(value_, DDS_DURABILITY_VOLATILE);
         dds_qset_history(value_, DDS_HISTORY_KEEP_ALL, 0);
         dds_qset_resource_limits(value_, history_depth, 1, history_depth);
@@ -323,7 +324,6 @@ class CycloneDdsPipeline final {
                        const BackendOptions& backend,
                        const std::array<std::string, 5>& topics)
         : role_(common.role),
-          deadline_seconds_(common.deadline_seconds),
           backend_(backend),
           topics_(topics) {
         try {
@@ -378,10 +378,21 @@ class CycloneDdsPipeline final {
         if (writer_ == DDS_ENTITY_NIL) {
             throw std::logic_error("pipeline role has no Cyclone DDS writer");
         }
-        EnsureBeforeDeadline(absolute_deadline_ns, "Cyclone DDS write");
-        RequireOk(dds_write(writer_, &sample), "Cyclone DDS dds_write");
-        EnsureBeforeDeadline(absolute_deadline_ns,
-                             "completion of Cyclone DDS write");
+        while (true) {
+            EnsureBeforeDeadline(absolute_deadline_ns, "Cyclone DDS write");
+            const dds_return_t code = dds_write(writer_, &sample);
+            if (code == DDS_RETCODE_OK) {
+                EnsureBeforeDeadline(absolute_deadline_ns,
+                                     "completion of Cyclone DDS write");
+                return;
+            }
+            if (code != DDS_RETCODE_TIMEOUT) {
+                throw std::runtime_error("Cyclone DDS dds_write failed: " +
+                                         DdsError(code));
+            }
+            EnsureBeforeDeadline(absolute_deadline_ns,
+                                 "retry of timed-out Cyclone DDS write");
+        }
     }
 
     DdsFrame Take(uint64_t absolute_deadline_ns) {
@@ -511,7 +522,7 @@ class CycloneDdsPipeline final {
     }
 
     dds_entity_t CreateTopic(size_t edge) {
-        Qos qos(backend_.history_depth, deadline_seconds_, false);
+        Qos qos(backend_.history_depth, false);
         const dds_entity_t topic = dds_create_topic(
             participant_,
             &mino_benchmarks_pipeline_AutonomyPipelineFrame_desc,
@@ -522,7 +533,7 @@ class CycloneDdsPipeline final {
 
     void CreateInput(size_t edge) {
         const dds_entity_t topic = CreateTopic(edge);
-        Qos qos(backend_.history_depth, deadline_seconds_, false);
+        Qos qos(backend_.history_depth, false);
         reader_ = dds_create_reader(participant_, topic, qos.get(), nullptr);
         RequireEntity(reader_, "Cyclone DDS dds_create_reader");
         read_condition_ = dds_create_readcondition(reader_, DDS_ANY_STATE);
@@ -536,7 +547,7 @@ class CycloneDdsPipeline final {
 
     void CreateOutput(size_t edge) {
         const dds_entity_t topic = CreateTopic(edge);
-        Qos qos(backend_.history_depth, deadline_seconds_, true);
+        Qos qos(backend_.history_depth, true);
         writer_ = dds_create_writer(participant_, topic, qos.get(), nullptr);
         RequireEntity(writer_, "Cyclone DDS dds_create_writer");
     }
@@ -556,7 +567,6 @@ class CycloneDdsPipeline final {
     }
 
     Role role_;
-    uint64_t deadline_seconds_;
     BackendOptions backend_;
     std::array<std::string, 5> topics_;
     dds_entity_t participant_ = DDS_ENTITY_NIL;
@@ -663,6 +673,15 @@ uint64_t TotalFrames(const CommonOptions& options) {
     return options.warmup_messages + options.messages;
 }
 
+void RecordEncodedSizeOnce(CycloneDdsPipeline* pipeline,
+                           const DdsFrame& sample,
+                           RunStatistics* statistics) {
+    if (statistics->encoded_bytes_per_message == 0) {
+        statistics->encoded_bytes_per_message =
+            pipeline->SerializedSize(sample);
+    }
+}
+
 void RunSource(const CommonOptions& options, CycloneDdsPipeline* pipeline,
                uint64_t deadline, RunStatistics* statistics) {
     const uint64_t total = TotalFrames(options);
@@ -683,7 +702,7 @@ void RunSource(const CommonOptions& options, CycloneDdsPipeline* pipeline,
         SemanticToTyped(frame, &typed);
         pipeline->Write(typed, deadline);
         if (measured) {
-            statistics->encoded_bytes_total += pipeline->SerializedSize(typed);
+            RecordEncodedSizeOnce(pipeline, typed, statistics);
             ++statistics->measured_completed;
         }
     }
@@ -708,8 +727,7 @@ void RunForwarder(const CommonOptions& options,
         SemanticToTyped(frame, &outgoing);
         pipeline->Write(outgoing, deadline);
         if (expected_id >= options.warmup_messages) {
-            statistics->encoded_bytes_total +=
-                pipeline->SerializedSize(outgoing);
+            RecordEncodedSizeOnce(pipeline, outgoing, statistics);
             ++statistics->measured_completed;
         }
     }
@@ -751,17 +769,19 @@ void RunSink(const CommonOptions& options, CycloneDdsPipeline* pipeline,
             statistics->latencies_ns.push_back(completion_ns -
                                                frame.origin_timestamp_ns);
         }
-        statistics->encoded_bytes_total += pipeline->SerializedSize(received);
+        // The profile fixes the payload length, so every XCDR1 sample has the
+        // same encoded size; calculate this reporting metric only once.
+        RecordEncodedSizeOnce(pipeline, received, statistics);
         ++statistics->measured_completed;
     }
 }
 
 std::string BackendDetails(
-    const BackendOptions& backend, uint64_t deadline_seconds,
+    const BackendOptions& backend,
     const std::array<std::string, 5>& topics) {
     std::string details =
         "{\"cyclonedds_pinned_version\":\"11.0.1\","
-        "\"idl_support\":\"Cyclone DDS idlc generated C type\",
+        "\"idl_support\":\"Cyclone DDS idlc generated C type\","
         "\"domain_id\":" + std::to_string(backend.domain_id) +
         ",\"topics\":[";
     for (size_t edge = 0; edge < topics.size(); ++edge) {
@@ -773,18 +793,18 @@ std::string BackendDetails(
         "\"durability\":\"volatile\","
         "\"history\":\"keep_all_bounded\","
         "\"writer_batching\":false,"
-        "\"data_representation\":\"xcdr1\",
+        "\"data_representation\":\"xcdr1\","
         "\"history_depth\":" + std::to_string(backend.history_depth) +
         ",\"resource_limits\":{\"max_samples\":" +
         std::to_string(backend.history_depth) +
         ",\"max_instances\":1,\"max_samples_per_instance\":" +
         std::to_string(backend.history_depth) +
         "},\"max_blocking_time_ms\":" +
-        std::to_string(deadline_seconds * 1000u) + "},"
+        std::to_string(kWriteBlockingNanoseconds / 1'000'000u) + "},"
         "\"discovery\":\"Cyclone DDS default SPDP or CYCLONEDDS_URI\","
         "\"transport\":\"Cyclone DDS default UDP; no PSMX target in BCR overlay\","
-        "\"shm_only\":false,
-        "\"encoded_bytes_metric\":\"average generated XCDR1 CDR stream size including 4-byte encapsulation\"}";
+        "\"shm_only\":false,"
+        "\"encoded_bytes_metric\":\"generated XCDR1 CDR stream size including 4-byte encapsulation\"}";
     return details;
 }
 
@@ -805,10 +825,7 @@ void PopulateResult(const CommonOptions& options,
         result->counts.lost = 0;
     }
     if (statistics.measured_completed != 0) {
-        result->encoded_bytes =
-            (statistics.encoded_bytes_total +
-             statistics.measured_completed / 2) /
-            statistics.measured_completed;
+        result->encoded_bytes = statistics.encoded_bytes_per_message;
     }
     if (options.role != Role::kCanbus) return;
 
@@ -867,8 +884,7 @@ int PipelineMain(int argc, char** argv) {
 
         backend_options = ParseBackendOptions(argc, argv);
         topics = TopicNames(options.run_id);
-        result.backend_details =
-            BackendDetails(backend_options, options.deadline_seconds, topics);
+        result.backend_details = BackendDetails(backend_options, topics);
         const uint64_t deadline = AbsoluteDeadline(options);
         CycloneDdsPipeline pipeline(options, backend_options, topics);
         pipeline.WaitForExpectedMatches(deadline);
@@ -913,8 +929,7 @@ int PipelineMain(int argc, char** argv) {
             result.payload_bytes = ProfilePayloadBytes(result.options.profile);
             if (topics[0].empty()) topics = TopicNames(result.options.run_id);
             if (result.backend_details.empty()) {
-                result.backend_details = BackendDetails(
-                    backend_options, result.options.deadline_seconds, topics);
+                result.backend_details = BackendDetails(backend_options, topics);
             }
             PopulateResult(result.options, statistics, false, &result);
             result.outcome = "failure";
@@ -930,8 +945,7 @@ int PipelineMain(int argc, char** argv) {
             result.payload_bytes = ProfilePayloadBytes(result.options.profile);
             if (topics[0].empty()) topics = TopicNames(result.options.run_id);
             if (result.backend_details.empty()) {
-                result.backend_details = BackendDetails(
-                    backend_options, result.options.deadline_seconds, topics);
+                result.backend_details = BackendDetails(backend_options, topics);
             }
             PopulateResult(result.options, statistics, false, &result);
             result.outcome = "failure";

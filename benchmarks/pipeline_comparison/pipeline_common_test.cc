@@ -6,15 +6,54 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
+
+#if defined(__linux__)
+namespace {
+
+thread_local bool g_inject_close_failure = false;
+thread_local int g_close_target = -1;
+thread_local int g_close_calls = 0;
+thread_local bool g_track_fsync = false;
+thread_local int g_fsync_calls = 0;
+
+}  // namespace
+
+extern "C" int close(int descriptor) {
+    if (g_inject_close_failure && descriptor == g_close_target) {
+        ++g_close_calls;
+        const int result =
+            static_cast<int>(syscall(SYS_close, descriptor));
+        if (g_close_calls == 1) {
+            errno = EIO;
+            return -1;
+        }
+        return result;
+    }
+    return static_cast<int>(syscall(SYS_close, descriptor));
+}
+
+extern "C" int fsync(int descriptor) {
+    if (g_inject_close_failure && g_close_target < 0) {
+        g_close_target = descriptor;
+    }
+    if (g_track_fsync) ++g_fsync_calls;
+    return static_cast<int>(syscall(SYS_fsync, descriptor));
+}
+#endif
 
 namespace mino::benchmarks::pipeline {
 namespace {
@@ -44,6 +83,78 @@ Arguments ValidArguments() {
                       "--runtime-dir", "/tmp/pipeline-runtime", "--output",
                       "/tmp/pipeline-result.json"});
 }
+
+std::filesystem::path CreateTestDirectory(std::string_view name) {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() /
+        (std::string(name) + "-" + std::to_string(getpid()));
+    std::filesystem::remove_all(directory);
+    if (!std::filesystem::create_directory(directory)) {
+        throw std::runtime_error("failed to create test directory");
+    }
+    return directory;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
+
+double ReadThroughput(const std::filesystem::path& path) {
+    const std::string json = ReadFile(path);
+    constexpr std::string_view prefix =
+        "\"throughput_messages_per_second\": ";
+    const size_t begin = json.find(prefix);
+    if (begin == std::string::npos) {
+        throw std::runtime_error("throughput field not found");
+    }
+    const size_t value_begin = begin + prefix.size();
+    const size_t value_end = json.find(',', value_begin);
+    return std::stod(json.substr(value_begin, value_end - value_begin));
+}
+
+SinkResult FallbackThroughputResult(const std::filesystem::path& output,
+                                    ClockMode clock_mode, uint64_t received) {
+    SinkResult result;
+    result.backend = "test-backend";
+    result.options = ValidArguments().Parse();
+    result.options.role = Role::kCanbus;
+    result.options.clock_mode = clock_mode;
+    result.options.output = output;
+    result.counts.offered = received;
+    result.counts.received = received;
+    result.elapsed_ns = 1'000'000'000;
+    return result;
+}
+
+#if defined(__linux__)
+class ScopedCloseFailure final {
+  public:
+    ScopedCloseFailure() {
+        g_close_target = -1;
+        g_close_calls = 0;
+        g_inject_close_failure = true;
+    }
+    ~ScopedCloseFailure() {
+        g_inject_close_failure = false;
+        g_close_target = -1;
+    }
+
+    int calls() const { return g_close_calls; }
+};
+
+class ScopedFsyncTracking final {
+  public:
+    ScopedFsyncTracking() {
+        g_fsync_calls = 0;
+        g_track_fsync = true;
+    }
+    ~ScopedFsyncTracking() { g_track_fsync = false; }
+
+    int calls() const { return g_fsync_calls; }
+};
+#endif
 
 TEST(PipelineCommonTest, ParsesEveryRoleAndDefinesOrderAndBits) {
     const std::vector<Role> roles = {
@@ -233,6 +344,86 @@ TEST(PipelineCommonTest, RejectsOptionValuesOutsideStrictRanges) {
         EXPECT_THROW(arguments.Parse(), std::runtime_error);
     }
 }
+
+TEST(PipelineCommonTest, RejectsDuplicateCommonOptions) {
+    Arguments arguments(
+        {"worker", "--run-id", "run", "--runtime-dir", "/tmp/r",
+         "--output", "/tmp/o", "--messages", "10", "--messages=20"});
+    EXPECT_THROW(arguments.Parse(), std::runtime_error);
+}
+
+TEST(PipelineCommonTest, RejectsNullSeparatedOptionValue) {
+    char worker[] = "worker";
+    char option[] = "--messages";
+    char* argv[] = {worker, option, nullptr};
+    EXPECT_THROW(ParseCommonOptions(3, argv), std::runtime_error);
+}
+
+TEST(PipelineCommonTest, ThroughputFallbackUsesClockModeSampleSemantics) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-throughput-mode-test");
+    const std::filesystem::path output = directory / "result.json";
+
+    WriteSinkResult(output,
+                    FallbackThroughputResult(output, ClockMode::kSameHost, 5));
+    EXPECT_DOUBLE_EQ(ReadThroughput(output), 5.0);
+
+    WriteSinkResult(output, FallbackThroughputResult(
+                                output, ClockMode::kIndependentHosts, 5));
+    EXPECT_DOUBLE_EQ(ReadThroughput(output), 4.0);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(PipelineCommonTest,
+     IndependentHostThroughputFallbackHandlesFewerThanTwoReceives) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-throughput-small-count-test");
+    const std::filesystem::path output = directory / "result.json";
+
+    WriteSinkResult(output, FallbackThroughputResult(
+                                output, ClockMode::kIndependentHosts, 0));
+    EXPECT_DOUBLE_EQ(ReadThroughput(output), 0.0);
+
+    WriteSinkResult(output, FallbackThroughputResult(
+                                output, ClockMode::kIndependentHosts, 1));
+    EXPECT_DOUBLE_EQ(ReadThroughput(output), 0.0);
+
+    std::filesystem::remove_all(directory);
+}
+
+#if defined(__linux__)
+TEST(PipelineCommonTest, AtomicWriteDoesNotRetryAfterCloseFailure) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-close-failure-test");
+    int close_calls = 0;
+    {
+        ScopedCloseFailure failure;
+        EXPECT_THROW(WriteReadyFile(directory, "backend", Role::kPlanning,
+                                    "run-id"),
+                     std::system_error);
+        close_calls = failure.calls();
+    }
+    EXPECT_EQ(close_calls, 1);
+    EXPECT_TRUE(std::filesystem::is_empty(directory));
+    std::filesystem::remove_all(directory);
+}
+
+TEST(PipelineCommonTest, AtomicWriteFsyncsParentDirectoryAfterRename) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-directory-fsync-test");
+    int fsync_calls = 0;
+    {
+        ScopedFsyncTracking tracking;
+        ASSERT_NO_THROW(WriteReadyFile(directory, "backend", Role::kPlanning,
+                                       "run-id"));
+        fsync_calls = tracking.calls();
+    }
+    EXPECT_EQ(fsync_calls, 2);
+    EXPECT_EQ(ReadFile(directory / "backend-planning.ready"), "run-id\n");
+    std::filesystem::remove_all(directory);
+}
+#endif
 
 TEST(PipelineCommonTest, FailureJsonEscapesErrorAndSanitizesInvalidDetails) {
     const std::filesystem::path output =

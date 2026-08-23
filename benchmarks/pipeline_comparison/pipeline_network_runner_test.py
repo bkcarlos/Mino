@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +162,32 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
             keep_remote_runtime=False,
         )
 
+    def test_load_topology_rejects_unsafe_hosts_and_workdirs(self) -> None:
+        cases = (
+            ("ssh_host", "-host", "ssh_host is invalid"),
+            ("ssh_host", "host name", "ssh_host is invalid"),
+            ("ssh_host", "host\nname", "ssh_host is invalid"),
+            ("ssh_host", "host\u202ename", "ssh_host is invalid"),
+            ("workdir", "/srv/Mino\0suffix", "without control characters"),
+            ("workdir", "/srv/Mino\nsuffix", "without control characters"),
+            ("workdir", "/srv/Mino\u202esuffix", "without control characters"),
+        )
+        for field, value, error in cases:
+            with self.subTest(field=field, value=repr(value)):
+                document = self.topology_document()
+                document["roles"]["perception"][field] = value
+                path = self.root / f"unsafe-{field}.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(runner.ConfigurationError, error):
+                    runner.load_topology(path)
+
+    def test_prepare_output_wraps_filesystem_errors(self) -> None:
+        with mock.patch.object(Path, "mkdir", side_effect=OSError("denied")):
+            with self.assertRaisesRegex(
+                runner.ConfigurationError, "cannot prepare output directory"
+            ):
+                runner.prepare_output(self.root / "denied")
+
     def test_local_six_process_run_writes_qualified_manifest(self) -> None:
         output = self.root / "output"
         arguments = [
@@ -189,6 +218,135 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
         self.assertEqual("same-host", manifest["clock_mode"])
         self.assertEqual(6, len(manifest["workers"]))
         self.assertEqual(3, manifest["sink_metrics"]["latency_ns"]["samples"])
+
+    def test_cleanup_failure_marks_manifest_failed(self) -> None:
+        output = self.root / "cleanup-failure"
+        arguments = [
+            "--topology", str(self.write_topology()),
+            "--output-dir", str(output),
+            "--backend", "mino_tcp",
+            "--messages", "3",
+            "--warmup-messages", "0",
+            "--deadline-seconds", "3",
+            "--binary-relative", str(self.fake_worker),
+        ]
+        fake_boot_ids = {role: "fake-boot" for role in runner.ROLES}
+        with mock.patch.object(
+            runner, "read_boot_ids", return_value=fake_boot_ids
+        ), mock.patch.object(
+            runner, "_remote_cleanup", side_effect=RuntimeError("rm failed")
+        ):
+            code = runner.main(arguments)
+        manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, code)
+        self.assertEqual("failed", manifest["outcome"])
+        self.assertTrue(
+            any("remote cleanup failed: rm failed" in error for error in manifest["errors"]),
+            manifest["errors"],
+        )
+
+    def test_manifest_write_failure_is_controlled(self) -> None:
+        output = self.root / "manifest-failure"
+        stderr = io.StringIO()
+        arguments = [
+            "--topology", str(self.write_topology()),
+            "--output-dir", str(output),
+            "--backend", "mino_tcp",
+        ]
+        with mock.patch.object(
+            runner, "read_boot_ids", side_effect=RuntimeError("preflight failed")
+        ), mock.patch.object(
+            runner,
+            "_write_json_atomic",
+            side_effect=runner.ConfigurationError("cannot write manifest.json"),
+        ), contextlib.redirect_stderr(stderr):
+            code = runner.main(arguments)
+        self.assertEqual(1, code)
+        self.assertIn("network pipeline output error", stderr.getvalue())
+        self.assertIn("cannot write manifest.json", stderr.getvalue())
+
+    def test_launch_remote_calls_use_current_global_remaining_deadline(self) -> None:
+        args = self.arguments()
+        args.deadline_seconds = 3
+        logs = self.root / "deadline-logs"
+        logs.mkdir()
+        host = runner.RoleHost(
+            role="perception",
+            ssh_host="local",
+            data_address="127.0.0.1",
+            workdir=runner.REPOSITORY_ROOT,
+            environment={},
+        )
+        worker = runner.Worker(
+            host=host,
+            runtime_dir=self.root / "runtime",
+            remote_result=self.root / "runtime" / "result.json",
+            local_result=self.root / "result.json",
+            stdout_path=logs / "stdout.log",
+            stderr_path=logs / "stderr.log",
+            command=[],
+            launcher_command=[],
+        )
+        clock = [100.0]
+        mkdir_timeouts: list[float] = []
+        read_timeouts: list[float] = []
+        start_timeouts: list[float] = []
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def remote_mkdir(_host: runner.RoleHost, _path: Path, timeout: float) -> None:
+            mkdir_timeouts.append(timeout)
+
+        def remote_read(_host: runner.RoleHost, _path: Path, timeout: float) -> str:
+            read_timeouts.append(timeout)
+            clock[0] += 2.9
+            return "run-deadline\n"
+
+        def remote_start(
+            _host: runner.RoleHost,
+            _path: Path,
+            _run_id: str,
+            timeout: float,
+        ) -> None:
+            start_timeouts.append(timeout)
+            clock[0] += 0.2
+
+        with mock.patch.object(runner.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
+            runner, "_remote_mkdir", side_effect=remote_mkdir
+        ), mock.patch.object(
+            runner, "_remote_read", side_effect=remote_read
+        ), mock.patch.object(
+            runner, "_remote_write_start", side_effect=remote_start
+        ), mock.patch.object(
+            runner.subprocess, "Popen", return_value=process
+        ), mock.patch.object(runner, "terminate_workers"):
+            errors = runner.launch_and_wait(args, [worker], "run-deadline")
+
+        self.assertEqual([3.0], mkdir_timeouts)
+        self.assertEqual([3.0], read_timeouts)
+        self.assertEqual(1, len(start_timeouts))
+        self.assertAlmostEqual(0.1, start_timeouts[0], places=6)
+        self.assertTrue(any("deadline expired" in error for error in errors), errors)
+
+    def test_remote_cleanup_rejects_nonzero_exit_and_propagates_timeout(self) -> None:
+        host = runner.RoleHost(
+            role="perception",
+            ssh_host="host-a",
+            data_address="10.0.0.1",
+            workdir=Path("/srv/Mino"),
+            environment={},
+        )
+        failed = mock.Mock(returncode=7, stdout="", stderr="permission denied")
+        with mock.patch.object(runner, "_remote_run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                runner._remote_cleanup(host, Path("/tmp/runtime"), 1)
+        with mock.patch.object(
+            runner,
+            "_remote_run",
+            side_effect=subprocess.TimeoutExpired(["rm"], 1),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runner._remote_cleanup(host, Path("/tmp/runtime"), 1)
 
     def test_boot_ids_define_clock_domain_instead_of_ssh_alias(self) -> None:
         topology = {

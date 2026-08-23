@@ -73,8 +73,11 @@ build:pipeline_comparison --host_per_file_copt=external/.*@-Wno-error
 # remain C++20 and consume its public headers from the normal target config.
 build:pipeline_comparison --per_file_copt=external/fastdds.*/.*@-std=c++17
 build:pipeline_comparison --host_per_file_copt=external/fastdds.*/.*@-std=c++17
-build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error=missing-requires
-build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/protobuf_zmq_pipeline.cc@-Wno-error=missing-requires
+# Generated protobuf code and its direct benchmark consumer include third-party
+# headers that warn differently under GCC and Clang. Keep those warnings visible
+# without passing compiler-specific warning names or weakening other sources.
+build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error
+build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/protobuf_zmq_pipeline.cc@-Wno-error
 
 ###############################################################################
 # debug (default-friendly)
