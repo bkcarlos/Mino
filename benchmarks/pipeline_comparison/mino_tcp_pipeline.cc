@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -47,6 +48,7 @@ using bridge::FrameType;
 using bridge::WireFrame;
 using bridge::WireFrameCodec;
 using bridge::WireFrameLimits;
+using schema::CanonicalWireScratch;
 using schema::DynamicMessage;
 using schema::DynamicValue;
 using schema::PreparedCanonicalWireCodec;
@@ -71,6 +73,7 @@ struct BackendOptions {
     std::string peer_address = "127.0.0.1";
     uint16_t port_base = kDefaultPortBase;
     std::filesystem::path descriptor;
+    uint32_t receive_batch_size = 1;
     bool independent_host_clocks = false;
 };
 
@@ -197,6 +200,7 @@ BackendOptions ParseBackendOptions(int argc, char** argv) {
     bool peer_seen = false;
     bool port_seen = false;
     bool descriptor_seen = false;
+    bool receive_batch_seen = false;
     bool clock_seen = false;
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) {
@@ -244,6 +248,22 @@ BackendOptions ParseBackendOptions(int argc, char** argv) {
             }
             descriptor_seen = true;
             options.descriptor = std::filesystem::path(*value);
+            continue;
+        }
+        if (const auto value = OptionValue(
+                &index, argc, argv, "--receive-batch-size")) {
+            if (receive_batch_seen) {
+                throw std::runtime_error(
+                    "--receive-batch-size may be specified only once");
+            }
+            receive_batch_seen = true;
+            const uint64_t parsed =
+                ParseUnsigned(*value, "--receive-batch-size");
+            if (parsed == 0 || parsed > 64) {
+                throw std::runtime_error(
+                    "--receive-batch-size must be in [1, 64]");
+            }
+            options.receive_batch_size = static_cast<uint32_t>(parsed);
             continue;
         }
         if (const auto value = OptionValue(&index, argc, argv, "--clock-mode")) {
@@ -320,12 +340,24 @@ class PipelineSchema final {
             ThrowStatus("prepare canonical wire codec", prepared.status());
         }
         prepared_codec_.emplace(std::move(*prepared));
+        const Status encode_reserved = encode_message_.ReserveFields(18);
+        if (!encode_reserved.ok()) {
+            ThrowStatus("reserve canonical encode fields", encode_reserved);
+        }
+        const Status decode_reserved = decode_message_.ReserveFields(18);
+        if (!decode_reserved.ok()) {
+            ThrowStatus("reserve canonical decode fields", decode_reserved);
+        }
     }
 
     const SchemaDescriptor& descriptor() const noexcept { return *descriptor_; }
 
-    std::vector<std::byte> Encode(const SemanticFrame& frame) const {
-        DynamicMessage message;
+    void Encode(const SemanticFrame& frame, std::vector<std::byte>* output) {
+        if (output == nullptr) {
+            throw std::invalid_argument("canonical encode destination is null");
+        }
+        encode_message_.Clear();
+        DynamicMessage& message = encode_message_;
         Set(message, 1, DynamicValue::Unsigned(frame.sample_id));
         Set(message, 2, DynamicValue::Unsigned(frame.origin_timestamp_ns));
         Set(message, 3, DynamicValue::Unsigned(frame.perception_timestamp_ns));
@@ -353,16 +385,19 @@ class PipelineSchema final {
         auto bytes = DynamicValue::Bytes(payload);
         if (!bytes.ok()) ThrowStatus("create dynamic payload", bytes.status());
         Set(message, 18, std::move(*bytes));
-        return TakeOrThrow("CanonicalWireCodec::Encode",
-                           prepared_codec_->Encode(message));
+        const Status encoded =
+            prepared_codec_->EncodeInto(message, encode_scratch_, *output);
+        if (!encoded.ok()) ThrowStatus("CanonicalWireCodec::EncodeInto", encoded);
     }
 
-    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) const {
+    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) {
         if (frame == nullptr) {
             throw std::invalid_argument("semantic decode destination is null");
         }
-        DynamicMessage message = TakeOrThrow("CanonicalWireCodec::Decode",
-                                             prepared_codec_->Decode(bytes));
+        const Status decoded = prepared_codec_->DecodeInto(
+            bytes, decode_scratch_, decode_message_);
+        if (!decoded.ok()) ThrowStatus("CanonicalWireCodec::DecodeInto", decoded);
+        const DynamicMessage& message = decode_message_;
         if (!message.unknown_fields().fields().empty()) {
             throw std::runtime_error(
                 "canonical pipeline message contains unknown fields");
@@ -450,6 +485,10 @@ class PipelineSchema final {
 
     std::shared_ptr<const SchemaDescriptor> descriptor_;
     std::optional<PreparedCanonicalWireCodec> prepared_codec_;
+    DynamicMessage encode_message_;
+    DynamicMessage decode_message_;
+    CanonicalWireScratch encode_scratch_;
+    CanonicalWireScratch decode_scratch_;
 };
 
 std::vector<std::byte> EncodeU64Pair(uint64_t first, uint64_t second) {
@@ -488,12 +527,13 @@ class MinoTcpPipeline final {
     ~MinoTcpPipeline() { CloseBestEffort(); }
 
     void SendData(size_t edge, uint64_t sample_id,
-                  const SemanticFrame& semantic, const PipelineSchema& schema,
+                  const SemanticFrame& semantic, PipelineSchema& schema,
                   uint64_t deadline_ns, size_t* encoded_size) {
         if (!output_connection_.has_value()) {
             throw std::logic_error("pipeline role has no TCP output connection");
         }
-        WireFrame frame;
+        WireFrame& frame = data_frame_;
+        frame.header = {};
         frame.header.frame_type = FrameType::kData;
         frame.header.flags = FlagValue(FrameFlag::kPayloadCrcPresent);
         frame.header.topic_id = static_cast<uint32_t>(edge + 1);
@@ -509,24 +549,25 @@ class MinoTcpPipeline final {
         frame.header.source_publisher_epoch = run_hash_;
         frame.header.sequence_num = sample_id + 1;
         frame.header.timestamp_ns = semantic.origin_timestamp_ns;
-        frame.payload = schema.Encode(semantic);
+        schema.Encode(semantic, &frame.payload);
         std::vector<std::byte> body = TakeOrThrow(
             "WireFrameCodec::Encode", WireFrameCodec::Encode(frame, limits_));
         if (encoded_size != nullptr) *encoded_size = body.size();
-        Send(*output_connection_, body, deadline_ns,
+        Send(*output_connection_, std::move(body), deadline_ns,
              transport::UntrackedTrafficClass::kData);
     }
 
     void ReceiveData(size_t edge, uint64_t expected_id,
-                     const PipelineSchema& schema, uint64_t deadline_ns,
+                     PipelineSchema& schema, uint64_t deadline_ns,
                      size_t* encoded_size, SemanticFrame* semantic) {
         if (!input_connection_.has_value()) {
             throw std::logic_error("pipeline role has no TCP input connection");
         }
         std::vector<std::byte> body = Receive(*input_connection_, deadline_ns);
         if (encoded_size != nullptr) *encoded_size = body.size();
-        WireFrame frame = TakeOrThrow(
-            "WireFrameCodec::Decode", WireFrameCodec::Decode(body, limits_));
+        auto frame = TakeOrThrow(
+            "WireFrameCodec::DecodeView",
+            WireFrameCodec::DecodeView(std::move(body), limits_));
         const auto& identity = schema.descriptor().identity();
         if (frame.header.frame_type != FrameType::kData ||
             frame.header.topic_id != edge + 1 ||
@@ -668,33 +709,48 @@ class MinoTcpPipeline final {
         }
     }
 
-    void Send(ConnectionId connection, std::span<const std::byte> body,
+    void Send(ConnectionId connection, std::vector<std::byte> body,
               uint64_t deadline_ns,
               transport::UntrackedTrafficClass traffic_class) {
         while (NowNs() < deadline_ns) {
-            auto sent = driver_->SendUntracked({
-                .connection_id = connection,
-                .payload = body,
-                .traffic_class = traffic_class,
-            });
+            auto sent = driver_->TrySendUntrackedOwned(
+                connection, std::move(body), traffic_class);
             if (sent.ok()) return;
             if (sent.status().code() != StatusCode::kWouldBlock &&
                 sent.status().code() != StatusCode::kResourceExhausted) {
-                ThrowStatus("TcpDriver::SendUntracked", sent.status());
+                ThrowStatus("TcpDriver::TrySendUntrackedOwned", sent.status());
+            }
+            if (body.empty()) {
+                throw std::runtime_error(
+                    "owned TCP send consumed payload on failed admission");
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         throw std::runtime_error("deadline expired sending through Mino TCP");
     }
 
+    std::deque<std::vector<std::byte>>& ReceiveCache(ConnectionId connection) {
+        if (input_connection_.has_value() && connection == *input_connection_) {
+            return input_receive_cache_;
+        }
+        if (output_connection_.has_value() && connection == *output_connection_) {
+            return output_receive_cache_;
+        }
+        throw std::logic_error("receive connection is not initialized");
+    }
+
     std::vector<std::byte> Receive(ConnectionId connection,
                                    uint64_t deadline_ns) {
-        while (NowNs() < deadline_ns) {
+        auto& cache = ReceiveCache(connection);
+        while (cache.empty() && NowNs() < deadline_ns) {
             const uint32_t timeout = RemainingMs(deadline_ns);
             if (timeout == 0) break;
             auto received = driver_->Poll({
-                .max_messages = 1,
-                .max_bytes = kMaximumFrameBodyBytes,
+                .max_messages = backend_.receive_batch_size,
+                .max_bytes = std::min<size_t>(
+                    transport::kMaxReceiveBatchBytes,
+                    static_cast<size_t>(kMaximumFrameBodyBytes) *
+                        backend_.receive_batch_size),
                 .timeout_ms = timeout,
                 .connection_id = connection,
             });
@@ -705,14 +761,26 @@ class MinoTcpPipeline final {
                 }
                 ThrowStatus("TcpDriver::Poll", received.status());
             }
-            if (received->messages.size() != 1 ||
-                received->messages.front().connection_id != connection) {
+            if (received->messages.empty() ||
+                received->messages.size() > backend_.receive_batch_size) {
                 throw std::runtime_error(
-                    "TcpDriver returned an invalid receive batch");
+                    "TcpDriver returned an invalid receive batch size");
             }
-            return std::move(received->messages.front().payload);
+            for (auto& message : received->messages) {
+                if (message.connection_id != connection) {
+                    throw std::runtime_error(
+                        "TcpDriver returned a receive for the wrong connection");
+                }
+                cache.push_back(std::move(message.payload));
+            }
         }
-        throw std::runtime_error("deadline expired receiving through Mino TCP");
+        if (cache.empty()) {
+            throw std::runtime_error(
+                "deadline expired receiving through Mino TCP");
+        }
+        std::vector<std::byte> body = std::move(cache.front());
+        cache.pop_front();
+        return body;
     }
 
     void SendCompletion(ConnectionId connection, uint64_t total_frames,
@@ -725,7 +793,7 @@ class MinoTcpPipeline final {
         std::vector<std::byte> body = TakeOrThrow(
             "encode pipeline completion",
             WireFrameCodec::Encode(completion, limits_));
-        Send(connection, body, deadline_ns,
+        Send(connection, std::move(body), deadline_ns,
              transport::UntrackedTrafficClass::kProtocolControl);
         // SendUntracked success is local queue admission only. Do not tear down
         // the process immediately after admitting the reverse completion ACK;
@@ -740,11 +808,11 @@ class MinoTcpPipeline final {
         }
     }
 
-    void ValidateCompletion(std::span<const std::byte> body,
+    void ValidateCompletion(std::vector<std::byte> body,
                             uint64_t total_frames) {
-        WireFrame completion = TakeOrThrow(
+        auto completion = TakeOrThrow(
             "decode pipeline completion",
-            WireFrameCodec::Decode(body, limits_));
+            WireFrameCodec::DecodeView(std::move(body), limits_));
         if (completion.header.frame_type != FrameType::kAck ||
             completion.payload.size() != 16 ||
             DecodeU64(completion.payload, 0) != run_hash_ ||
@@ -769,10 +837,13 @@ class MinoTcpPipeline final {
     BackendOptions backend_;
     uint64_t run_hash_ = 0;
     WireFrameLimits limits_;
+    WireFrame data_frame_;
     std::unique_ptr<TcpDriver> driver_;
     std::optional<ConnectionId> listener_;
     std::optional<ConnectionId> input_connection_;
     std::optional<ConnectionId> output_connection_;
+    std::deque<std::vector<std::byte>> input_receive_cache_;
+    std::deque<std::vector<std::byte>> output_receive_cache_;
 };
 
 void ValidateSequenceAndPhase(const CommonOptions& options,
@@ -857,7 +928,7 @@ uint64_t TotalFrames(const CommonOptions& options) {
 }
 
 void RunSource(const CommonOptions& options, const BackendOptions& backend,
-               MinoTcpPipeline* transport, const PipelineSchema& schema,
+               MinoTcpPipeline* transport, PipelineSchema& schema,
                uint64_t deadline_ns, RunStatistics* statistics) {
     const size_t output_edge = *OutputEdge(options.role);
     const uint64_t total = TotalFrames(options);
@@ -885,7 +956,7 @@ void RunSource(const CommonOptions& options, const BackendOptions& backend,
 }
 
 void RunForwarder(const CommonOptions& options, const BackendOptions& backend,
-                  MinoTcpPipeline* transport, const PipelineSchema& schema,
+                  MinoTcpPipeline* transport, PipelineSchema& schema,
                   uint64_t deadline_ns, RunStatistics* statistics) {
     const size_t input_edge = *InputEdge(options.role);
     const size_t output_edge = *OutputEdge(options.role);
@@ -913,7 +984,7 @@ void RunForwarder(const CommonOptions& options, const BackendOptions& backend,
 }
 
 void RunSink(const CommonOptions& options, const BackendOptions& backend,
-             MinoTcpPipeline* transport, const PipelineSchema& schema,
+             MinoTcpPipeline* transport, PipelineSchema& schema,
              uint64_t deadline_ns, RunStatistics* statistics) {
     const size_t input_edge = *InputEdge(options.role);
     statistics->latencies_ns.reserve(static_cast<size_t>(std::min(
@@ -957,24 +1028,11 @@ std::string BackendDetails(const BackendOptions& backend,
                            const PipelineSchema& schema,
                            const MinoTcpPipeline& transport) {
     const auto& identity = schema.descriptor().identity();
-    return "{\"transport\":\"production TcpDriver plaintext benchmark mode\","
-           "\"wire_frame\":\"WireFrameCodec v1 with payload CRC\","
-           "\"schema_codec\":\"CanonicalWireCodec\","
-           "\"canonical_descriptor_closure\":\"startup-prepared\","
-           "\"schema_source\":\"minoc descriptor artifact\","
-           "\"compilation_mode\":\"" + std::string(CompilationMode()) +
-           "\",\"schema_short_id\":" + std::to_string(identity.short_id()) +
-           ",\"schema_version\":" +
-           std::to_string(identity.schema_version()) +
-           ",\"layout_version\":" +
-           std::to_string(identity.layout_version()) +
-           ",\"clock_mode\":\"" +
-           std::string(backend.independent_host_clocks ? "independent-hosts"
-                                                       : "same-host") +
-           "\",\"one_way_latency_valid\":" +
-           (backend.independent_host_clocks ? "false" : "true") +
-           ",\"completion_barrier\":\"reverse hop-by-hop ACK\","
-           "\"endpoints\":" + transport.EndpointsJson() + "}";
+    return BuildMinoTcpBackendDetails(
+        identity.short_id(), identity.schema_version(), identity.layout_version(),
+        backend.independent_host_clocks ? ClockMode::kIndependentHosts
+                                        : ClockMode::kSameHost,
+        backend.receive_batch_size, transport.EndpointsJson());
 }
 
 void PopulateResult(const CommonOptions& options,

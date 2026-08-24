@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -69,6 +70,7 @@ using bridge::FrameType;
 using bridge::WireFrame;
 using bridge::WireFrameCodec;
 using bridge::WireFrameLimits;
+using schema::CanonicalWireScratch;
 using schema::DynamicMessage;
 using schema::DynamicValue;
 using schema::PreparedCanonicalWireCodec;
@@ -104,6 +106,11 @@ static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
               "pipeline bridge manifest requires lock-free 64-bit atomics");
 
 enum class Mode : uint8_t { kSource, kSink };
+enum class BridgeValidation : uint8_t {
+    kFull,
+    kStructural,
+    kFullInstrumented,
+};
 
 struct Options {
     Mode mode = Mode::kSource;
@@ -119,6 +126,10 @@ struct Options {
     std::string peer_address;
     uint16_t port = 0;
     std::filesystem::path descriptor;
+    ClockMode clock_mode = ClockMode::kSameHost;
+    BridgeValidation validation = BridgeValidation::kFull;
+    uint32_t receive_batch_size = 1;
+    std::filesystem::path output;
 };
 
 struct ChannelExtent {
@@ -168,6 +179,15 @@ std::string_view ModeName(Mode mode) {
     return mode == Mode::kSource ? "source" : "sink";
 }
 
+std::string_view ValidationName(BridgeValidation validation) {
+    switch (validation) {
+        case BridgeValidation::kFull: return "full";
+        case BridgeValidation::kStructural: return "structural";
+        case BridgeValidation::kFullInstrumented: return "full-instrumented";
+    }
+    throw std::invalid_argument("invalid bridge validation mode");
+}
+
 std::string StatusToken(Mode mode) {
     return std::string(kBridgeToken) + "-" + std::string(ModeName(mode));
 }
@@ -178,8 +198,10 @@ std::string StatusToken(Mode mode) {
         "\nusage: mino_shm_tcp_bridge --mode=source|sink --profile=small|medium|large "
         "--messages=N --warmup-messages=N --run-id=ID --runtime-dir=DIR "
         "--shm-name=/NAME --edge=0..4 --port=PORT "
-        "--schema-descriptor=PATH --deadline-seconds=N "
-        "[--peer-address=IPv4] [--listen-address=IPv4]");
+        "--schema-descriptor=PATH --deadline-seconds=N --clock-mode=MODE "
+        "--bridge-validation=full|structural|full-instrumented --output=PATH "
+        "[--receive-batch-size=1..64] [--peer-address=IPv4] "
+        "[--listen-address=IPv4]");
 }
 
 uint64_t ParseUnsigned(std::string_view value, std::string_view option) {
@@ -259,6 +281,10 @@ Options ParseOptions(int argc, char** argv) {
     bool peer_seen = false;
     bool port_seen = false;
     bool descriptor_seen = false;
+    bool clock_seen = false;
+    bool validation_seen = false;
+    bool receive_batch_seen = false;
+    bool output_seen = false;
 
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) UsageError("argv contains a null argument");
@@ -369,12 +395,57 @@ Options ParseOptions(int argc, char** argv) {
             options.descriptor = std::filesystem::path(*value);
             continue;
         }
+        if (const auto value =
+                TakeOptionValue(&index, argc, argv, "--clock-mode")) {
+            unique(&clock_seen, "--clock-mode");
+            if (*value == "same-host") {
+                options.clock_mode = ClockMode::kSameHost;
+            } else if (*value == "independent-hosts") {
+                options.clock_mode = ClockMode::kIndependentHosts;
+            } else {
+                UsageError("--clock-mode must be same-host or independent-hosts");
+            }
+            continue;
+        }
+        if (const auto value = TakeOptionValue(
+                &index, argc, argv, "--bridge-validation")) {
+            unique(&validation_seen, "--bridge-validation");
+            if (*value == "full") {
+                options.validation = BridgeValidation::kFull;
+            } else if (*value == "structural") {
+                options.validation = BridgeValidation::kStructural;
+            } else if (*value == "full-instrumented") {
+                options.validation = BridgeValidation::kFullInstrumented;
+            } else {
+                UsageError(
+                    "--bridge-validation must be full, structural, or full-instrumented");
+            }
+            continue;
+        }
+        if (const auto value = TakeOptionValue(
+                &index, argc, argv, "--receive-batch-size")) {
+            unique(&receive_batch_seen, "--receive-batch-size");
+            const uint64_t parsed =
+                ParseUnsigned(*value, "--receive-batch-size");
+            if (parsed == 0 || parsed > 64) {
+                UsageError("--receive-batch-size must be in [1, 64]");
+            }
+            options.receive_batch_size = static_cast<uint32_t>(parsed);
+            continue;
+        }
+        if (const auto value =
+                TakeOptionValue(&index, argc, argv, "--output")) {
+            unique(&output_seen, "--output");
+            options.output = std::filesystem::path(*value);
+            continue;
+        }
         UsageError("unknown argument: " + std::string(argument));
     }
 
     if (!mode_seen || !profile_seen || !messages_seen || !warmup_seen ||
         !deadline_seen || !run_seen || !runtime_seen || !shm_seen ||
-        !edge_seen || !port_seen || !descriptor_seen) {
+        !edge_seen || !port_seen || !descriptor_seen || !clock_seen ||
+        !validation_seen || !output_seen) {
         UsageError("all non-address options are required");
     }
     if (options.mode == Mode::kSource && !peer_seen) {
@@ -395,6 +466,10 @@ Options ParseOptions(int argc, char** argv) {
     }
     if (options.run_id.find('\0') != std::string::npos) {
         UsageError("--run-id must not contain NUL");
+    }
+    if (options.output.empty() ||
+        options.output.string().find('\0') != std::string::npos) {
+        UsageError("--output must be a non-empty path without NUL");
     }
     ValidateShmName(options.shm_name);
     std::error_code error;
@@ -724,12 +799,24 @@ class PipelineSchema final {
             ThrowStatus("prepare canonical wire codec", prepared.status());
         }
         prepared_codec_.emplace(std::move(*prepared));
+        const Status encode_reserved = encode_message_.ReserveFields(18);
+        if (!encode_reserved.ok()) {
+            ThrowStatus("reserve canonical encode fields", encode_reserved);
+        }
+        const Status decode_reserved = decode_message_.ReserveFields(18);
+        if (!decode_reserved.ok()) {
+            ThrowStatus("reserve canonical decode fields", decode_reserved);
+        }
     }
 
     const SchemaDescriptor& descriptor() const noexcept { return *descriptor_; }
 
-    std::vector<std::byte> Encode(const SemanticFrame& frame) const {
-        DynamicMessage message;
+    void Encode(const SemanticFrame& frame, std::vector<std::byte>* output) {
+        if (output == nullptr) {
+            throw std::invalid_argument("canonical encode destination is null");
+        }
+        encode_message_.Clear();
+        DynamicMessage& message = encode_message_;
         Set(message, 1, DynamicValue::Unsigned(frame.sample_id));
         Set(message, 2, DynamicValue::Unsigned(frame.origin_timestamp_ns));
         Set(message, 3,
@@ -758,16 +845,19 @@ class PipelineSchema final {
         auto bytes = DynamicValue::Bytes(payload);
         if (!bytes.ok()) ThrowStatus("create dynamic payload", bytes.status());
         Set(message, 18, std::move(*bytes));
-        return TakeOrThrow("CanonicalWireCodec::Encode",
-                           prepared_codec_->Encode(message));
+        const Status encoded =
+            prepared_codec_->EncodeInto(message, encode_scratch_, *output);
+        if (!encoded.ok()) ThrowStatus("CanonicalWireCodec::EncodeInto", encoded);
     }
 
-    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) const {
+    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) {
         if (frame == nullptr) {
             throw std::invalid_argument("semantic decode destination is null");
         }
-        DynamicMessage message = TakeOrThrow("CanonicalWireCodec::Decode",
-                                             prepared_codec_->Decode(bytes));
+        const Status decoded = prepared_codec_->DecodeInto(
+            bytes, decode_scratch_, decode_message_);
+        if (!decoded.ok()) ThrowStatus("CanonicalWireCodec::DecodeInto", decoded);
+        const DynamicMessage& message = decode_message_;
         if (!message.unknown_fields().fields().empty() ||
             message.fields().size() != 18) {
             throw std::runtime_error(
@@ -856,6 +946,10 @@ class PipelineSchema final {
 
     std::shared_ptr<const SchemaDescriptor> descriptor_;
     std::optional<PreparedCanonicalWireCodec> prepared_codec_;
+    DynamicMessage encode_message_;
+    DynamicMessage decode_message_;
+    CanonicalWireScratch encode_scratch_;
+    CanonicalWireScratch decode_scratch_;
 };
 
 EndpointDescriptor MakeEndpoint(std::string_view address, uint16_t port) {
@@ -884,13 +978,106 @@ uint64_t LoadU64(std::span<const std::byte> bytes, size_t offset) {
     return value;
 }
 
+struct BridgeCounters {
+    uint64_t validation_calls = 0;
+    uint64_t validation_payload_bytes = 0;
+    uint64_t validation_thread_cpu_ns = 0;
+    uint64_t data_frames_sent = 0;
+    uint64_t data_frame_body_bytes_sent = 0;
+    uint64_t data_frames_received = 0;
+    uint64_t data_frame_body_bytes_received = 0;
+    uint64_t control_frames_sent = 0;
+    uint64_t control_frame_body_bytes_sent = 0;
+    uint64_t control_frames_received = 0;
+    uint64_t control_frame_body_bytes_received = 0;
+};
+
+void WriteBridgeArtifact(const Options& options,
+                         const BridgeCounters& counters,
+                         std::string_view outcome, std::string_view error) {
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"schema\": \"mino.pipeline_bridge_benchmark.v1\",\n"
+         << "  \"run_id\": \"" << JsonEscape(options.run_id) << "\",\n"
+         << "  \"edge\": " << options.edge << ",\n"
+         << "  \"mode\": \"" << ModeName(options.mode) << "\",\n"
+         << "  \"validation\": \"" << ValidationName(options.validation)
+         << "\",\n"
+         << "  \"profile\": \"" << ProfileName(options.profile) << "\",\n"
+         << "  \"clock_mode\": \"" << ClockModeName(options.clock_mode)
+         << "\",\n"
+         << "  \"clock\": {\"name\": \"" << JsonEscape(ClockName())
+         << "\", \"resolution_ns\": " << ClockResolutionNs()
+         << ", \"boot_id\": \"" << JsonEscape(ReadBootId()) << "\"},\n"
+         << "  \"compilation_mode\": \"" << CompilationMode() << "\",\n"
+         << "  \"receive_batch_size\": " << options.receive_batch_size
+         << ",\n"
+         << "  \"outcome\": \"" << JsonEscape(outcome) << "\",\n"
+         << "  \"error\": \"" << JsonEscape(error) << "\",\n"
+         << "  \"counters\": {\"validation_calls\": "
+         << counters.validation_calls
+         << ", \"validation_payload_bytes\": "
+         << counters.validation_payload_bytes
+         << ", \"validation_thread_cpu_ns\": "
+         << counters.validation_thread_cpu_ns << "},\n"
+         << "  \"wire\": {\"data_frames_sent\": "
+         << counters.data_frames_sent
+         << ", \"data_frame_body_bytes_sent\": "
+         << counters.data_frame_body_bytes_sent
+         << ", \"data_frames_received\": "
+         << counters.data_frames_received
+         << ", \"data_frame_body_bytes_received\": "
+         << counters.data_frame_body_bytes_received
+         << ", \"control_frames_sent\": "
+         << counters.control_frames_sent
+         << ", \"control_frame_body_bytes_sent\": "
+         << counters.control_frame_body_bytes_sent
+         << ", \"control_frames_received\": "
+         << counters.control_frames_received
+         << ", \"control_frame_body_bytes_received\": "
+         << counters.control_frame_body_bytes_received << "}\n"
+         << "}\n";
+    AtomicWrite(options.output, json.str());
+}
+
+void WriteBridgeArtifactBestEffort(const Options& options,
+                                   const BridgeCounters& counters,
+                                   std::string_view error) noexcept {
+    try {
+        WriteBridgeArtifact(options, counters, "failure", error);
+    } catch (const std::exception& exception) {
+        std::cerr << "failed to write bridge result artifact " << options.output
+                  << ": " << exception.what() << '\n';
+    } catch (...) {
+        std::cerr << "failed to write bridge result artifact " << options.output
+                  << ": unknown exception\n";
+    }
+}
+
+void WriteBridgeParseFailureArtifactBestEffort(
+    int argc, char** argv, std::string_view error) noexcept {
+    try {
+        (void)WriteBridgeParseFailureArtifactFromArgs(argc, argv, error);
+    } catch (const std::exception& exception) {
+        std::cerr << "failed to write bridge parse-failure artifact: "
+                  << exception.what() << '\n';
+    } catch (...) {
+        std::cerr << "failed to write bridge parse-failure artifact: "
+                     "unknown exception\n";
+    }
+}
+
 class BridgeTransport final {
   public:
-    BridgeTransport(const Options& options, const PipelineSchema& schema,
-                    uint64_t deadline_ns)
+    BridgeTransport(const Options& options, PipelineSchema& schema,
+                    BridgeCounters* counters, uint64_t deadline_ns)
         : options_(options),
           schema_(schema),
+          counters_(counters),
           run_hash_(StableRunHash(options.run_id)) {
+        if (counters_ == nullptr) {
+            throw std::invalid_argument("bridge counters must not be null");
+        }
         try {
             Initialize(deadline_ns);
         } catch (...) {
@@ -904,24 +1091,31 @@ class BridgeTransport final {
     ~BridgeTransport() { CloseBestEffort(); }
 
     void SendData(const SemanticFrame& semantic, uint64_t deadline_ns) {
-        WireFrame frame;
+        WireFrame& frame = data_frame_;
+        frame.header = {};
         PopulateIdentityHeader(&frame);
         frame.header.frame_type = FrameType::kData;
         frame.header.flags = FlagValue(FrameFlag::kPayloadCrcPresent);
         frame.header.sequence_num = semantic.sample_id + 1;
         frame.header.timestamp_ns = semantic.origin_timestamp_ns;
-        frame.payload = schema_.Encode(semantic);
+        schema_.Encode(semantic, &frame.payload);
         std::vector<std::byte> body = TakeOrThrow(
             "WireFrameCodec::Encode", WireFrameCodec::Encode(frame, limits_));
-        Send(body, deadline_ns, transport::UntrackedTrafficClass::kData);
+        const size_t body_size = body.size();
+        Send(std::move(body), deadline_ns,
+             transport::UntrackedTrafficClass::kData);
+        ++counters_->data_frames_sent;
+        counters_->data_frame_body_bytes_sent += body_size;
     }
 
     void ReceiveData(uint64_t expected_id, uint64_t deadline_ns,
                      SemanticFrame* semantic) {
         std::vector<std::byte> body = Receive(deadline_ns);
-        WireFrame frame = TakeOrThrow(
-            "WireFrameCodec::Decode", WireFrameCodec::Decode(body, limits_));
-        ValidateIdentityHeader(frame);
+        const size_t body_size = body.size();
+        auto frame = TakeOrThrow(
+            "WireFrameCodec::DecodeView",
+            WireFrameCodec::DecodeView(std::move(body), limits_));
+        ValidateIdentityHeader(frame.header);
         if (frame.header.frame_type != FrameType::kData ||
             frame.header.flags != FlagValue(FrameFlag::kPayloadCrcPresent) ||
             frame.header.perf_trace.has_value() ||
@@ -934,6 +1128,8 @@ class BridgeTransport final {
             throw std::runtime_error(
                 "WireFrame timestamp does not match canonical message origin");
         }
+        ++counters_->data_frames_received;
+        counters_->data_frame_body_bytes_received += body_size;
     }
 
     void SendCompletion(uint64_t total_frames, uint64_t deadline_ns) {
@@ -953,16 +1149,21 @@ class BridgeTransport final {
         std::vector<std::byte> body = TakeOrThrow(
             "encode bridge completion",
             WireFrameCodec::Encode(completion, limits_));
-        Send(body, deadline_ns,
+        const size_t body_size = body.size();
+        Send(std::move(body), deadline_ns,
              transport::UntrackedTrafficClass::kProtocolControl);
+        ++counters_->control_frames_sent;
+        counters_->control_frame_body_bytes_sent += body_size;
         Flush(deadline_ns);
     }
 
     void ReceiveCompletion(uint64_t total_frames, uint64_t deadline_ns) {
         std::vector<std::byte> body = Receive(deadline_ns);
-        WireFrame completion = TakeOrThrow(
-            "decode bridge completion", WireFrameCodec::Decode(body, limits_));
-        ValidateIdentityHeader(completion);
+        const size_t body_size = body.size();
+        auto completion = TakeOrThrow(
+            "decode bridge completion",
+            WireFrameCodec::DecodeView(std::move(body), limits_));
+        ValidateIdentityHeader(completion.header);
         if (completion.header.frame_type != FrameType::kAck ||
             completion.header.flags !=
                 (FlagValue(FrameFlag::kControlFrame) |
@@ -979,6 +1180,8 @@ class BridgeTransport final {
                 static_cast<uint32_t>(options_.profile)) {
             throw std::runtime_error("bridge completion acknowledgment is invalid");
         }
+        ++counters_->control_frames_received;
+        counters_->control_frame_body_bytes_received += body_size;
     }
 
     void CloseOrThrow() {
@@ -1001,17 +1204,16 @@ class BridgeTransport final {
         frame->header.source_publisher_epoch = run_hash_;
     }
 
-    void ValidateIdentityHeader(const WireFrame& frame) const {
+    void ValidateIdentityHeader(const bridge::WireFrameHeader& header) const {
         const auto& identity = schema_.descriptor().identity();
-        if (frame.header.topic_id != options_.edge + 1 ||
-            frame.header.msg_type !=
-                static_cast<uint32_t>(identity.short_id()) ||
-            frame.header.connection_schema_ref != 1 ||
-            frame.header.schema_version != identity.schema_version() ||
-            frame.header.layout_version != identity.layout_version() ||
-            frame.header.source_node_id != run_hash_ ||
-            frame.header.source_publisher_id != 1 ||
-            frame.header.source_publisher_epoch != run_hash_) {
+        if (header.topic_id != options_.edge + 1 ||
+            header.msg_type != static_cast<uint32_t>(identity.short_id()) ||
+            header.connection_schema_ref != 1 ||
+            header.schema_version != identity.schema_version() ||
+            header.layout_version != identity.layout_version() ||
+            header.source_node_id != run_hash_ ||
+            header.source_publisher_id != 1 ||
+            header.source_publisher_epoch != run_hash_) {
             throw std::runtime_error(
                 "bridge WireFrame identity does not match this schema/run/edge");
         }
@@ -1094,21 +1296,22 @@ class BridgeTransport final {
         }
     }
 
-    void Send(std::span<const std::byte> body, uint64_t deadline_ns,
+    void Send(std::vector<std::byte> body, uint64_t deadline_ns,
               transport::UntrackedTrafficClass traffic_class) {
         if (!connection_.has_value()) {
             throw std::logic_error("bridge TCP connection is not initialized");
         }
         while (NowNs() < deadline_ns) {
-            auto sent = driver_->SendUntracked({
-                .connection_id = *connection_,
-                .payload = body,
-                .traffic_class = traffic_class,
-            });
+            auto sent = driver_->TrySendUntrackedOwned(
+                *connection_, std::move(body), traffic_class);
             if (sent.ok()) return;
             if (sent.status().code() != StatusCode::kWouldBlock &&
                 sent.status().code() != StatusCode::kResourceExhausted) {
-                ThrowStatus("TcpDriver::SendUntracked", sent.status());
+                ThrowStatus("TcpDriver::TrySendUntrackedOwned", sent.status());
+            }
+            if (body.empty()) {
+                throw std::runtime_error(
+                    "owned bridge send consumed payload on failed admission");
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
@@ -1119,12 +1322,15 @@ class BridgeTransport final {
         if (!connection_.has_value()) {
             throw std::logic_error("bridge TCP connection is not initialized");
         }
-        while (NowNs() < deadline_ns) {
+        while (receive_cache_.empty() && NowNs() < deadline_ns) {
             const uint32_t timeout = RemainingMs(deadline_ns);
             if (timeout == 0) break;
             auto received = driver_->Poll({
-                .max_messages = 1,
-                .max_bytes = kMaximumFrameBodyBytes,
+                .max_messages = options_.receive_batch_size,
+                .max_bytes = std::min<size_t>(
+                    transport::kMaxReceiveBatchBytes,
+                    static_cast<size_t>(kMaximumFrameBodyBytes) *
+                        options_.receive_batch_size),
                 .timeout_ms = timeout,
                 .connection_id = *connection_,
             });
@@ -1135,14 +1341,26 @@ class BridgeTransport final {
                 }
                 ThrowStatus("TcpDriver::Poll", received.status());
             }
-            if (received->messages.size() != 1 ||
-                received->messages.front().connection_id != *connection_) {
+            if (received->messages.empty() ||
+                received->messages.size() > options_.receive_batch_size) {
                 throw std::runtime_error(
-                    "TcpDriver returned an invalid bridge receive batch");
+                    "TcpDriver returned an invalid bridge receive batch size");
             }
-            return std::move(received->messages.front().payload);
+            for (auto& message : received->messages) {
+                if (message.connection_id != *connection_) {
+                    throw std::runtime_error(
+                        "TcpDriver returned a bridge receive for the wrong connection");
+                }
+                receive_cache_.push_back(std::move(message.payload));
+            }
         }
-        throw std::runtime_error("deadline expired receiving through bridge TCP");
+        if (receive_cache_.empty()) {
+            throw std::runtime_error(
+                "deadline expired receiving through bridge TCP");
+        }
+        std::vector<std::byte> body = std::move(receive_cache_.front());
+        receive_cache_.pop_front();
+        return body;
     }
 
     void Flush(uint64_t deadline_ns) {
@@ -1166,12 +1384,15 @@ class BridgeTransport final {
     }
 
     const Options& options_;
-    const PipelineSchema& schema_;
+    PipelineSchema& schema_;
+    BridgeCounters* counters_ = nullptr;
     uint64_t run_hash_ = 0;
     WireFrameLimits limits_;
+    WireFrame data_frame_;
     std::unique_ptr<TcpDriver> driver_;
     std::optional<ConnectionId> listener_;
     std::optional<ConnectionId> connection_;
+    std::deque<std::vector<std::byte>> receive_cache_;
 };
 
 Role RoleAfterEdge(size_t edge) {
@@ -1208,6 +1429,49 @@ void ValidateSampleAndPhase(const Options& options,
     if (!ValidateFrameForStage(RoleAfterEdge(options.edge), frame, &error)) {
         throw std::runtime_error("frame sample/phase validation failed: " + error);
     }
+}
+
+uint64_t ThreadCpuNowNs() {
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+    }
+    return static_cast<uint64_t>(value.tv_sec) * kNanosecondsPerSecond +
+           static_cast<uint64_t>(value.tv_nsec);
+}
+
+void ValidateTransit(const Options& options, const SemanticFrame& frame,
+                     uint64_t expected_id, BridgeCounters* counters) {
+    if (options.validation == BridgeValidation::kStructural) {
+        std::string error;
+        if (!ValidateBridgeTransitFrame(
+                frame, expected_id, options.warmup_messages, options.profile,
+                RoleAfterEdge(options.edge), options.clock_mode, &error)) {
+            throw std::runtime_error(
+                "frame structural transit validation failed: " + error);
+        }
+        return;
+    }
+    if (options.validation == BridgeValidation::kFull) {
+        ValidateSampleAndPhase(options, frame, expected_id);
+        return;
+    }
+    if (counters == nullptr) {
+        throw std::invalid_argument("instrumented validation counters are null");
+    }
+    ++counters->validation_calls;
+    counters->validation_payload_bytes += frame.payload.size();
+    const uint64_t started_ns = ThreadCpuNowNs();
+    try {
+        ValidateSampleAndPhase(options, frame, expected_id);
+    } catch (...) {
+        const uint64_t finished_ns = ThreadCpuNowNs();
+        counters->validation_thread_cpu_ns += finished_ns - started_ns;
+        throw;
+    }
+    const uint64_t finished_ns = ThreadCpuNowNs();
+    counters->validation_thread_cpu_ns += finished_ns - started_ns;
 }
 
 void GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
@@ -1333,39 +1597,23 @@ void PopulateGeneratedFrame(const SemanticFrame& source,
     }
 }
 
-bool IsRetryable(const Status& status) {
-    return status.code() == StatusCode::kResourceExhausted ||
-           status.code() == StatusCode::kWouldBlock;
-}
-
 void PublishBounded(Publisher<Frame>* publisher,
                     const SemanticFrame& semantic, Deadline deadline) {
-    for (;;) {
-        if (deadline.expired()) {
-            throw std::runtime_error("deadline expired before bridge SHM publish");
-        }
-        Result<MessageBuilder<Frame>> allocated = publisher->Allocate(deadline);
-        if (!allocated.ok()) {
-            if (IsRetryable(allocated.status())) {
-                std::this_thread::yield();
-                continue;
-            }
-            ThrowStatus("Publisher::Allocate", allocated.status());
-        }
-        PopulateGeneratedFrame(semantic, &*allocated);
-        const Status published =
-            publisher->PublishLocal(std::move(*allocated), deadline);
-        if (published.ok()) return;
-        if (IsRetryable(published)) {
-            std::this_thread::yield();
-            continue;
-        }
+    if (deadline.expired()) {
+        throw std::runtime_error("deadline expired before bridge SHM publish");
+    }
+    Result<MessageBuilder<Frame>> allocated = publisher->Allocate(deadline);
+    if (!allocated.ok()) ThrowStatus("Publisher::Allocate", allocated.status());
+    PopulateGeneratedFrame(semantic, &*allocated);
+    const Status published =
+        publisher->PublishLocal(std::move(*allocated), deadline);
+    if (!published.ok()) {
         ThrowStatus("Publisher::PublishLocal", published);
     }
 }
 
 void RunSourceBridge(const Options& options, BridgeTransport* transport,
-                     uint64_t deadline_ns) {
+                     BridgeCounters* counters, uint64_t deadline_ns) {
     SharedMemorySegment segment = TakeOrThrow(
         "open source shared-memory segment",
         SharedMemorySegment::Open(options.shm_name, /*read_only=*/false));
@@ -1404,7 +1652,7 @@ void RunSourceBridge(const Options& options, BridgeTransport* transport,
         BorrowedMessage<Frame> borrowed = std::move(*polled);
         GeneratedToSemantic(*borrowed, borrowed.metadata().payload, allocator,
                             options.profile, &semantic);
-        ValidateSampleAndPhase(options, semantic, expected_id);
+        ValidateTransit(options, semantic, expected_id, counters);
         transport->SendData(semantic, deadline_ns);
         const Status ack = std::move(borrowed).Ack();
         if (!ack.ok()) ThrowStatus("Subscriber source Ack", ack);
@@ -1413,7 +1661,7 @@ void RunSourceBridge(const Options& options, BridgeTransport* transport,
 }
 
 void RunSinkBridge(const Options& options, BridgeTransport* transport,
-                   uint64_t deadline_ns) {
+                   BridgeCounters* counters, uint64_t deadline_ns) {
     SharedMemorySegment segment = TakeOrThrow(
         "open sink shared-memory segment",
         SharedMemorySegment::Open(options.shm_name, /*read_only=*/false));
@@ -1441,7 +1689,7 @@ void RunSinkBridge(const Options& options, BridgeTransport* transport,
     Publisher<Frame> publisher(
         allocator, channel, options.edge + 1, journal,
         ProcessIdentity::Current(),
-        PublisherOptions{.queue_full_policy = QueueFullPolicy::kFail});
+        PublisherOptions{.queue_full_policy = QueueFullPolicy::kBlock});
 
     WriteBridgeStatus(options, "ready");
     if (!WaitForStartFile(options.runtime_dir, options.run_id, deadline_ns)) {
@@ -1453,7 +1701,7 @@ void RunSinkBridge(const Options& options, BridgeTransport* transport,
     semantic.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         transport->ReceiveData(expected_id, deadline_ns, &semantic);
-        ValidateSampleAndPhase(options, semantic, expected_id);
+        ValidateTransit(options, semantic, expected_id, counters);
         PublishBounded(&publisher, semantic, runtime_deadline);
     }
     transport->SendCompletion(total, deadline_ns);
@@ -1461,18 +1709,20 @@ void RunSinkBridge(const Options& options, BridgeTransport* transport,
 
 int BridgeMain(int argc, char** argv) {
     std::optional<Options> parsed_options;
+    BridgeCounters counters;
     try {
         parsed_options = ParseOptions(argc, argv);
         const Options& options = *parsed_options;
         const uint64_t deadline_ns = AbsoluteDeadline(options);
         PipelineSchema schema(options.descriptor);
-        BridgeTransport transport(options, schema, deadline_ns);
+        BridgeTransport transport(options, schema, &counters, deadline_ns);
         if (options.mode == Mode::kSource) {
-            RunSourceBridge(options, &transport, deadline_ns);
+            RunSourceBridge(options, &transport, &counters, deadline_ns);
         } else {
-            RunSinkBridge(options, &transport, deadline_ns);
+            RunSinkBridge(options, &transport, &counters, deadline_ns);
         }
         transport.CloseOrThrow();
+        WriteBridgeArtifact(options, counters, "success", "");
         WriteBridgeStatus(options, "done",
                           "completed=" + std::to_string(TotalFrames(options)));
         std::cout << StatusToken(options.mode) << " completed "
@@ -1482,13 +1732,23 @@ int BridgeMain(int argc, char** argv) {
     } catch (const std::exception& exception) {
         std::cerr << kBridgeToken << " failed: " << exception.what() << '\n';
         if (parsed_options.has_value()) {
+            WriteBridgeArtifactBestEffort(*parsed_options, counters,
+                                          exception.what());
             WriteErrorBestEffort(*parsed_options, exception.what());
+        } else {
+            WriteBridgeParseFailureArtifactBestEffort(argc, argv,
+                                                      exception.what());
         }
         return 1;
     } catch (...) {
         std::cerr << kBridgeToken << " failed: unknown exception\n";
         if (parsed_options.has_value()) {
+            WriteBridgeArtifactBestEffort(*parsed_options, counters,
+                                          "unknown exception");
             WriteErrorBestEffort(*parsed_options, "unknown exception");
+        } else {
+            WriteBridgeParseFailureArtifactBestEffort(
+                argc, argv, "unknown exception");
         }
         return 1;
     }

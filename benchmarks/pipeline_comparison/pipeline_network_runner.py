@@ -161,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--zmq-hwm", type=_bounded_int("--zmq-hwm", 1, 2_147_483_647), default=64
     )
     parser.add_argument(
+        "--receive-batch-size",
+        type=_bounded_int("--receive-batch-size", 1, 64),
+        default=1,
+        help="ordered TcpDriver receive batch size; 1 preserves benchmark fairness",
+    )
+    parser.add_argument(
         "--binary-relative",
         help="repository-relative worker binary; defaults by backend",
     )
@@ -530,6 +536,8 @@ def _backend_arguments(
         str(args.port_base),
         "--schema-descriptor",
         str(topology[role].workdir / args.schema_descriptor_relative),
+        "--receive-batch-size",
+        str(args.receive_batch_size),
     ]
 
 
@@ -984,6 +992,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "history_depth": args.history_depth,
                 "port_base": args.port_base,
                 "zmq_hwm": args.zmq_hwm,
+                "receive_batch_size": args.receive_batch_size,
             },
             "started_utc": started_utc,
             "finished_utc": dt.datetime.now(dt.timezone.utc)

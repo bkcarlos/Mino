@@ -5,6 +5,7 @@
 #ifndef MINO_RUNTIME_PUBLISHER_H_
 #define MINO_RUNTIME_PUBLISHER_H_
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -514,6 +515,10 @@ public:
         if (!validation.ok()) {
             return AbortWith(builder, validation);
         }
+        const Status manifest = ValidateOwnedGraphManifest(builder);
+        if (!manifest.ok()) {
+            return AbortWith(builder, manifest);
+        }
 
         Result<OutstandingReceiptTable::Reservation> receipt_reservation =
             receipts.Reserve(publisher_identity, target_snapshot, requirement);
@@ -629,6 +634,10 @@ private:
         if (!validation.ok()) {
             return AbortWith(builder, validation);
         }
+        const Status manifest = ValidateOwnedGraphManifest(builder);
+        if (!manifest.ok()) {
+            return AbortWith(builder, manifest);
+        }
 
         if (std::holds_alternative<SpscChannel*>(channel_)) {
             return FinishPublish(builder, ReserveSpsc(deadline),
@@ -640,6 +649,45 @@ private:
         }
         return FinishPublish(builder, ReserveBroadcast(deadline),
                              source_sequence, locally_published);
+    }
+
+    static constexpr bool SupportsOwnedGraphCollection() noexcept {
+        if constexpr (requires {
+                          StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+                          StaticMessageTraits<T>::kMaxOwnedGraphHandles;
+                      }) {
+            return StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+        }
+        return false;
+    }
+
+    static Status ValidateOwnedGraphManifest(
+        MessageBuilder<T>& builder) noexcept {
+        if constexpr (!SupportsOwnedGraphCollection()) {
+            return Status::Ok();
+        } else {
+            static_assert(StaticMessageTraits<T>::kMaxOwnedGraphHandles > 0,
+                          "owned graph collector must have root capacity");
+            std::array<ShmHandle,
+                       StaticMessageTraits<T>::kMaxOwnedGraphHandles>
+                reachable{};
+            size_t handle_count = 0;
+            MINO_RETURN_IF_ERROR(CollectOwnedGraph(
+                builder.handle_, *builder.value_, reachable, handle_count));
+            if (handle_count == 0 || handle_count > reachable.size()) {
+                return Status::Error(StatusCode::kCorruption,
+                                     "owned graph collector returned an invalid size");
+            }
+            if (handle_count == 1) return Status::Ok();
+            if (builder.journal_ == nullptr) {
+                return Status::Error(
+                    StatusCode::kUnsupported,
+                    "owned graph publication requires an allocation journal");
+            }
+            return builder.journal_->ValidateManifest(
+                builder.transaction_,
+                std::span<const ShmHandle>(reachable.data(), handle_count));
+        }
     }
 
     static constexpr void ValidateStaticContract() noexcept {

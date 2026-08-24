@@ -27,6 +27,17 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "golden_generated_testdata",
+    hdrs = ["testdata/golden.generated.h"],
+    deps = [
+        "//mino/runtime:runtime_types",
+        "//mino/schema:dynamic_object",
+        "//mino/schema:wire",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
 cc_test(
     name = "code_generator_test",
     srcs = [

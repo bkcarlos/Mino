@@ -176,6 +176,8 @@ struct CentralSlabAllocator::LocalCacheState {
     std::atomic<uint64_t> numa_fallback_allocations{0};
     std::atomic<uint64_t> numa_bind_errors{0};
     std::atomic<uint64_t> numa_migrations{0};
+    std::atomic<uint64_t> published_graph_reclaims{0};
+    std::atomic<uint64_t> append_gap_reclaim_scans{0};
     std::shared_ptr<const NumaRuntime> numa_runtime;
 };
 
@@ -568,6 +570,12 @@ AllocatorLocalCacheStats CentralSlabAllocator::local_cache_stats() const noexcep
             std::memory_order_relaxed),
         .numa_migrations = local_cache_state_->numa_migrations.load(
             std::memory_order_relaxed),
+        .published_graph_reclaims =
+            local_cache_state_->published_graph_reclaims.load(
+                std::memory_order_relaxed),
+        .append_gap_reclaim_scans =
+            local_cache_state_->append_gap_reclaim_scans.load(
+                std::memory_order_relaxed),
     };
 }
 
@@ -1004,11 +1012,114 @@ Status CentralSlabAllocator::ReclaimTransaction(
     return Status::Ok();
 }
 
+Status CentralSlabAllocator::ReclaimPublishedGraph(
+    ShmHandle root, std::span<const ShmHandle> root_first_manifest) {
+    if (root.IsNull() || root_first_manifest.empty() ||
+        root_first_manifest.front() != root) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "published graph manifest is not root-first");
+    }
+
+    uint64_t owner_epoch = 0;
+    uint64_t transaction_id = 0;
+    for (size_t i = 0; i < root_first_manifest.size(); ++i) {
+        const ShmHandle handle = root_first_manifest[i];
+        if (handle.IsNull()) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "published graph manifest contains a null handle");
+        }
+        for (size_t prior = 0; prior < i; ++prior) {
+            if (root_first_manifest[prior] == handle) {
+                return Status::Error(
+                    StatusCode::kCorruption,
+                    "published graph manifest contains a duplicate handle");
+            }
+        }
+
+        MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+        const SlabHeader& header = HeaderAt(slot_index);
+        if (!VerifyImmutableHeader(header) ||
+            generations_.Get(slot_index) != handle.generation ||
+            header.generation.load(std::memory_order_acquire) !=
+                handle.generation) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "published graph handle identity is corrupt");
+        }
+        const uint32_t expected_role =
+            i == 0 ? kAllocationFlagTransactionRoot
+                   : kAllocationFlagTransactionChild;
+        if (header.allocation_role.load(std::memory_order_acquire) !=
+            expected_role) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "published graph allocation role mismatch");
+        }
+        const uint64_t handle_owner =
+            header.owner_epoch.load(std::memory_order_acquire);
+        const uint64_t handle_transaction =
+            header.allocation_transaction_id.load(std::memory_order_acquire);
+        if (i == 0) {
+            owner_epoch = handle_owner;
+            transaction_id = handle_transaction;
+            if (owner_epoch == 0 || transaction_id == 0) {
+                return Status::Error(
+                    StatusCode::kCorruption,
+                    "published graph root has no transaction identity");
+            }
+        } else if (handle_owner != owner_epoch ||
+                   handle_transaction != transaction_id) {
+            return Status::Error(
+                StatusCode::kCorruption,
+                "published graph owner or transaction mismatch");
+        }
+        const ObjectState state = static_cast<ObjectState>(
+            header.object_state.load(std::memory_order_acquire));
+        if (state != ObjectState::kPublished && state != ObjectState::kRetired) {
+            return Status::Error(
+                StatusCode::kCorruption,
+                "published graph handle is not Published or Retired");
+        }
+        if (!CanReclaim(handle)) {
+            return Status::Error(StatusCode::kWouldBlock,
+                                 "published graph has a live or in-flight Pin");
+        }
+    }
+
+    for (size_t i = root_first_manifest.size(); i > 0; --i) {
+        const ShmHandle handle = root_first_manifest[i - 1];
+        MINO_ASSIGN_OR_RETURN(const uint32_t slot_index, ResolveLocked(handle));
+        const SlabHeader& header = HeaderAt(slot_index);
+        const uint32_t expected_role =
+            i == 1 ? kAllocationFlagTransactionRoot
+                   : kAllocationFlagTransactionChild;
+        if (!VerifyImmutableHeader(header) ||
+            header.allocation_role.load(std::memory_order_acquire) !=
+                expected_role ||
+            header.owner_epoch.load(std::memory_order_acquire) != owner_epoch ||
+            header.allocation_transaction_id.load(std::memory_order_acquire) !=
+                transaction_id) {
+            return Status::Error(
+                StatusCode::kCorruption,
+                "published graph identity changed before reclaim");
+        }
+        MINO_RETURN_IF_ERROR(Retire(handle));
+        MINO_RETURN_IF_ERROR(ReclaimSlotExact(slot_index, handle, false));
+    }
+    if (local_cache_state_ != nullptr) {
+        local_cache_state_->published_graph_reclaims.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return Status::Ok();
+}
+
 Status CentralSlabAllocator::ReclaimTransactionAppendGap(
     uint64_t owner_epoch, uint64_t transaction_id) {
     if (owner_epoch == 0 || transaction_id == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "invalid allocation transaction identity");
+    }
+    if (local_cache_state_ != nullptr) {
+        local_cache_state_->append_gap_reclaim_scans.fetch_add(
+            1, std::memory_order_relaxed);
     }
     for (uint32_t i = 0; i < total_slot_count(); ++i) {
         if (!bitmap_.IsSet(i)) continue;

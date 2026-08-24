@@ -662,6 +662,30 @@ Result<size_t> TransportDriver::DoSendUntracked(
     return Unsupported("driver does not support untracked sends");
 }
 
+Result<SendResult> TransportDriver::DoTrySendOwned(
+    const SendRequest& request, std::vector<std::byte>&& payload,
+    SendOperation operation) {
+    auto result = DoSend(request, operation);
+    if (!result.ok()) return result.status();
+    if (!ValidateSendResult(request, operation, *result).ok()) {
+        return InvalidDriverResult("driver returned invalid Send admission");
+    }
+    payload.clear();
+    return result;
+}
+
+Result<size_t> TransportDriver::DoTrySendUntrackedOwned(
+    const UntrackedSendRequest& request, std::vector<std::byte>&& payload) {
+    auto result = DoSendUntracked(request);
+    if (!result.ok()) return result.status();
+    if (*result != request.payload.size()) {
+        return InvalidDriverResult(
+            "driver returned invalid untracked Send admission");
+    }
+    payload.clear();
+    return result;
+}
+
 Status TransportDriver::DoConfirmRemoteAccepted(SendOperation) {
     return Unsupported("driver does not support protocol ACK confirmation");
 }
@@ -958,6 +982,79 @@ Result<size_t> TransportDriver::SendUntracked(
         if (*result != request.payload.size()) {
             return InvalidDriverResult(
                 "driver returned invalid untracked Send admission");
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<SendResult> TransportDriver::TrySendOwned(
+    ConnectionId connection_id, std::vector<std::byte>&& payload,
+    DeliveryStage target_stage) {
+    try {
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        const TransportCapabilities driver_capabilities = capabilities();
+        MINO_RETURN_IF_ERROR(
+            ValidateDriverCapabilitiesForCall(driver_capabilities));
+        const SendRequest request{
+            .connection_id = connection_id,
+            .payload = payload,
+            .target_stage = target_stage,
+        };
+        MINO_RETURN_IF_ERROR(
+            ValidateSendRequest(request, driver_capabilities));
+        auto reserved = ReserveSendOperation(request);
+        if (!reserved.ok()) return reserved.status();
+        const SendOperation operation = *reserved;
+
+        try {
+            auto result =
+                DoTrySendOwned(request, std::move(payload), operation);
+            if (!result.ok()) {
+                CancelSendOperation(operation.id);
+                return result.status();
+            }
+            if (!ValidateSendResult(request, operation, *result).ok()) {
+                CancelSendOperation(operation.id);
+                return InvalidDriverResult(
+                    "driver returned invalid owned Send admission");
+            }
+            return result;
+        } catch (const std::bad_alloc&) {
+            CancelSendOperation(operation.id);
+            return AllocationFailure();
+        } catch (...) {
+            CancelSendOperation(operation.id);
+            throw;
+        }
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Result<size_t> TransportDriver::TrySendUntrackedOwned(
+    ConnectionId connection_id, std::vector<std::byte>&& payload,
+    UntrackedTrafficClass traffic_class) {
+    try {
+        auto active = AcquireActiveOperation();
+        if (!active.ok()) return active.status();
+        const TransportCapabilities driver_capabilities = capabilities();
+        MINO_RETURN_IF_ERROR(
+            ValidateDriverCapabilitiesForCall(driver_capabilities));
+        const UntrackedSendRequest request{
+            .connection_id = connection_id,
+            .payload = payload,
+            .traffic_class = traffic_class,
+        };
+        MINO_RETURN_IF_ERROR(
+            ValidateUntrackedSendRequest(request, driver_capabilities));
+        auto result = DoTrySendUntrackedOwned(request, std::move(payload));
+        if (!result.ok()) return result.status();
+        if (*result != request.payload.size()) {
+            return InvalidDriverResult(
+                "driver returned invalid owned untracked Send admission");
         }
         return result;
     } catch (const std::bad_alloc&) {

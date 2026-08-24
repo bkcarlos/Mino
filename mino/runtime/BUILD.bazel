@@ -279,6 +279,7 @@ cc_test(
         ":subscriber",
         "//mino/common:status",
         "//mino/platform:process_identity",
+        "//mino/schema/codegen:golden_generated_testdata",
         "//mino/shm/allocator:central_slab",
         "//mino/shm/channel:broadcast",
         "//mino/shm/channel:mpsc",

@@ -5,6 +5,7 @@
 #include "mino/schema/wire.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
 #include <map>
@@ -38,6 +39,13 @@ Status ValidateWireLimits(const WireLimits& limits) {
                              "wire limits must be non-zero");
     }
     return Status::Ok();
+}
+
+bool UnknownLimitsMatch(const DynamicMessage& message,
+                        const WireLimits& limits) noexcept {
+    const UnknownFieldLimits& actual = message.unknown_fields().limits();
+    return actual.max_bytes == limits.unknown_fields.max_bytes &&
+           actual.max_fields == limits.unknown_fields.max_fields;
 }
 
 bool IsValidUtf8(std::span<const std::byte> bytes) noexcept {
@@ -277,13 +285,89 @@ private:
     std::map<std::string, const SchemaDescriptor*, std::less<>> descriptors_;
 };
 
+struct FieldPlan {
+    const FieldDescriptor* descriptor = nullptr;
+    uint32_t id = 0;
+    WireType wire_type = WireType::kVarint;
+    std::array<std::byte, 10> tag{};
+    size_t tag_size = 0;
+};
+
+struct MessagePlan {
+    std::vector<FieldPlan> fields;
+};
+
+class FieldPlanCache {
+public:
+    Status Add(const SchemaDescriptor& descriptor) {
+        if (plans_.contains(&descriptor)) return Status::Ok();
+        MessagePlan plan;
+        plan.fields.reserve(descriptor.aggregate().fields().size());
+        for (const FieldDescriptor& field : descriptor.aggregate().fields()) {
+            auto wire_type = ExpectedWireType(field.type());
+            if (!wire_type.ok()) return wire_type.status();
+            FieldPlan field_plan;
+            field_plan.descriptor = &field;
+            field_plan.id = field.id();
+            field_plan.wire_type = *wire_type;
+            uint64_t tag = (static_cast<uint64_t>(field.id()) << 3) |
+                           static_cast<uint8_t>(*wire_type);
+            do {
+                uint8_t byte = static_cast<uint8_t>(tag & 0x7fu);
+                tag >>= 7;
+                if (tag != 0) byte |= 0x80u;
+                field_plan.tag[field_plan.tag_size++] =
+                    static_cast<std::byte>(byte);
+            } while (tag != 0);
+            plan.fields.push_back(std::move(field_plan));
+        }
+        plans_.emplace(&descriptor, std::move(plan));
+        return Status::Ok();
+    }
+
+    const MessagePlan* Find(const SchemaDescriptor& descriptor) const noexcept {
+        const auto it = plans_.find(&descriptor);
+        return it == plans_.end() ? nullptr : &it->second;
+    }
+
+private:
+    std::map<const SchemaDescriptor*, MessagePlan> plans_;
+};
+
+Result<FieldPlanCache> BuildFieldPlanCache(
+    const SchemaDescriptor& root,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors) {
+    FieldPlanCache plans;
+    MINO_RETURN_IF_ERROR(plans.Add(root));
+    for (const auto& descriptor : descriptors) {
+        if (descriptor != nullptr) {
+            MINO_RETURN_IF_ERROR(plans.Add(*descriptor));
+        }
+    }
+    return plans;
+}
+
 struct CodecContext {
     const DescriptorResolver& resolver;
     const WireLimits& limits;
+    const FieldPlanCache* plans = nullptr;
+    std::vector<std::vector<size_t>>* unknown_orders = nullptr;
     size_t decoded_elements = 0;
 };
 
+const MessagePlan* FindMessagePlan(const SchemaDescriptor& descriptor,
+                                   const CodecContext& context) noexcept {
+    return context.plans == nullptr ? nullptr : context.plans->Find(descriptor);
+}
 
+const FieldPlan* FindFieldPlan(const MessagePlan& plan, uint32_t id) noexcept {
+    const auto it = std::lower_bound(
+        plan.fields.begin(), plan.fields.end(), id,
+        [](const FieldPlan& field, uint32_t field_id) {
+            return field.id < field_id;
+        });
+    return it != plan.fields.end() && it->id == id ? &*it : nullptr;
+}
 
 Status EncodeValue(const TypeDescriptor& type, const ConstraintSet& constraints,
                    const DynamicValue& value, size_t depth,
@@ -293,17 +377,11 @@ Status EncodeMessage(const SchemaDescriptor& descriptor,
                      const DynamicMessage& message, size_t depth,
                      CodecContext& context, std::vector<std::byte>& output);
 
-Status EncodeLengthPayload(std::span<const std::byte> payload,
-                           CodecContext& context,
-                           std::vector<std::byte>& output) {
-    if (payload.size() > context.limits.max_length_bytes) {
-        return Resource("length-delimited value exceeds max_length_bytes");
-    }
-    Status status = AppendLeb128(payload.size(), context.limits.max_frame_bytes,
-                                 output);
-    if (!status.ok()) return status;
-    return Append(payload, context.limits.max_frame_bytes, output);
-}
+Status EncodeLengthDelimitedValue(const TypeDescriptor& type,
+                                  const ConstraintSet& constraints,
+                                  const DynamicValue& value, size_t depth,
+                                  CodecContext& context,
+                                  std::vector<std::byte>& output);
 
 Status EncodeVectorPayload(const TypeDescriptor& element_type,
                            const ConstraintSet& constraints,
@@ -326,15 +404,92 @@ Status EncodeVectorPayload(const TypeDescriptor& element_type,
             status = EncodeValue(element_type, constraints, element, depth + 1,
                                  context, output);
         } else {
-            std::vector<std::byte> payload;
-            status = EncodeValue(element_type, constraints, element, depth + 1,
-                                 context, payload);
-            if (status.ok()) {
-                status = EncodeLengthPayload(payload, context, output);
-            }
+            status = EncodeLengthDelimitedValue(
+                element_type, constraints, element, depth + 1, context, output);
         }
         if (!status.ok()) return status;
     }
+    return Status::Ok();
+}
+
+Status EncodeLengthDelimitedValue(const TypeDescriptor& type,
+                                  const ConstraintSet& constraints,
+                                  const DynamicValue& value, size_t depth,
+                                  CodecContext& context,
+                                  std::vector<std::byte>& output) {
+    if (depth > context.limits.max_depth) {
+        return Resource("canonical nesting exceeds max_depth");
+    }
+    const size_t start = output.size();
+    if (type.kind() == TypeDescriptor::Kind::kScalar &&
+        type.scalar().has_value() &&
+        (*type.scalar() == ScalarType::kString ||
+         *type.scalar() == ScalarType::kBytes)) {
+        std::span<const std::byte> bytes;
+        if (*type.scalar() == ScalarType::kString) {
+            const auto* string = value.string();
+            if (string == nullptr) {
+                return Mismatch("string value has the wrong dynamic type");
+            }
+            bytes = std::as_bytes(std::span(string->value));
+            if (!IsValidUtf8(bytes)) {
+                return Mismatch("string is not valid UTF-8");
+            }
+        } else {
+            const auto* byte_value = value.bytes();
+            if (byte_value == nullptr) {
+                return Mismatch("bytes value has the wrong dynamic type");
+            }
+            bytes = byte_value->value;
+        }
+        if (constraints.max_bytes().has_value() &&
+            bytes.size() > *constraints.max_bytes()) {
+            return Resource(*type.scalar() == ScalarType::kString
+                                ? "string exceeds descriptor max_bytes"
+                                : "bytes exceeds descriptor max_bytes");
+        }
+        if (bytes.size() > context.limits.max_length_bytes) {
+            return Resource("length-delimited value exceeds max_length_bytes");
+        }
+        Status status = AppendLeb128(bytes.size(),
+                                     context.limits.max_frame_bytes, output);
+        if (status.ok()) {
+            status = Append(bytes, context.limits.max_frame_bytes, output);
+        }
+        if (!status.ok()) output.resize(start);
+        return status;
+    }
+
+    const size_t payload_start = output.size();
+    Status status =
+        EncodeValue(type, constraints, value, depth, context, output);
+    if (!status.ok()) {
+        output.resize(start);
+        return status;
+    }
+    const size_t payload_size = output.size() - payload_start;
+    if (payload_size > context.limits.max_length_bytes) {
+        output.resize(start);
+        return Resource("length-delimited value exceeds max_length_bytes");
+    }
+    std::array<std::byte, 10> prefix{};
+    size_t prefix_size = 0;
+    uint64_t length = payload_size;
+    do {
+        uint8_t byte = static_cast<uint8_t>(length & 0x7fu);
+        length >>= 7;
+        if (length != 0) byte |= 0x80u;
+        prefix[prefix_size++] = static_cast<std::byte>(byte);
+    } while (length != 0);
+    if (prefix_size > context.limits.max_frame_bytes -
+                          std::min(output.size(),
+                                   context.limits.max_frame_bytes)) {
+        output.resize(start);
+        return Resource("canonical frame exceeds max_frame_bytes");
+    }
+    output.insert(output.begin() + static_cast<std::ptrdiff_t>(payload_start),
+                  prefix.begin(), prefix.begin() +
+                                      static_cast<std::ptrdiff_t>(prefix_size));
     return Status::Ok();
 }
 
@@ -493,84 +648,121 @@ Status ValidateUnknownCanonical(const UnknownField& field,
     return Status::Ok();
 }
 
-struct EncodedField {
-    uint32_t id = 0;
-    size_t order = 0;
-    std::vector<std::byte> bytes;
-};
-
 Status EncodeMessage(const SchemaDescriptor& descriptor,
                      const DynamicMessage& message, size_t depth,
                      CodecContext& context, std::vector<std::byte>& output) {
     if (depth > context.limits.max_depth) {
         return Resource("canonical nesting exceeds max_depth");
     }
+    const MessagePlan* plan = FindMessagePlan(descriptor, context);
+    const auto descriptor_fields = descriptor.aggregate().fields();
+    const size_t known_count =
+        plan == nullptr ? descriptor_fields.size() : plan->fields.size();
+    const auto known_descriptor = [&](size_t index) -> const FieldDescriptor& {
+        return plan == nullptr ? descriptor_fields[index]
+                               : *plan->fields[index].descriptor;
+    };
+    const auto find_known = [&](uint32_t id) -> const FieldDescriptor* {
+        if (plan == nullptr) return descriptor.aggregate().FindField(id);
+        const FieldPlan* field = FindFieldPlan(*plan, id);
+        return field == nullptr ? nullptr : field->descriptor;
+    };
+
     for (const DynamicField& field : message.fields()) {
-        if (descriptor.aggregate().FindField(field.id()) == nullptr) {
-            return Mismatch("DynamicMessage contains a field absent from descriptor");
+        if (find_known(field.id()) == nullptr) {
+            return Mismatch(
+                "DynamicMessage contains a field absent from descriptor");
         }
     }
-    if (message.unknown_fields().fields().size() >
-            context.limits.unknown_fields.max_fields ||
+    const auto unknown_fields = message.unknown_fields().fields();
+    if (unknown_fields.size() > context.limits.unknown_fields.max_fields ||
         message.unknown_fields().byte_size() >
             context.limits.unknown_fields.max_bytes) {
         return Resource("unknown field set exceeds wire limits");
     }
+    if (context.unknown_orders == nullptr) {
+        return Status::Error(StatusCode::kInternal,
+                             "canonical wire scratch is unavailable");
+    }
+    if (context.unknown_orders->size() <= depth) {
+        context.unknown_orders->resize(depth + 1);
+    }
+    {
+        auto& order = (*context.unknown_orders)[depth];
+        order.clear();
+        order.reserve(unknown_fields.size());
+        for (size_t index = 0; index < unknown_fields.size(); ++index) {
+            const UnknownField& field = unknown_fields[index];
+            if (find_known(field.field_id()) != nullptr) {
+                return Mismatch(
+                    "unknown field collides with a known descriptor field");
+            }
+            Status status = ValidateUnknownCanonical(field, context.limits);
+            if (!status.ok()) return status;
+            order.push_back(index);
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](size_t lhs, size_t rhs) {
+                      const uint32_t lhs_id = unknown_fields[lhs].field_id();
+                      const uint32_t rhs_id = unknown_fields[rhs].field_id();
+                      return lhs_id != rhs_id ? lhs_id < rhs_id : lhs < rhs;
+                  });
+    }
 
-    std::vector<EncodedField> encoded;
-    encoded.reserve(descriptor.aggregate().fields().size() +
-                    message.unknown_fields().fields().size());
-    size_t order = 0;
-    for (const FieldDescriptor& field : descriptor.aggregate().fields()) {
+    const auto append_unknown = [&](size_t ordered_index) -> Status {
+        const size_t field_index =
+            (*context.unknown_orders)[depth][ordered_index];
+        return Append(unknown_fields[field_index].canonical_bytes(),
+                      context.limits.max_frame_bytes, output);
+    };
+
+    size_t unknown_index = 0;
+    for (size_t known_index = 0; known_index < known_count; ++known_index) {
+        const FieldDescriptor& field = known_descriptor(known_index);
+        while (unknown_index < unknown_fields.size()) {
+            const size_t field_index =
+                (*context.unknown_orders)[depth][unknown_index];
+            if (unknown_fields[field_index].field_id() >= field.id()) break;
+            Status status = append_unknown(unknown_index++);
+            if (!status.ok()) return status;
+        }
+
         const DynamicValue* value = message.FindField(field.id());
         if (value == nullptr) {
             if (field.cardinality() == FieldCardinality::kOptional) continue;
             return Mismatch("required field is missing from DynamicMessage");
         }
-        auto wire_type = ExpectedWireType(field.type());
-        if (!wire_type.ok()) return wire_type.status();
-        EncodedField item;
-        item.id = field.id();
-        item.order = order++;
-        Status status = AppendLeb128(
-            (static_cast<uint64_t>(field.id()) << 3) |
-                static_cast<uint8_t>(*wire_type),
-            context.limits.max_frame_bytes, item.bytes);
+        WireType wire_type;
+        Status status = Status::Ok();
+        if (plan != nullptr) {
+            const FieldPlan& field_plan = plan->fields[known_index];
+            wire_type = field_plan.wire_type;
+            status = Append(
+                std::span<const std::byte>(field_plan.tag.data(),
+                                          field_plan.tag_size),
+                context.limits.max_frame_bytes, output);
+        } else {
+            auto expected = ExpectedWireType(field.type());
+            if (!expected.ok()) return expected.status();
+            wire_type = *expected;
+            status = AppendLeb128(
+                (static_cast<uint64_t>(field.id()) << 3) |
+                    static_cast<uint8_t>(wire_type),
+                context.limits.max_frame_bytes, output);
+        }
         if (!status.ok()) return status;
-        if (*wire_type == WireType::kLengthDelimited) {
-            std::vector<std::byte> payload;
-            status = EncodeValue(field.type(), field.constraints(), *value,
-                                 depth + 1, context, payload);
-            if (status.ok()) {
-                status = EncodeLengthPayload(payload, context, item.bytes);
-            }
+        if (wire_type == WireType::kLengthDelimited) {
+            status = EncodeLengthDelimitedValue(
+                field.type(), field.constraints(), *value, depth + 1, context,
+                output);
         } else {
             status = EncodeValue(field.type(), field.constraints(), *value,
-                                 depth + 1, context, item.bytes);
+                                 depth + 1, context, output);
         }
         if (!status.ok()) return status;
-        encoded.push_back(std::move(item));
     }
-    for (const UnknownField& field : message.unknown_fields().fields()) {
-        if (descriptor.aggregate().FindField(field.field_id()) != nullptr) {
-            return Mismatch("unknown field collides with a known descriptor field");
-        }
-        Status status = ValidateUnknownCanonical(field, context.limits);
-        if (!status.ok()) return status;
-        EncodedField item;
-        item.id = field.field_id();
-        item.order = order++;
-        item.bytes.assign(field.canonical_bytes().begin(),
-                          field.canonical_bytes().end());
-        encoded.push_back(std::move(item));
-    }
-    std::stable_sort(encoded.begin(), encoded.end(),
-                     [](const EncodedField& lhs, const EncodedField& rhs) {
-                         return lhs.id < rhs.id;
-                     });
-    for (const EncodedField& field : encoded) {
-        Status status = Append(field.bytes, context.limits.max_frame_bytes,
-                               output);
+    while (unknown_index < unknown_fields.size()) {
+        Status status = append_unknown(unknown_index++);
         if (!status.ok()) return status;
     }
     return Status::Ok();
@@ -581,9 +773,9 @@ Result<DynamicValue> DecodeValue(const TypeDescriptor& type,
                                  WireType wire_type, Reader& reader,
                                  size_t depth, CodecContext& context);
 
-Result<DynamicMessage> DecodeMessage(const SchemaDescriptor& descriptor,
-                                     std::span<const std::byte> bytes,
-                                     size_t depth, CodecContext& context);
+Status DecodeMessageInto(const SchemaDescriptor& descriptor,
+                         std::span<const std::byte> bytes, size_t depth,
+                         CodecContext& context, DynamicMessage& message);
 
 Result<DynamicValue> DecodeElement(const TypeDescriptor& type,
                                    const ConstraintSet& constraints,
@@ -617,11 +809,12 @@ Result<DynamicValue> DecodeValue(const TypeDescriptor& type,
         }
         auto descriptor = context.resolver.Find(type.name());
         if (!descriptor.ok()) return descriptor.status();
-        auto nested = DecodeMessage(**descriptor, reader.remaining(), depth,
-                                    context);
-        if (!nested.ok()) return nested.status();
+        auto pointer = std::make_shared<DynamicMessage>(
+            context.limits.unknown_fields);
+        Status status = DecodeMessageInto(**descriptor, reader.remaining(), depth,
+                                         context, *pointer);
+        if (!status.ok()) return status;
         reader.ConsumeAll();
-        auto pointer = std::make_shared<DynamicMessage>(std::move(*nested));
         return DynamicValue::Message(std::move(pointer));
     }
     if (type.kind() == TypeDescriptor::Kind::kVector) {
@@ -738,19 +931,23 @@ Result<DynamicValue> DecodeValue(const TypeDescriptor& type,
     return Mismatch("unsupported scalar type");
 }
 
-Result<DynamicMessage> DecodeMessage(const SchemaDescriptor& descriptor,
-                                     std::span<const std::byte> bytes,
-                                     size_t depth, CodecContext& context) {
+Status DecodeMessageInto(const SchemaDescriptor& descriptor,
+                         std::span<const std::byte> bytes, size_t depth,
+                         CodecContext& context, DynamicMessage& message) {
     if (depth > context.limits.max_depth) {
         return Resource("canonical nesting exceeds max_depth");
     }
     if (bytes.size() > context.limits.max_frame_bytes) {
         return Resource("canonical frame exceeds max_frame_bytes");
     }
-    DynamicMessage message(context.limits.unknown_fields);
+    const MessagePlan* plan = FindMessagePlan(descriptor, context);
+    const size_t known_count = plan == nullptr
+                                   ? descriptor.aggregate().fields().size()
+                                   : plan->fields.size();
+    message.Clear();
+    MINO_RETURN_IF_ERROR(message.ReserveFields(known_count));
     Reader reader(bytes, context.limits);
     uint32_t previous_id = 0;
-    std::vector<uint32_t> seen;
     while (!reader.done()) {
         const size_t field_start = reader.offset();
         auto tag = reader.Varint();
@@ -763,26 +960,38 @@ Result<DynamicMessage> DecodeMessage(const SchemaDescriptor& descriptor,
         if (id < previous_id) {
             return Corruption("canonical fields are not sorted by field ID");
         }
-        previous_id = id;
         auto wire_type = ParseWireType(*tag & 7u);
         if (!wire_type.ok()) return wire_type.status();
-        const FieldDescriptor* field = descriptor.aggregate().FindField(id);
+        const FieldPlan* field_plan =
+            plan == nullptr ? nullptr : FindFieldPlan(*plan, id);
+        const FieldDescriptor* field =
+            plan == nullptr ? descriptor.aggregate().FindField(id)
+                            : (field_plan == nullptr
+                                   ? nullptr
+                                   : field_plan->descriptor);
         if (field == nullptr) {
             Status status = reader.Skip(*wire_type);
             if (!status.ok()) return status;
             const auto raw = bytes.subspan(field_start,
-                                            reader.offset() - field_start);
+                                           reader.offset() - field_start);
             status = message.mutable_unknown_fields().Add(id, raw);
             if (!status.ok()) return status;
+            previous_id = id;
             continue;
         }
-        if (std::binary_search(seen.begin(), seen.end(), id)) {
+        if (id == previous_id) {
             return Corruption("known field is encoded more than once");
         }
-        seen.insert(std::lower_bound(seen.begin(), seen.end(), id), id);
-        auto expected = ExpectedWireType(field->type());
-        if (!expected.ok()) return expected.status();
-        if (*expected != *wire_type) {
+        previous_id = id;
+        WireType expected;
+        if (field_plan != nullptr) {
+            expected = field_plan->wire_type;
+        } else {
+            auto resolved = ExpectedWireType(field->type());
+            if (!resolved.ok()) return resolved.status();
+            expected = *resolved;
+        }
+        if (expected != *wire_type) {
             return Mismatch("wire type does not match field descriptor");
         }
 
@@ -804,13 +1013,25 @@ Result<DynamicMessage> DecodeMessage(const SchemaDescriptor& descriptor,
         Status status = message.SetField(id, std::move(*value));
         if (!status.ok()) return status;
     }
-    for (const FieldDescriptor& field : descriptor.aggregate().fields()) {
-        if (field.cardinality() != FieldCardinality::kOptional &&
-            message.FindField(field.id()) == nullptr) {
-            return Mismatch("required field is absent from canonical frame");
+    if (plan != nullptr) {
+        for (const FieldPlan& field : plan->fields) {
+            if (field.descriptor->cardinality() !=
+                    FieldCardinality::kOptional &&
+                message.FindField(field.id) == nullptr) {
+                return Mismatch(
+                    "required field is absent from canonical frame");
+            }
+        }
+    } else {
+        for (const FieldDescriptor& field : descriptor.aggregate().fields()) {
+            if (field.cardinality() != FieldCardinality::kOptional &&
+                message.FindField(field.id()) == nullptr) {
+                return Mismatch(
+                    "required field is absent from canonical frame");
+            }
         }
     }
-    return message;
+    return Status::Ok();
 }
 
 }  // namespace
@@ -819,17 +1040,23 @@ class PreparedCanonicalWireCodec::State {
 public:
     State(std::shared_ptr<const SchemaDescriptor> root_descriptor,
           std::vector<std::shared_ptr<const SchemaDescriptor>> descriptor_closure,
-          WireLimits wire_limits)
+          WireLimits wire_limits, FieldPlanCache field_plans)
         : root(std::move(root_descriptor)),
           descriptors(std::move(descriptor_closure)),
           limits(std::move(wire_limits)),
-          resolver(*root, descriptors) {}
+          resolver(*root, descriptors),
+          plans(std::move(field_plans)) {}
 
     const std::shared_ptr<const SchemaDescriptor> root;
     const std::vector<std::shared_ptr<const SchemaDescriptor>> descriptors;
     const WireLimits limits;
     const DescriptorResolver resolver;
+    const FieldPlanCache plans;
 };
+
+void CanonicalWireScratch::Clear() noexcept {
+    for (auto& order : unknown_field_order_) order.clear();
+}
 
 uint64_t ZigZagEncode(int64_t value) noexcept {
     return (static_cast<uint64_t>(value) << 1) ^
@@ -890,35 +1117,78 @@ Result<std::vector<std::byte>> CanonicalWireCodec::Encode(
     const SchemaDescriptor& descriptor, const DynamicMessage& message,
     std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
     const WireLimits& limits) noexcept {
-    try {
-        MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
-        MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
-        DescriptorResolver resolver(descriptor, descriptors);
-        CodecContext context{resolver, limits, 0};
-        std::vector<std::byte> output;
-        Status status = EncodeMessage(descriptor, message, 0, context, output);
-        if (!status.ok()) return status;
-        return output;
-    } catch (const std::bad_alloc&) {
-        return Status::Error(StatusCode::kResourceExhausted);
-    } catch (...) {
-        return Status::Error(StatusCode::kInternal);
-    }
+    CanonicalWireScratch scratch;
+    std::vector<std::byte> output;
+    Status status = EncodeInto(descriptor, message, scratch, output,
+                               descriptors, limits);
+    if (!status.ok()) return status;
+    return output;
 }
 
 Result<DynamicMessage> CanonicalWireCodec::Decode(
     const SchemaDescriptor& descriptor, std::span<const std::byte> bytes,
     std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
     const WireLimits& limits) noexcept {
+    CanonicalWireScratch scratch;
+    DynamicMessage message(limits.unknown_fields);
+    Status status = DecodeInto(descriptor, bytes, scratch, message,
+                               descriptors, limits);
+    if (!status.ok()) return status;
+    return message;
+}
+
+Status CanonicalWireCodec::EncodeInto(
+    const SchemaDescriptor& descriptor, const DynamicMessage& message,
+    CanonicalWireScratch& scratch, std::vector<std::byte>& output,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
+    const WireLimits& limits) noexcept {
+    output.clear();
+    scratch.Clear();
     try {
         MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
         DescriptorResolver resolver(descriptor, descriptors);
-        CodecContext context{resolver, limits, 0};
-        return DecodeMessage(descriptor, bytes, 0, context);
+        CodecContext context{resolver, limits, nullptr,
+                             &scratch.unknown_field_order_, 0};
+        Status status = EncodeMessage(descriptor, message, 0, context, output);
+        if (!status.ok()) output.clear();
+        return status;
     } catch (const std::bad_alloc&) {
+        output.clear();
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {
+        output.clear();
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+Status CanonicalWireCodec::DecodeInto(
+    const SchemaDescriptor& descriptor, std::span<const std::byte> bytes,
+    CanonicalWireScratch& scratch, DynamicMessage& message,
+    std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors,
+    const WireLimits& limits) noexcept {
+    message.Clear();
+    scratch.Clear();
+    try {
+        MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
+        if (!UnknownLimitsMatch(message, limits)) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "decode target has different unknown-field limits");
+        }
+        MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
+        DescriptorResolver resolver(descriptor, descriptors);
+        CodecContext context{resolver, limits, nullptr,
+                             &scratch.unknown_field_order_, 0};
+        Status status =
+            DecodeMessageInto(descriptor, bytes, 0, context, message);
+        if (!status.ok()) message.Clear();
+        return status;
+    } catch (const std::bad_alloc&) {
+        message.Clear();
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        message.Clear();
         return Status::Error(StatusCode::kInternal);
     }
 }
@@ -938,10 +1208,13 @@ Result<PreparedCanonicalWireCodec> PreparedCanonicalWireCodec::Create(
         }
         MINO_RETURN_IF_ERROR(ValidateWireLimits(limits));
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(*root, descriptors));
+        auto plans = BuildFieldPlanCache(*root, descriptors);
+        if (!plans.ok()) return plans.status();
         std::vector<std::shared_ptr<const SchemaDescriptor>> owned_descriptors(
             descriptors.begin(), descriptors.end());
         std::shared_ptr<const State> state(new State(
-            std::move(root), std::move(owned_descriptors), limits));
+            std::move(root), std::move(owned_descriptors), limits,
+            std::move(*plans)));
         return PreparedCanonicalWireCodec(std::move(state));
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
@@ -952,28 +1225,65 @@ Result<PreparedCanonicalWireCodec> PreparedCanonicalWireCodec::Create(
 
 Result<std::vector<std::byte>> PreparedCanonicalWireCodec::Encode(
     const DynamicMessage& message) const noexcept {
-    try {
-        CodecContext context{state_->resolver, state_->limits, 0};
-        std::vector<std::byte> output;
-        Status status =
-            EncodeMessage(*state_->root, message, 0, context, output);
-        if (!status.ok()) return status;
-        return output;
-    } catch (const std::bad_alloc&) {
-        return Status::Error(StatusCode::kResourceExhausted);
-    } catch (...) {
-        return Status::Error(StatusCode::kInternal);
-    }
+    CanonicalWireScratch scratch;
+    std::vector<std::byte> output;
+    Status status = EncodeInto(message, scratch, output);
+    if (!status.ok()) return status;
+    return output;
 }
 
 Result<DynamicMessage> PreparedCanonicalWireCodec::Decode(
     std::span<const std::byte> bytes) const noexcept {
+    CanonicalWireScratch scratch;
+    DynamicMessage message(state_->limits.unknown_fields);
+    Status status = DecodeInto(bytes, scratch, message);
+    if (!status.ok()) return status;
+    return message;
+}
+
+Status PreparedCanonicalWireCodec::EncodeInto(
+    const DynamicMessage& message, CanonicalWireScratch& scratch,
+    std::vector<std::byte>& output) const noexcept {
+    output.clear();
+    scratch.Clear();
     try {
-        CodecContext context{state_->resolver, state_->limits, 0};
-        return DecodeMessage(*state_->root, bytes, 0, context);
+        CodecContext context{state_->resolver, state_->limits, &state_->plans,
+                             &scratch.unknown_field_order_, 0};
+        Status status =
+            EncodeMessage(*state_->root, message, 0, context, output);
+        if (!status.ok()) output.clear();
+        return status;
     } catch (const std::bad_alloc&) {
+        output.clear();
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (...) {
+        output.clear();
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+Status PreparedCanonicalWireCodec::DecodeInto(
+    std::span<const std::byte> bytes, CanonicalWireScratch& scratch,
+    DynamicMessage& message) const noexcept {
+    message.Clear();
+    scratch.Clear();
+    try {
+        if (!UnknownLimitsMatch(message, state_->limits)) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "decode target has different unknown-field limits");
+        }
+        CodecContext context{state_->resolver, state_->limits, &state_->plans,
+                             &scratch.unknown_field_order_, 0};
+        Status status = DecodeMessageInto(*state_->root, bytes, 0, context,
+                                          message);
+        if (!status.ok()) message.Clear();
+        return status;
+    } catch (const std::bad_alloc&) {
+        message.Clear();
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        message.Clear();
         return Status::Error(StatusCode::kInternal);
     }
 }

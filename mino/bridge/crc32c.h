@@ -16,6 +16,13 @@ namespace mino::bridge {
 class Crc32cAccumulator {
 public:
     void Update(std::span<const std::byte> bytes) noexcept;
+
+    // Copies bytes to an equally sized, non-overlapping output span while
+    // updating this accumulator from exactly the values written. This uses the
+    // same runtime-selected implementation as Update.
+    void CopyAndUpdate(std::span<const std::byte> bytes,
+                       std::span<std::byte> output) noexcept;
+
     uint32_t Finish() const noexcept { return state_ ^ 0xffffffffu; }
 
 private:

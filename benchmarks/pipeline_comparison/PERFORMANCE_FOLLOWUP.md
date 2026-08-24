@@ -19,9 +19,10 @@ A later Mino-only run reached `39,557.43 msg/s`, while Mino hybrid reached
 
 The strongest code-level explanation for the small-message fixed cost was that
 `CanonicalWireCodec` authenticated and rebuilt the immutable descriptor resolver
-for every encode and decode. The candidate implementation adds
+for every encode and decode. The candidate implementation now uses
 `PreparedCanonicalWireCodec`, prepares the closure at process startup, reuses
-semantic payload capacity, uses bulk payload copies, and combines checksum and
+18-field dynamic messages, codec scratch and output capacity, reuses semantic
+payload capacity, uses bulk payload copies, and combines checksum and
 deterministic-byte validation into one pass. A local optimized microbenchmark of
 the real 18-field, 256 B schema observed:
 
@@ -33,6 +34,14 @@ the real 18-field, 256 B schema observed:
 These are diagnostic codec numbers, not an end-to-end throughput claim. The
 campaigns below determine whether the improvement survives framing, transport,
 scheduling, validation, and five pipeline hops.
+
+A candidate-only Linux run on 2026-08-24 has now established an initial
+correctness and integration gate: 225 functional tests and 134 selected ASAN
+tests passed, all three Mino TCP `-c opt` saturation profiles conserved every
+message, and one-boot hybrid/all-SHM smoke passed. The checkout was dirty, the
+4-vCPU KVM guest was not isolated or pinned for the performance runs, and no
+baseline was run, so this evidence does not satisfy the clean-ref A/B or formal
+performance phases below. See `RESULTS_LINUX_VALIDATION_20260824.md`.
 
 ## Required refs and artifact naming
 
@@ -57,6 +66,11 @@ hash, topology, environment file, and preflight record. Generate SHA-256 hashes
 for final manifests and never overwrite a failed run.
 
 ## Phase 0: correctness and build gate
+
+Candidate status: initial Linux functional, selected ASAN, optimized Mino binary,
+and six-process smoke gates passed on 2026-08-24. Clean baseline/candidate refs,
+non-root Bazel runner targets, remaining backends, TSAN/fault injection, and the
+full formal gate are still required.
 
 Run on Linux for both refs before collecting performance data:
 
@@ -271,6 +285,9 @@ Status: implemented, awaiting Linux same-host and two-host campaigns.
 
 ### P1: remove generic canonical encoder fixed allocations
 
+Status: implementation and benchmark integration complete; awaiting Linux
+allocation profiling, controlled codec benchmarks, and end-to-end campaigns.
+
 Expected benefit: high for small messages; medium implementation risk.
 
 - reserve the known dynamic field count before inserting 18 fields;
@@ -287,19 +304,29 @@ allocation counts, and Phase 1 benchmark.
 
 ### P1: validated WireFrame decode view and ownership-taking send
 
+Status: implementation and benchmark integration complete; selected Linux ASAN
+and end-to-end smoke passed on 2026-08-24. Fuzzing, TSAN, clean-ref wire
+qualification, and formal performance campaigns remain pending.
+
 Expected benefit: medium for small, CPU/memory reduction for large; medium risk.
 
 - add a decode API that validates header CRC, payload CRC, lengths, and flags but
   exposes payload as a span into the owning received body;
 - ensure the view cannot outlive the body;
-- let `TcpDriver` take ownership of an already encoded length-prefixed body so it
-  does not copy the complete frame into another queue buffer;
+- let `TcpDriver` take ownership of an already encoded WireFrame body, retain it,
+  and add the TCP length prefix as a separate write segment so it does not copy
+  the complete frame into another queue buffer;
 - preserve current CRC and frame limits.
 
 Required validation: malformed-frame tests, lifetime tests, fuzzing, TSAN/ASAN,
 and unchanged wire bytes.
 
 ### P1: instrument and remove bridge-only duplicate deep validation
+
+Status: implemented. `full` retains the previous deep check, `structural` keeps
+only transit invariants, and `full-instrumented` records validation calls, payload
+bytes, and thread CPU nanoseconds. Formal hybrid runs select `structural`; Linux
+`perf` attribution remains pending.
 
 Expected benefit: medium for 64 KiB and 1 MiB hybrid; low-to-medium risk.
 
@@ -317,6 +344,11 @@ Do not remove graph root/child transaction ownership checks.
 
 ### P2: reuse dynamic message and codec scratch storage
 
+Status: implemented in Mino TCP and both bridge directions with per-worker
+messages, `ReserveFields(18)`, prepared `EncodeInto`/`DecodeInto`, reusable
+scratch, and reusable canonical output capacity; Linux allocation/perf validation
+remains pending.
+
 Expected benefit: medium for small; medium risk.
 
 - add `DynamicMessage::ReserveFields`;
@@ -326,6 +358,11 @@ Expected benefit: medium for small; medium risk.
 - keep public codec calls reentrant and thread-safe.
 
 ### P2: batch ready-message draining
+
+Status: implemented as `--receive-batch-size=[1,64]` with a local ordered cache,
+completion-ACK retention, runner passthrough, and artifact metadata. The default
+remains 1 for fairness; Linux batching sweeps and equivalent competitor policies
+remain pending.
 
 Expected benefit: medium for small when thread handoff dominates; medium risk.
 
@@ -338,6 +375,11 @@ Expected benefit: medium for small when thread handoff dominates; medium risk.
 
 ### P2: avoid SHM graph rebuild on transient queue-full
 
+Status: implemented for the Mino SHM source/forwarders and bridge sink using
+deadline-bounded `QueueFullPolicy::kBlock`; the outer queue-full rebuild loop was
+removed. Linux stalled-consumer and live-set/performance validation remains
+pending.
+
 Expected benefit: unknown until instrumented; low-to-medium risk.
 
 - count `QueueFullPolicy::kFail` rebuilds and aborted root/child graphs;
@@ -347,15 +389,28 @@ Expected benefit: unknown until instrumented; low-to-medium risk.
 
 ### P2: allocation journal small-graph fast path
 
+Status: implemented with two inline root/child handles per journal record and a
+shared-memory overflow sidecar for larger graphs. Recovery, tombstone, replay,
+and persistence-point tests cover both inline and overflow paths; Linux
+allocation/performance qualification remains pending. This changes the journal
+layout to v3: existing v2 shared segments fail closed with `kSchemaMismatch` and
+must be reinitialized before deployment or process restart.
+
 Expected benefit: medium if per-message journal allocation is visible; medium
 risk.
 
 - store the common root-plus-one-child handle list in an inline buffer;
-- fall back to heap storage for larger graphs;
+- fall back to the bounded shared-memory sidecar for larger graphs;
 - preserve crash recovery, tombstone, and replay behavior;
 - add allocator/journal recovery tests before benchmarking.
 
 ### P3: O(children) normal graph reclaim
+
+Status: implemented for generated graphs whose owned allocations are direct leaf
+fields. Generated traits emit a deterministic root-first manifest; normal ACK
+reclaim validates every exact handle and reclaims children before the root.
+Nested owned-graph traversal remains explicitly unsupported, and Linux stress,
+TSAN, and fault-injection qualification remains pending.
 
 Expected benefit: potentially high if allocator scans remain visible; high risk.
 
@@ -366,6 +421,10 @@ Expected benefit: potentially high if allocator scans remain visible; high risk.
 
 ### P3: safe generated graph ownership forwarding
 
+Status: not implemented. The hybrid bridge still performs
+graph-to-semantic-to-wire and wire-to-semantic-to-graph payload copies; this
+requires a reviewed lifetime and ownership-transfer design before coding.
+
 Expected benefit: high for medium/large hybrid; very high risk.
 
 - avoid graph-to-semantic-to-graph payload copies at a cross-host boundary;
@@ -375,6 +434,11 @@ Expected benefit: high for medium/large hybrid; very high risk.
 - require a reviewed lifetime design before implementation.
 
 ### P3: fuse CRC with final encode/copy
+
+Status: implemented on WireFrame encode with runtime-selected
+`Crc32cAccumulator::CopyAndUpdate`; wire-equivalence and alignment/tail tests are
+included, and selected Linux ASAN passed on 2026-08-24. `perf` attribution,
+fuzzing, and the full sanitizer matrix remain pending.
 
 Expected benefit: low for small, potentially measurable for large; medium risk.
 

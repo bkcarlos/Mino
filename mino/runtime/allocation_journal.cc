@@ -4,6 +4,7 @@
 
 #include "mino/runtime/allocation_journal.h"
 
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <new>
@@ -25,6 +26,14 @@ struct alignas(64) AllocationJournal::SharedControl {
 
 static_assert(sizeof(AllocationJournal::SharedControl) == 64);
 
+struct alignas(8) AllocationJournal::SharedHandle {
+    std::atomic<uint64_t> offset{0};
+    std::atomic<uint64_t> identity{0};
+};
+
+static_assert(sizeof(AllocationJournal::SharedHandle) == 16);
+static_assert(alignof(AllocationJournal::SharedHandle) == 8);
+
 struct alignas(64) AllocationJournal::SharedRecord {
     std::atomic<uint64_t> control{0};
     std::atomic<uint32_t> handle_count{0};
@@ -41,19 +50,11 @@ struct alignas(64) AllocationJournal::SharedRecord {
     std::atomic<uint64_t> publication_sequence{0};
     std::atomic<uint64_t> publication_payload_offset{0};
     std::atomic<uint64_t> publication_payload_identity{0};
-    unsigned char reserved[32] = {};
+    SharedHandle inline_handles[kInlineHandleCapacity] = {};
 };
 
 static_assert(sizeof(AllocationJournal::SharedRecord) == 128);
 static_assert(alignof(AllocationJournal::SharedRecord) == 64);
-
-struct alignas(8) AllocationJournal::SharedHandle {
-    std::atomic<uint64_t> offset{0};
-    std::atomic<uint64_t> identity{0};
-};
-
-static_assert(sizeof(AllocationJournal::SharedHandle) == 16);
-static_assert(alignof(AllocationJournal::SharedHandle) == 8);
 
 namespace {
 
@@ -112,7 +113,11 @@ size_t AllocationJournal::RequiredSize(
     constexpr size_t kRecord = sizeof(SharedRecord);
     constexpr size_t kHandle = sizeof(SharedHandle);
     const size_t transactions = transaction_capacity;
-    const size_t handles_per = handles_per_transaction;
+    const size_t overflow_handles_per_transaction =
+        handles_per_transaction > kInlineHandleCapacity
+            ? static_cast<size_t>(handles_per_transaction -
+                                  kInlineHandleCapacity)
+            : 0;
     if (transactions >
         (std::numeric_limits<size_t>::max() - kFixed) / kRecord) {
         return 0;
@@ -120,14 +125,16 @@ size_t AllocationJournal::RequiredSize(
     const size_t records_size = transactions * kRecord;
     const size_t remaining =
         std::numeric_limits<size_t>::max() - kFixed - records_size;
-    if (handles_per > std::numeric_limits<size_t>::max() / transactions) {
+    if (overflow_handles_per_transaction >
+        std::numeric_limits<size_t>::max() / transactions) {
         return 0;
     }
-    const size_t handle_count = transactions * handles_per;
-    if (handle_count > remaining / kHandle) {
+    const size_t overflow_handle_count =
+        transactions * overflow_handles_per_transaction;
+    if (overflow_handle_count > remaining / kHandle) {
         return 0;
     }
-    return kFixed + records_size + handle_count * kHandle;
+    return kFixed + records_size + overflow_handle_count * kHandle;
 }
 
 Result<AllocationJournal> AllocationJournal::Init(
@@ -162,9 +169,15 @@ Result<AllocationJournal> AllocationJournal::Init(
             MakeTag(0, AllocationJournalState::kFree),
             std::memory_order_relaxed);
     }
-    const size_t handle_count =
-        static_cast<size_t>(transaction_capacity) * handles_per_transaction;
-    for (size_t i = 0; i < handle_count; ++i) {
+    const size_t overflow_handles_per_transaction =
+        handles_per_transaction > kInlineHandleCapacity
+            ? static_cast<size_t>(handles_per_transaction -
+                                  kInlineHandleCapacity)
+            : 0;
+    const size_t overflow_handle_count =
+        static_cast<size_t>(transaction_capacity) *
+        overflow_handles_per_transaction;
+    for (size_t i = 0; i < overflow_handle_count; ++i) {
         new (&layout.handles[i]) SharedHandle{};
     }
     layout.control->magic.store(kMagic, std::memory_order_release);
@@ -320,14 +333,18 @@ Status AllocationJournal::AppendHandle(
     SharedRecord& record = records_[transaction.journal_index];
     const uint32_t count =
         record.handle_count.load(std::memory_order_acquire);
+    if (count > handles_per_transaction_) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocation transaction handle count is invalid");
+    }
     if ((root && count != 0) || (!root && count == 0)) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "transaction root/child order is invalid");
     }
-    SharedHandle* handles = HandlesAt(transaction.journal_index);
     uint32_t destination = count;
     for (uint32_t i = 0; i < count; ++i) {
-        const ShmHandle existing = LoadHandle(handles[i]);
+        const ShmHandle existing =
+            LoadHandle(*HandleAt(transaction.journal_index, i));
         if (existing == handle) {
             return Status::Error(StatusCode::kAlreadyExists,
                                  "allocation handle is already registered");
@@ -340,7 +357,7 @@ Status AllocationJournal::AppendHandle(
         return Status::Error(StatusCode::kResourceExhausted,
                              "allocation transaction handle capacity exhausted");
     }
-    StoreHandle(handles[destination], handle);
+    StoreHandle(*HandleAt(transaction.journal_index, destination), handle);
     if (destination == count) {
         record.handle_count.store(count + 1, std::memory_order_release);
     }
@@ -384,10 +401,13 @@ Status AllocationJournal::ReleaseChild(
     }
     SharedRecord& record = records_[transaction.journal_index];
     const uint32_t count = record.handle_count.load(std::memory_order_acquire);
-    SharedHandle* handles = HandlesAt(transaction.journal_index);
+    if (count > handles_per_transaction_) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocation transaction handle count is invalid");
+    }
     uint32_t found = count;
     for (uint32_t i = 1; i < count; ++i) {
-        if (LoadHandle(handles[i]) == child) {
+        if (LoadHandle(*HandleAt(transaction.journal_index, i)) == child) {
             found = i;
             break;
         }
@@ -403,7 +423,7 @@ Status AllocationJournal::ReleaseChild(
         return Status::Error(StatusCode::kNotFound,
                              "allocation transaction ended during child release");
     }
-    StoreHandle(handles[found], {});
+    StoreHandle(*HandleAt(transaction.journal_index, found), {});
     InvokePersistenceHook(PersistencePoint::kHandleReleased,
                           transaction.transaction_epoch);
     return Status::Ok();
@@ -425,8 +445,8 @@ Status AllocationJournal::ValidateManifest(
             return Status::Error(StatusCode::kCorruption,
                                  "allocation manifest has no valid root");
         }
-        const SharedHandle* handles = HandlesAt(transaction.journal_index);
-        if (LoadHandle(handles[0]) != reachable.front()) {
+        if (LoadHandle(*HandleAt(transaction.journal_index, 0)) !=
+            reachable.front()) {
             return Status::Error(StatusCode::kCorruption,
                                  "allocation manifest root is not graph root");
         }
@@ -436,7 +456,8 @@ Status AllocationJournal::ValidateManifest(
         };
         std::set<HandleKey> manifest;
         for (uint32_t i = 0; i < count; ++i) {
-            const ShmHandle handle = LoadHandle(handles[i]);
+            const ShmHandle handle =
+                LoadHandle(*HandleAt(transaction.journal_index, i));
             if (handle.IsNull()) continue;
             if (!manifest.emplace(key(handle)).second) {
                 return Status::Error(StatusCode::kCorruption,
@@ -470,18 +491,44 @@ Status AllocationJournal::PublishGraph(
                              "allocation transaction is stale or inactive");
     }
     SharedRecord& record = records_[transaction.journal_index];
-    if (record.handle_count.load(std::memory_order_acquire) == 0) {
+    const uint32_t count =
+        record.handle_count.load(std::memory_order_acquire);
+    if (count == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "allocation transaction has no root");
     }
+    if (count > handles_per_transaction_) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocation transaction handle count is invalid");
+    }
+
+    if (count <= kInlineHandleCapacity) {
+        std::array<ShmHandle, kInlineHandleCapacity> local_manifest;
+        size_t manifest_size = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const ShmHandle handle =
+                LoadHandle(*HandleAt(transaction.journal_index, i));
+            if (!handle.IsNull()) {
+                local_manifest[manifest_size++] = handle;
+            }
+        }
+        if (manifest_size == 0) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "allocation transaction root is missing");
+        }
+        const std::span<const ShmHandle> manifest(local_manifest.data(),
+                                                  manifest_size);
+        return allocator_->PublishTransaction(
+            transaction.owner.process_epoch, transaction.transaction_epoch,
+            manifest, manifest.front());
+    }
+
     try {
-        const uint32_t count =
-            record.handle_count.load(std::memory_order_acquire);
         std::vector<ShmHandle> manifest;
         manifest.reserve(count);
-        SharedHandle* handles = HandlesAt(transaction.journal_index);
         for (uint32_t i = 0; i < count; ++i) {
-            const ShmHandle handle = LoadHandle(handles[i]);
+            const ShmHandle handle =
+                LoadHandle(*HandleAt(transaction.journal_index, i));
             if (!handle.IsNull()) manifest.push_back(handle);
         }
         if (manifest.empty()) {
@@ -493,6 +540,8 @@ Status AllocationJournal::PublishGraph(
             manifest, manifest.front());
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
     }
 }
 
@@ -526,7 +575,7 @@ Status AllocationJournal::Commit(
     }
     PublicationBinding stored = binding;
     if (stored.payload.IsNull()) {
-        stored.payload = LoadHandle(HandlesAt(transaction.journal_index)[0]);
+        stored.payload = LoadHandle(*HandleAt(transaction.journal_index, 0));
     }
     StoreBinding(record, stored);
     uint64_t expected = building;
@@ -617,13 +666,17 @@ Status AllocationJournal::ContinueReclaim(uint32_t journal_index,
     }
     uint32_t cursor = record.reclaim_cursor.load(std::memory_order_acquire);
     const uint32_t count = record.handle_count.load(std::memory_order_acquire);
-    if (cursor > count || count > handles_per_transaction_) {
+    if (count > handles_per_transaction_) {
+        return Status::Error(StatusCode::kCorruption,
+                             "allocation transaction handle count is invalid");
+    }
+    if (cursor > count) {
         cursor = count;
         record.reclaim_cursor.store(cursor, std::memory_order_release);
     }
-    SharedHandle* handles = HandlesAt(journal_index);
     while (cursor > 0) {
-        const ShmHandle handle = LoadHandle(handles[cursor - 1]);
+        const ShmHandle handle =
+            LoadHandle(*HandleAt(journal_index, cursor - 1));
         const Status status = handle.IsNull() ? Status::Ok()
                                               : ReclaimHandle(handle);
         if (!status.ok()) {
@@ -898,10 +951,16 @@ void AllocationJournal::InvokePersistenceHook(PersistencePoint point,
     }
 }
 
-AllocationJournal::SharedHandle* AllocationJournal::HandlesAt(
-    uint32_t journal_index) const noexcept {
+AllocationJournal::SharedHandle* AllocationJournal::HandleAt(
+    uint32_t journal_index, uint32_t handle_index) const noexcept {
+    if (handle_index < kInlineHandleCapacity) {
+        return &records_[journal_index].inline_handles[handle_index];
+    }
+    const size_t overflow_handles_per_transaction =
+        static_cast<size_t>(handles_per_transaction_ - kInlineHandleCapacity);
     return handles_ + static_cast<size_t>(journal_index) *
-                          handles_per_transaction_;
+                          overflow_handles_per_transaction +
+           (handle_index - kInlineHandleCapacity);
 }
 
 ShmHandle AllocationJournal::LoadHandle(

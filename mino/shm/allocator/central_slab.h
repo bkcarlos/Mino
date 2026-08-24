@@ -156,6 +156,8 @@ struct AllocatorLocalCacheStats {
     uint64_t numa_fallback_allocations = 0;
     uint64_t numa_bind_errors = 0;
     uint64_t numa_migrations = 0;
+    uint64_t published_graph_reclaims = 0;
+    uint64_t append_gap_reclaim_scans = 0;
 };
 
 // CentralSlabAllocator allocates fixed-size-class slots from a shared-memory
@@ -240,6 +242,15 @@ public:
                               ShmHandle root);
     Status ReclaimTransaction(uint64_t owner_epoch, uint64_t transaction_id,
                               std::span<const ShmHandle> handles);
+
+    // Normal post-ACK graph reclaim. `root_first_manifest` must contain `root`
+    // exactly once at index zero. Before changing any lifecycle state, this
+    // validates every exact handle, root/child role, Published/Retired state,
+    // immutable generation/region identity, and common owner/transaction stamp.
+    // Destruction then proceeds children first and root last. This path never
+    // invokes the recovery-only append-gap scan.
+    Status ReclaimPublishedGraph(
+        ShmHandle root, std::span<const ShmHandle> root_first_manifest);
 
     // Recovery-only append-gap scan. Callers must have exclusively claimed the
     // dead journal transaction before invoking this O(all slots) fallback.

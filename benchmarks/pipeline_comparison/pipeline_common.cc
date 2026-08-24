@@ -717,6 +717,73 @@ bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error) {
     return true;
 }
 
+bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
+                                uint64_t expected_sequence,
+                                uint64_t warmup_messages,
+                                Profile expected_profile,
+                                Role destination_role, ClockMode clock_mode,
+                                std::string* error) {
+    if (frame.sample_id != expected_sequence) {
+        return Fail(frame.sample_id < expected_sequence
+                        ? "duplicate sample_id: expected " +
+                              std::to_string(expected_sequence) + ", got " +
+                              std::to_string(frame.sample_id)
+                        : "out-of-order sample_id: expected " +
+                              std::to_string(expected_sequence) + ", got " +
+                              std::to_string(frame.sample_id),
+                    error);
+    }
+    const bool measured = expected_sequence >= warmup_messages;
+    if ((measured && frame.origin_timestamp_ns == 0) ||
+        (!measured && frame.origin_timestamp_ns != 0)) {
+        return Fail(measured ? "measured frame has a zero origin timestamp"
+                             : "warmup frame has a non-zero origin timestamp",
+                    error);
+    }
+    if (frame.profile != static_cast<uint32_t>(expected_profile)) {
+        return Fail("frame profile does not match expected profile", error);
+    }
+    const size_t expected_payload_bytes =
+        ProfilePayloadBytes(expected_profile);
+    if (frame.payload.size() != expected_payload_bytes) {
+        return Fail("payload size mismatch: expected " +
+                        std::to_string(expected_payload_bytes) + ", got " +
+                        std::to_string(frame.payload.size()),
+                    error);
+    }
+    if (frame.completed_stage_mask != ExpectedMask(destination_role)) {
+        return Fail("stage mask mismatch for " +
+                        std::string(RoleName(destination_role)) + ": expected " +
+                        std::to_string(ExpectedMask(destination_role)) +
+                        ", got " +
+                        std::to_string(frame.completed_stage_mask),
+                    error);
+    }
+    if (clock_mode != ClockMode::kSameHost &&
+        clock_mode != ClockMode::kIndependentHosts) {
+        return Fail("invalid clock mode", error);
+    }
+
+    const size_t completed = ForwardingStageCountBefore(destination_role);
+    const std::array<uint64_t, 5> timestamps = StageTimestamps(frame);
+    uint64_t previous = frame.origin_timestamp_ns;
+    for (size_t index = 0; index < timestamps.size(); ++index) {
+        if (index < completed) {
+            if (timestamps[index] == 0) {
+                return Fail("completed stage has a zero timestamp", error);
+            }
+            if (clock_mode == ClockMode::kSameHost && previous != 0 &&
+                timestamps[index] < previous) {
+                return Fail("stage timestamps are not monotonic", error);
+            }
+            previous = timestamps[index];
+        } else if (timestamps[index] != 0) {
+            return Fail("incomplete stage has a non-zero timestamp", error);
+        }
+    }
+    return true;
+}
+
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
                            std::string* error) {
     if (!ValidateSemanticFrame(frame, error)) return false;
@@ -1110,6 +1177,74 @@ std::string JsonEscape(std::string_view input) {
         }
     }
     return output.str();
+}
+
+bool WriteBridgeParseFailureArtifactFromArgs(
+    int argc, char** argv, std::string_view parse_error) {
+    if (argc < 0 || (argc > 0 && argv == nullptr)) return false;
+    std::optional<std::filesystem::path> output;
+    for (int index = 1; index < argc; ++index) {
+        if (argv[index] == nullptr) return false;
+        const std::string_view argument(argv[index]);
+        std::optional<std::string_view> value;
+        if (argument == "--output") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) return false;
+            value = std::string_view(argv[++index]);
+        } else if (argument.starts_with("--output=")) {
+            value = argument.substr(std::string_view("--output=").size());
+        }
+        if (!value.has_value()) continue;
+        if (output.has_value() || value->empty() || ContainsNul(*value)) {
+            return false;
+        }
+        output = std::filesystem::path(*value);
+    }
+    if (!output.has_value()) return false;
+
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"schema\": "
+            "\"mino.pipeline_bridge_benchmark.parse_failure.v1\",\n"
+         << "  \"outcome\": \"failure\",\n"
+         << "  \"error\": \"" << JsonEscape(parse_error) << "\"\n"
+         << "}\n";
+    AtomicWrite(*output, json.str());
+    return true;
+}
+
+std::string BuildMinoTcpBackendDetails(
+    uint64_t schema_short_id, uint32_t schema_version,
+    uint32_t layout_version, ClockMode clock_mode,
+    uint32_t receive_batch_size, std::string_view endpoints_json) {
+    const std::string endpoints = Trim(endpoints_json);
+    if (!JsonParser(endpoints).ParseObjectDocument()) {
+        throw std::invalid_argument("Mino TCP endpoints must be a JSON object");
+    }
+    if (receive_batch_size == 0 || receive_batch_size > 64) {
+        throw std::invalid_argument("Mino TCP receive batch size must be in [1, 64]");
+    }
+    const bool independent = clock_mode == ClockMode::kIndependentHosts;
+    (void)ClockModeName(clock_mode);
+
+    std::ostringstream json;
+    json << "{\"transport\":"
+            "\"production TcpDriver plaintext benchmark mode\","
+         << "\"wire_frame\":\"WireFrameCodec v1 with payload CRC\","
+         << "\"schema_codec\":\"CanonicalWireCodec\","
+         << "\"canonical_descriptor_closure\":\"startup-prepared\","
+         << "\"schema_source\":\"minoc descriptor artifact\","
+         << "\"compilation_mode\":\"" << CompilationMode() << "\","
+         << "\"schema_short_id\":" << schema_short_id << ','
+         << "\"schema_version\":" << schema_version << ','
+         << "\"layout_version\":" << layout_version << ','
+         << "\"clock_mode\":\"" << ClockModeName(clock_mode) << "\","
+         << "\"one_way_latency_valid\":"
+         << (independent ? "false" : "true") << ','
+         << "\"completion_barrier\":\"reverse hop-by-hop ACK\","
+         << "\"receive_batch_size\":" << receive_batch_size << ','
+         << "\"receive_cache\":\"per-connection ordered\","
+         << "\"endpoints\":" << endpoints << '}';
+    return json.str();
 }
 
 void WriteSinkResult(const SinkResult& result) {

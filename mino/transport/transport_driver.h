@@ -404,6 +404,16 @@ public:
     Result<ConnectionInfo> Accept(const AcceptRequest& request);
     Result<SendResult> Send(const SendRequest& request);
     Result<size_t> SendUntracked(const UntrackedSendRequest& request);
+    // Additive owned admission APIs. On success payload is consumed (left
+    // empty); on every failure it remains unchanged. Implementations may retain
+    // the vector's allocation after admission instead of copying its bytes.
+    Result<SendResult> TrySendOwned(
+        ConnectionId connection_id, std::vector<std::byte>&& payload,
+        DeliveryStage target_stage = DeliveryStage::kRemoteAccepted);
+    Result<size_t> TrySendUntrackedOwned(
+        ConnectionId connection_id, std::vector<std::byte>&& payload,
+        UntrackedTrafficClass traffic_class =
+            UntrackedTrafficClass::kProtocolControl);
     // Called only after Bridge protocol validation proves peer acceptance.
     // The resulting successful completion remains observable through
     // PollCompletions().
@@ -439,6 +449,15 @@ protected:
                                       SendOperation operation) = 0;
     virtual Result<size_t> DoSendUntracked(
         const UntrackedSendRequest& request);
+    // The default owned implementations use the borrowed hooks above and only
+    // consume payload after valid admission. Fast-path implementations must
+    // preserve the same no-consume-on-failure contract.
+    virtual Result<SendResult> DoTrySendOwned(
+        const SendRequest& request, std::vector<std::byte>&& payload,
+        SendOperation operation);
+    virtual Result<size_t> DoTrySendUntrackedOwned(
+        const UntrackedSendRequest& request,
+        std::vector<std::byte>&& payload);
     virtual Status DoConfirmRemoteAccepted(SendOperation operation);
     virtual Result<ReceiveResult> DoPoll(const ReceiveRequest& request) = 0;
     virtual Result<CompletionPollResult> DoPollCompletions(

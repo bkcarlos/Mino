@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "mino/common/result.h"
 #include "mino/security/tls.h"
@@ -28,6 +29,11 @@ struct TcpDriverOptions {
     uint32_t partial_frame_timeout_ms = 5000;
     uint32_t tls_handshake_timeout_ms = 5000;
     uint32_t io_poll_max_ms = 50;
+    // Bounds work performed for one connection in one worker turn. The byte
+    // budget limits newly read stream bytes; the frame budget limits complete
+    // frames drained from already-buffered and newly read bytes.
+    uint32_t max_receive_frames_per_turn = 64;
+    size_t max_receive_bytes_per_turn = 256u * 1024u;
     // Null preserves the explicit plaintext TcpDriver mode. Production remote
     // Bridge composition rejects that mode unless a test-only override is set.
     std::shared_ptr<security::TlsChannelFactory> tls_factory;
@@ -81,6 +87,12 @@ protected:
                               SendOperation operation) override;
     Result<size_t> DoSendUntracked(
         const UntrackedSendRequest& request) override;
+    Result<SendResult> DoTrySendOwned(
+        const SendRequest& request, std::vector<std::byte>&& payload,
+        SendOperation operation) override;
+    Result<size_t> DoTrySendUntrackedOwned(
+        const UntrackedSendRequest& request,
+        std::vector<std::byte>&& payload) override;
     Status DoConfirmRemoteAccepted(SendOperation operation) override;
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override;
     Result<CompletionPollResult> DoPollCompletions(

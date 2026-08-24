@@ -5,6 +5,7 @@
 #ifndef MINO_RUNTIME_SUBSCRIBER_H_
 #define MINO_RUNTIME_SUBSCRIBER_H_
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -135,22 +136,49 @@ public:
             return Status::Error(StatusCode::kInvalidArgument,
                                  "borrowed message is not active");
         }
-        active_ = false;
-        value_ = nullptr;
 
-        const Status channel_ack = std::visit(
-            [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
-        Status retire = Status::Ok();
-        Status reclaim = Status::Ok();
-        Status release_pin = Status::Ok();
-        if (!payload_cleanup_by_channel_) {
-            retire = allocator_->Retire(metadata_.payload);
-            if (retire.ok() &&
-                (pin_table_ == nullptr ||
-                 pin_table_->PinCount(metadata_.payload) == 0)) {
-                reclaim = allocator_->Reclaim(metadata_.payload);
+        const bool typed_reclaim_eligible =
+            !payload_cleanup_by_channel_ && pin_table_ == nullptr;
+        std::array<ShmHandle, OwnedGraphCapacity()> manifest{};
+        size_t manifest_count = 0;
+        Status graph_collection = Status::Ok();
+        if constexpr (SupportsOwnedGraphCollection()) {
+            if (typed_reclaim_eligible) {
+                graph_collection = CollectOwnedGraph(
+                    metadata_.payload, *value_, manifest, manifest_count);
+                if (graph_collection.ok() &&
+                    (manifest_count == 0 || manifest_count > manifest.size())) {
+                    graph_collection = Status::Error(
+                        StatusCode::kCorruption,
+                        "owned graph collector returned an invalid size");
+                }
             }
         }
+
+        active_ = false;
+        value_ = nullptr;
+        const Status channel_ack = std::visit(
+            [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
+
+        Status typed_reclaim = Status::Ok();
+        Status fallback_cleanup = Status::Ok();
+        if (channel_ack.ok() && !payload_cleanup_by_channel_) {
+            bool reclaimed_by_manifest = false;
+            if constexpr (SupportsOwnedGraphCollection()) {
+                if (typed_reclaim_eligible && graph_collection.ok()) {
+                    typed_reclaim = allocator_->ReclaimPublishedGraph(
+                        metadata_.payload,
+                        std::span<const ShmHandle>(manifest.data(),
+                                                   manifest_count));
+                    reclaimed_by_manifest = typed_reclaim.ok();
+                }
+            }
+            if (!reclaimed_by_manifest) {
+                fallback_cleanup = FallbackRootCleanup();
+            }
+        }
+
+        Status release_pin = Status::Ok();
         if (borrow_pin_.active()) {
             release_pin = borrow_pin_.Release();
         }
@@ -158,20 +186,44 @@ public:
         pin_table_ = nullptr;
         pin_owner_ = {};
 
-        if (!channel_ack.ok()) {
-            return channel_ack;
-        }
-        if (!retire.ok()) {
-            return retire;
-        }
-        if (!reclaim.ok()) {
-            return reclaim;
-        }
+        if (!channel_ack.ok()) return channel_ack;
+        if (!graph_collection.ok()) return graph_collection;
+        if (!typed_reclaim.ok()) return typed_reclaim;
+        if (!fallback_cleanup.ok()) return fallback_cleanup;
         return release_pin;
     }
 
 private:
     friend class Subscriber<T>;
+
+    static constexpr bool SupportsOwnedGraphCollection() noexcept {
+        if constexpr (requires {
+                          StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+                          StaticMessageTraits<T>::kMaxOwnedGraphHandles;
+                      }) {
+            return StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+        }
+        return false;
+    }
+
+    static constexpr size_t OwnedGraphCapacity() noexcept {
+        if constexpr (SupportsOwnedGraphCollection()) {
+            static_assert(StaticMessageTraits<T>::kMaxOwnedGraphHandles > 0,
+                          "owned graph collector must have root capacity");
+            return StaticMessageTraits<T>::kMaxOwnedGraphHandles;
+        }
+        return 1;
+    }
+
+    Status FallbackRootCleanup() noexcept {
+        const Status retire = allocator_->Retire(metadata_.payload);
+        if (!retire.ok()) return retire;
+        const Status reclaim = allocator_->Reclaim(metadata_.payload);
+        if (reclaim.code() == StatusCode::kWouldBlock && pin_table_ != nullptr) {
+            return Status::Ok();
+        }
+        return reclaim;
+    }
 
     template <typename ChannelBorrow>
     BorrowedMessage(CentralSlabAllocator* allocator, ShmPinTable* pin_table,

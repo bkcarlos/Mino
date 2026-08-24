@@ -116,6 +116,9 @@ public:
     explicit DynamicMessage(UnknownFieldLimits limits = {}) noexcept
         : unknown_fields_(limits) {}
 
+    Status ReserveFields(size_t count) noexcept;
+    void Clear() noexcept;
+
     Status SetField(uint32_t field_id, DynamicValue value) noexcept;
     const DynamicValue* FindField(uint32_t field_id) const noexcept;
     std::span<const DynamicField> fields() const noexcept { return fields_; }

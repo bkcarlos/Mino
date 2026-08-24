@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -70,6 +71,9 @@ class Arguments {
     CommonOptions Parse() {
         return ParseCommonOptions(static_cast<int>(argv_.size()), argv_.data());
     }
+
+    int argc() const { return static_cast<int>(argv_.size()); }
+    char** argv() { return argv_.data(); }
 
   private:
     std::vector<std::string> storage_;
@@ -258,6 +262,57 @@ TEST(PipelineCommonTest, SemanticAndChecksumCorruptionAreDetected) {
     EXPECT_EQ(error, "payload checksum mismatch");
 }
 
+TEST(PipelineCommonTest,
+     BridgeStructuralValidationAcceptsBusinessCorruptionThatStageRejects) {
+    enum class Corruption { kScalar, kChecksum, kPayloadPattern };
+    const std::vector<std::pair<std::string_view, Corruption>> cases = {
+        {"deterministic scalar", Corruption::kScalar},
+        {"payload checksum", Corruption::kChecksum},
+        {"payload pattern", Corruption::kPayloadPattern},
+    };
+    for (const auto& [name, corruption] : cases) {
+        SCOPED_TRACE(name);
+        SemanticFrame frame =
+            InitializeSourceFrameAt(20, Profile::kSmall, 100);
+        std::string error;
+        ASSERT_TRUE(ApplyStage(Role::kPerception, &frame, 101, &error));
+        ASSERT_TRUE(ApplyStage(Role::kPrediction, &frame, 102, &error));
+        switch (corruption) {
+            case Corruption::kScalar: ++frame.object_count; break;
+            case Corruption::kChecksum: ++frame.payload_checksum; break;
+            case Corruption::kPayloadPattern: frame.payload[7] ^= 1u; break;
+        }
+        EXPECT_TRUE(ValidateBridgeTransitFrame(
+            frame, 20, 10, Profile::kSmall, Role::kPlanning,
+            ClockMode::kSameHost, &error))
+            << error;
+        EXPECT_FALSE(ValidateFrameForStage(Role::kPlanning, frame, &error));
+    }
+}
+
+TEST(PipelineCommonTest, BridgeStructuralValidationIsClockModeAware) {
+    SemanticFrame frame = InitializeSourceFrameAt(20, Profile::kSmall, 100);
+    std::string error;
+    ASSERT_TRUE(ApplyStage(Role::kPerception, &frame, 101, &error));
+    ASSERT_TRUE(ApplyStage(Role::kPrediction, &frame, 102, &error));
+    EXPECT_TRUE(ValidateBridgeTransitFrame(
+        frame, 20, 10, Profile::kSmall, Role::kPlanning,
+        ClockMode::kSameHost, &error));
+
+    frame.prediction_timestamp_ns = 99;
+    EXPECT_FALSE(ValidateBridgeTransitFrame(
+        frame, 20, 10, Profile::kSmall, Role::kPlanning,
+        ClockMode::kSameHost, &error));
+    EXPECT_TRUE(ValidateBridgeTransitFrame(
+        frame, 20, 10, Profile::kSmall, Role::kPlanning,
+        ClockMode::kIndependentHosts, &error));
+
+    frame.payload.pop_back();
+    EXPECT_FALSE(ValidateBridgeTransitFrame(
+        frame, 20, 10, Profile::kSmall, Role::kPlanning,
+        ClockMode::kIndependentHosts, &error));
+}
+
 TEST(PipelineCommonTest, WarmupAndMeasuredOriginsAreDistinct) {
     const SemanticFrame warmup =
         InitializeSourceFrame(1, Profile::kSmall, false);
@@ -424,6 +479,80 @@ TEST(PipelineCommonTest, AtomicWriteFsyncsParentDirectoryAfterRename) {
     std::filesystem::remove_all(directory);
 }
 #endif
+
+TEST(PipelineCommonTest,
+     BridgeParseFailureArtifactPreservesErrorWithoutInventingMetadata) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-bridge-parse-failure-test");
+    const std::filesystem::path output = directory / "bridge-failure.json";
+    Arguments malformed(
+        {"bridge", "--mode=invalid", "--profile=small", "--output",
+         output.string()});
+    const std::string parse_error =
+        "--mode must be source or sink\nusage: original bridge usage";
+
+    ASSERT_TRUE(WriteBridgeParseFailureArtifactFromArgs(
+        malformed.argc(), malformed.argv(), parse_error));
+    const std::string json = ReadFile(output);
+    EXPECT_NE(json.find(
+                  "\"schema\": "
+                  "\"mino.pipeline_bridge_benchmark.parse_failure.v1\""),
+              std::string::npos);
+    EXPECT_NE(json.find("\"outcome\": \"failure\""), std::string::npos);
+    EXPECT_NE(json.find(
+                  "\"error\": \"--mode must be source or sink\\nusage: "
+                  "original bridge usage\""),
+              std::string::npos);
+    EXPECT_EQ(json.find("\"run_id\""), std::string::npos);
+    EXPECT_EQ(json.find("\"profile\""), std::string::npos);
+    EXPECT_EQ(json.find("\"clock\""), std::string::npos);
+    EXPECT_EQ(json.find("\"counters\""), std::string::npos);
+
+    Arguments ambiguous(
+        {"bridge", "--output", (directory / "first.json").string(),
+         "--output=" + (directory / "second.json").string()});
+    EXPECT_FALSE(WriteBridgeParseFailureArtifactFromArgs(
+        ambiguous.argc(), ambiguous.argv(), parse_error));
+    EXPECT_FALSE(std::filesystem::exists(directory / "first.json"));
+    EXPECT_FALSE(std::filesystem::exists(directory / "second.json"));
+    std::filesystem::remove_all(directory);
+}
+
+TEST(PipelineCommonTest, MinoTcpBackendDetailsRemainsValidJson) {
+    const std::filesystem::path directory =
+        CreateTestDirectory("pipeline-mino-tcp-details-test");
+    const std::filesystem::path output = directory / "result.json";
+    const std::string details = BuildMinoTcpBackendDetails(
+        123, 4, 5, ClockMode::kSameHost, 8,
+        "{\"listen\":\"127.0.0.1:24000\",\"peer\":null}");
+    EXPECT_NE(details.find(
+                  "\"completion_barrier\":\"reverse hop-by-hop ACK\","
+                  "\"receive_batch_size\":8"),
+              std::string::npos);
+
+    SinkResult result;
+    result.backend = "mino-tcp-canonical";
+    result.options = ValidArguments().Parse();
+    result.options.role = Role::kCanbus;
+    result.options.output = output;
+    result.counts.offered = result.options.messages;
+    result.counts.received = result.options.messages;
+    result.payload_bytes = kSmallPayloadBytes;
+    result.encoded_bytes = 320;
+    result.backend_details = details;
+    ASSERT_NO_THROW(WriteSinkResult(result));
+
+    const std::string artifact = ReadFile(output);
+    EXPECT_NE(artifact.find("\"outcome\": \"success\""),
+              std::string::npos);
+    EXPECT_EQ(artifact.find("invalid backend_details JSON object"),
+              std::string::npos);
+    EXPECT_NE(artifact.find(
+                  "\"completion_barrier\":\"reverse hop-by-hop ACK\","
+                  "\"receive_batch_size\":8"),
+              std::string::npos);
+    std::filesystem::remove_all(directory);
+}
 
 TEST(PipelineCommonTest, FailureJsonEscapesErrorAndSanitizesInvalidDetails) {
     const std::filesystem::path output =

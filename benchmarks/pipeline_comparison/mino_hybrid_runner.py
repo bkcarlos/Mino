@@ -22,6 +22,7 @@ from benchmarks.pipeline_comparison import pipeline_network_runner as network
 from benchmarks.pipeline_comparison.pipeline_comparison_runner import validate_worker_result
 
 MANIFEST_SCHEMA = "mino.pipeline_hybrid_benchmark.manifest.v1"
+BRIDGE_SCHEMA = "mino.pipeline_bridge_benchmark.v1"
 WORKER_BACKEND = "mino-shm"
 DEFAULT_SHM_BINARY = "bazel-bin/benchmarks/pipeline_comparison/mino_shm_pipeline"
 DEFAULT_BRIDGE_BINARY = "bazel-bin/benchmarks/pipeline_comparison/mino_shm_tcp_bridge"
@@ -66,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deadline-seconds", type=_bounded_int("--deadline-seconds", 1, 86_400), default=120)
     parser.add_argument("--port-base", type=_bounded_int("--port-base", 1, 65_531), default=25_000)
     parser.add_argument("--channel-capacity", type=_bounded_int("--channel-capacity", 2, 4096), default=8)
+    parser.add_argument(
+        "--receive-batch-size",
+        type=_bounded_int("--receive-batch-size", 1, 64),
+        default=1,
+        help="ordered bridge TcpDriver receive batch size; 1 preserves fairness",
+    )
     parser.add_argument("--shm-binary-relative", default=DEFAULT_SHM_BINARY)
     parser.add_argument("--bridge-binary-relative", default=DEFAULT_BRIDGE_BINARY)
     parser.add_argument("--schema-descriptor-relative", default=network.DEFAULT_DESCRIPTOR)
@@ -286,6 +293,7 @@ def create_processes(
             "channel": f"edge-{edge}",
             "schema": "mino.benchmarks.pipeline.AutonomyPipelineFrame",
             "generated_type": "AutonomyPipelineFrame",
+            "bridge_validation": "structural" if not local else None,
         }
         if local:
             edges.append(record)
@@ -303,6 +311,8 @@ def create_processes(
         ):
             name = f"bridge-edge-{edge}-{mode}"
             runtime = Path("/tmp") / f"mino-hybrid-{token}-{name}"
+            result_remote = runtime / "bridge-result.json"
+            result_local = results / f"{name}.json"
             command = [
                 str(host.workdir / args.bridge_binary_relative),
                 "--mode", mode,
@@ -316,11 +326,16 @@ def create_processes(
                 "--edge", str(edge),
                 "--port", str(args.port_base + edge),
                 "--schema-descriptor", str(host.workdir / args.schema_descriptor_relative),
+                "--clock-mode", "same-host" if same_host else "independent-hosts",
+                "--bridge-validation", "structural",
+                "--receive-batch-size", str(args.receive_batch_size),
+                "--output", str(result_remote),
             ]
             command += ["--listen-address", "0.0.0.0"] if mode == "sink" else ["--peer-address", sink.data_address]
             bridges.append(_make_process(
                 name=name, host=host, runtime=runtime, command=command,
                 ready_name=f"mino-shm-tcp-bridge-{mode}.ready", logs=logs,
+                result_remote=result_remote, result_local=result_local,
             ))
     # TCP listeners must exist before connector construction.
     bridges.sort(key=lambda process: 0 if process.name.endswith("-sink") else 1)
@@ -518,6 +533,112 @@ def launch_and_wait(args: argparse.Namespace, processes: list[ProcessRecord], ru
     return errors
 
 
+def _non_negative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def validate_bridge_result(
+    document: Any,
+    *,
+    args: argparse.Namespace,
+    process: ProcessRecord,
+    run_id: str,
+    same_host: bool,
+    expected_boot_id: str,
+) -> dict[str, Any]:
+    expected_top = {
+        "schema", "run_id", "edge", "mode", "validation", "profile",
+        "clock_mode", "clock", "compilation_mode", "receive_batch_size",
+        "outcome", "error", "counters", "wire",
+    }
+    result = network._strict_keys(document, expected_top, "bridge result")
+    parts = process.name.split("-")
+    if len(parts) != 4 or parts[:2] != ["bridge", "edge"]:
+        raise ValueError("bridge process name is malformed")
+    expected_edge = int(parts[2], 10)
+    expected_mode = parts[3]
+    expected_clock = "same-host" if same_host else "independent-hosts"
+    expected = {
+        "schema": BRIDGE_SCHEMA,
+        "run_id": run_id,
+        "edge": expected_edge,
+        "mode": expected_mode,
+        "validation": "structural",
+        "profile": args.profile,
+        "clock_mode": expected_clock,
+        "receive_batch_size": args.receive_batch_size,
+    }
+    for key, value in expected.items():
+        if result[key] != value:
+            raise ValueError(f"bridge result {key} differs from expected value")
+    clock = network._strict_keys(
+        result["clock"], {"name", "resolution_ns", "boot_id"},
+        "bridge result clock",
+    )
+    if not isinstance(clock["name"], str) or not clock["name"]:
+        raise ValueError("bridge result clock.name is invalid")
+    if _non_negative_int(clock["resolution_ns"], "bridge result clock.resolution_ns") == 0:
+        raise ValueError("bridge result clock.resolution_ns must be positive")
+    if clock["boot_id"] != expected_boot_id:
+        raise ValueError("bridge result clock.boot_id differs from topology preflight")
+    if result["compilation_mode"] not in {"fastbuild", "opt", "dbg"}:
+        raise ValueError("bridge result compilation_mode is invalid")
+    if result["outcome"] not in {"success", "failure"}:
+        raise ValueError("bridge result outcome is invalid")
+    if not isinstance(result["error"], str):
+        raise ValueError("bridge result error must be a string")
+
+    counters = network._strict_keys(
+        result["counters"],
+        {"validation_calls", "validation_payload_bytes", "validation_thread_cpu_ns"},
+        "bridge result counters",
+    )
+    for key, value in counters.items():
+        _non_negative_int(value, f"bridge result counters.{key}")
+    if any(counters.values()):
+        raise ValueError("structural bridge validation counters must be zero")
+
+    wire_keys = {
+        "data_frames_sent", "data_frame_body_bytes_sent", "data_frames_received",
+        "data_frame_body_bytes_received", "control_frames_sent",
+        "control_frame_body_bytes_sent", "control_frames_received",
+        "control_frame_body_bytes_received",
+    }
+    wire = network._strict_keys(result["wire"], wire_keys, "bridge result wire")
+    for key, value in wire.items():
+        _non_negative_int(value, f"bridge result wire.{key}")
+
+    process_succeeded = (
+        process.process is not None and process.process.poll() == 0
+    )
+    if process_succeeded:
+        if result["outcome"] != "success" or result["error"]:
+            raise ValueError("successful bridge process reported failure")
+        total = args.messages + args.warmup_messages
+        expected_wire = {
+            "data_frames_sent": total if expected_mode == "source" else 0,
+            "data_frames_received": total if expected_mode == "sink" else 0,
+            "control_frames_sent": 1 if expected_mode == "sink" else 0,
+            "control_frames_received": 1 if expected_mode == "source" else 0,
+        }
+        for key, value in expected_wire.items():
+            if wire[key] != value:
+                raise ValueError(f"bridge result wire.{key} differs from expected count")
+        for count_key, bytes_key in (
+            ("data_frames_sent", "data_frame_body_bytes_sent"),
+            ("data_frames_received", "data_frame_body_bytes_received"),
+            ("control_frames_sent", "control_frame_body_bytes_sent"),
+            ("control_frames_received", "control_frame_body_bytes_received"),
+        ):
+            if (wire[count_key] == 0) != (wire[bytes_key] == 0):
+                raise ValueError(f"bridge result {bytes_key} disagrees with frame count")
+    elif result["outcome"] != "failure":
+        raise ValueError("failed bridge process did not preserve a failure artifact")
+    return result
+
+
 def collect_and_validate(
     args: argparse.Namespace,
     processes: Sequence[ProcessRecord],
@@ -547,6 +668,16 @@ def collect_and_validate(
             continue
         try:
             document = json.loads(process.result_local.read_text(encoding="utf-8"))
+            if process.name.startswith("bridge-edge-"):
+                validate_bridge_result(
+                    document,
+                    args=args,
+                    process=process,
+                    run_id=run_id,
+                    same_host=same_host,
+                    expected_boot_id=boot_ids[process.host.role],
+                )
+                continue
             validated = validate_worker_result(
                 document,
                 expected_backend=WORKER_BACKEND,
@@ -575,7 +706,12 @@ def collect_and_validate(
                 }
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             errors.append(f"{process.name}: invalid result: {exc}")
-    if sink is None:
+    has_worker_results = any(
+        process.result_remote is not None
+        and not process.name.startswith("bridge-edge-")
+        for process in processes
+    )
+    if sink is None and has_worker_results:
         errors.append("validated canbus result is missing")
     return errors, sink
 
@@ -604,6 +740,20 @@ def _cleanup_process_runtimes(
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
             errors.append(f"{process.name}: remote cleanup failed: {exc}")
     return errors
+
+
+def _bridge_artifact_records(
+    processes: Sequence[ProcessRecord], output: Path
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": process.name,
+            "result": network._artifact(process.result_local, output),
+        }
+        for process in processes
+        if process.name.startswith("bridge-edge-")
+        and process.result_local is not None
+    ]
 
 
 def _process_records(processes: Sequence[ProcessRecord], output: Path) -> list[dict[str, Any]]:
@@ -680,6 +830,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "deadline_seconds": args.deadline_seconds,
                 "port_base": args.port_base,
                 "channel_capacity": args.channel_capacity,
+                "receive_batch_size": args.receive_batch_size,
+                "bridge_validation": "structural",
                 "schema_descriptor_relative": args.schema_descriptor_relative,
             },
             "boot_ids": boot_ids,
@@ -688,6 +840,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "started_utc": started_utc,
             "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
             "processes": _process_records(processes, output),
+            "bridge_artifacts": _bridge_artifact_records(processes, output),
             "sink_metrics": sink,
         }
         network._write_json_atomic(output / "manifest.json", manifest)

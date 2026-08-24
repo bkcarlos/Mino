@@ -147,7 +147,11 @@ private:
     }
     static bool ValidateBasic(const TelemetryVariableMetadata& value) noexcept {
         if (value.length > value.capacity) return false;
-        return value.offset == 0 ? value.length == 0 && value.capacity == 0 : value.capacity != 0;
+        if (value.offset == 0) {
+            return value.generation == 0 && value.region_id == 0 &&
+                   value.length == 0 && value.capacity == 0;
+        }
+        return value.capacity != 0;
     }
     static bool ValidateBytes(const TelemetryVariableMetadata& value, std::uint64_t maximum) noexcept {
         return ValidateBasic(value) && value.element_size == 1 && value.capacity <= maximum;
@@ -156,13 +160,13 @@ private:
         return ValidateBasic(value) && element_size != 0 && value.element_size == element_size && value.capacity <= maximum;
     }
     static bool ValidateNested(const TelemetryVariableMetadata& value, std::uint64_t object_size) noexcept {
-        return value.offset != 0 && object_size != 0 && value.length == object_size &&
-               value.capacity == object_size && value.element_size == 1;
+        return ValidateBasic(value) && object_size != 0 &&
+               value.length == object_size && value.capacity == object_size &&
+               value.element_size == 1;
     }
     static bool ValidateUnknown(const TelemetryVariableMetadata& value) noexcept {
-        if (value.element_size != 0 || value.length > 64u || value.capacity > 66048u) return false;
-        return value.length == 0 ? value.offset == 0 && value.capacity == 0
-                                 : value.offset != 0 && value.capacity != 0;
+        if (!ValidateBasic(value) || value.element_size != 0 || value.length > 64u || value.capacity > 66048u) return false;
+        return value.length == 0 ? value.offset == 0 : value.offset != 0;
     }
     const std::byte* data_ = nullptr;
     std::size_t size_ = 0;
@@ -186,7 +190,7 @@ public:
     }
 
     bool set_label(const TelemetryVariableMetadata& value) noexcept {
-        if (value.length > value.capacity || value.capacity > 16u || value.element_size != 1u || (value.offset == 0 ? (value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
+        if (value.length > value.capacity || value.capacity > 16u || value.element_size != 1u || (value.offset == 0 ? (value.generation != 0 || value.region_id != 0 || value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
         WriteVariable(48, value);
         SetPresence(0, true);
         return true;
@@ -197,13 +201,13 @@ public:
     }
 
     bool set_payload(const TelemetryVariableMetadata& value) noexcept {
-        if (value.length > value.capacity || value.capacity > 32u || value.element_size != 1u || (value.offset == 0 ? (value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
+        if (value.length > value.capacity || value.capacity > 32u || value.element_size != 1u || (value.offset == 0 ? (value.generation != 0 || value.region_id != 0 || value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
         WriteVariable(88, value);
         return true;
     }
 
     bool set_samples(const TelemetryVariableMetadata& value) noexcept {
-        if (value.length > value.capacity || value.capacity > 8u || value.element_size != 8u || (value.offset == 0 ? (value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
+        if (value.length > value.capacity || value.capacity > 8u || value.element_size != 8u || (value.offset == 0 ? (value.generation != 0 || value.region_id != 0 || value.length != 0 || value.capacity != 0) : value.capacity == 0)) return false;
         WriteVariable(128, value);
         return true;
     }
@@ -292,9 +296,41 @@ template <> struct StaticMessageTraits<::golden::Telemetry> {
     static constexpr std::uint64_t schema_short_id = ::golden::Telemetry::kSchemaShortId;
     static constexpr std::uint32_t layout_version = ::golden::Telemetry::kLayoutVersion;
     static constexpr std::uint32_t index_flags = ::mino::kIndexSlotFlagHasChildSlabs;
+    static constexpr bool kOwnedGraphCollectionSupported = true;
+    static constexpr std::size_t kMaxOwnedGraphHandles = 5u;
     static Status Validate(const ::golden::Telemetry& value) noexcept {
         return ::golden::TelemetryAccessor(value).valid() ? Status::Ok() :
             Status::Error(StatusCode::kSchemaMismatch, "invalid generated SHM object");
+    }
+    static Status CollectOwnedGraph(
+        ShmHandle root, const ::golden::Telemetry& value,
+        std::span<ShmHandle> output, std::size_t& handle_count) noexcept {
+        handle_count = 0;
+        const ::golden::TelemetryAccessor accessor(value);
+        if (!accessor.valid()) {
+            return Status::Error(StatusCode::kSchemaMismatch,
+                                 "invalid generated SHM object metadata");
+        }
+        OwnedGraphCollector collector(output);
+        Status status = collector.AddRoot(root);
+        if (!status.ok()) return status;
+        const auto collect_child = [&collector](const auto& metadata) {
+            if (metadata.offset == 0) return Status::Ok();
+            return collector.AddOwnedChild(
+                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});
+        };
+        if (accessor.has_label()) {
+            status = collect_child(accessor.label());
+            if (!status.ok()) return status;
+        }
+        status = collect_child(accessor.payload());
+        if (!status.ok()) return status;
+        status = collect_child(accessor.samples());
+        if (!status.ok()) return status;
+        status = collect_child(accessor.unknown_fields());
+        if (!status.ok()) return status;
+        handle_count = collector.size();
+        return Status::Ok();
     }
 };
 }  // namespace mino

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -283,6 +285,342 @@ TEST(PreparedCanonicalWireCodecTest, RejectsInvalidCreationInputs) {
     auto invalid_closure = PreparedCanonicalWireCodec::Create(root, {});
     ASSERT_FALSE(invalid_closure.ok());
     EXPECT_EQ(invalid_closure.status().code(), StatusCode::kSchemaMismatch);
+}
+
+TEST(DynamicMessageTest, ReserveAndClearRetainReusableMessageSemantics) {
+    DynamicMessage message;
+    ASSERT_TRUE(message.ReserveFields(8).ok());
+    ASSERT_TRUE(message.SetField(2, DynamicValue::Unsigned(9)).ok());
+    const auto unknown = Bytes({0x08, 0x01});
+    ASSERT_TRUE(message.mutable_unknown_fields().Add(1, unknown).ok());
+
+    message.Clear();
+    EXPECT_TRUE(message.fields().empty());
+    EXPECT_TRUE(message.unknown_fields().fields().empty());
+    EXPECT_EQ(message.unknown_fields().byte_size(), 0u);
+
+    ASSERT_TRUE(message.SetField(1, DynamicValue::Signed(-7)).ok());
+    ASSERT_NE(message.FindField(1), nullptr);
+    EXPECT_EQ(message.FindField(1)->signed_integer()->value, -7);
+}
+
+TEST(CanonicalWireTest, RejectsRepeatedKnownAndPreservesRepeatedUnknown) {
+    auto descriptor = CompileOne(
+        "package p; message M { optional uint32 known = 2; }");
+    ASSERT_NE(descriptor, nullptr);
+
+    const auto repeated_unknown =
+        Bytes({0x08, 0x01, 0x08, 0x02, 0x10, 0x03});
+    auto decoded = CanonicalWireCodec::Decode(*descriptor, repeated_unknown);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    ASSERT_EQ(decoded->unknown_fields().fields().size(), 2u);
+    EXPECT_EQ(Hex(decoded->unknown_fields().fields()[0].canonical_bytes()),
+              "0801");
+    EXPECT_EQ(Hex(decoded->unknown_fields().fields()[1].canonical_bytes()),
+              "0802");
+    auto roundtrip = CanonicalWireCodec::Encode(*descriptor, *decoded);
+    ASSERT_TRUE(roundtrip.ok()) << roundtrip.status().ToString();
+    EXPECT_EQ(*roundtrip, repeated_unknown);
+
+    const auto repeated_known = Bytes({0x10, 0x01, 0x10, 0x02});
+    auto rejected = CanonicalWireCodec::Decode(*descriptor, repeated_known);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), StatusCode::kCorruption);
+}
+
+TEST(PreparedCanonicalWireCodecTest,
+     ReuseApiDirectlyMergesKnownAndStableUnknownFields) {
+    auto descriptor = CompileOne(R"idl(
+package p;
+message M {
+  optional uint32 known = 2;
+  optional string text = 4 [max_bytes = 8];
+  optional bytes blob = 5 [max_bytes = 8];
+}
+)idl");
+    ASSERT_NE(descriptor, nullptr);
+    auto prepared = PreparedCanonicalWireCodec::Create(descriptor);
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+    DynamicMessage message;
+    ASSERT_TRUE(message.ReserveFields(3).ok());
+    ASSERT_TRUE(message.SetField(2, DynamicValue::Unsigned(9)).ok());
+    auto text = DynamicValue::String("xy");
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(message.SetField(4, std::move(*text)).ok());
+    const auto blob_bytes = Bytes({0x00, 0xff});
+    auto blob = DynamicValue::Bytes(blob_bytes);
+    ASSERT_TRUE(blob.ok());
+    ASSERT_TRUE(message.SetField(5, std::move(*blob)).ok());
+    const auto unknown3_first = Bytes({0x18, 0x01});
+    const auto unknown1 = Bytes({0x08, 0x07});
+    const auto unknown3_second = Bytes({0x18, 0x02});
+    ASSERT_TRUE(
+        message.mutable_unknown_fields().Add(3, unknown3_first).ok());
+    ASSERT_TRUE(message.mutable_unknown_fields().Add(1, unknown1).ok());
+    ASSERT_TRUE(
+        message.mutable_unknown_fields().Add(3, unknown3_second).ok());
+
+    CanonicalWireScratch scratch;
+    std::vector<std::byte> output;
+    output.reserve(128);
+    const size_t reserved_capacity = output.capacity();
+    ASSERT_TRUE(prepared->EncodeInto(message, scratch, output).ok());
+    EXPECT_EQ(Hex(output), "0807100918011802220278792a0200ff");
+    EXPECT_EQ(output.capacity(), reserved_capacity);
+
+    CanonicalWireScratch generic_scratch;
+    std::vector<std::byte> generic_output;
+    ASSERT_TRUE(CanonicalWireCodec::EncodeInto(
+                    *descriptor, message, generic_scratch, generic_output)
+                    .ok());
+    EXPECT_EQ(generic_output, output);
+    DynamicMessage generic_decoded;
+    ASSERT_TRUE(CanonicalWireCodec::DecodeInto(
+                    *descriptor, generic_output, generic_scratch,
+                    generic_decoded)
+                    .ok());
+    EXPECT_EQ(generic_decoded.unknown_fields().fields().size(), 3u);
+
+    DynamicMessage decoded;
+    ASSERT_TRUE(decoded.SetField(2, DynamicValue::Unsigned(999)).ok());
+    const auto stale_unknown = Bytes({0x28, 0x01});
+    ASSERT_TRUE(decoded.mutable_unknown_fields().Add(5, stale_unknown).ok());
+    ASSERT_TRUE(prepared->DecodeInto(output, scratch, decoded).ok());
+    ASSERT_NE(decoded.FindField(2), nullptr);
+    EXPECT_EQ(decoded.FindField(2)->unsigned_integer()->value, 9u);
+    ASSERT_EQ(decoded.unknown_fields().fields().size(), 3u);
+    EXPECT_EQ(decoded.unknown_fields().fields()[0].field_id(), 1u);
+    EXPECT_EQ(decoded.unknown_fields().fields()[1].field_id(), 3u);
+    EXPECT_EQ(decoded.unknown_fields().fields()[2].field_id(), 3u);
+
+    ASSERT_TRUE(prepared->EncodeInto(decoded, scratch, output).ok());
+    EXPECT_EQ(Hex(output), "0807100918011802220278792a0200ff");
+    const auto malformed = Bytes({0x10, 0x81, 0x00});
+    Status status = prepared->DecodeInto(malformed, scratch, decoded);
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), StatusCode::kCorruption);
+    EXPECT_TRUE(decoded.fields().empty());
+    EXPECT_TRUE(decoded.unknown_fields().fields().empty());
+
+    DynamicMessage wrong_limits(UnknownFieldLimits{1, 1});
+    status = prepared->DecodeInto(output, scratch, wrong_limits);
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), StatusCode::kInvalidArgument);
+}
+
+TEST(CanonicalWireScratchTest,
+     FailedPartialEncodeDoesNotLeakUnknownOrderIntoNestedReuse) {
+    CompileOptions options;
+    options.allow_implicit_schema_version = true;
+    auto compiled = SchemaCompiler::Compile(R"idl(
+package p;
+message Leaf { uint32 value = 2; }
+message Child { Leaf leaf = 2; }
+message Root {
+  uint32 known = 2;
+  Child child = 4;
+}
+)idl",
+                                            options);
+    ASSERT_TRUE(compiled.ok()) << compiled.status().ToString();
+    std::shared_ptr<const SchemaDescriptor> root;
+    for (const auto& type : compiled->types()) {
+        if (type->aggregate().full_name() == "p.Root") root = type;
+    }
+    ASSERT_NE(root, nullptr);
+    auto prepared = PreparedCanonicalWireCodec::Create(root, compiled->types());
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+    DynamicMessage failing;
+    ASSERT_TRUE(failing.SetField(2, DynamicValue::Signed(7)).ok());
+    const auto failing_unknown3 = Bytes({0x18, 0x03});
+    const auto failing_unknown1 = Bytes({0x08, 0x01});
+    ASSERT_TRUE(
+        failing.mutable_unknown_fields().Add(3, failing_unknown3).ok());
+    ASSERT_TRUE(
+        failing.mutable_unknown_fields().Add(1, failing_unknown1).ok());
+
+    auto leaf = std::make_shared<DynamicMessage>();
+    ASSERT_TRUE(leaf->SetField(2, DynamicValue::Unsigned(42)).ok());
+    const auto leaf_unknown4 = Bytes({0x20, 0x1c});
+    const auto leaf_unknown1 = Bytes({0x08, 0x15});
+    ASSERT_TRUE(
+        leaf->mutable_unknown_fields().Add(4, leaf_unknown4).ok());
+    ASSERT_TRUE(
+        leaf->mutable_unknown_fields().Add(1, leaf_unknown1).ok());
+    auto leaf_value = DynamicValue::Message(leaf);
+    ASSERT_TRUE(leaf_value.ok());
+
+    auto child = std::make_shared<DynamicMessage>();
+    ASSERT_TRUE(child->SetField(2, std::move(*leaf_value)).ok());
+    const auto child_unknown3 = Bytes({0x18, 0x0d});
+    const auto child_unknown1 = Bytes({0x08, 0x0b});
+    ASSERT_TRUE(
+        child->mutable_unknown_fields().Add(3, child_unknown3).ok());
+    ASSERT_TRUE(
+        child->mutable_unknown_fields().Add(1, child_unknown1).ok());
+    auto child_value = DynamicValue::Message(child);
+    ASSERT_TRUE(child_value.ok());
+
+    DynamicMessage succeeding;
+    ASSERT_TRUE(succeeding.SetField(2, DynamicValue::Unsigned(7)).ok());
+    ASSERT_TRUE(succeeding.SetField(4, std::move(*child_value)).ok());
+    const auto success_unknown6 = Bytes({0x30, 0x06});
+    const auto success_unknown1 = Bytes({0x08, 0x09});
+    const auto success_unknown3 = Bytes({0x18, 0x03});
+    ASSERT_TRUE(succeeding.mutable_unknown_fields()
+                    .Add(6, success_unknown6)
+                    .ok());
+    ASSERT_TRUE(succeeding.mutable_unknown_fields()
+                    .Add(1, success_unknown1)
+                    .ok());
+    ASSERT_TRUE(succeeding.mutable_unknown_fields()
+                    .Add(3, success_unknown3)
+                    .ok());
+
+    constexpr std::string_view kExpected =
+        "080910071803220c080b12060815102a201c180d3006";
+    const auto exercise = [&](auto&& encode_into) {
+        CanonicalWireScratch scratch;
+        std::vector<std::byte> output = Bytes({0xff, 0xff});
+        output.reserve(128);
+
+        // ID 1 is emitted before known field 2's tag; encoding then fails on
+        // the uint32/Signed dynamic-type mismatch after output is non-empty.
+        Status status = encode_into(failing, scratch, output);
+        ASSERT_FALSE(status.ok());
+        EXPECT_EQ(status.code(), StatusCode::kSchemaMismatch);
+        EXPECT_TRUE(output.empty());
+
+        status = encode_into(succeeding, scratch, output);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        EXPECT_EQ(Hex(output), kExpected);
+    };
+
+    exercise([&](const DynamicMessage& message, CanonicalWireScratch& scratch,
+                 std::vector<std::byte>& output) {
+        return CanonicalWireCodec::EncodeInto(
+            *root, message, scratch, output, compiled->types());
+    });
+    exercise([&](const DynamicMessage& message, CanonicalWireScratch& scratch,
+                 std::vector<std::byte>& output) {
+        return prepared->EncodeInto(message, scratch, output);
+    });
+}
+
+TEST(PreparedCanonicalWireCodecTest, PlansCoverNestedDescriptorClosure) {
+    CompileOptions options;
+    options.allow_implicit_schema_version = true;
+    auto compiled = SchemaCompiler::Compile(R"idl(
+package p;
+message Child { string value = 1 [max_bytes = 8]; }
+message Root { Child child = 1; }
+)idl",
+                                            options);
+    ASSERT_TRUE(compiled.ok()) << compiled.status().ToString();
+    std::shared_ptr<const SchemaDescriptor> root;
+    for (const auto& type : compiled->types()) {
+        if (type->aggregate().full_name() == "p.Root") root = type;
+    }
+    ASSERT_NE(root, nullptr);
+    auto prepared = PreparedCanonicalWireCodec::Create(root, compiled->types());
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+    auto child = std::make_shared<DynamicMessage>();
+    auto text = DynamicValue::String("nested");
+    ASSERT_TRUE(text.ok());
+    ASSERT_TRUE(child->SetField(1, std::move(*text)).ok());
+    auto child_value = DynamicValue::Message(child);
+    ASSERT_TRUE(child_value.ok());
+    DynamicMessage message;
+    ASSERT_TRUE(message.SetField(1, std::move(*child_value)).ok());
+
+    CanonicalWireScratch scratch;
+    std::vector<std::byte> output;
+    ASSERT_TRUE(prepared->EncodeInto(message, scratch, output).ok());
+    EXPECT_EQ(Hex(output), "0a080a066e6573746564");
+    DynamicMessage decoded;
+    ASSERT_TRUE(prepared->DecodeInto(output, scratch, decoded).ok());
+    ASSERT_NE(decoded.FindField(1), nullptr);
+    ASSERT_NE(decoded.FindField(1)->message(), nullptr);
+    const DynamicValue* nested =
+        decoded.FindField(1)->message()->value->FindField(1);
+    ASSERT_NE(nested, nullptr);
+    ASSERT_NE(nested->string(), nullptr);
+    EXPECT_EQ(nested->string()->value, "nested");
+}
+
+TEST(PreparedCanonicalWireCodecTest,
+     CopiedHandlesAreConcurrentWithCallerOwnedScratch) {
+    auto descriptor = CompileOne(R"idl(
+package p;
+message M {
+  uint32 sequence = 1;
+  string label = 2 [max_bytes = 16];
+}
+)idl");
+    ASSERT_NE(descriptor, nullptr);
+    auto prepared = PreparedCanonicalWireCodec::Create(descriptor);
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    const PreparedCanonicalWireCodec codec = *prepared;
+
+    DynamicMessage sample;
+    ASSERT_TRUE(sample.SetField(1, DynamicValue::Unsigned(300)).ok());
+    auto sample_label = DynamicValue::String("worker");
+    ASSERT_TRUE(sample_label.ok());
+    ASSERT_TRUE(sample.SetField(2, std::move(*sample_label)).ok());
+    auto expected = codec.Encode(sample);
+    ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+
+    constexpr size_t kThreadCount = 6;
+    constexpr size_t kIterations = 100;
+    std::atomic<bool> all_ok = true;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t thread_index = 0; thread_index < kThreadCount; ++thread_index) {
+        PreparedCanonicalWireCodec copied = codec;
+        threads.emplace_back(
+            [copied, expected_bytes = *expected, &all_ok]() mutable {
+                DynamicMessage message;
+                if (!message.SetField(1, DynamicValue::Unsigned(300)).ok()) {
+                    all_ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                auto label = DynamicValue::String("worker");
+                if (!label.ok() ||
+                    !message.SetField(2, std::move(*label)).ok()) {
+                    all_ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                CanonicalWireScratch scratch;
+                std::vector<std::byte> output;
+                output.reserve(expected_bytes.size());
+                DynamicMessage decoded;
+                for (size_t iteration = 0; iteration < kIterations;
+                     ++iteration) {
+                    if (!copied.EncodeInto(message, scratch, output).ok() ||
+                        output != expected_bytes ||
+                        !copied.DecodeInto(output, scratch, decoded).ok()) {
+                        all_ok.store(false, std::memory_order_relaxed);
+                        return;
+                    }
+                    const DynamicValue* sequence = decoded.FindField(1);
+                    const DynamicValue* decoded_label = decoded.FindField(2);
+                    if (sequence == nullptr ||
+                        sequence->unsigned_integer() == nullptr ||
+                        sequence->unsigned_integer()->value != 300 ||
+                        decoded_label == nullptr ||
+                        decoded_label->string() == nullptr ||
+                        decoded_label->string()->value != "worker") {
+                        all_ok.store(false, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_TRUE(all_ok.load(std::memory_order_relaxed));
 }
 
 TEST(CanonicalWireTest, EnforcesContainerAndDepthLimitsBeforeAllocation) {

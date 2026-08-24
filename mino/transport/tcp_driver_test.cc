@@ -203,6 +203,8 @@ TcpDriverOptions TestOptions() {
         .idle_timeout_ms = 500,
         .partial_frame_timeout_ms = 250,
         .io_poll_max_ms = 5,
+        .max_receive_frames_per_turn = 64,
+        .max_receive_bytes_per_turn = 256 * 1024,
         .tls_factory = {},
     };
 }
@@ -353,6 +355,171 @@ private:
 
     std::shared_ptr<ScriptedTlsState> state_;
     char pending_ = 0;
+};
+
+class SegmentedRetryTlsState final {
+public:
+    void RecordWrite() {
+        std::lock_guard lock(mutex);
+        ++write_calls;
+        cv.notify_all();
+    }
+
+    void Append(std::span<const std::byte> input, size_t count) {
+        std::lock_guard lock(mutex);
+        wire.insert(wire.end(), input.begin(), input.begin() + count);
+        cv.notify_all();
+    }
+
+    void SaveRetry(std::span<const std::byte> input) {
+        std::lock_guard lock(mutex);
+        retry_data = input.data();
+        retry_size = input.size();
+        retry_bytes.assign(input.begin(), input.end());
+    }
+
+    bool ValidateRetry(std::span<const std::byte> input) {
+        std::lock_guard lock(mutex);
+        const bool valid = input.data() == retry_data &&
+                           input.size() == retry_size &&
+                           std::equal(input.begin(), input.end(),
+                                      retry_bytes.begin(), retry_bytes.end());
+        retry_arguments_stable &= valid;
+        return valid;
+    }
+
+    bool WaitForWriteCalls(size_t count,
+                           std::chrono::milliseconds timeout = 1000ms) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout, [&] { return write_calls >= count; });
+    }
+
+    bool WaitForWireSize(size_t size,
+                         std::chrono::milliseconds timeout = 1000ms) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, timeout, [&] { return wire.size() >= size; });
+    }
+
+    std::vector<std::byte> Wire() const {
+        std::lock_guard lock(mutex);
+        return wire;
+    }
+
+    bool RetryArgumentsStable() const {
+        std::lock_guard lock(mutex);
+        return retry_arguments_stable;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    size_t write_calls = 0;
+    const std::byte* retry_data = nullptr;
+    size_t retry_size = 0;
+    std::vector<std::byte> retry_bytes;
+    std::vector<std::byte> wire;
+    bool retry_arguments_stable = true;
+};
+
+class SegmentedRetryTlsChannel final : public security::TlsChannel {
+public:
+    SegmentedRetryTlsChannel(int fd,
+                             std::shared_ptr<SegmentedRetryTlsState> state)
+        : fd_(fd), state_(std::move(state)) {}
+
+    Result<security::TlsIoResult> Handshake() noexcept override {
+        return security::TlsIoResult{};
+    }
+
+    Result<security::TlsIoResult> Read(std::span<std::byte> output) noexcept override {
+        std::byte byte{};
+        const ssize_t received = ::recv(fd_, &byte, 1, 0);
+        if (received == 1 && !output.empty()) {
+            output[0] = byte;
+            return security::TlsIoResult{.bytes = 1};
+        }
+        return security::TlsIoResult{.need = security::TlsIoNeed::kRead};
+    }
+
+    Result<security::TlsIoResult> Write(
+        std::span<const std::byte> input) noexcept override {
+        state_->RecordWrite();
+        switch (step_++) {
+            case 0:
+                state_->Append(input, std::min<size_t>(2, input.size()));
+                return security::TlsIoResult{
+                    .bytes = std::min<size_t>(2, input.size())};
+            case 1:
+                state_->SaveRetry(input);
+                return security::TlsIoResult{
+                    .need = security::TlsIoNeed::kWrite};
+            case 2:
+                if (!state_->ValidateRetry(input)) return RetryFailure();
+                state_->Append(input, std::min<size_t>(2, input.size()));
+                return security::TlsIoResult{
+                    .bytes = std::min<size_t>(2, input.size())};
+            case 3:
+                state_->SaveRetry(input);
+                return security::TlsIoResult{
+                    .need = security::TlsIoNeed::kRead};
+            case 4: {
+                if (!state_->ValidateRetry(input)) return RetryFailure();
+                std::byte readiness{};
+                (void)::recv(fd_, &readiness, 1, 0);
+                const size_t amount = std::max<size_t>(1, input.size() / 2);
+                state_->Append(input, amount);
+                return security::TlsIoResult{.bytes = amount};
+            }
+            case 5:
+                state_->SaveRetry(input);
+                return security::TlsIoResult{
+                    .need = security::TlsIoNeed::kWrite};
+            case 6:
+                if (!state_->ValidateRetry(input)) return RetryFailure();
+                state_->Append(input, input.size());
+                return security::TlsIoResult{.bytes = input.size()};
+            default:
+                state_->Append(input, input.size());
+                return security::TlsIoResult{.bytes = input.size()};
+        }
+    }
+
+    bool handshake_complete() const noexcept override { return true; }
+    bool has_buffered_read() const noexcept override { return false; }
+    Result<security::AuthenticatedPeer> peer() const noexcept override {
+        return security::AuthenticatedPeer{
+            .node_id = NodeId{1},
+            .security_domain = SecurityDomainId{1},
+            .credential_generation = 1,
+        };
+    }
+
+private:
+    Result<security::TlsIoResult> RetryFailure() noexcept {
+        return Status::Error(StatusCode::kInternal,
+                             "segmented TLS retry arguments changed");
+    }
+
+    int fd_;
+    std::shared_ptr<SegmentedRetryTlsState> state_;
+    size_t step_ = 0;
+};
+
+class SegmentedRetryTlsFactory final : public security::TlsChannelFactory {
+public:
+    explicit SegmentedRetryTlsFactory(
+        std::shared_ptr<SegmentedRetryTlsState> state)
+        : state_(std::move(state)) {}
+
+    Status Prepare() override { return Status::Ok(); }
+    Result<std::unique_ptr<security::TlsChannel>> Create(
+        int fd, security::TlsRole) override {
+        return std::unique_ptr<security::TlsChannel>(
+            new SegmentedRetryTlsChannel(fd, state_));
+    }
+
+private:
+    std::shared_ptr<SegmentedRetryTlsState> state_;
 };
 
 class ScriptedTlsFactory final : public security::TlsChannelFactory {
@@ -523,6 +690,16 @@ bool WaitForQueuedSendBytes(const TcpDriver& driver, size_t expected,
     return driver.stats().queued_send_bytes == expected;
 }
 
+bool WaitForSuccessfulSend(const TcpDriver& driver,
+                           std::chrono::milliseconds timeout = 1000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (driver.stats().successful_send_syscalls != 0) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return driver.stats().successful_send_syscalls != 0;
+}
+
 TEST(TcpDriverBackendTest, SelectsPlatformReadinessBackend) {
 #if defined(__linux__)
     EXPECT_STREQ(TcpDriverReadinessBackendForTest(), "epoll");
@@ -551,6 +728,20 @@ TEST(TcpDriverOptionsTest, RejectsUnboundedOrContradictoryConfiguration) {
               StatusCode::kInvalidArgument);
     options = TestOptions();
     options.max_control_send_messages = 0;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = TestOptions();
+    options.max_receive_frames_per_turn = 0;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options.max_receive_frames_per_turn = kMaxReceiveBatchMessages + 1;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options = TestOptions();
+    options.max_receive_bytes_per_turn = 0;
+    EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
+              StatusCode::kInvalidArgument);
+    options.max_receive_bytes_per_turn = kMaxReceiveBatchBytes + 1;
     EXPECT_EQ(ValidateTcpDriverOptions(options).code(),
               StatusCode::kInvalidArgument);
 }
@@ -595,6 +786,42 @@ TEST(TcpDriverTest, TlsWriteWantReadRetriesWriteBeforeAnyRead) {
     EXPECT_EQ(calls[0], 'W');
     EXPECT_EQ(calls[1], 'W');
     EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
+}
+
+TEST(TcpDriverTest, SegmentedTlsPartialRetryPreservesExactWire) {
+    RawListener listener = ListenRaw();
+    auto state = std::make_shared<SegmentedRetryTlsState>();
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    options.tls_factory =
+        std::make_shared<SegmentedRetryTlsFactory>(state);
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    auto driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+
+    std::vector<std::byte> body = FrameBody(64, 8003);
+    const std::vector<std::byte> expected_wire = Prefix(body);
+    auto sent = driver->TrySendUntrackedOwned(
+        connected->id, std::move(body), UntrackedTrafficClass::kData);
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    EXPECT_TRUE(body.empty());
+
+    ASSERT_TRUE(state->WaitForWriteCalls(4));
+    const std::byte read_ready{0x03};
+    ASSERT_EQ(SendRawNoSignal(peer.get(), std::span(&read_ready, 1)), 1);
+    ASSERT_TRUE(state->WaitForWireSize(expected_wire.size(), 3000ms));
+    EXPECT_TRUE(state->RetryArgumentsStable());
+    EXPECT_EQ(state->Wire(), expected_wire);
 }
 
 TEST(TcpDriverTest, TlsReadWantWriteRetriesReadBeforeAnyWrite) {
@@ -834,6 +1061,71 @@ TEST(TcpDriverTest, TlsHandshakePeerCloseIsCleanlyReaped) {
     EXPECT_TRUE(WaitForConnectionCount(*server, 0, 2000ms));
 }
 
+TEST(TcpDriverTest, TlsAllowsUnidirectionalBurstsFromEitherPeer) {
+    const std::array principals = {
+        security::testing::TestPrincipal{
+            NodeId{101}, SecurityDomainId{77}},
+    };
+    auto generated = security::testing::GenerateTlsCredentials(principals);
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    auto provider = security::StaticTlsCredentialProvider::Create(
+        std::move((*generated)[0]));
+    ASSERT_TRUE(provider.ok()) << provider.status().ToString();
+    auto factory = security::CreateOpenSslTlsChannelFactory(*provider);
+    ASSERT_TRUE(factory.ok()) << factory.status().ToString();
+
+    TcpDriverOptions options = TestOptions();
+    options.tls_factory = *factory;
+    options.heartbeat_interval_ms = 30'000;
+    options.idle_timeout_ms = 60'000;
+
+    const auto exercise = [&](bool accepted_peer_sends) {
+        DriverPair pair = ConnectPair(options);
+        ASSERT_NE(pair.server, nullptr);
+        ASSERT_NE(pair.client, nullptr);
+
+        TcpDriver& sender =
+            accepted_peer_sends ? *pair.server : *pair.client;
+        TcpDriver& receiver =
+            accepted_peer_sends ? *pair.client : *pair.server;
+        const ConnectionId sender_connection =
+            accepted_peer_sends ? pair.server_connection.id
+                                : pair.client_connection.id;
+        const ConnectionId receiver_connection =
+            accepted_peer_sends ? pair.client_connection.id
+                                : pair.server_connection.id;
+
+        constexpr size_t kFrameCount = 4;
+        std::array<std::vector<std::byte>, kFrameCount> frames;
+        for (size_t index = 0; index < kFrameCount; ++index) {
+            frames[index] = FrameBody(
+                128, (accepted_peer_sends ? 30'000 : 40'000) + index);
+            ASSERT_TRUE(sender.SendUntracked({
+                .connection_id = sender_connection,
+                .payload = frames[index],
+                .traffic_class = UntrackedTrafficClass::kData,
+            }).ok());
+        }
+
+        for (size_t index = 0; index < kFrameCount; ++index) {
+            auto received = receiver.Poll({
+                .max_messages = 1,
+                .max_bytes = options.max_frame_body_bytes,
+                .timeout_ms = 5000,
+                .connection_id = receiver_connection,
+            });
+            ASSERT_TRUE(received.ok())
+                << received.status().ToString() << " index=" << index;
+            ASSERT_EQ(received->messages.size(), 1u);
+            EXPECT_EQ(received->messages.front().payload, frames[index]);
+        }
+        EXPECT_TRUE(WaitForQueuedSendBytes(sender, 0));
+    };
+
+    exercise(true);
+    exercise(false);
+}
+
 TEST(TcpDriverTest, TlsBidirectionalLargeFramesSurviveSocketBackpressure) {
     const std::array principals = {
         security::testing::TestPrincipal{
@@ -854,7 +1146,8 @@ TEST(TcpDriverTest, TlsBidirectionalLargeFramesSurviveSocketBackpressure) {
     options.max_ready_receive_bytes = 32u * 1024u * 1024u;
     options.max_ready_receive_messages = 32;
     options.max_control_send_buffer_bytes = 4u * 1024u * 1024u;
-    options.idle_timeout_ms = 10'000;
+    options.heartbeat_interval_ms = 30'000;
+    options.idle_timeout_ms = 60'000;
     options.partial_frame_timeout_ms = 10'000;
     options.tls_factory = *factory;
     DriverPair pair = ConnectPair(options);
@@ -1338,44 +1631,44 @@ TEST(TcpDriverTest, ControlReserveWorksAtFullDataQuotaWithoutInterleaving) {
     ScopedFd peer = AcceptRaw(listener);
     ASSERT_GE(peer.get(), 0);
 
-    auto tracked = driver->Send({
-        .connection_id = connected->id,
-        .payload = data,
-        .target_stage = DeliveryStage::kRemoteAccepted,
-    });
+    std::vector<std::byte> owned_data = data;
+    auto tracked = driver->TrySendOwned(
+        connected->id, std::move(owned_data),
+        DeliveryStage::kRemoteAccepted);
     ASSERT_TRUE(tracked.ok()) << tracked.status().ToString();
+    EXPECT_TRUE(owned_data.empty());
 
     std::vector<std::byte> received_wire;
     ASSERT_TRUE(ReceiveUntil(peer.get(), &received_wire, 1));
     ASSERT_NE(driver->stats().queued_send_bytes, 0u);
-    auto data_blocked = driver->Send({
-        .connection_id = connected->id,
-        .payload = data,
-        .target_stage = DeliveryStage::kRemoteAccepted,
-    });
+    std::vector<std::byte> blocked_data = data;
+    auto data_blocked = driver->TrySendOwned(
+        connected->id, std::move(blocked_data),
+        DeliveryStage::kRemoteAccepted);
     ASSERT_FALSE(data_blocked.ok());
     EXPECT_EQ(data_blocked.status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(blocked_data, data);
 
-    auto best_effort_blocked = driver->SendUntracked({
-        .connection_id = connected->id,
-        .payload = control,
-        .traffic_class = UntrackedTrafficClass::kData,
-    });
+    std::vector<std::byte> blocked_best_effort = control;
+    auto best_effort_blocked = driver->TrySendUntrackedOwned(
+        connected->id, std::move(blocked_best_effort),
+        UntrackedTrafficClass::kData);
     ASSERT_FALSE(best_effort_blocked.ok());
     EXPECT_EQ(best_effort_blocked.status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(blocked_best_effort, control);
 
-    auto control_sent = driver->SendUntracked({
-        .connection_id = connected->id,
-        .payload = control,
-    });
+    std::vector<std::byte> owned_control = control;
+    auto control_sent = driver->TrySendUntrackedOwned(
+        connected->id, std::move(owned_control));
     ASSERT_TRUE(control_sent.ok()) << control_sent.status().ToString();
     EXPECT_EQ(*control_sent, control.size());
-    auto control_blocked = driver->SendUntracked({
-        .connection_id = connected->id,
-        .payload = control,
-    });
+    EXPECT_TRUE(owned_control.empty());
+    std::vector<std::byte> blocked_control = control;
+    auto control_blocked = driver->TrySendUntrackedOwned(
+        connected->id, std::move(blocked_control));
     ASSERT_FALSE(control_blocked.ok());
     EXPECT_EQ(control_blocked.status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(blocked_control, control);
 
     std::vector<std::byte> expected_wire = Prefix(data);
     const std::vector<std::byte> control_wire = Prefix(control);
@@ -1420,12 +1713,11 @@ TEST(TcpDriverTest, GathersQueuedFramesAndPreservesAckCompletionSemantics) {
         bodies.push_back(FrameBody(128 * 1024, 1000 + index));
         const std::vector<std::byte> wire = Prefix(bodies.back());
         expected_wire.insert(expected_wire.end(), wire.begin(), wire.end());
-        auto sent = driver->Send({
-            .connection_id = connected->id,
-            .payload = bodies.back(),
-            .target_stage = DeliveryStage::kRemoteAccepted,
-        });
+        auto sent = driver->TrySendOwned(
+            connected->id, std::move(bodies.back()),
+            DeliveryStage::kRemoteAccepted);
         ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+        EXPECT_TRUE(bodies.back().empty());
         operations.push_back(sent->operation);
     }
 
@@ -1631,17 +1923,19 @@ TEST(TcpDriverTest, WritableReadinessRecoversBlockedWriteAndDisablesAfterDrain) 
     ASSERT_TRUE(connected.ok()) << connected.status().ToString();
     ScopedFd peer = AcceptRaw(listener);
 
-    ASSERT_TRUE(driver->SendUntracked({
-        .connection_id = connected->id,
-        .payload = body,
-        .traffic_class = UntrackedTrafficClass::kData,
-    }).ok());
+    std::vector<std::byte> owned_body = body;
+    ASSERT_TRUE(driver->TrySendUntrackedOwned(
+        connected->id, std::move(owned_body),
+        UntrackedTrafficClass::kData).ok());
+    EXPECT_TRUE(owned_body.empty());
 #if defined(__linux__)
     const int epoll_fd = FindProcessEpollFd();
     ASSERT_GE(epoll_fd, 0);
     ASSERT_TRUE(WaitForEpollEventMask(epoll_fd, EPOLLOUT, true, 3000ms));
 #endif
     ASSERT_NE(driver->stats().queued_send_bytes, 0u);
+    ASSERT_TRUE(WaitForSuccessfulSend(*driver));
+    std::this_thread::sleep_for(50ms);
     const uint64_t sends_while_blocked =
         driver->stats().successful_send_syscalls;
     std::this_thread::sleep_for(50ms);
@@ -1719,6 +2013,122 @@ TEST(TcpDriverTest, IncrementalReaderAcceptsOneBytePrefixAndBodyFragments) {
     ASSERT_TRUE(received.ok()) << received.status().ToString();
     ASSERT_EQ(received->messages.size(), 1u);
     EXPECT_EQ(received->messages[0].payload, body);
+}
+
+TEST(TcpDriverTest, OneReadDrainsMultipleBufferedFramesWithinTurnBudget) {
+    TcpDriverOptions options = TestOptions();
+    options.max_receive_frames_per_turn = 8;
+    options.max_receive_bytes_per_turn = 4096;
+    options.io_poll_max_ms = 1000;
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    constexpr size_t kFrameCount = 4;
+    std::array<std::vector<std::byte>, kFrameCount> bodies;
+    std::vector<std::byte> combined;
+    for (size_t index = 0; index < kFrameCount; ++index) {
+        bodies[index] = FrameBody(32, 4000 + index);
+        const std::vector<std::byte> wire = Prefix(bodies[index]);
+        combined.insert(combined.end(), wire.begin(), wire.end());
+    }
+    ASSERT_EQ(SendRawNoSignal(peer.get(), combined),
+              static_cast<ssize_t>(combined.size()));
+    ASSERT_TRUE(WaitForReadyMessageCount(*server, kFrameCount, 200ms));
+
+    auto received = server->Poll({
+        .max_messages = kFrameCount,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = accepted->id,
+    });
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), kFrameCount);
+    for (size_t index = 0; index < kFrameCount; ++index) {
+        EXPECT_EQ(received->messages[index].payload, bodies[index]);
+    }
+}
+
+TEST(TcpDriverTest, ReceiveTurnBudgetsProgressAcrossFramesAndPartialReads) {
+    TcpDriverOptions options = TestOptions();
+    options.max_receive_frames_per_turn = 1;
+    options.max_receive_bytes_per_turn = 7;
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    const std::vector<std::byte> first = FrameBody(64, 4051);
+    const std::vector<std::byte> second = FrameBody(64, 4052);
+    std::vector<std::byte> combined = Prefix(first);
+    const std::vector<std::byte> second_wire = Prefix(second);
+    combined.insert(combined.end(), second_wire.begin(), second_wire.end());
+    ASSERT_EQ(SendRawNoSignal(peer.get(), combined),
+              static_cast<ssize_t>(combined.size()));
+
+    ASSERT_TRUE(WaitForReadyMessageCount(*server, 2));
+    auto received = server->Poll({
+        .max_messages = 2,
+        .max_bytes = 4096,
+        .timeout_ms = 0,
+        .connection_id = accepted->id,
+    });
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 2u);
+    EXPECT_EQ(received->messages[0].payload, first);
+    EXPECT_EQ(received->messages[1].payload, second);
+    EXPECT_EQ(server->stats().active_connections, 1u);
+}
+
+TEST(TcpDriverTest, MalformedSecondBufferedFrameFailsClosed) {
+    TcpDriverOptions options = TestOptions();
+    options.max_receive_frames_per_turn = 8;
+    options.max_receive_bytes_per_turn = 4096;
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    auto server_result = TcpDriver::Create(options);
+    ASSERT_TRUE(server_result.ok()) << server_result.status().ToString();
+    std::unique_ptr<TcpDriver> server = std::move(*server_result);
+    ASSERT_TRUE(server->Start(TestConfig()).ok());
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = server->Listen({.local_endpoint = endpoint, .backlog = 2});
+    ASSERT_TRUE(listener.ok());
+    ScopedFd peer = ConnectRaw(endpoint);
+    auto accepted = server->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    std::vector<std::byte> combined = Prefix(FrameBody(32, 4099));
+    const std::array<std::byte, 4> malformed_prefix = {
+        std::byte{0x7f}, std::byte{0xff}, std::byte{0xff}, std::byte{0xff}};
+    combined.insert(combined.end(), malformed_prefix.begin(),
+                    malformed_prefix.end());
+    ASSERT_EQ(SendRawNoSignal(peer.get(), combined),
+              static_cast<ssize_t>(combined.size()));
+    EXPECT_TRUE(WaitForConnectionCount(*server, 0));
+    EXPECT_EQ(server->stats().ready_receive_messages, 0u);
+    EXPECT_EQ(server->stats().ready_receive_bytes, 0u);
 }
 
 TEST(TcpDriverTest, OversizedPrefixClosesBeforeAllocatingBody) {

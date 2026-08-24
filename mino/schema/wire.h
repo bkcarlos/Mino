@@ -36,6 +36,19 @@ struct WireLimits {
 uint64_t ZigZagEncode(int64_t value) noexcept;
 int64_t ZigZagDecode(uint64_t value) noexcept;
 
+// Per-call mutable storage for allocation-sensitive codec paths. Keep one per
+// worker/thread; it is intentionally never stored in a prepared codec handle.
+class CanonicalWireScratch {
+public:
+    void Clear() noexcept;
+
+private:
+    friend class CanonicalWireCodec;
+    friend class PreparedCanonicalWireCodec;
+
+    std::vector<std::vector<size_t>> unknown_field_order_;
+};
+
 // Appends/reads the shortest unsigned LEB128 representation. Decode rejects
 // overlong, non-minimal and >64-bit encodings with kCorruption.
 Status EncodeLeb128(uint64_t value, std::vector<std::byte>& output) noexcept;
@@ -51,6 +64,20 @@ public:
 
     static Result<DynamicMessage> Decode(
         const SchemaDescriptor& descriptor, std::span<const std::byte> bytes,
+        std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors = {},
+        const WireLimits& limits = {}) noexcept;
+
+    // Reuse-oriented variants. output/message are cleared before use and are
+    // empty on failure while retaining their allocated capacity. A decode
+    // target must use the same unknown-field limits as limits.
+    static Status EncodeInto(
+        const SchemaDescriptor& descriptor, const DynamicMessage& message,
+        CanonicalWireScratch& scratch, std::vector<std::byte>& output,
+        std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors = {},
+        const WireLimits& limits = {}) noexcept;
+    static Status DecodeInto(
+        const SchemaDescriptor& descriptor, std::span<const std::byte> bytes,
+        CanonicalWireScratch& scratch, DynamicMessage& message,
         std::span<const std::shared_ptr<const SchemaDescriptor>> descriptors = {},
         const WireLimits& limits = {}) noexcept;
 };
@@ -74,6 +101,13 @@ public:
         const DynamicMessage& message) const noexcept;
     Result<DynamicMessage> Decode(
         std::span<const std::byte> bytes) const noexcept;
+
+    Status EncodeInto(const DynamicMessage& message,
+                      CanonicalWireScratch& scratch,
+                      std::vector<std::byte>& output) const noexcept;
+    Status DecodeInto(std::span<const std::byte> bytes,
+                      CanonicalWireScratch& scratch,
+                      DynamicMessage& message) const noexcept;
 
 private:
     class State;

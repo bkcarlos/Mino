@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -118,6 +119,19 @@ protected:
         req.schema = SchemaIdentity{.short_id = 0x1234, .layout_version = 1};
         req.alignment = 1;
         return req;
+    }
+
+    Result<ShmHandle> PublishTransactionObject(uint32_t role,
+                                               uint64_t owner_epoch,
+                                               uint64_t transaction_id) {
+        AllocationRequest request = Request(32);
+        request.owner_epoch = owner_epoch;
+        request.allocation_transaction_id = transaction_id;
+        request.allocation_flags = role;
+        MINO_ASSIGN_OR_RETURN(ShmHandle handle, alloc_.Allocate(request));
+        MINO_RETURN_IF_ERROR(alloc_.BeginBuild(handle).status());
+        MINO_RETURN_IF_ERROR(alloc_.Publish(handle));
+        return handle;
     }
 };
 
@@ -472,6 +486,119 @@ TEST_F(CentralSlabTest, CrashRecoveryClearsUnpublishedSlot) {
     ASSERT_TRUE(reused.ok());
     EXPECT_EQ(reused->offset, handle->offset);
     EXPECT_EQ(reused->generation, handle->generation + 1);
+}
+
+TEST_F(CentralSlabTest,
+       ReclaimPublishedGraphIsValidatedThenChildrenFirstWithoutAppendGap) {
+    constexpr uint64_t kOwner = 0xAA01;
+    constexpr uint64_t kTransaction = 0xBB01;
+    auto root = PublishTransactionObject(kAllocationFlagTransactionRoot,
+                                         kOwner, kTransaction);
+    auto first_child = PublishTransactionObject(
+        kAllocationFlagTransactionChild, kOwner, kTransaction);
+    auto second_child = PublishTransactionObject(
+        kAllocationFlagTransactionChild, kOwner, kTransaction);
+    ASSERT_TRUE(root.ok() && first_child.ok() && second_child.ok());
+    ASSERT_TRUE(alloc_.Retire(*second_child).ok())
+        << "a fully validated graph may already contain Retired children";
+
+    const auto before = alloc_.local_cache_stats();
+    const std::array<ShmHandle, 3> manifest = {
+        *root, *first_child, *second_child};
+    ASSERT_TRUE(alloc_.ReclaimPublishedGraph(*root, manifest).ok());
+    EXPECT_EQ(alloc_.Inspect(*first_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(alloc_.Inspect(*second_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(alloc_.Inspect(*root).status().code(), StatusCode::kNotFound);
+
+    const auto after = alloc_.local_cache_stats();
+    EXPECT_EQ(after.published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+    EXPECT_EQ(after.append_gap_reclaim_scans,
+              before.append_gap_reclaim_scans);
+
+    auto reused = alloc_.Allocate(Request(32));
+    ASSERT_TRUE(reused.ok());
+    EXPECT_EQ(reused->offset, root->offset)
+        << "root must be the last slot returned to the local cursor";
+}
+
+TEST_F(CentralSlabTest,
+       ReclaimPublishedGraphRejectsWrongOwnerTransactionAndRoleBeforeMutation) {
+    constexpr uint64_t kOwner = 0xAA02;
+    constexpr uint64_t kTransaction = 0xBB02;
+    auto root = PublishTransactionObject(kAllocationFlagTransactionRoot,
+                                         kOwner, kTransaction);
+    auto wrong_transaction = PublishTransactionObject(
+        kAllocationFlagTransactionChild, kOwner, kTransaction + 1);
+    ASSERT_TRUE(root.ok() && wrong_transaction.ok());
+    const std::array<ShmHandle, 2> transaction_manifest = {
+        *root, *wrong_transaction};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, transaction_manifest).code(),
+              StatusCode::kCorruption);
+    ASSERT_TRUE(alloc_.Inspect(*root).ok());
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+
+    auto wrong_owner = PublishTransactionObject(
+        kAllocationFlagTransactionChild, kOwner + 1, kTransaction);
+    ASSERT_TRUE(wrong_owner.ok());
+    const std::array<ShmHandle, 2> owner_manifest = {*root, *wrong_owner};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, owner_manifest).code(),
+              StatusCode::kCorruption);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+
+    auto wrong_role = PublishTransactionObject(
+        kAllocationFlagTransactionRoot, kOwner, kTransaction);
+    ASSERT_TRUE(wrong_role.ok());
+    const std::array<ShmHandle, 2> role_manifest = {*root, *wrong_role};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, role_manifest).code(),
+              StatusCode::kCorruption);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+}
+
+TEST_F(CentralSlabTest,
+       ReclaimPublishedGraphRejectsStaleDuplicateForeignAndUnpublishedChild) {
+    constexpr uint64_t kOwner = 0xAA03;
+    constexpr uint64_t kTransaction = 0xBB03;
+    auto root = PublishTransactionObject(kAllocationFlagTransactionRoot,
+                                         kOwner, kTransaction);
+    auto child = PublishTransactionObject(kAllocationFlagTransactionChild,
+                                          kOwner, kTransaction);
+    ASSERT_TRUE(root.ok() && child.ok());
+
+    const std::array<ShmHandle, 3> duplicate = {*root, *child, *child};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, duplicate).code(),
+              StatusCode::kCorruption);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+
+    ShmHandle foreign = *child;
+    foreign.region_id = 0xFFFFu;
+    const std::array<ShmHandle, 2> foreign_manifest = {*root, foreign};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, foreign_manifest).code(),
+              StatusCode::kInvalidArgument);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+    EXPECT_TRUE(alloc_.Inspect(*child).ok())
+        << "foreign manifest rejection must not reclaim a local lookalike";
+
+    ASSERT_TRUE(alloc_.Retire(*child).ok());
+    ASSERT_TRUE(alloc_.Reclaim(*child).ok());
+    const std::array<ShmHandle, 2> stale_manifest = {*root, *child};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, stale_manifest).code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
+
+    AllocationRequest building_request = Request(32);
+    building_request.owner_epoch = kOwner;
+    building_request.allocation_transaction_id = kTransaction;
+    building_request.allocation_flags = kAllocationFlagTransactionChild;
+    auto building = alloc_.Allocate(building_request);
+    ASSERT_TRUE(building.ok());
+    ASSERT_TRUE(alloc_.BeginBuild(*building).ok());
+    const std::array<ShmHandle, 2> building_manifest = {*root, *building};
+    EXPECT_EQ(alloc_.ReclaimPublishedGraph(*root, building_manifest).code(),
+              StatusCode::kCorruption);
+    EXPECT_EQ(alloc_.Inspect(*root)->state, ObjectState::kPublished);
 }
 
 TEST_F(CentralSlabTest, LocalCursorCacheCanBeConfiguredDrainedAndObserved) {

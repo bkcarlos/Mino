@@ -836,37 +836,18 @@ void ValidateSequenceAndPhase(const CommonOptions& options,
     }
 }
 
-bool IsRetryable(const Status& status) {
-    return status.code() == StatusCode::kResourceExhausted ||
-           status.code() == StatusCode::kWouldBlock;
-}
-
 template <typename Frame>
 void PublishBounded(Publisher<Frame>* publisher,
                     const SemanticFrame& semantic, Deadline deadline) {
-    for (;;) {
-        if (deadline.expired()) {
-            throw std::runtime_error("deadline expired before SHM publish");
-        }
-        Result<MessageBuilder<Frame>> allocated = publisher->Allocate(deadline);
-        if (!allocated.ok()) {
-            if (IsRetryable(allocated.status())) {
-                std::this_thread::yield();
-                continue;
-            }
-            ThrowStatus("Publisher::Allocate", allocated.status());
-        }
-        PopulateGeneratedFrame(semantic, &*allocated);
-        const Status published =
-            publisher->PublishLocal(std::move(*allocated), deadline);
-        if (published.ok()) return;
-        // kFail never spins in SpscChannel. PublishLocal aborts the active
-        // builder before returning queue-full, then this loop retries bounded
-        // by the shared absolute Deadline.
-        if (IsRetryable(published)) {
-            std::this_thread::yield();
-            continue;
-        }
+    if (deadline.expired()) {
+        throw std::runtime_error("deadline expired before SHM publish");
+    }
+    Result<MessageBuilder<Frame>> allocated = publisher->Allocate(deadline);
+    if (!allocated.ok()) ThrowStatus("Publisher::Allocate", allocated.status());
+    PopulateGeneratedFrame(semantic, &*allocated);
+    const Status published =
+        publisher->PublishLocal(std::move(*allocated), deadline);
+    if (!published.ok()) {
         ThrowStatus("Publisher::PublishLocal", published);
     }
 }
@@ -893,7 +874,7 @@ void RunSource(const CommonOptions& options, CentralSlabAllocator* allocator,
                RunStatistics* statistics) {
     Publisher<Frame> publisher(
         *allocator, *output, 1, *journal, ProcessIdentity::Current(),
-        PublisherOptions{.queue_full_policy = QueueFullPolicy::kFail});
+        PublisherOptions{.queue_full_policy = QueueFullPolicy::kBlock});
     const uint64_t total = TotalFrames(options);
     const uint64_t schedule_start_ns = NowNs();
     for (uint64_t sample_id = 0; sample_id < total; ++sample_id) {
@@ -926,7 +907,7 @@ void RunForwarder(const CommonOptions& options,
     Publisher<Frame> publisher(
         *allocator, *output, output_edge + 1, *journal,
         ProcessIdentity::Current(),
-        PublisherOptions{.queue_full_policy = QueueFullPolicy::kFail});
+        PublisherOptions{.queue_full_policy = QueueFullPolicy::kBlock});
     const uint64_t total = TotalFrames(options);
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         BorrowedMessage<Frame> borrowed =
@@ -1004,7 +985,7 @@ std::string BackendDetails(uint64_t capacity, uint64_t segment_bytes,
            "\"allocator\":\"CentralSlabAllocator\","
            "\"channel\":\"SpscChannel\","
            "\"typed_runtime\":\"Publisher<T>/Subscriber<T>\","
-           "\"queue_full_policy\":\"fail_with_deadline_bounded_retry\","
+           "\"queue_full_policy\":\"deadline_bounded_block\","
            "\"capacity\":" + std::to_string(capacity) +
            ",\"channel_count\":5,\"segment_bytes\":" +
            std::to_string(segment_bytes) + ",\"frame_bytes\":" +

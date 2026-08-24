@@ -100,7 +100,8 @@ public:
         void*) noexcept;
 
     static constexpr uint64_t kMagic = 0x4D49'4E4F'414A'4E4CULL;
-    static constexpr uint32_t kLayoutVersion = 2;
+    static constexpr uint32_t kLayoutVersion = 3;
+    static constexpr uint32_t kInlineHandleCapacity = 2;
     static constexpr uint64_t kMaxTransactionEpoch = (uint64_t{1} << 56) - 1;
 
     struct SharedControl;
@@ -232,7 +233,8 @@ private:
                         AllocationJournalState from) noexcept;
     Status ContinueReclaim(uint32_t journal_index, uint64_t tag) noexcept;
     Status ContinueFinalize(uint32_t journal_index, uint64_t tag) noexcept;
-    SharedHandle* HandlesAt(uint32_t journal_index) const noexcept;
+    SharedHandle* HandleAt(uint32_t journal_index,
+                           uint32_t handle_index) const noexcept;
     static ShmHandle LoadHandle(const SharedHandle& handle) noexcept;
     static void StoreHandle(SharedHandle& destination,
                             ShmHandle handle) noexcept;

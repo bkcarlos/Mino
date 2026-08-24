@@ -188,7 +188,249 @@ PerfTraceContext DecodeTrace(std::span<const std::byte> input,
     };
 }
 
+Result<std::vector<std::byte>> EncodeWithPrefix(
+    const WireFrame& frame, size_t prefix_size,
+    const WireFrameLimits& limits) {
+    MINO_ASSIGN_OR_RETURN(const size_t body_length,
+                          WireFrameCodec::EncodedSize(frame, limits));
+    const bool is_control =
+        HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame);
+    const bool has_payload_crc =
+        HasFrameFlag(frame.header.flags, FrameFlag::kPayloadCrcPresent);
+    const size_t wire_payload_length =
+        frame.payload.size() +
+        (is_control ? kWireControlOpcodeLength : 0u);
+    const uint32_t header_length =
+        CanonicalHeaderLength(frame.header.flags);
+
+    std::vector<std::byte> output(prefix_size + body_length);
+    std::span<std::byte> bytes(output);
+    std::span<std::byte> body = bytes.subspan(prefix_size, body_length);
+    if (prefix_size != 0) {
+        WriteBe32(bytes, 0, static_cast<uint32_t>(body_length));
+    }
+
+    WriteBe32(body, kMagicOffset, kWireFrameMagic);
+    WriteBe16(body, kVersionOffset, kWireProtocolVersion);
+    WriteBe16(body, kFlagsOffset, frame.header.flags);
+    WriteBe32(body, kHeaderLengthOffset, header_length);
+    WriteBe32(body, kTopicIdOffset, frame.header.topic_id);
+    WriteBe32(body, kMsgTypeOffset, frame.header.msg_type);
+    WriteBe32(body, kConnectionSchemaRefOffset,
+              frame.header.connection_schema_ref);
+    WriteBe32(body, kSchemaVersionOffset, frame.header.schema_version);
+    WriteBe32(body, kLayoutVersionOffset, frame.header.layout_version);
+    WriteBe64(body, kSourceNodeIdOffset, frame.header.source_node_id);
+    WriteBe64(body, kSourcePublisherIdOffset,
+              frame.header.source_publisher_id);
+    WriteBe64(body, kSourcePublisherEpochOffset,
+              frame.header.source_publisher_epoch);
+    WriteBe64(body, kSequenceNumOffset, frame.header.sequence_num);
+    WriteBe64(body, kTimestampNsOffset, frame.header.timestamp_ns);
+    WriteBe32(body, kPayloadLengthOffset,
+              static_cast<uint32_t>(wire_payload_length));
+    WriteBe32(body, kHeaderCrcOffset, 0);
+
+    Crc32cAccumulator payload_crc;
+    size_t payload_offset = header_length;
+    if (is_control) {
+        WriteBe32(body, payload_offset,
+                  static_cast<uint32_t>(frame.header.frame_type));
+        if (has_payload_crc) {
+            payload_crc.Update(body.subspan(payload_offset,
+                                            kWireControlOpcodeLength));
+        }
+        payload_offset += kWireControlOpcodeLength;
+    }
+    std::span<std::byte> payload_output =
+        body.subspan(payload_offset, frame.payload.size());
+    if (has_payload_crc) {
+        payload_crc.CopyAndUpdate(frame.payload, payload_output);
+    } else {
+        std::copy(frame.payload.begin(), frame.payload.end(),
+                  payload_output.begin());
+    }
+
+    size_t optional_offset = kOptionalHeaderOffset;
+    if (has_payload_crc) {
+        WriteBe32(body, optional_offset, payload_crc.Finish());
+        optional_offset += kWirePayloadCrcLength;
+    }
+    if (frame.header.perf_trace.has_value()) {
+        EncodeTrace(*frame.header.perf_trace, body, optional_offset);
+        optional_offset += kWirePerfTraceContextLength;
+    }
+    if (optional_offset != header_length) {
+        return Status::Error(StatusCode::kInternal,
+                             "canonical header construction mismatch");
+    }
+
+    WriteBe32(body, kHeaderCrcOffset,
+              HeaderCrc(std::span<const std::byte>(body).first(
+                  header_length)));
+    return output;
+}
+
+struct DecodedFrameParts {
+    WireFrameHeader header;
+    std::span<const std::byte> payload;
+};
+
+Result<DecodedFrameParts> DecodeFrameBody(
+    std::span<const std::byte> frame_body,
+    const WireFrameLimits& limits) {
+    const uint64_t maximum_body_length =
+        static_cast<uint64_t>(kWireMaximumHeaderLength) +
+        limits.max_payload_length;
+    if (frame_body.size() > maximum_body_length) {
+        return Resource("frame body exceeds configured maximum");
+    }
+    if (frame_body.size() < kWireBaseHeaderLength) {
+        return Corruption("frame is shorter than the base header");
+    }
+    if (ReadBe32(frame_body, kMagicOffset) != kWireFrameMagic) {
+        return Corruption("frame magic mismatch");
+    }
+    if (ReadBe16(frame_body, kVersionOffset) != kWireProtocolVersion) {
+        return Unsupported("unsupported wire protocol version");
+    }
+
+    const uint16_t flags = ReadBe16(frame_body, kFlagsOffset);
+    const bool has_trace =
+        HasFrameFlag(flags, FrameFlag::kPerfTraceSampled);
+    Status validation = ValidateFlags(flags, has_trace, false);
+    if (!validation.ok()) return validation;
+
+    const uint32_t header_length =
+        ReadBe32(frame_body, kHeaderLengthOffset);
+    if (header_length != CanonicalHeaderLength(flags)) {
+        return Corruption("noncanonical header_length");
+    }
+    if (header_length > frame_body.size()) {
+        return Corruption("truncated optional header");
+    }
+
+    const uint32_t stored_header_crc =
+        ReadBe32(frame_body, kHeaderCrcOffset);
+    if (stored_header_crc != HeaderCrc(frame_body.first(header_length))) {
+        return Corruption("header CRC32C mismatch");
+    }
+
+    const uint32_t payload_length =
+        ReadBe32(frame_body, kPayloadLengthOffset);
+    if (payload_length > limits.max_payload_length) {
+        return Resource("wire payload exceeds max_payload_length");
+    }
+    const uint64_t expected_body_length =
+        static_cast<uint64_t>(header_length) + payload_length;
+    if (expected_body_length != frame_body.size()) {
+        return Corruption(expected_body_length < frame_body.size()
+                              ? "trailing bytes after frame payload"
+                              : "truncated frame payload");
+    }
+
+    size_t optional_offset = kOptionalHeaderOffset;
+    std::optional<uint32_t> stored_payload_crc;
+    if (HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent)) {
+        stored_payload_crc = ReadBe32(frame_body, optional_offset);
+        optional_offset += kWirePayloadCrcLength;
+    }
+
+    std::optional<PerfTraceContext> trace;
+    if (has_trace) {
+        trace = DecodeTrace(frame_body, optional_offset);
+        optional_offset += kWirePerfTraceContextLength;
+    }
+    if (optional_offset != header_length) {
+        return Corruption("noncanonical optional header fields");
+    }
+
+    const auto wire_payload =
+        frame_body.subspan(header_length, payload_length);
+    if (stored_payload_crc.has_value() &&
+        *stored_payload_crc != Crc32c(wire_payload)) {
+        return Corruption("payload CRC32C mismatch");
+    }
+
+    FrameType frame_type = FrameType::kData;
+    auto decoded_payload = wire_payload;
+    if (HasFrameFlag(flags, FrameFlag::kControlFrame)) {
+        if (wire_payload.size() < kWireControlOpcodeLength) {
+            return Corruption("control payload is missing its opcode");
+        }
+        frame_type = static_cast<FrameType>(ReadBe32(wire_payload, 0));
+        validation = ValidateFrameType(flags, frame_type, false);
+        if (!validation.ok()) return validation;
+        decoded_payload = wire_payload.subspan(kWireControlOpcodeLength);
+    }
+
+    return DecodedFrameParts{
+        .header = WireFrameHeader{
+            .frame_type = frame_type,
+            .flags = flags,
+            .topic_id = ReadBe32(frame_body, kTopicIdOffset),
+            .msg_type = ReadBe32(frame_body, kMsgTypeOffset),
+            .connection_schema_ref =
+                ReadBe32(frame_body, kConnectionSchemaRefOffset),
+            .schema_version = ReadBe32(frame_body, kSchemaVersionOffset),
+            .layout_version = ReadBe32(frame_body, kLayoutVersionOffset),
+            .source_node_id = ReadBe64(frame_body, kSourceNodeIdOffset),
+            .source_publisher_id =
+                ReadBe64(frame_body, kSourcePublisherIdOffset),
+            .source_publisher_epoch =
+                ReadBe64(frame_body, kSourcePublisherEpochOffset),
+            .sequence_num = ReadBe64(frame_body, kSequenceNumOffset),
+            .timestamp_ns = ReadBe64(frame_body, kTimestampNsOffset),
+            .perf_trace = trace,
+        },
+        .payload = decoded_payload,
+    };
+}
+
 }  // namespace
+
+ValidatedWireFrameView::ValidatedWireFrameView(
+    std::vector<std::byte>&& body, WireFrameHeader&& decoded_header,
+    size_t payload_offset, size_t payload_size) noexcept
+    : header(std::move(decoded_header)),
+      payload(),
+      body_(std::move(body)),
+      payload_offset_(payload_offset),
+      payload_size_(payload_size) {
+    RebindPayload();
+}
+
+ValidatedWireFrameView::ValidatedWireFrameView(
+    ValidatedWireFrameView&& other) noexcept
+    : header(std::move(other.header)),
+      payload(),
+      body_(std::move(other.body_)),
+      payload_offset_(other.payload_offset_),
+      payload_size_(other.payload_size_) {
+    RebindPayload();
+    other.payload_offset_ = 0;
+    other.payload_size_ = 0;
+    other.RebindPayload();
+}
+
+ValidatedWireFrameView& ValidatedWireFrameView::operator=(
+    ValidatedWireFrameView&& other) noexcept {
+    if (this == &other) return *this;
+    body_ = std::move(other.body_);
+    payload_offset_ = other.payload_offset_;
+    payload_size_ = other.payload_size_;
+    header = std::move(other.header);
+    RebindPayload();
+    other.payload_offset_ = 0;
+    other.payload_size_ = 0;
+    other.RebindPayload();
+    return *this;
+}
+
+void ValidatedWireFrameView::RebindPayload() noexcept {
+    payload = std::span<const std::byte>(body_).subspan(payload_offset_,
+                                                         payload_size_);
+}
 
 Result<size_t> WireFrameCodec::EncodedSize(
     const WireFrame& frame, const WireFrameLimits& limits) noexcept {
@@ -235,70 +477,7 @@ Result<size_t> WireFrameCodec::EncodedSize(
 Result<std::vector<std::byte>> WireFrameCodec::Encode(
     const WireFrame& frame, const WireFrameLimits& limits) noexcept {
     try {
-        MINO_ASSIGN_OR_RETURN(const size_t body_length,
-                              EncodedSize(frame, limits));
-        const bool is_control =
-            HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame);
-        const size_t wire_payload_length =
-            frame.payload.size() +
-            (is_control ? kWireControlOpcodeLength : 0u);
-        const uint32_t header_length =
-            CanonicalHeaderLength(frame.header.flags);
-
-        std::vector<std::byte> output(body_length);
-        std::span<std::byte> bytes(output);
-        WriteBe32(bytes, kMagicOffset, kWireFrameMagic);
-        WriteBe16(bytes, kVersionOffset, kWireProtocolVersion);
-        WriteBe16(bytes, kFlagsOffset, frame.header.flags);
-        WriteBe32(bytes, kHeaderLengthOffset, header_length);
-        WriteBe32(bytes, kTopicIdOffset, frame.header.topic_id);
-        WriteBe32(bytes, kMsgTypeOffset, frame.header.msg_type);
-        WriteBe32(bytes, kConnectionSchemaRefOffset,
-                  frame.header.connection_schema_ref);
-        WriteBe32(bytes, kSchemaVersionOffset, frame.header.schema_version);
-        WriteBe32(bytes, kLayoutVersionOffset, frame.header.layout_version);
-        WriteBe64(bytes, kSourceNodeIdOffset, frame.header.source_node_id);
-        WriteBe64(bytes, kSourcePublisherIdOffset,
-                  frame.header.source_publisher_id);
-        WriteBe64(bytes, kSourcePublisherEpochOffset,
-                  frame.header.source_publisher_epoch);
-        WriteBe64(bytes, kSequenceNumOffset, frame.header.sequence_num);
-        WriteBe64(bytes, kTimestampNsOffset, frame.header.timestamp_ns);
-        WriteBe32(bytes, kPayloadLengthOffset,
-                  static_cast<uint32_t>(wire_payload_length));
-        WriteBe32(bytes, kHeaderCrcOffset, 0);
-
-        size_t payload_offset = header_length;
-        if (is_control) {
-            WriteBe32(bytes, payload_offset,
-                      static_cast<uint32_t>(frame.header.frame_type));
-            payload_offset += kWireControlOpcodeLength;
-        }
-        std::copy(frame.payload.begin(), frame.payload.end(),
-                  output.begin() + payload_offset);
-        const auto wire_payload =
-            std::span<const std::byte>(bytes).subspan(
-                header_length, static_cast<size_t>(wire_payload_length));
-
-        size_t optional_offset = kOptionalHeaderOffset;
-        if (HasFrameFlag(frame.header.flags,
-                         FrameFlag::kPayloadCrcPresent)) {
-            WriteBe32(bytes, optional_offset, Crc32c(wire_payload));
-            optional_offset += kWirePayloadCrcLength;
-        }
-        if (frame.header.perf_trace.has_value()) {
-            EncodeTrace(*frame.header.perf_trace, bytes, optional_offset);
-            optional_offset += kWirePerfTraceContextLength;
-        }
-        if (optional_offset != header_length) {
-            return Status::Error(StatusCode::kInternal,
-                                 "canonical header construction mismatch");
-        }
-
-        WriteBe32(bytes, kHeaderCrcOffset,
-                  HeaderCrc(std::span<const std::byte>(bytes).first(
-                      header_length)));
-        return output;
+        return EncodeWithPrefix(frame, 0, limits);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {
@@ -309,14 +488,7 @@ Result<std::vector<std::byte>> WireFrameCodec::Encode(
 Result<std::vector<std::byte>> WireFrameCodec::EncodeLengthPrefixed(
     const WireFrame& frame, const WireFrameLimits& limits) noexcept {
     try {
-        auto body = Encode(frame, limits);
-        if (!body.ok()) return body.status();
-        const size_t output_size = kLengthPrefixSize + body->size();
-        std::vector<std::byte> output(output_size);
-        WriteBe32(output, 0, static_cast<uint32_t>(body->size()));
-        std::copy(body->begin(), body->end(),
-                  output.begin() + kLengthPrefixSize);
-        return output;
+        return EncodeWithPrefix(frame, kLengthPrefixSize, limits);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {
@@ -422,113 +594,33 @@ Result<WireFrame> WireFrameCodec::Decode(
     std::span<const std::byte> frame_body,
     const WireFrameLimits& limits) noexcept {
     try {
-        const uint64_t maximum_body_length =
-            static_cast<uint64_t>(kWireMaximumHeaderLength) +
-            limits.max_payload_length;
-        if (frame_body.size() > maximum_body_length) {
-            return Resource("frame body exceeds configured maximum");
-        }
-        if (frame_body.size() < kWireBaseHeaderLength) {
-            return Corruption("frame is shorter than the base header");
-        }
-        if (ReadBe32(frame_body, kMagicOffset) != kWireFrameMagic) {
-            return Corruption("frame magic mismatch");
-        }
-        if (ReadBe16(frame_body, kVersionOffset) != kWireProtocolVersion) {
-            return Unsupported("unsupported wire protocol version");
-        }
-
-        const uint16_t flags = ReadBe16(frame_body, kFlagsOffset);
-        const bool has_trace =
-            HasFrameFlag(flags, FrameFlag::kPerfTraceSampled);
-        Status validation = ValidateFlags(flags, has_trace, false);
-        if (!validation.ok()) return validation;
-
-        const uint32_t header_length =
-            ReadBe32(frame_body, kHeaderLengthOffset);
-        if (header_length != CanonicalHeaderLength(flags)) {
-            return Corruption("noncanonical header_length");
-        }
-        if (header_length > frame_body.size()) {
-            return Corruption("truncated optional header");
-        }
-
-        const uint32_t stored_header_crc =
-            ReadBe32(frame_body, kHeaderCrcOffset);
-        if (stored_header_crc != HeaderCrc(frame_body.first(header_length))) {
-            return Corruption("header CRC32C mismatch");
-        }
-
-        const uint32_t payload_length =
-            ReadBe32(frame_body, kPayloadLengthOffset);
-        if (payload_length > limits.max_payload_length) {
-            return Resource("wire payload exceeds max_payload_length");
-        }
-        const uint64_t expected_body_length =
-            static_cast<uint64_t>(header_length) + payload_length;
-        if (expected_body_length != frame_body.size()) {
-            return Corruption(expected_body_length < frame_body.size()
-                                  ? "trailing bytes after frame payload"
-                                  : "truncated frame payload");
-        }
-
-        size_t optional_offset = kOptionalHeaderOffset;
-        std::optional<uint32_t> stored_payload_crc;
-        if (HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent)) {
-            stored_payload_crc = ReadBe32(frame_body, optional_offset);
-            optional_offset += kWirePayloadCrcLength;
-        }
-
-        std::optional<PerfTraceContext> trace;
-        if (has_trace) {
-            trace = DecodeTrace(frame_body, optional_offset);
-            optional_offset += kWirePerfTraceContextLength;
-        }
-        if (optional_offset != header_length) {
-            return Corruption("noncanonical optional header fields");
-        }
-
-        const auto wire_payload =
-            frame_body.subspan(header_length, payload_length);
-        if (stored_payload_crc.has_value() &&
-            *stored_payload_crc != Crc32c(wire_payload)) {
-            return Corruption("payload CRC32C mismatch");
-        }
-
-        FrameType frame_type = FrameType::kData;
-        auto decoded_payload = wire_payload;
-        if (HasFrameFlag(flags, FrameFlag::kControlFrame)) {
-            if (wire_payload.size() < kWireControlOpcodeLength) {
-                return Corruption("control payload is missing its opcode");
-            }
-            frame_type =
-                static_cast<FrameType>(ReadBe32(wire_payload, 0));
-            validation = ValidateFrameType(flags, frame_type, false);
-            if (!validation.ok()) return validation;
-            decoded_payload = wire_payload.subspan(kWireControlOpcodeLength);
-        }
+        auto decoded = DecodeFrameBody(frame_body, limits);
+        if (!decoded.ok()) return decoded.status();
 
         WireFrame frame;
-        frame.header = WireFrameHeader{
-            .frame_type = frame_type,
-            .flags = flags,
-            .topic_id = ReadBe32(frame_body, kTopicIdOffset),
-            .msg_type = ReadBe32(frame_body, kMsgTypeOffset),
-            .connection_schema_ref =
-                ReadBe32(frame_body, kConnectionSchemaRefOffset),
-            .schema_version = ReadBe32(frame_body, kSchemaVersionOffset),
-            .layout_version = ReadBe32(frame_body, kLayoutVersionOffset),
-            .source_node_id = ReadBe64(frame_body, kSourceNodeIdOffset),
-            .source_publisher_id =
-                ReadBe64(frame_body, kSourcePublisherIdOffset),
-            .source_publisher_epoch =
-                ReadBe64(frame_body, kSourcePublisherEpochOffset),
-            .sequence_num = ReadBe64(frame_body, kSequenceNumOffset),
-            .timestamp_ns = ReadBe64(frame_body, kTimestampNsOffset),
-            .perf_trace = trace,
-        };
-        frame.payload.assign(decoded_payload.begin(), decoded_payload.end());
+        frame.header = std::move(decoded->header);
+        frame.payload.assign(decoded->payload.begin(), decoded->payload.end());
         return frame;
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
+
+Result<ValidatedWireFrameView> WireFrameCodec::DecodeView(
+    std::vector<std::byte>&& frame_body,
+    const WireFrameLimits& limits) noexcept {
+    try {
+        auto decoded = DecodeFrameBody(frame_body, limits);
+        if (!decoded.ok()) return decoded.status();
+
+        const size_t payload_offset = static_cast<size_t>(
+            decoded->payload.data() - frame_body.data());
+        const size_t payload_size = decoded->payload.size();
+        return ValidatedWireFrameView(
+            std::move(frame_body), std::move(decoded->header), payload_offset,
+            payload_size);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {

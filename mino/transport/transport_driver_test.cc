@@ -583,6 +583,59 @@ TEST(TransportDriverTest, SendAdmissionDoesNotCompleteRemoteReceipt) {
     EXPECT_EQ(driver.state(), DriverState::kStopped);
 }
 
+TEST(TransportDriverTest, OwnedFallbackConsumesOnlySuccessfulAdmissions) {
+    MockTransportDriver driver;
+    DriverConfig config;
+    config.max_queued_sends = 1;
+    ASSERT_TRUE(driver.Start(config).ok());
+
+    std::vector<std::byte> owned = {
+        std::byte{1}, std::byte{2}, std::byte{3}};
+    const std::vector<std::byte> expected = owned;
+    auto sent = driver.TrySendOwned(1, std::move(owned));
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    EXPECT_TRUE(owned.empty());
+
+    std::vector<std::byte> queue_full = {std::byte{4}};
+    const std::vector<std::byte> queue_full_expected = queue_full;
+    auto blocked = driver.TrySendOwned(1, std::move(queue_full));
+    ASSERT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(queue_full, queue_full_expected);
+
+    driver.QueueCompletion(DeliveryCompletion{
+        .operation = sent->operation,
+        .reached_stage = DeliveryStage::kRemoteAccepted,
+    });
+    ASSERT_TRUE(driver.PollCompletions({}).ok());
+
+    driver.return_bad_send_result(true);
+    std::vector<std::byte> invalid_admission = {std::byte{5}};
+    const std::vector<std::byte> invalid_expected = invalid_admission;
+    auto invalid = driver.TrySendOwned(1, std::move(invalid_admission));
+    ASSERT_FALSE(invalid.ok());
+    EXPECT_EQ(invalid.status().code(), StatusCode::kInternal);
+    EXPECT_EQ(invalid_admission, invalid_expected);
+    driver.return_bad_send_result(false);
+
+    std::vector<std::byte> untracked = {std::byte{6}, std::byte{7}};
+    auto untracked_sent = driver.TrySendUntrackedOwned(
+        1, std::move(untracked), UntrackedTrafficClass::kData);
+    ASSERT_TRUE(untracked_sent.ok()) << untracked_sent.status().ToString();
+    EXPECT_TRUE(untracked.empty());
+
+    std::vector<std::byte> missing = {std::byte{8}};
+    const std::vector<std::byte> missing_expected = missing;
+    auto missing_sent = driver.TrySendUntrackedOwned(99, std::move(missing));
+    ASSERT_FALSE(missing_sent.ok());
+    EXPECT_EQ(missing_sent.status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(missing, missing_expected);
+
+    auto received = driver.Poll({.max_messages = 1, .max_bytes = 16});
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->messages.front().payload, expected);
+}
+
 TEST(TransportDriverTest, WrapperRejectsBoundsAndBrokenDriverResults) {
     MockTransportDriver driver;
     ASSERT_TRUE(driver.Start(DriverConfig{}).ok());

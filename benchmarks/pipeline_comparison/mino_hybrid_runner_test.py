@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
+import hashlib
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -38,6 +41,7 @@ class MinoHybridRunnerTest(unittest.TestCase):
             deadline_seconds=60,
             port_base=25000,
             channel_capacity=64,
+            receive_batch_size=1,
             shm_binary_relative=hybrid.DEFAULT_SHM_BINARY,
             bridge_binary_relative=hybrid.DEFAULT_BRIDGE_BINARY,
             schema_descriptor_relative=network.DEFAULT_DESCRIPTOR,
@@ -55,6 +59,50 @@ class MinoHybridRunnerTest(unittest.TestCase):
                 environment={},
             )
             for index, role in enumerate(network.ROLES)
+        }
+
+    @staticmethod
+    def bridge_document(
+        args: argparse.Namespace,
+        *,
+        mode: str,
+        boot_id: str,
+        clock_mode: str = "independent-hosts",
+    ) -> dict[str, object]:
+        total = args.messages + args.warmup_messages
+        source = mode == "source"
+        return {
+            "schema": hybrid.BRIDGE_SCHEMA,
+            "run_id": "run-result",
+            "edge": 2,
+            "mode": mode,
+            "validation": "structural",
+            "profile": args.profile,
+            "clock_mode": clock_mode,
+            "clock": {
+                "name": "CLOCK_MONOTONIC_RAW",
+                "resolution_ns": 1,
+                "boot_id": boot_id,
+            },
+            "compilation_mode": "opt",
+            "receive_batch_size": args.receive_batch_size,
+            "outcome": "success",
+            "error": "",
+            "counters": {
+                "validation_calls": 0,
+                "validation_payload_bytes": 0,
+                "validation_thread_cpu_ns": 0,
+            },
+            "wire": {
+                "data_frames_sent": total if source else 0,
+                "data_frame_body_bytes_sent": total * 320 if source else 0,
+                "data_frames_received": 0 if source else total,
+                "data_frame_body_bytes_received": 0 if source else total * 320,
+                "control_frames_sent": 0 if source else 1,
+                "control_frame_body_bytes_sent": 0 if source else 128,
+                "control_frames_received": 1 if source else 0,
+                "control_frame_body_bytes_received": 128 if source else 0,
+            },
         }
 
     def test_three_plus_three_maps_only_middle_edge_to_tcp(self) -> None:
@@ -86,6 +134,233 @@ class MinoHybridRunnerTest(unittest.TestCase):
         self.assertEqual("10.0.0.12", source.command[source.command.index("--peer-address") + 1])
         self.assertEqual(shm_names["boot-b"], sink.command[sink.command.index("--shm-name") + 1])
         self.assertEqual(shm_names["boot-a"], source.command[source.command.index("--shm-name") + 1])
+        for bridge in bridges:
+            self.assertEqual(
+                "structural",
+                bridge.command[bridge.command.index("--bridge-validation") + 1],
+            )
+            self.assertEqual(
+                "independent-hosts",
+                bridge.command[bridge.command.index("--clock-mode") + 1],
+            )
+            self.assertEqual(
+                "1",
+                bridge.command[bridge.command.index("--receive-batch-size") + 1],
+            )
+            self.assertIsNotNone(bridge.result_remote)
+            self.assertIsNotNone(bridge.result_local)
+            self.assertEqual(
+                str(bridge.result_remote),
+                bridge.command[bridge.command.index("--output") + 1],
+            )
+
+    def test_bridge_result_validation_checks_topology_and_wire_counts(self) -> None:
+        args = self.arguments()
+        host = self.topology()["planning"]
+        process = hybrid.ProcessRecord(
+            name="bridge-edge-2-source",
+            host=host,
+            runtime_dir=Path("/tmp/bridge-source"),
+            command=[],
+            ready_name="ready",
+            stdout_path=Path("/tmp/stdout"),
+            stderr_path=Path("/tmp/stderr"),
+        )
+        process.process = mock.Mock()
+        process.process.poll.return_value = 0
+        total = args.messages + args.warmup_messages
+        document = {
+            "schema": hybrid.BRIDGE_SCHEMA,
+            "run_id": "run-result",
+            "edge": 2,
+            "mode": "source",
+            "validation": "structural",
+            "profile": "small",
+            "clock_mode": "independent-hosts",
+            "clock": {
+                "name": "CLOCK_MONOTONIC_RAW",
+                "resolution_ns": 1,
+                "boot_id": "boot-a",
+            },
+            "compilation_mode": "opt",
+            "receive_batch_size": 1,
+            "outcome": "success",
+            "error": "",
+            "counters": {
+                "validation_calls": 0,
+                "validation_payload_bytes": 0,
+                "validation_thread_cpu_ns": 0,
+            },
+            "wire": {
+                "data_frames_sent": total,
+                "data_frame_body_bytes_sent": total * 320,
+                "data_frames_received": 0,
+                "data_frame_body_bytes_received": 0,
+                "control_frames_sent": 0,
+                "control_frame_body_bytes_sent": 0,
+                "control_frames_received": 1,
+                "control_frame_body_bytes_received": 128,
+            },
+        }
+        self.assertEqual(
+            document,
+            hybrid.validate_bridge_result(
+                document,
+                args=args,
+                process=process,
+                run_id="run-result",
+                same_host=False,
+                expected_boot_id="boot-a",
+            ),
+        )
+        corrupted = dict(document)
+        corrupted["wire"] = dict(document["wire"])
+        corrupted["wire"]["control_frames_received"] = 0
+        with self.assertRaisesRegex(ValueError, "control_frames_received"):
+            hybrid.validate_bridge_result(
+                corrupted,
+                args=args,
+                process=process,
+                run_id="run-result",
+                same_host=False,
+                expected_boot_id="boot-a",
+            )
+
+        sink_process = copy.copy(process)
+        sink_process.name = "bridge-edge-2-sink"
+        sink_process.host = self.topology()["control"]
+        sink_document = self.bridge_document(
+            args, mode="sink", boot_id="boot-b"
+        )
+        self.assertEqual(
+            sink_document,
+            hybrid.validate_bridge_result(
+                sink_document,
+                args=args,
+                process=sink_process,
+                run_id="run-result",
+                same_host=False,
+                expected_boot_id="boot-b",
+            ),
+        )
+        self.assertEqual(
+            args.messages + args.warmup_messages,
+            sink_document["wire"]["data_frames_received"],
+        )
+        self.assertEqual(1, sink_document["wire"]["control_frames_sent"])
+
+    def test_bridge_result_rejects_boot_mismatch_in_each_clock_mode(self) -> None:
+        args = self.arguments()
+        process = hybrid.ProcessRecord(
+            name="bridge-edge-2-source",
+            host=self.topology()["planning"],
+            runtime_dir=Path("/tmp/bridge-source"),
+            command=[],
+            ready_name="ready",
+            stdout_path=Path("/tmp/stdout"),
+            stderr_path=Path("/tmp/stderr"),
+        )
+        process.process = mock.Mock()
+        process.process.poll.return_value = 0
+        for same_host, clock_mode in (
+            (True, "same-host"),
+            (False, "independent-hosts"),
+        ):
+            with self.subTest(clock_mode=clock_mode):
+                document = self.bridge_document(
+                    args,
+                    mode="source",
+                    boot_id="artifact-boot",
+                    clock_mode=clock_mode,
+                )
+                with self.assertRaisesRegex(ValueError, "boot_id"):
+                    hybrid.validate_bridge_result(
+                        document,
+                        args=args,
+                        process=process,
+                        run_id="run-result",
+                        same_host=same_host,
+                        expected_boot_id="preflight-boot",
+                    )
+
+    def test_collects_both_bridges_and_manifest_records_path_and_sha256(self) -> None:
+        assert self.root is not None
+        args = self.arguments()
+        output = self.root / "output"
+        remote = self.root / "remote"
+        results = output / "results"
+        remote.mkdir()
+        results.mkdir(parents=True)
+        topology = self.topology()
+        records: list[hybrid.ProcessRecord] = []
+        for mode, role, boot_id in (
+            ("source", "planning", "boot-a"),
+            ("sink", "control", "boot-b"),
+        ):
+            remote_result = remote / f"{mode}.json"
+            local_result = results / f"bridge-edge-2-{mode}.json"
+            remote_result.write_text(
+                json.dumps(
+                    self.bridge_document(args, mode=mode, boot_id=boot_id)
+                ),
+                encoding="utf-8",
+            )
+            process = hybrid.ProcessRecord(
+                name=f"bridge-edge-2-{mode}",
+                host=topology[role],
+                runtime_dir=Path(f"/tmp/bridge-{mode}"),
+                command=[],
+                ready_name="ready",
+                stdout_path=output / f"{mode}.stdout",
+                stderr_path=output / f"{mode}.stderr",
+                result_remote=remote_result,
+                result_local=local_result,
+            )
+            process.process = mock.Mock()
+            process.process.poll.return_value = 0
+            records.append(process)
+
+        def copy_result(
+            _host: network.RoleHost, source: Path, destination: Path,
+            _timeout: float,
+        ) -> bool:
+            destination.write_bytes(source.read_bytes())
+            return True
+
+        with mock.patch.object(
+            network, "_remote_copy", side_effect=copy_result
+        ):
+            errors, sink = hybrid.collect_and_validate(
+                args,
+                records,
+                {"planning": "boot-a", "control": "boot-b"},
+                "run-result",
+                False,
+            )
+        self.assertEqual([], errors)
+        self.assertIsNone(sink)
+
+        artifacts = hybrid._bridge_artifact_records(records, output)
+        self.assertEqual(
+            [
+                "results/bridge-edge-2-source.json",
+                "results/bridge-edge-2-sink.json",
+            ],
+            [artifact["result"]["path"] for artifact in artifacts],
+        )
+        for process, artifact in zip(records, artifacts):
+            assert process.result_local is not None
+            expected_sha = hashlib.sha256(
+                process.result_local.read_bytes()
+            ).hexdigest()
+            self.assertEqual(expected_sha, artifact["result"]["sha256"])
+
+        manifest_path = output / "manifest.json"
+        network._write_json_atomic(
+            manifest_path, {"bridge_artifacts": artifacts}
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifacts, manifest["bridge_artifacts"])
 
     def test_one_boot_degenerates_to_all_shm_without_bridges(self) -> None:
         assert self.root is not None
@@ -263,6 +538,7 @@ class MinoHybridRunnerTest(unittest.TestCase):
             ["--topology", "/tmp/topology.json", "--output-dir", "/tmp/output"]
         )
         self.assertEqual(8, args.channel_capacity)
+        self.assertEqual(1, args.receive_batch_size)
 
     def test_channel_capacity_must_be_power_of_two(self) -> None:
         args = self.arguments()

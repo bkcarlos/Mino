@@ -85,6 +85,90 @@ TEST(Crc32cTest, HandlesEveryShortTailAtUnalignedAddresses) {
     }
 }
 
+TEST(Crc32cTest, CopyAndUpdateMatchesIndependentCrcForAlignmentAndTails) {
+    std::array<std::byte, 128> source_storage;
+    uint64_t random = 0xd1b54a32d192ed03ull;
+    for (std::byte& byte : source_storage) {
+        byte = static_cast<std::byte>(NextRandom(random));
+    }
+
+    std::array<std::byte, 128> destination_storage;
+    for (size_t source_offset = 0; source_offset < 16; ++source_offset) {
+        for (size_t destination_offset = 0; destination_offset < 16;
+             ++destination_offset) {
+            for (size_t length = 0; length <= 96; ++length) {
+                destination_storage.fill(std::byte{0xa5});
+                const std::span<const std::byte> input(
+                    source_storage.data() + source_offset, length);
+                const std::span<std::byte> output(
+                    destination_storage.data() + destination_offset, length);
+
+                Crc32cAccumulator accumulator;
+                accumulator.CopyAndUpdate(input, output);
+
+                SCOPED_TRACE(source_offset);
+                SCOPED_TRACE(destination_offset);
+                SCOPED_TRACE(length);
+                EXPECT_TRUE(std::equal(input.begin(), input.end(),
+                                       output.begin(), output.end()));
+                EXPECT_EQ(accumulator.Finish(), ReferenceCrc32c(input));
+                if (destination_offset != 0) {
+                    EXPECT_EQ(destination_storage[destination_offset - 1],
+                              std::byte{0xa5});
+                }
+                if (destination_offset + length <
+                    destination_storage.size()) {
+                    EXPECT_EQ(destination_storage[destination_offset + length],
+                              std::byte{0xa5});
+                }
+            }
+        }
+    }
+}
+
+TEST(Crc32cTest, CopyAndUpdateMatchesIndependentCrcAcrossRandomChunks) {
+    std::vector<std::byte> source_storage(4096 + 16);
+    std::vector<std::byte> destination_storage(source_storage.size(),
+                                               std::byte{0xa5});
+    uint64_t random = 0x94d049bb133111ebull;
+    for (std::byte& byte : source_storage) {
+        byte = static_cast<std::byte>(NextRandom(random));
+    }
+
+    for (size_t iteration = 0; iteration < 256; ++iteration) {
+        const size_t source_offset = NextRandom(random) % 16;
+        const size_t destination_offset = NextRandom(random) % 16;
+        const size_t maximum_length =
+            std::min(source_storage.size() - source_offset,
+                     destination_storage.size() - destination_offset);
+        const size_t length = NextRandom(random) % (maximum_length + 1);
+        const std::span<const std::byte> input(
+            source_storage.data() + source_offset, length);
+        const std::span<std::byte> output(
+            destination_storage.data() + destination_offset, length);
+        std::fill(output.begin(), output.end(), std::byte{0xa5});
+
+        Crc32cAccumulator accumulator;
+        size_t consumed = 0;
+        while (consumed < length) {
+            const size_t chunk_size = std::min<size_t>(
+                1 + NextRandom(random) % 37, length - consumed);
+            accumulator.CopyAndUpdate(input.subspan(consumed, chunk_size),
+                                      output.subspan(consumed, chunk_size));
+            consumed += chunk_size;
+        }
+        accumulator.CopyAndUpdate({}, {});
+
+        SCOPED_TRACE(iteration);
+        SCOPED_TRACE(source_offset);
+        SCOPED_TRACE(destination_offset);
+        SCOPED_TRACE(length);
+        EXPECT_TRUE(std::equal(input.begin(), input.end(), output.begin(),
+                               output.end()));
+        EXPECT_EQ(accumulator.Finish(), Crc32c(input));
+    }
+}
+
 TEST(Crc32cTest, MatchesReferenceForRandomLengthsAndChunking) {
     std::vector<std::byte> storage(4096 + 16);
     uint64_t random = 0x9e3779b97f4a7c15ull;

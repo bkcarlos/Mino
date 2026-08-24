@@ -41,6 +41,27 @@ std::string Read(std::string_view path) {
                        std::istreambuf_iterator<char>());
 }
 
+golden::Telemetry BuildTelemetry(
+    golden::TelemetryVariableMetadata label,
+    golden::TelemetryVariableMetadata payload,
+    golden::TelemetryVariableMetadata samples) {
+    golden::Telemetry value;
+    golden::TelemetryBuilder builder(value);
+    builder.set_sequence(1u);
+    EXPECT_TRUE(builder.set_label(label));
+    EXPECT_TRUE(builder.set_payload(payload));
+    EXPECT_TRUE(builder.set_samples(samples));
+    return value;
+}
+
+void StoreU32LittleEndian(golden::Telemetry& value, size_t offset,
+                          uint32_t word) {
+    for (size_t i = 0; i < sizeof(word); ++i) {
+        value.storage[offset + i] =
+            std::byte{static_cast<unsigned char>(word >> (i * 8u))};
+    }
+}
+
 Result<GeneratedArtifacts> Generate(std::string_view idl,
                                     std::string header_include) {
     CompileOptions compile_options;
@@ -134,6 +155,121 @@ TEST(CodeGeneratorTest, FullProductionGoldenCompilesWithRuntimeContract) {
     EXPECT_NE(graph_decode, nullptr);
 }
 
+TEST(CodeGeneratorTest, CollectOwnedGraphIsRootFirstBoundedAndDeterministic) {
+    using Traits = mino::StaticMessageTraits<golden::Telemetry>;
+    static_assert(Traits::kOwnedGraphCollectionSupported);
+    static_assert(Traits::kMaxOwnedGraphHandles == 5u);
+
+    const mino::ShmHandle root{64u, 9u, 7u};
+    const mino::ShmHandle label{128u, 1u, 7u};
+    const mino::ShmHandle payload{256u, 2u, 7u};
+    const mino::ShmHandle samples{384u, 3u, 7u};
+    const golden::Telemetry value = BuildTelemetry(
+        {.offset = label.offset, .generation = label.generation,
+         .region_id = label.region_id, .length = 2u, .capacity = 4u,
+         .element_size = 1u},
+        {.offset = payload.offset, .generation = payload.generation,
+         .region_id = payload.region_id, .length = 3u, .capacity = 8u,
+         .element_size = 1u},
+        {.offset = samples.offset, .generation = samples.generation,
+         .region_id = samples.region_id, .length = 2u, .capacity = 4u,
+         .element_size = 8u});
+
+    std::array<mino::ShmHandle, Traits::kMaxOwnedGraphHandles> first{};
+    std::array<mino::ShmHandle, Traits::kMaxOwnedGraphHandles> second{};
+    size_t first_count = 0;
+    size_t second_count = 0;
+    ASSERT_TRUE(mino::CollectOwnedGraph(root, value, first, first_count).ok());
+    ASSERT_TRUE(mino::CollectOwnedGraph(root, value, second, second_count).ok());
+    ASSERT_EQ(first_count, 4u);
+    EXPECT_EQ(second_count, first_count);
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(first[0], root);
+    EXPECT_EQ(first[1], label);
+    EXPECT_EQ(first[2], payload);
+    EXPECT_EQ(first[3], samples);
+
+    std::array<mino::ShmHandle, 3> bounded{};
+    size_t bounded_count = 99u;
+    const Status bounded_status =
+        mino::CollectOwnedGraph(root, value, bounded, bounded_count);
+    EXPECT_EQ(bounded_status.code(), StatusCode::kResourceExhausted);
+    EXPECT_EQ(bounded_count, 0u);
+}
+
+TEST(CodeGeneratorTest, CollectOwnedGraphAcceptsCanonicalZeroMetadata) {
+    using Traits = mino::StaticMessageTraits<golden::Telemetry>;
+    const golden::Telemetry value = BuildTelemetry(
+        {.element_size = 1u}, {.element_size = 1u}, {.element_size = 8u});
+    const mino::ShmHandle root{64u, 1u, 7u};
+    std::array<mino::ShmHandle, Traits::kMaxOwnedGraphHandles> graph{};
+    size_t count = 0;
+    ASSERT_TRUE(mino::CollectOwnedGraph(root, value, graph, count).ok());
+    ASSERT_EQ(count, 1u);
+    EXPECT_EQ(graph[0], root);
+}
+
+TEST(CodeGeneratorTest, CollectOwnedGraphRejectsDuplicateCycleAndStaleShape) {
+    using Traits = mino::StaticMessageTraits<golden::Telemetry>;
+    const mino::ShmHandle root{64u, 1u, 7u};
+    const mino::ShmHandle shared{128u, 2u, 7u};
+    const mino::ShmHandle samples{256u, 3u, 7u};
+    std::array<mino::ShmHandle, Traits::kMaxOwnedGraphHandles> graph{};
+    size_t count = 0;
+
+    const golden::Telemetry duplicate = BuildTelemetry(
+        {.offset = shared.offset, .generation = shared.generation,
+         .region_id = shared.region_id, .length = 1u, .capacity = 4u,
+         .element_size = 1u},
+        {.offset = shared.offset, .generation = shared.generation,
+         .region_id = shared.region_id, .length = 1u, .capacity = 4u,
+         .element_size = 1u},
+        {.offset = samples.offset, .generation = samples.generation,
+         .region_id = samples.region_id, .length = 1u, .capacity = 2u,
+         .element_size = 8u});
+    EXPECT_EQ(mino::CollectOwnedGraph(root, duplicate, graph, count).code(),
+              StatusCode::kCorruption);
+
+    const golden::Telemetry cycle = BuildTelemetry(
+        {.element_size = 1u},
+        {.offset = root.offset, .generation = root.generation,
+         .region_id = root.region_id, .length = 1u, .capacity = 4u,
+         .element_size = 1u},
+        {.element_size = 8u});
+    EXPECT_EQ(mino::CollectOwnedGraph(root, cycle, graph, count).code(),
+              StatusCode::kCorruption);
+
+    golden::Telemetry stale = BuildTelemetry(
+        {.element_size = 1u}, {.element_size = 1u}, {.element_size = 8u});
+    // payload metadata starts at 88; a null offset retaining a generation is
+    // stale structural metadata, not an allocator freshness determination.
+    StoreU32LittleEndian(stale, 96u, 1u);
+    EXPECT_EQ(mino::CollectOwnedGraph(root, stale, graph, count).code(),
+              StatusCode::kSchemaMismatch);
+}
+
+TEST(CodeGeneratorTest, ComplexNestedOwnedGraphIsExplicitlyUnsupported) {
+    auto generated = Generate(R"idl(
+syntax = "v1";
+package nested_graph;
+option schema_version = "1.0";
+message Child { bytes payload = 1 [max_bytes = 8]; }
+message Root { Child child = 1; }
+)idl", "nested.generated.h");
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    const size_t root_traits = generated->header.find(
+        "StaticMessageTraits<::nested_graph::Root>");
+    ASSERT_NE(root_traits, std::string::npos);
+    const std::string root_contract =
+        generated->header.substr(root_traits, 2400u);
+    EXPECT_NE(root_contract.find(
+                  "kOwnedGraphCollectionSupported = false"),
+              std::string::npos);
+    EXPECT_NE(root_contract.find(
+                  "generated owned graph requires nested traversal"),
+              std::string::npos);
+}
+
 TEST(CodeGeneratorTest, SameInputIsByteForByteDeterministic) {
     const std::string idl =
         Read("mino/schema/codegen/testdata/golden.mino");
@@ -144,6 +280,21 @@ TEST(CodeGeneratorTest, SameInputIsByteForByteDeterministic) {
     EXPECT_EQ(first->header, second->header);
     EXPECT_EQ(first->source, second->source);
     EXPECT_EQ(first->descriptor, second->descriptor);
+
+    const size_t label = first->header.find("collect_child(accessor.label())");
+    const size_t payload =
+        first->header.find("collect_child(accessor.payload())");
+    const size_t samples =
+        first->header.find("collect_child(accessor.samples())");
+    const size_t unknown =
+        first->header.find("collect_child(accessor.unknown_fields())");
+    ASSERT_NE(label, std::string::npos);
+    ASSERT_NE(payload, std::string::npos);
+    ASSERT_NE(samples, std::string::npos);
+    ASSERT_NE(unknown, std::string::npos);
+    EXPECT_LT(label, payload);
+    EXPECT_LT(payload, samples);
+    EXPECT_LT(samples, unknown);
 }
 
 TEST(CodeGeneratorTest, DescriptorCodecRoundTripsSemanticsAndRejectsTampering) {

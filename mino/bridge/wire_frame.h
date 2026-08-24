@@ -105,6 +105,34 @@ struct WireFrame {
     bool operator==(const WireFrame&) const = default;
 };
 
+// Owns a fully validated wire-frame body while exposing its decoded payload as
+// a zero-copy view. The payload span is rebound after every move and always
+// aliases body(). Copying is disabled so the span cannot outlive its owner.
+class ValidatedWireFrameView {
+public:
+    ValidatedWireFrameView(const ValidatedWireFrameView&) = delete;
+    ValidatedWireFrameView& operator=(const ValidatedWireFrameView&) = delete;
+    ValidatedWireFrameView(ValidatedWireFrameView&& other) noexcept;
+    ValidatedWireFrameView& operator=(ValidatedWireFrameView&& other) noexcept;
+
+    std::span<const std::byte> body() const noexcept { return body_; }
+
+    WireFrameHeader header;
+    std::span<const std::byte> payload;
+
+private:
+    friend class WireFrameCodec;
+
+    ValidatedWireFrameView(std::vector<std::byte>&& body,
+                           WireFrameHeader&& header, size_t payload_offset,
+                           size_t payload_size) noexcept;
+    void RebindPayload() noexcept;
+
+    std::vector<std::byte> body_;
+    size_t payload_offset_ = 0;
+    size_t payload_size_ = 0;
+};
+
 struct WireFrameLimits {
     // Maximum value of the header payload_length field. For control frames it
     // includes the 4-byte canonical control opcode prefix. Payload CRC, when
@@ -152,6 +180,12 @@ public:
         const WireFrameLimits& limits = {}) noexcept;
     static Result<WireFrame> Decode(
         std::span<const std::byte> frame_body,
+        const WireFrameLimits& limits = {}) noexcept;
+
+    // Takes ownership of one frame body after performing exactly Decode's full
+    // validation. On success payload aliases the retained body without copying.
+    static Result<ValidatedWireFrameView> DecodeView(
+        std::vector<std::byte>&& frame_body,
         const WireFrameLimits& limits = {}) noexcept;
 };
 

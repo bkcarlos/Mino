@@ -40,8 +40,16 @@ Protobuf are comparison-only dependencies.
   `RESULTS_TWO_HOST_20260816.md`; it covers all three payload profiles with
   Mino TCP, Mino hybrid, Protobuf+ZeroMQ, Fast DDS, and Cyclone DDS. These are
   one-round capability/smoke observations, not a publication-grade comparison.
-- The required post-optimization validation campaigns, acceptance criteria,
-  profiling checklist, and prioritized optimization backlog are maintained in
+- Benchmark-side P1/P2 integration is complete: per-worker prepared canonical
+  message/scratch/output reuse, zero-copy WireFrame decode views, ownership-taking
+  TCP sends, bounded receive batching, deadline-bounded SHM publication, and
+  structural bridge validation/artifacts are implemented.
+- A candidate-only Linux validation is recorded in
+  `RESULTS_LINUX_VALIDATION_20260824.md`: 225 functional tests and 134 selected
+  ASAN tests passed, Mino TCP passed all three `-c opt` saturation profiles, and
+  one-boot hybrid/all-SHM smoke passed with zero message-integrity failures. It
+  used a dirty checkout on a 4-vCPU KVM guest, so clean-ref A/B, paced multi-round,
+  `perf`, TSAN, and physical-host qualification remain pending; see
   `PERFORMANCE_FOLLOWUP.md`.
 
 ## Real schema and generation contract
@@ -54,11 +62,16 @@ hop, not a mock envelope that bypasses middleware serialization.
 
 - Mino SHM uses the `minoc`-generated `AutonomyPipelineFrame`, builder,
   accessor, graph allocation journal, and child payload slab.
-- Mino TCP loads the real `minoc` descriptor artifact and uses
-  `CanonicalWireCodec` inside production `WireFrameCodec` and `TcpDriver`.
+- Mino TCP loads the real `minoc` descriptor artifact and uses a startup-prepared
+  canonical codec with per-worker reusable 18-field `DynamicMessage`, scratch,
+  and output storage inside production `WireFrameCodec` and `TcpDriver`. Receive
+  framing uses an owning validated view, and send admission transfers the encoded
+  body without another payload copy while preserving retry ownership on failure.
 - Mino hybrid uses the generated SHM root/child-slab graph on each host; a
   cross-host bridge resolves that graph, canonical-encodes it over `TcpDriver`,
-  then rebuilds the generated graph in the destination host's SHM segment.
+  then rebuilds the generated graph in the destination host's SHM segment. Formal
+  hybrid runs use structural bridge validation because all six business stages
+  retain full deterministic scalar/checksum/payload validation.
 - Protobuf+ZeroMQ uses the generated `autonomy_pipeline.proto` C++ type on every
   IPC and TCP edge.
 - Cyclone DDS runs official `idlc` during Bazel builds and uses its generated C
@@ -134,7 +147,10 @@ For every backend/profile/round, the sink result includes:
 - clock, host, boot ID, commit, compiler, binary, and schema provenance.
 
 A non-zero loss, corruption, duplicate, stage-mask mismatch, payload mismatch,
-or timeout makes that run fail while preserving its artifact.
+or timeout makes that run fail while preserving its artifact. Every cross-host
+bridge also writes an atomic `mino.pipeline_bridge_benchmark.v1` JSON artifact
+containing run/edge/mode/profile/clock/compilation identity, validation mode,
+outcome/error, optional validation instrumentation, and sent/received wire counts.
 
 ## Build
 
@@ -285,12 +301,20 @@ bazel-bin/benchmarks/pipeline_comparison/mino_hybrid_runner \
   --messages=1000 \
   --warmup-messages=100 \
   --channel-capacity=8 \
+  --receive-batch-size=1 \
   --deadline-seconds=120
 ```
 
 The runner cleans both SHM segments and all local/remote process groups on
-success and failure, while retaining local logs, worker results, and manifest.
-Its qualified default SHM capacity is 8; larger rings increased queue residence
+success and failure, while retaining local logs, worker results, bridge result
+artifacts, and manifest references (including partial failure artifacts). It
+always launches formal bridge optimization runs with
+`--bridge-validation=structural`; direct bridge diagnosis may instead use `full`
+or `full-instrumented`, where the latter records validation calls, payload bytes,
+and thread CPU nanoseconds. `--receive-batch-size` is bounded to `[1,64]` and
+remains `1` by default for cross-backend fairness; larger values are explicitly
+recorded and require an equivalent competitor policy before ranking. Its
+qualified default SHM capacity is 8; larger rings increased queue residence
 and allocator live-set contention in the current six-stage saturation workload.
 All C++ results record Bazel `compilation_mode`; performance comparisons must use
 `-c opt` on every host.

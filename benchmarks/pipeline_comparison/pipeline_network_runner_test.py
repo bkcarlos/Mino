@@ -157,6 +157,7 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
             history_depth=64,
             port_base=24000,
             zmq_hwm=64,
+            receive_batch_size=1,
             binary_relative=None,
             schema_descriptor_relative=runner.DEFAULT_DESCRIPTOR,
             keep_remote_runtime=False,
@@ -389,6 +390,9 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
             self.assertEqual("0.0.0.0", command[listen_index])
             downstream = runner.ROLES[min(index + 1, len(runner.ROLES) - 1)]
             self.assertEqual(topology[downstream].data_address, command[peer_index])
+            self.assertEqual(
+                "1", command[command.index("--receive-batch-size") + 1]
+            )
         remote_worker = workers[3]
         self.assertIn("setsid sh -c", remote_worker.launcher_command[-1])
         self.assertIn("worker-control.pid", remote_worker.launcher_command[-1])
@@ -450,6 +454,16 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
         self.assertEqual("10.0.0.12", option(workers[2], "--peer-address"))
         self.assertEqual("10.0.0.11", option(workers[3], "--upstream-address"))
         self.assertEqual("64", option(workers[2], "--hwm"))
+
+    def test_receive_batch_size_defaults_to_one_and_is_bounded(self) -> None:
+        parsed = runner.build_parser().parse_args(
+            ["--topology", "/tmp/topology.json", "--output-dir", "/tmp/output", "--backend", "mino_tcp"]
+        )
+        self.assertEqual(1, parsed.receive_batch_size)
+        with self.assertRaises(SystemExit):
+            runner.build_parser().parse_args(
+                ["--topology", "/tmp/topology.json", "--output-dir", "/tmp/output", "--backend", "mino_tcp", "--receive-batch-size", "65"]
+            )
 
     def test_mino_tcp_rejects_non_numeric_ipv4_before_launch(self) -> None:
         topology = {

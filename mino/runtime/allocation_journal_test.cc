@@ -6,10 +6,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -48,6 +50,31 @@ struct BlockingResolverContext {
     std::atomic<bool> entered{false};
     std::atomic<bool> release{false};
 };
+
+struct ReverseReclaimContext {
+    CentralSlabAllocator* allocator = nullptr;
+    std::array<ShmHandle, 3> manifest = {};
+    uint32_t progress = 0;
+    bool order_correct = true;
+};
+
+void ObserveReverseReclaim(AllocationJournal::PersistencePoint point, uint64_t,
+                           void* opaque) noexcept {
+    if (point != AllocationJournal::PersistencePoint::kReclaimProgress) {
+        return;
+    }
+    auto* context = static_cast<ReverseReclaimContext*>(opaque);
+    ++context->progress;
+    for (size_t i = 0; i < context->manifest.size(); ++i) {
+        const bool reclaimed =
+            !context->allocator->Inspect(context->manifest[i]).ok();
+        const bool expected_reclaimed =
+            i >= context->manifest.size() - context->progress;
+        if (reclaimed != expected_reclaimed) {
+            context->order_correct = false;
+        }
+    }
+}
 
 AllocationJournal::CommittedOrphanAction BlockingRollback(
     const AllocationTransaction&, const PublicationBinding&,
@@ -122,6 +149,85 @@ protected:
     CentralSlabAllocator allocator_;
     std::optional<AllocationJournal> journal_;
 };
+
+TEST(AllocationJournalLayoutTest, RequiredSizeStoresOnlyOverflowInSidecar) {
+    constexpr size_t kControlSize = 64;
+    constexpr size_t kRecordSize = 128;
+    constexpr size_t kHandleSize = 16;
+
+    EXPECT_EQ(AllocationJournal::RequiredSize(1, 1),
+              kControlSize + kRecordSize);
+    EXPECT_EQ(AllocationJournal::RequiredSize(1, 2),
+              kControlSize + kRecordSize);
+    EXPECT_EQ(AllocationJournal::RequiredSize(1, 3),
+              kControlSize + kRecordSize + kHandleSize);
+    EXPECT_EQ(AllocationJournal::RequiredSize(4, 4),
+              kControlSize + 4 * kRecordSize + 8 * kHandleSize);
+    EXPECT_EQ(AllocationJournal::RequiredSize(0, 2), 0u);
+    EXPECT_EQ(AllocationJournal::RequiredSize(1, 0), 0u);
+    EXPECT_EQ(AllocationJournal::RequiredSize(
+                  std::numeric_limits<uint32_t>::max(),
+                  std::numeric_limits<uint32_t>::max()),
+              0u);
+}
+
+TEST_F(AllocationJournalTest, InlineOnlyLayoutNeedsNoSidecar) {
+    constexpr uint32_t kHandles = AllocationJournal::kInlineHandleCapacity;
+    const size_t required = AllocationJournal::RequiredSize(1, kHandles);
+    auto memory = AllocateAligned(required + 64);
+    std::memset(memory.get() + required, 0xA5, 64);
+    auto journal = AllocationJournal::Init(memory.get(), required, 1, kHandles,
+                                           allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    auto transaction = journal->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(transaction.ok());
+    auto root = journal->AllocateRoot(*transaction, Request());
+    ASSERT_TRUE(root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
+    auto child = journal->AllocateChild(*transaction, Request(8));
+    ASSERT_TRUE(child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*child).ok());
+
+    ASSERT_TRUE(journal->PublishGraph(*transaction).ok());
+    ASSERT_TRUE(journal->Abort(*transaction).ok());
+    for (size_t i = required; i < required + 64; ++i) {
+        EXPECT_EQ(memory[i], std::byte{0xA5});
+    }
+}
+
+TEST_F(AllocationJournalTest, OverflowLayoutUsesSidecarAfterTwoInlineHandles) {
+    constexpr uint32_t kHandles =
+        AllocationJournal::kInlineHandleCapacity + 1;
+    const size_t required = AllocationJournal::RequiredSize(1, kHandles);
+    auto memory = AllocateAligned(required + 64);
+    std::memset(memory.get() + required, 0xA5, 64);
+    auto journal = AllocationJournal::Init(memory.get(), required, 1, kHandles,
+                                           allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+    auto attached = AllocationJournal::Attach(memory.get(), required, allocator_);
+    ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+
+    auto transaction = journal->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(transaction.ok());
+    auto root = journal->AllocateRoot(*transaction, Request());
+    ASSERT_TRUE(root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
+    auto inline_child = journal->AllocateChild(*transaction, Request(8));
+    ASSERT_TRUE(inline_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*inline_child).ok());
+    auto overflow_child = journal->AllocateChild(*transaction, Request(9));
+    ASSERT_TRUE(overflow_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*overflow_child).ok());
+
+    const std::array<ShmHandle, 3> graph = {
+        *root, *inline_child, *overflow_child};
+    EXPECT_TRUE(attached->ValidateManifest(*transaction, graph).ok());
+    ASSERT_TRUE(attached->Abort(*transaction).ok());
+    for (size_t i = required; i < required + 64; ++i) {
+        EXPECT_EQ(memory[i], std::byte{0xA5});
+    }
+}
 
 TEST_F(AllocationJournalTest, JournalFirstAbortReclaimsRootAndChildren) {
     auto transaction = journal_->Begin(ProcessIdentity::Current());
@@ -288,6 +394,179 @@ TEST_F(AllocationJournalTest, InterruptedReclaimIsRetriedFromPersistentState) {
     EXPECT_EQ(allocator_.Inspect(*child).status().code(), StatusCode::kNotFound);
 }
 
+TEST_F(AllocationJournalTest,
+       AttachedInstanceRecoversBuildingAcrossInlineOverflowBoundary) {
+    constexpr uint32_t kHandles =
+        AllocationJournal::kInlineHandleCapacity + 1;
+    const size_t journal_size = AllocationJournal::RequiredSize(1, kHandles);
+    auto memory = AllocateAligned(journal_size);
+    std::optional<AllocationJournal> original;
+    {
+        auto initialized = AllocationJournal::Init(
+            memory.get(), journal_size, 1, kHandles, allocator_);
+        ASSERT_TRUE(initialized.ok()) << initialized.status().ToString();
+        original.emplace(*initialized);
+    }
+
+    ProcessIdentity dead_owner = ProcessIdentity::Current();
+    dead_owner.process_epoch ^= 0xB017D1u;
+    auto transaction = original->Begin(dead_owner);
+    ASSERT_TRUE(transaction.ok());
+    auto root = original->AllocateRoot(*transaction, Request());
+    ASSERT_TRUE(root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
+    auto inline_child = original->AllocateChild(*transaction, Request(8));
+    ASSERT_TRUE(inline_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*inline_child).ok());
+    auto overflow_child = original->AllocateChild(*transaction, Request(9));
+    ASSERT_TRUE(overflow_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*overflow_child).ok());
+
+    original.reset();
+    auto attached =
+        AllocationJournal::Attach(memory.get(), journal_size, allocator_);
+    ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+    ASSERT_EQ(*attached->State(*transaction), AllocationJournalState::kBuilding);
+    EXPECT_EQ(attached->RecoverOrphans(&AlwaysDead), 1u);
+    EXPECT_EQ(allocator_.Inspect(*overflow_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(*inline_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(*root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(attached->ActiveTransactionCount(), 0u);
+
+    auto reused = attached->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(reused.ok());
+    EXPECT_EQ(reused->journal_index, transaction->journal_index);
+    EXPECT_NE(reused->transaction_epoch, transaction->transaction_epoch);
+    EXPECT_EQ(attached->State(*transaction).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(attached->Abort(*transaction).code(), StatusCode::kNotFound);
+    EXPECT_EQ(*attached->State(*reused), AllocationJournalState::kBuilding);
+    auto reused_root = attached->AllocateRoot(*reused, Request(10));
+    ASSERT_TRUE(reused_root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*reused_root).ok());
+    EXPECT_TRUE(attached->Abort(*reused).ok());
+}
+
+TEST_F(AllocationJournalTest,
+       AttachedInstanceResumesReclaimingAcrossOverflowInlineBoundary) {
+    constexpr uint32_t kHandles =
+        AllocationJournal::kInlineHandleCapacity + 1;
+    const size_t journal_size = AllocationJournal::RequiredSize(1, kHandles);
+    auto memory = AllocateAligned(journal_size);
+    std::optional<AllocationJournal> original;
+    {
+        auto initialized = AllocationJournal::Init(
+            memory.get(), journal_size, 1, kHandles, allocator_);
+        ASSERT_TRUE(initialized.ok()) << initialized.status().ToString();
+        original.emplace(*initialized);
+    }
+
+    auto transaction = original->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(transaction.ok());
+    auto root = original->AllocateRoot(*transaction, Request());
+    ASSERT_TRUE(root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*root).ok());
+    auto inline_child = original->AllocateChild(*transaction, Request(8));
+    ASSERT_TRUE(inline_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*inline_child).ok());
+    auto overflow_child = original->AllocateChild(*transaction, Request(9));
+    ASSERT_TRUE(overflow_child.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*overflow_child).ok());
+
+    auto inline_view = allocator_.Inspect(*inline_child);
+    ASSERT_TRUE(inline_view.ok());
+    auto* inline_header = reinterpret_cast<SlabHeader*>(
+        static_cast<std::byte*>(const_cast<void*>(inline_view->data)) -
+        sizeof(SlabHeader));
+    const uint32_t original_crc = inline_header->immutable_header_crc;
+    inline_header->immutable_header_crc ^= 1u;
+
+    const Status interrupted = original->Abort(*transaction);
+    EXPECT_EQ(interrupted.code(), StatusCode::kCorruption);
+    EXPECT_EQ(*original->State(*transaction),
+              AllocationJournalState::kReclaiming);
+    EXPECT_EQ(allocator_.Inspect(*overflow_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_TRUE(allocator_.Inspect(*root).ok());
+    inline_header->immutable_header_crc = original_crc;
+    EXPECT_TRUE(allocator_.Inspect(*inline_child).ok());
+
+    original.reset();
+    auto attached =
+        AllocationJournal::Attach(memory.get(), journal_size, allocator_);
+    ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+    ASSERT_EQ(*attached->State(*transaction),
+              AllocationJournalState::kReclaiming);
+    EXPECT_EQ(attached->RecoverOrphans(&AlwaysUnknown), 1u)
+        << "kReclaiming must resume without consulting owner liveness";
+    EXPECT_EQ(allocator_.Inspect(*overflow_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(*inline_child).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(*root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(attached->ActiveTransactionCount(), 0u);
+
+    auto reused = attached->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(reused.ok());
+    EXPECT_EQ(reused->journal_index, transaction->journal_index);
+    EXPECT_NE(reused->transaction_epoch, transaction->transaction_epoch);
+    EXPECT_EQ(attached->State(*transaction).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(attached->Abort(*transaction).code(), StatusCode::kNotFound);
+    EXPECT_EQ(*attached->State(*reused), AllocationJournalState::kBuilding);
+    auto reused_root = attached->AllocateRoot(*reused, Request(10));
+    ASSERT_TRUE(reused_root.ok());
+    ASSERT_TRUE(allocator_.BeginBuild(*reused_root).ok());
+    EXPECT_TRUE(attached->Abort(*reused).ok());
+}
+
+TEST_F(AllocationJournalTest, ReleasedInlineAndOverflowSlotsAreReused) {
+    auto transaction = journal_->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(transaction.ok());
+    auto root = AllocateRoot(*transaction);
+    auto inline_child = AllocateChild(*transaction, 8);
+    auto overflow_child = AllocateChild(*transaction, 9);
+    auto retained_overflow_child = AllocateChild(*transaction, 10);
+    ASSERT_TRUE(root.ok() && inline_child.ok() && overflow_child.ok() &&
+                retained_overflow_child.ok());
+
+    ASSERT_TRUE(journal_->ReleaseChild(*transaction, *inline_child).ok());
+    ASSERT_TRUE(journal_->ReleaseChild(*transaction, *overflow_child).ok());
+    auto inline_replacement = AllocateChild(*transaction, 11);
+    auto overflow_replacement = AllocateChild(*transaction, 12);
+    ASSERT_TRUE(inline_replacement.ok() && overflow_replacement.ok());
+    EXPECT_EQ(AllocateChild(*transaction, 13).status().code(),
+              StatusCode::kResourceExhausted);
+
+    const std::array<ShmHandle, 4> graph = {
+        *root, *inline_replacement, *overflow_replacement,
+        *retained_overflow_child};
+    EXPECT_TRUE(journal_->ValidateManifest(*transaction, graph).ok());
+    EXPECT_TRUE(journal_->Abort(*transaction).ok());
+}
+
+TEST_F(AllocationJournalTest, AbortReclaimsOverflowThenInlineThenRoot) {
+    auto transaction = journal_->Begin(ProcessIdentity::Current());
+    ASSERT_TRUE(transaction.ok());
+    auto root = AllocateRoot(*transaction);
+    auto inline_child = AllocateChild(*transaction, 8);
+    auto overflow_child = AllocateChild(*transaction, 9);
+    ASSERT_TRUE(root.ok() && inline_child.ok() && overflow_child.ok());
+
+    ReverseReclaimContext context{
+        .allocator = &allocator_,
+        .manifest = {*root, *inline_child, *overflow_child},
+    };
+    journal_->SetPersistenceHook(&ObserveReverseReclaim, &context);
+    ASSERT_TRUE(journal_->Abort(*transaction).ok());
+    journal_->SetPersistenceHook(nullptr, nullptr);
+
+    EXPECT_EQ(context.progress, context.manifest.size());
+    EXPECT_TRUE(context.order_correct);
+}
+
 TEST_F(AllocationJournalTest, ReleasedChildManifestSlotIsReusableBeyondCapacity) {
     auto transaction = journal_->Begin(ProcessIdentity::Current());
     ASSERT_TRUE(transaction.ok());
@@ -324,6 +603,45 @@ TEST_F(AllocationJournalTest, RegisterChildRejectsForeignAndPublishedHandles) {
     EXPECT_TRUE(journal_->Abort(*transaction).ok());
     EXPECT_TRUE(allocator_.Retire(*foreign).ok());
     EXPECT_TRUE(allocator_.Reclaim(*foreign).ok());
+}
+
+TEST_F(AllocationJournalTest, AttachRejectsOldLayoutAndInvalidCapacityMetadata) {
+    struct alignas(64) ControlMirror {
+        std::atomic<uint64_t> magic{0};
+        std::atomic<uint32_t> layout_version{0};
+        uint32_t transaction_capacity = 0;
+        uint32_t handles_per_transaction = 0;
+        uint32_t reserved0 = 0;
+        unsigned char reserved[40] = {};
+    };
+    static_assert(sizeof(ControlMirror) == 64);
+
+    const size_t journal_size = AllocationJournal::RequiredSize(
+        kTransactionCapacity, kHandlesPerTransaction);
+    auto* control = reinterpret_cast<ControlMirror*>(journal_memory_.get());
+
+    control->layout_version.store(AllocationJournal::kLayoutVersion - 1,
+                                  std::memory_order_release);
+    auto old_layout = AllocationJournal::Attach(
+        journal_memory_.get(), journal_size, allocator_);
+    ASSERT_FALSE(old_layout.ok());
+    EXPECT_EQ(old_layout.status().code(), StatusCode::kSchemaMismatch);
+    control->layout_version.store(AllocationJournal::kLayoutVersion,
+                                  std::memory_order_release);
+
+    const uint32_t saved_handles = control->handles_per_transaction;
+    control->handles_per_transaction = 0;
+    auto zero_capacity = AllocationJournal::Attach(
+        journal_memory_.get(), journal_size, allocator_);
+    ASSERT_FALSE(zero_capacity.ok());
+    EXPECT_EQ(zero_capacity.status().code(), StatusCode::kCorruption);
+
+    control->handles_per_transaction = std::numeric_limits<uint32_t>::max();
+    auto oversized_layout = AllocationJournal::Attach(
+        journal_memory_.get(), journal_size, allocator_);
+    ASSERT_FALSE(oversized_layout.ok());
+    EXPECT_EQ(oversized_layout.status().code(), StatusCode::kCorruption);
+    control->handles_per_transaction = saved_handles;
 }
 
 TEST_F(AllocationJournalTest, AttachRejectsBufferSmallerThanControlBeforeRead) {

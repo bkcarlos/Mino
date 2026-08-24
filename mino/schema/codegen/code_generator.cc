@@ -379,6 +379,27 @@ size_t NestedObjectSize(
     return plan == plans.end() ? 0 : plan->second->object_size();
 }
 
+// A direct variable allocation is a leaf only when its payload cannot contain
+// more variable metadata. User-defined and recursively variable containers are
+// intentionally unsupported until codegen can safely walk their nested shape.
+bool IsDirectOwnedLeaf(const FieldDescriptor& field,
+                       const FieldLayout& layout) {
+    if (layout.storage_kind() != FieldStorageKind::kVariable) return false;
+    if (field.type().kind() == TypeDescriptor::Kind::kScalar) return true;
+    if (field.type().kind() != TypeDescriptor::Kind::kVector) return false;
+    const TypeDescriptor& element = *field.type().element_type();
+    return element.kind() == TypeDescriptor::Kind::kScalar &&
+           element.scalar() != ScalarType::kString &&
+           element.scalar() != ScalarType::kBytes;
+}
+
+bool RequiresUnsupportedOwnedGraphTraversal(const FieldDescriptor& field,
+                                             const FieldLayout& layout) {
+    if (layout.storage_kind() == FieldStorageKind::kScalar) return false;
+    if (IsDirectOwnedLeaf(field, layout)) return false;
+    return true;
+}
+
 std::string HeaderGuard(std::string_view include,
                         const CompiledSchema& schema) {
     std::string result("MINO_GENERATED_");
@@ -865,7 +886,7 @@ Status EmitType(
         Line(header);
     }
 
-    if (emit_wire_adapter && layout.unknown_fields_offset().has_value()) {
+    if (layout.unknown_fields_offset().has_value()) {
         Line(header, "    " + metadata_name + " unknown_fields() const noexcept {");
         Line(header, "        return ReadVariable(" +
                          std::to_string(*layout.unknown_fields_offset()) + "u);");
@@ -982,7 +1003,11 @@ Status EmitType(
     Line(header, "    }");
     Line(header, "    static bool ValidateBasic(const " + metadata_name + "& value) noexcept {");
     Line(header, "        if (value.length > value.capacity) return false;");
-    Line(header, "        return value.offset == 0 ? value.length == 0 && value.capacity == 0 : value.capacity != 0;");
+    Line(header, "        if (value.offset == 0) {");
+    Line(header, "            return value.generation == 0 && value.region_id == 0 &&");
+    Line(header, "                   value.length == 0 && value.capacity == 0;");
+    Line(header, "        }");
+    Line(header, "        return value.capacity != 0;");
     Line(header, "    }");
     Line(header, "    static bool ValidateBytes(const " + metadata_name +
                      "& value, std::uint64_t maximum) noexcept {");
@@ -994,15 +1019,15 @@ Status EmitType(
     Line(header, "    }");
     Line(header, "    static bool ValidateNested(const " + metadata_name +
                      "& value, std::uint64_t object_size) noexcept {");
-    Line(header, "        return value.offset != 0 && object_size != 0 && value.length == object_size &&");
-    Line(header, "               value.capacity == object_size && value.element_size == 1;");
+    Line(header, "        return ValidateBasic(value) && object_size != 0 &&");
+    Line(header, "               value.length == object_size && value.capacity == object_size &&");
+    Line(header, "               value.element_size == 1;");
     Line(header, "    }");
     Line(header, "    static bool ValidateUnknown(const " + metadata_name + "& value) noexcept {");
-    Line(header, "        if (value.element_size != 0 || value.length > " +
+    Line(header, "        if (!ValidateBasic(value) || value.element_size != 0 || value.length > " +
                      std::to_string(kDynamicUnknownFieldMaxCount) + "u || value.capacity > " +
                      std::to_string(kDynamicUnknownFieldMaxBytes) + "u) return false;");
-    Line(header, "        return value.length == 0 ? value.offset == 0 && value.capacity == 0");
-    Line(header, "                                 : value.offset != 0 && value.capacity != 0;");
+    Line(header, "        return value.length == 0 ? value.offset == 0 : value.offset != 0;");
     Line(header, "    }");
     Line(header, "    const std::byte* data_ = nullptr;");
     Line(header, "    std::size_t size_ = 0;");
@@ -1052,7 +1077,7 @@ Status EmitType(
                 condition = "value.length > value.capacity || value.capacity > " +
                             std::to_string(field.constraints().max_bytes().value_or(0)) +
                             "u || value.element_size != 1u || "
-                            "(value.offset == 0 ? (value.length != 0 || value.capacity != 0) : value.capacity == 0)";
+                            "(value.offset == 0 ? (value.generation != 0 || value.region_id != 0 || value.length != 0 || value.capacity != 0) : value.capacity == 0)";
             } else if (field.type().kind() == TypeDescriptor::Kind::kVector) {
                 const size_t element_size = ElementSize(
                     *field.type().element_type(), plans, descriptors);
@@ -1060,7 +1085,7 @@ Status EmitType(
                             std::to_string(field.constraints().max_capacity().value_or(0)) +
                             "u || value.element_size != " +
                             std::to_string(element_size) +
-                            "u || (value.offset == 0 ? (value.length != 0 || value.capacity != 0) : value.capacity == 0)";
+                            "u || (value.offset == 0 ? (value.generation != 0 || value.region_id != 0 || value.length != 0 || value.capacity != 0) : value.capacity == 0)";
             } else {
                 const size_t nested_size = NestedObjectSize(field.type(), plans);
                 condition = "value.offset == 0 || value.length != " +
@@ -1179,6 +1204,18 @@ Status EmitType(
     if (!cpp_namespace.empty()) Line(header, "}  // namespace " + cpp_namespace);
     Line(header);
 
+    bool owned_graph_supported = true;
+    size_t direct_owned_children = 0;
+    for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+        const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+        const FieldLayout& field_layout = layout.fields()[i];
+        if (RequiresUnsupportedOwnedGraphTraversal(field, field_layout)) {
+            owned_graph_supported = false;
+        }
+        if (IsDirectOwnedLeaf(field, field_layout)) ++direct_owned_children;
+    }
+    if (layout.unknown_fields_offset().has_value()) ++direct_owned_children;
+
     Line(header, "namespace mino {");
     Line(header, "template <> struct StaticMessageTraits<" + qualified_name + "> {");
     Line(header, "    static constexpr bool kIsSpecialized = true;");
@@ -1196,11 +1233,64 @@ Status EmitType(
                                      ? "0"
                                      : "::mino::kIndexSlotFlagHasChildSlabs") +
                      ";");
+    Line(header, "    static constexpr bool kOwnedGraphCollectionSupported = " +
+                     std::string(owned_graph_supported ? "true" : "false") + ";");
+    Line(header, "    static constexpr std::size_t kMaxOwnedGraphHandles = " +
+                     std::to_string(direct_owned_children + 1) + "u;");
     Line(header, "    static Status Validate(const " + qualified_name +
                      "& value) noexcept {");
     Line(header, "        return " + qualified_name +
                      "Accessor(value).valid() ? Status::Ok() :");
     Line(header, "            Status::Error(StatusCode::kSchemaMismatch, \"invalid generated SHM object\");");
+    Line(header, "    }");
+    Line(header, "    static Status CollectOwnedGraph(");
+    Line(header, "        ShmHandle root, const " + qualified_name + "& value,");
+    Line(header, "        std::span<ShmHandle> output, std::size_t& handle_count) noexcept {");
+    Line(header, "        handle_count = 0;");
+    if (!owned_graph_supported) {
+        Line(header, "        static_cast<void>(root);");
+        Line(header, "        static_cast<void>(value);");
+        Line(header, "        static_cast<void>(output);");
+        Line(header, "        return Status::Error(StatusCode::kUnsupported,");
+        Line(header, "                             \"generated owned graph requires nested traversal\");");
+    } else {
+        Line(header, "        const " + qualified_name + "Accessor accessor(value);");
+        Line(header, "        if (!accessor.valid()) {");
+        Line(header, "            return Status::Error(StatusCode::kSchemaMismatch,");
+        Line(header, "                                 \"invalid generated SHM object metadata\");");
+        Line(header, "        }");
+        Line(header, "        OwnedGraphCollector collector(output);");
+        Line(header, "        Status status = collector.AddRoot(root);");
+        Line(header, "        if (!status.ok()) return status;");
+        if (direct_owned_children != 0) {
+            Line(header, "        const auto collect_child = [&collector](const auto& metadata) {");
+            Line(header, "            if (metadata.offset == 0) return Status::Ok();");
+            Line(header, "            return collector.AddOwnedChild(");
+            Line(header, "                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});");
+            Line(header, "        };");
+        }
+        for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+            const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+            const FieldLayout& field_layout = layout.fields()[i];
+            if (!IsDirectOwnedLeaf(field, field_layout)) continue;
+            const std::string& name = field_names.at(field.id());
+            if (field_layout.presence_bit().has_value()) {
+                Line(header, "        if (accessor.has_" + name + "()) {");
+                Line(header, "            status = collect_child(accessor." + name + "());");
+                Line(header, "            if (!status.ok()) return status;");
+                Line(header, "        }");
+            } else {
+                Line(header, "        status = collect_child(accessor." + name + "());");
+                Line(header, "        if (!status.ok()) return status;");
+            }
+        }
+        if (layout.unknown_fields_offset().has_value()) {
+            Line(header, "        status = collect_child(accessor.unknown_fields());");
+            Line(header, "        if (!status.ok()) return status;");
+        }
+        Line(header, "        handle_count = collector.size();");
+        Line(header, "        return Status::Ok();");
+    }
     Line(header, "    }");
     Line(header, "};");
     Line(header, "}  // namespace mino");

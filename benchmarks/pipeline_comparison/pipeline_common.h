@@ -108,6 +108,16 @@ SemanticFrame InitializeSourceFrameAt(uint64_t sample_id, Profile profile,
                                       uint64_t origin_timestamp_ns);
 
 bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error);
+// Bridge-only validation for canonical transit. This deliberately validates
+// transport structure, sequencing, phase, profile, exact payload size, stage
+// mask, and timestamp shape without re-running deterministic business-field,
+// checksum, or payload-pattern checks performed by the six business stages.
+bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
+                                uint64_t expected_sequence,
+                                uint64_t warmup_messages,
+                                Profile expected_profile,
+                                Role destination_role, ClockMode clock_mode,
+                                std::string* error);
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
                            std::string* error);
 // Explicit timestamp form is useful when the backend timestamps immediately
@@ -195,6 +205,20 @@ struct SinkResult {
 };
 
 std::string JsonEscape(std::string_view input);
+// Best-effort callers can invoke this after backend option parsing fails. It
+// recognizes exactly one non-empty --output PATH or --output=PATH occurrence
+// and atomically writes only parse-failure schema/outcome/error fields. It
+// returns false when no unambiguous safe output path was present; no run/profile
+// or other unvalidated metadata is synthesized.
+bool WriteBridgeParseFailureArtifactFromArgs(int argc, char** argv,
+                                             std::string_view parse_error);
+
+// Pure JSON builder shared by the Mino TCP worker and regression tests.
+std::string BuildMinoTcpBackendDetails(
+    uint64_t schema_short_id, uint32_t schema_version,
+    uint32_t layout_version, ClockMode clock_mode,
+    uint32_t receive_batch_size, std::string_view endpoints_json);
+
 // Writes via a temporary sibling and atomic rename. Count inconsistencies and
 // malformed backend_details force a failure artifact rather than suppressing it.
 void WriteSinkResult(const SinkResult& result);

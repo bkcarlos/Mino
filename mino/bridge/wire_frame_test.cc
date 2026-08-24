@@ -13,6 +13,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "mino/bridge/crc32c.h"
@@ -29,6 +31,10 @@ concept HasShmHandleMember = requires(T value) { value.shm_handle; };
 
 static_assert(!HasOffsetMember<WireFrameHeader>);
 static_assert(!HasShmHandleMember<WireFrameHeader>);
+static_assert(!std::is_copy_constructible_v<ValidatedWireFrameView>);
+static_assert(!std::is_copy_assignable_v<ValidatedWireFrameView>);
+static_assert(std::is_nothrow_move_constructible_v<ValidatedWireFrameView>);
+static_assert(std::is_nothrow_move_assignable_v<ValidatedWireFrameView>);
 
 std::vector<std::byte> Bytes(std::initializer_list<uint8_t> values) {
     std::vector<std::byte> result;
@@ -88,6 +94,31 @@ void ExpectDecodeFailure(std::span<const std::byte> body,
     ASSERT_FALSE(decoded.ok());
     EXPECT_EQ(decoded.status().code(), expected)
         << decoded.status().ToString();
+}
+
+void ExpectDecodeAndViewEquivalent(
+    const std::vector<std::byte>& body,
+    const WireFrameLimits& limits = {}) {
+    const auto decoded = WireFrameCodec::Decode(body, limits);
+    std::vector<std::byte> owned_body = body;
+    auto view = WireFrameCodec::DecodeView(std::move(owned_body), limits);
+
+    ASSERT_EQ(decoded.ok(), view.ok());
+    if (!decoded.ok()) {
+        EXPECT_EQ(view.status().code(), decoded.status().code());
+        EXPECT_EQ(view.status().message(), decoded.status().message());
+        return;
+    }
+
+    EXPECT_EQ(view->header, decoded->header);
+    ASSERT_EQ(view->payload.size(), decoded->payload.size());
+    EXPECT_TRUE(std::equal(view->payload.begin(), view->payload.end(),
+                           decoded->payload.begin(), decoded->payload.end()));
+    ASSERT_EQ(view->body().size(), body.size());
+    EXPECT_TRUE(std::equal(view->body().begin(), view->body().end(),
+                           body.begin(), body.end()));
+    EXPECT_EQ(view->payload.data(),
+              view->body().data() + body.size() - view->payload.size());
 }
 
 void ExpectEncodedSizeMatchesEncode(const WireFrame& frame,
@@ -254,6 +285,180 @@ TEST(WireFrameCodecTest, GoldenVectorIsExact80ByteV1Header) {
     auto decoded = WireFrameCodec::Decode(body);
     ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
     EXPECT_EQ(*decoded, frame);
+}
+
+TEST(WireFrameCodecTest, DecodeViewOwnsGoldenBodyAndSurvivesMoves) {
+    WireFrame frame = GoldenFrame();
+    frame.header.frame_type = FrameType::kHeartbeat;
+    frame.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                         FlagValue(FrameFlag::kPayloadCrcPresent);
+    auto body = WireFrameCodec::Encode(frame);
+    ASSERT_TRUE(body.ok()) << body.status().ToString();
+    const std::vector<std::byte> expected_body = *body;
+    const std::byte* const original_allocation = body->data();
+
+    auto decoded = WireFrameCodec::DecodeView(std::move(*body));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(decoded->body().data(), original_allocation);
+    EXPECT_EQ(decoded->header, frame.header);
+    EXPECT_EQ(decoded->payload.data(),
+              decoded->body().data() + decoded->body().size() -
+                  decoded->payload.size());
+    EXPECT_TRUE(std::equal(decoded->payload.begin(), decoded->payload.end(),
+                           frame.payload.begin(), frame.payload.end()));
+
+    ValidatedWireFrameView moved = std::move(*decoded);
+    EXPECT_EQ(moved.body().data(), original_allocation);
+    EXPECT_EQ(moved.payload.data(),
+              moved.body().data() + moved.body().size() -
+                  moved.payload.size());
+    EXPECT_TRUE(decoded->payload.empty());
+
+    WireFrame replacement_frame = GoldenFrame();
+    replacement_frame.payload = Bytes({1, 2, 3});
+    auto replacement_body = WireFrameCodec::Encode(replacement_frame);
+    ASSERT_TRUE(replacement_body.ok());
+    auto replacement =
+        WireFrameCodec::DecodeView(std::move(*replacement_body));
+    ASSERT_TRUE(replacement.ok());
+    ValidatedWireFrameView assigned = std::move(*replacement);
+    assigned = std::move(moved);
+
+    EXPECT_EQ(assigned.body().data(), original_allocation);
+    EXPECT_EQ(assigned.header, frame.header);
+    EXPECT_EQ(assigned.payload.data(),
+              assigned.body().data() + assigned.body().size() -
+                  assigned.payload.size());
+    EXPECT_TRUE(std::equal(assigned.body().begin(), assigned.body().end(),
+                           expected_body.begin(), expected_body.end()));
+    EXPECT_TRUE(std::equal(assigned.payload.begin(), assigned.payload.end(),
+                           frame.payload.begin(), frame.payload.end()));
+    EXPECT_TRUE(moved.payload.empty());
+}
+
+TEST(WireFrameCodecTest,
+     EncodeFormsAndDecodeViewAreDifferentialForEveryShapeAndTail) {
+    const std::array<FrameType, 7> types = {
+        FrameType::kData,          FrameType::kSchemaAnnounce,
+        FrameType::kSchemaRequest, FrameType::kAck,
+        FrameType::kHeartbeat,     FrameType::kSessionHello,
+        FrameType::kSessionDiscovery,
+    };
+    const std::array<size_t, 19> payload_lengths = {
+        0,  1,  2,  3,  4,  5,  7,  8,  9,  15,
+        16, 17, 31, 32, 33, 63, 64, 65, 127,
+    };
+
+    for (FrameType type : types) {
+        for (uint32_t combination = 0; combination < 4; ++combination) {
+            for (size_t payload_length : payload_lengths) {
+                SCOPED_TRACE(static_cast<uint32_t>(type));
+                SCOPED_TRACE(combination);
+                SCOPED_TRACE(payload_length);
+
+                WireFrame frame = GoldenFrame();
+                frame.header.frame_type = type;
+                frame.header.flags = 0;
+                if (type != FrameType::kData) {
+                    frame.header.flags |=
+                        FlagValue(FrameFlag::kControlFrame);
+                }
+                if ((combination & 1u) != 0) {
+                    frame.header.flags |=
+                        FlagValue(FrameFlag::kPayloadCrcPresent);
+                }
+                if ((combination & 2u) != 0) {
+                    frame.header.flags |=
+                        FlagValue(FrameFlag::kPerfTraceSampled);
+                    frame.header.perf_trace = PerfTraceContext{
+                        .trace_id_high = 1,
+                        .trace_id_low = 2,
+                        .sample_flags = 3,
+                        .clock_domain_id = 4,
+                        .origin_wall_time_ns = 5,
+                        .origin_monotonic_ns = 6,
+                    };
+                }
+                frame.payload.resize(payload_length);
+                for (size_t i = 0; i < payload_length; ++i) {
+                    frame.payload[i] = static_cast<std::byte>(
+                        (i * 37u + payload_length) & 0xffu);
+                }
+
+                auto body = WireFrameCodec::Encode(frame);
+                auto length_prefixed =
+                    WireFrameCodec::EncodeLengthPrefixed(frame);
+                ASSERT_TRUE(body.ok()) << body.status().ToString();
+                ASSERT_TRUE(length_prefixed.ok())
+                    << length_prefixed.status().ToString();
+                ASSERT_EQ(length_prefixed->size(),
+                          kLengthPrefixSize + body->size());
+                const uint32_t body_size =
+                    static_cast<uint32_t>(body->size());
+                for (size_t i = 0; i < kLengthPrefixSize; ++i) {
+                    EXPECT_EQ(
+                        (*length_prefixed)[i],
+                        static_cast<std::byte>(
+                            (body_size >> (24 - 8 * i)) & 0xffu));
+                }
+                EXPECT_TRUE(std::equal(
+                    body->begin(), body->end(),
+                    length_prefixed->begin() + kLengthPrefixSize));
+                ExpectDecodeAndViewEquivalent(*body);
+            }
+        }
+    }
+}
+
+TEST(WireFrameCodecTest,
+     DecodeAndDecodeViewHaveIdenticalMalformedErrorsAndPriority) {
+    WireFrame frame = GoldenFrame();
+    frame.header.frame_type = FrameType::kHeartbeat;
+    frame.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                         FlagValue(FrameFlag::kPayloadCrcPresent) |
+                         FlagValue(FrameFlag::kPerfTraceSampled);
+    frame.header.perf_trace = PerfTraceContext{
+        .trace_id_high = 1,
+        .trace_id_low = 2,
+        .sample_flags = 3,
+        .clock_domain_id = 4,
+        .origin_wall_time_ns = 5,
+        .origin_monotonic_ns = 6,
+    };
+    auto valid = WireFrameCodec::Encode(frame);
+    ASSERT_TRUE(valid.ok());
+
+    for (size_t size = 0; size < valid->size(); ++size) {
+        SCOPED_TRACE(size);
+        ExpectDecodeAndViewEquivalent(std::vector<std::byte>(
+            valid->begin(), valid->begin() + size));
+    }
+
+    for (size_t offset = 0; offset < valid->size(); ++offset) {
+        SCOPED_TRACE(offset);
+        std::vector<std::byte> mutated = *valid;
+        mutated[offset] ^= static_cast<std::byte>(
+            1u << static_cast<unsigned>(offset % 8));
+        ExpectDecodeAndViewEquivalent(mutated);
+    }
+
+    std::vector<std::byte> trailing = *valid;
+    trailing.push_back(std::byte{0});
+    ExpectDecodeAndViewEquivalent(trailing);
+
+    std::vector<std::byte> multiple_errors = *valid;
+    multiple_errors[0] = std::byte{0};
+    multiple_errors[5] = std::byte{0xff};
+    multiple_errors[6] = std::byte{0x80};
+    multiple_errors[76] ^= std::byte{1};
+    ExpectDecodeAndViewEquivalent(multiple_errors);
+    auto prioritized = WireFrameCodec::Decode(multiple_errors);
+    ASSERT_FALSE(prioritized.ok());
+    EXPECT_EQ(prioritized.status().message(), "frame magic mismatch");
+
+    WireFrameLimits limits;
+    limits.max_payload_length = 2;
+    ExpectDecodeAndViewEquivalent(*valid, limits);
 }
 
 TEST(WireFrameCodecTest, RoundTripsTraceContextAndEveryFrameType) {

@@ -125,6 +125,22 @@ Status DynamicVector::Add(DynamicValue value) noexcept {
     }
 }
 
+Status DynamicMessage::ReserveFields(size_t count) noexcept {
+    try {
+        fields_.reserve(count);
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
+void DynamicMessage::Clear() noexcept {
+    fields_.clear();
+    unknown_fields_.Clear();
+}
+
 Status DynamicMessage::SetField(uint32_t field_id, DynamicValue value) noexcept {
     try {
         if (field_id == 0 || field_id > 536870911u) {
