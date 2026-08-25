@@ -136,7 +136,10 @@ build:tsan --copt=-fno-omit-frame-pointer
 build:tsan --copt=-g
 build:tsan --linkopt=-fsanitize=thread
 # GCC diagnoses std::atomic_thread_fence as unsupported under TSAN even when
-# the fence is used in a deliberately serialized offline upgrade path.
+# the fence is used in a deliberately serialized offline upgrade path. Clang
+# does not define the "tsan" warning group, so ignore unknown warning names
+# before applying the GCC-specific demotion.
+build:tsan --cxxopt=-Wno-unknown-warning-option
 build:tsan --cxxopt=-Wno-error=tsan
 
 # Clang coverage-guided fuzzing engine. Combine this with exactly one sanitizer

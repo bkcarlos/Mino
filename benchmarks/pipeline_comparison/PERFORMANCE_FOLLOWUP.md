@@ -68,9 +68,12 @@ for final manifests and never overwrite a failed run.
 ## Phase 0: correctness and build gate
 
 Candidate status: initial Linux functional, selected ASAN, optimized Mino binary,
-and six-process smoke gates passed on 2026-08-24. Clean baseline/candidate refs,
-non-root Bazel runner targets, remaining backends, TSAN/fault injection, and the
-full formal gate are still required.
+and six-process smoke gates passed on 2026-08-24. The generic allocator fixture
+is now independent of scheduler NUMA placement, includes a deterministic
+no-local-shard fallback regression, and the physical NUMA workflow runs its
+unpinned normal/ASAN/TSAN gate. A physical multi-NUMA rerun is still required.
+Clean baseline/candidate refs, non-root Bazel runner targets, remaining backends,
+fault injection, and the full formal gate are still required.
 
 Run on Linux for both refs before collecting performance data:
 

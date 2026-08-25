@@ -46,10 +46,24 @@ jobs:
           git --no-pager diff --exit-code
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-      - name: Build release NUMA benchmark and runner self-test
+      - name: Run unpinned allocator regression and runner self-tests
         run: |
-          bazel test --lockfile_mode=error --config=gcc12 \
-            //benchmarks/allocator:numa_qualification_test
+          bazel test --nocache_test_results --lockfile_mode=error \
+            --config=gcc12 \
+            //mino/shm/allocator:central_slab_test \
+            //benchmarks/allocator:numa_qualification_test \
+            --test_output=errors
+          bazel test --nocache_test_results --lockfile_mode=error \
+            --config=gcc12 --config=asan \
+            //mino/shm/allocator:central_slab_test \
+            --test_output=errors
+          bazel test --nocache_test_results --lockfile_mode=error \
+            --config=gcc12 --config=tsan \
+            //mino/shm/allocator:central_slab_test \
+            --test_output=errors
+
+      - name: Build release NUMA benchmark
+        run: |
           bazel build --lockfile_mode=error --config=gcc12 --config=release \
             //benchmarks/allocator:numa_allocator_benchmark
 

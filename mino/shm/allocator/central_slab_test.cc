@@ -106,8 +106,12 @@ protected:
     void SetUp() override {
         region_.reset(new (std::align_val_t(64)) std::byte[kRegionSize]);
         std::memset(region_.get(), 0, kRegionSize);
-        auto result =
-            CentralSlabAllocator::Create(region_.get(), kRegionSize, TestConfig());
+        // Generic allocator tests must not depend on the scheduler's current
+        // NUMA node. Dedicated CentralSlabNumaTest cases cover local-shard
+        // selection with a deterministic fake topology.
+        auto result = CentralSlabAllocator::Create(
+            region_.get(), kRegionSize, TestConfig(),
+            {.prefer_local_shards = false});
         ASSERT_TRUE(result.ok()) << result.status().ToString();
         alloc_ = result.value();
     }
@@ -695,6 +699,35 @@ TEST(CentralSlabNumaTest, PrefersLocalShardAndInvalidatesHintAfterMigration) {
     EXPECT_EQ(stats.numa_remote_allocations, 0u);
     EXPECT_EQ(stats.numa_fallback_allocations, 0u);
     EXPECT_EQ(stats.numa_migrations, 1u);
+}
+
+TEST(CentralSlabNumaTest, FallsBackWhenCurrentNodeHasNoAssignedShard) {
+    FakeAllocatorNumaSystem system;
+    system.current_cpu.store(4, std::memory_order_relaxed);
+    ClassTableConfig config;
+    config.classes = {{.slot_size = 64, .slot_count = 8}};
+    auto region = std::unique_ptr<std::byte[], TestAlignedDeleter>(
+        new (std::align_val_t(64)) std::byte[kRegionSize]);
+    std::memset(region.get(), 0, kRegionSize);
+    auto created = CentralSlabAllocator::Create(
+        region.get(), kRegionSize, config,
+        {.placement = {.system = &system}, .prefer_local_shards = true});
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+
+    AllocationRequest request;
+    request.object_size = 32;
+    request.type_id = TypeId{0xD603};
+    request.schema = {.short_id = 0xD603, .layout_version = 1};
+    auto handle = created->Allocate(request);
+    ASSERT_TRUE(handle.ok()) << handle.status().ToString();
+
+    const AllocatorLocalCacheStats stats = created->local_cache_stats();
+    EXPECT_EQ(stats.allocations, 1u);
+    EXPECT_EQ(stats.hint_hits, 0u);
+    EXPECT_EQ(stats.fallback_scans, 1u);
+    EXPECT_EQ(stats.numa_local_allocations, 0u);
+    EXPECT_EQ(stats.numa_remote_allocations, 1u);
+    EXPECT_EQ(stats.numa_fallback_allocations, 1u);
 }
 
 TEST(CentralSlabNumaTest, StrictBindFailureLeavesStorageUninitialized) {

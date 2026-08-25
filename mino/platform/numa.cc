@@ -36,6 +36,7 @@ std::string Trim(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+#if defined(__linux__)
 std::string ReadTextFile(const std::string& path) {
     std::ifstream input(path);
     if (!input) return {};
@@ -59,6 +60,7 @@ std::string StatusList(std::string_view status, std::string_view key) {
     }
     return {};
 }
+#endif
 
 std::vector<uint32_t> Intersect(const std::vector<uint32_t>& left,
                                 const std::vector<uint32_t>& right) {

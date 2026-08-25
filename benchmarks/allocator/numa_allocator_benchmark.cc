@@ -237,7 +237,7 @@ public:
 
 private:
     void* address_ = nullptr;
-    size_t size_ = 0;
+    [[maybe_unused]] size_t size_ = 0;
 };
 
 uint64_t Percentile(const std::vector<uint64_t>& sorted, double percentile) {
