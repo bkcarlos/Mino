@@ -88,7 +88,7 @@ cc_binary(
         ":autonomy_pipeline_cc_proto",
         ":pipeline_common",
         "@libzmq",
-        "@protobuf//:protobuf",
+        "@protobuf",
     ],
 )
 
@@ -181,8 +181,8 @@ cc_library(
     copts = PIPELINE_COPTS,
     tags = ["manual"],
     deps = [
-        "@fastcdr//:fastcdr",
-        "@fastdds//:fastdds",
+        "@fastcdr",
+        "@fastdds",
     ],
 )
 
@@ -195,7 +195,7 @@ cc_binary(
     deps = [
         ":autonomy_pipeline_fastdds_type",
         ":pipeline_common",
-        "@fastdds//:fastdds",
+        "@fastdds",
     ],
 )
 
