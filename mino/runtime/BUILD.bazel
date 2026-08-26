@@ -341,3 +341,50 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "mp_stress_harness",
+    testonly = True,
+    hdrs = ["mp_stress_harness.h"],
+)
+
+cc_test(
+    name = "zmq_ipc_mp_stress_test",
+    size = "small",
+    srcs = ["zmq_ipc_mp_stress_test.cc"],
+    data = ["//examples:zmq_ipc_pubsub_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "zmq_ipc_business_mp_stress_test",
+    size = "small",
+    srcs = ["zmq_ipc_business_mp_stress_test.cc"],
+    data = ["//examples:zmq_ipc_business_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "simple_node_business_mp_stress_test",
+    size = "small",
+    srcs = ["simple_node_business_mp_stress_test.cc"],
+    data = [
+        "//benchmarks/pipeline_comparison:autonomy_pipeline_descriptor",
+        "//examples:simple_mp_business_stress",
+    ],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        ":simple_node",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+

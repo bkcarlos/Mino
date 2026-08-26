@@ -40,3 +40,22 @@ bazel-bin/examples/simple_mp_pubsub_stress pub /mino_stress \
 
 订阅端结束时在 stdout 打一行 JSON（`received` / `lost` / `p50_ns` / `p95_ns` / `msgs_per_s`）。
 64KiB payload 用 `--messages 2000`，队列深度仍须能放进默认 64MiB tmpfs。
+
+## ZMQ ipc:// comparison (independent processes)
+
+Same spawn model as the SimpleNode stress: two binaries, no fork-after-bind.
+The subscriber binds `ipc://` (Unix domain socket under `TEST_TMPDIR` or `/tmp`);
+the publisher connects PUSH with HWM=`queue-depth`.
+
+Raw payloads match SimpleNode (`origin_ns` + `seq` + pattern). Business payloads
+fill `SemanticFrame` and encode with protobuf on ZMQ / CanonicalWireCodec on
+SimpleNode so serialize sits inside p50.
+
+```bash
+bazel test --config=release \
+  //mino/runtime:simple_node_mp_stress_test \
+  //mino/runtime:zmq_ipc_mp_stress_test \
+  //mino/runtime:simple_node_business_mp_stress_test \
+  //mino/runtime:zmq_ipc_business_mp_stress_test
+```
+

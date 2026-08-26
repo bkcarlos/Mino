@@ -2,32 +2,44 @@
 //
 // Licensed under the GNU Lesser General Public License, Version 3.0.
 
+#include "benchmarks/pipeline_comparison/pipeline_common.h"
+#include "benchmarks/pipeline_comparison/semantic_canonical_codec.h"
 #include "mino/runtime/simple_node.h"
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdlib>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <optional>
 #include <iostream>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
-#include <time.h>
-
 namespace {
+
+using mino::benchmarks::pipeline::InitializeSourceFrame;
+using mino::benchmarks::pipeline::Profile;
+using mino::benchmarks::pipeline::SemanticCanonicalCodec;
+using mino::benchmarks::pipeline::SemanticFrame;
+using mino::benchmarks::pipeline::ValidateSemanticFrame;
+using mino::benchmarks::pipeline::kLargePayloadBytes;
+using mino::benchmarks::pipeline::kMediumPayloadBytes;
+using mino::benchmarks::pipeline::kSmallPayloadBytes;
+using mino::benchmarks::pipeline::NowNs;
 
 constexpr uint32_t kTopicSlots = 4;
 constexpr uint32_t kDefaultMessages = 20000;
 constexpr uint32_t kDefaultPayloadBytes = 256;
 constexpr uint32_t kDefaultQueueDepth = 32;
-constexpr uint32_t kMinPayloadBytes = 16;  // origin_ns + seq
+constexpr uint32_t kHeaderAllowanceBytes = 2048;
 constexpr uint64_t kMaxMessages = 1000000;
 constexpr char kTopic[] = "camera";
 
@@ -35,26 +47,15 @@ struct Config {
     uint64_t messages = kDefaultMessages;
     uint32_t payload_bytes = kDefaultPayloadBytes;
     uint32_t queue_depth = kDefaultQueueDepth;
+    std::string schema_descriptor;
 };
-
-uint64_t MonotonicNs() {
-    timespec ts{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
-           static_cast<uint64_t>(ts.tv_nsec);
-}
 
 void Usage() {
     std::cerr
-        << "usage: simple_mp_pubsub_stress pub|sub shm-name "
-           "[--messages N] [--payload-bytes B] [--queue-depth D]\n"
-        << "  pub  Create/Advertise and publish N sequenced payloads\n"
-        << "  sub  Open/Subscribe, check sequences, print one JSON line\n"
-        << "  defaults: N=" << kDefaultMessages
-        << " B=" << kDefaultPayloadBytes
-        << " D=" << kDefaultQueueDepth << "\n";
+        << "usage: simple_mp_business_stress pub|sub shm-name "
+           "[--messages N] [--payload-bytes B] [--queue-depth D] "
+           "--schema-descriptor PATH\n"
+        << "  encodes SemanticFrame with CanonicalWireCodec\n";
 }
 
 bool ParseU64(std::string_view text, uint64_t* out) {
@@ -63,39 +64,40 @@ bool ParseU64(std::string_view text, uint64_t* out) {
     errno = 0;
     char* end = nullptr;
     const unsigned long long value = std::strtoull(copy.c_str(), &end, 10);
-    if (errno != 0 || end == nullptr || *end != '\0') {
-        return false;
-    }
+    if (errno != 0 || end == nullptr || *end != '\0') return false;
     *out = static_cast<uint64_t>(value);
     return true;
 }
 
+std::optional<Profile> ProfileFromPayload(uint32_t payload_bytes) {
+    if (payload_bytes == kSmallPayloadBytes) return Profile::kSmall;
+    if (payload_bytes == kMediumPayloadBytes) return Profile::kMedium;
+    if (payload_bytes == kLargePayloadBytes) return Profile::kLarge;
+    return std::nullopt;
+}
+
 bool ParseArgs(int argc, char** argv, std::string_view* mode, std::string* name,
                Config* config) {
-    if (argc < 3 || argv[1] == nullptr || argv[2] == nullptr) {
-        return false;
-    }
+    if (argc < 3 || argv[1] == nullptr || argv[2] == nullptr) return false;
     *mode = argv[1];
     *name = argv[2];
-    if (name->empty() || (*name)[0] == '-') {
-        return false;
-    }
+    if (name->empty() || (*name)[0] == '-') return false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view flag = argv[i] == nullptr ? "" : argv[i];
-        if (i + 1 >= argc || argv[i + 1] == nullptr) {
-            return false;
+        if (i + 1 >= argc || argv[i + 1] == nullptr) return false;
+        if (flag == "--schema-descriptor") {
+            config->schema_descriptor = argv[i + 1];
+            ++i;
+            continue;
         }
         uint64_t value = 0;
-        if (!ParseU64(argv[i + 1], &value)) {
-            return false;
-        }
+        if (!ParseU64(argv[i + 1], &value)) return false;
         ++i;
         if (flag == "--messages") {
             if (value == 0 || value > kMaxMessages) return false;
             config->messages = value;
         } else if (flag == "--payload-bytes") {
-            if (value < kMinPayloadBytes ||
-                value > 1024ull * 1024ull) {
+            if (ProfileFromPayload(static_cast<uint32_t>(value)) == std::nullopt) {
                 return false;
             }
             config->payload_bytes = static_cast<uint32_t>(value);
@@ -108,33 +110,42 @@ bool ParseArgs(int argc, char** argv, std::string_view* mode, std::string* name,
             return false;
         }
     }
-    return true;
+    return !config->schema_descriptor.empty();
 }
 
-void FillPayload(std::span<std::byte> buf, uint64_t seq, uint64_t origin_ns) {
-    std::memcpy(buf.data(), &origin_ns, sizeof(origin_ns));
-    std::memcpy(buf.data() + sizeof(origin_ns), &seq, sizeof(seq));
-    for (size_t i = 16; i < buf.size(); ++i) {
-        buf[i] = static_cast<std::byte>(
-            static_cast<uint8_t>(seq ^ static_cast<uint64_t>(i)));
-    }
+uint32_t MaxEncodedBytes(uint32_t payload_bytes) {
+    return payload_bytes + kHeaderAllowanceBytes;
 }
 
-bool PayloadMatches(std::span<const std::byte> buf, uint64_t seq) {
-    for (size_t i = 16; i < buf.size(); ++i) {
-        const std::byte expected = static_cast<std::byte>(
-            static_cast<uint8_t>(seq ^ static_cast<uint64_t>(i)));
-        if (buf[i] != expected) return false;
-    }
-    return true;
+uint64_t PercentileNs(std::vector<uint64_t>* latencies, int percent) {
+    if (latencies == nullptr || latencies->empty()) return 0;
+    std::sort(latencies->begin(), latencies->end());
+    const size_t n = latencies->size();
+    size_t index = (static_cast<size_t>(percent) * (n - 1)) / 100;
+    if (index >= n) index = n - 1;
+    return (*latencies)[index];
 }
 
 int RunPub(std::string_view name, const Config& config) {
+    const auto profile = ProfileFromPayload(config.payload_bytes);
+    if (!profile.has_value()) {
+        std::cerr << "unsupported payload-bytes for business profile\n";
+        return 1;
+    }
+    std::optional<SemanticCanonicalCodec> codec_holder;
+    try {
+        codec_holder = SemanticCanonicalCodec::FromDescriptorFile(
+            config.schema_descriptor);
+    } catch (const std::exception& ex) {
+        std::cerr << "schema load failed: " << ex.what() << "\n";
+        return 1;
+    }
+    SemanticCanonicalCodec& codec = *codec_holder;
     (void)mino::SimpleNode::Unlink(name);
     mino::SimpleNodeOptions options;
     options.topic_slots = kTopicSlots;
     options.queue_depth = config.queue_depth;
-    options.max_payload_bytes = config.payload_bytes;
+    options.max_payload_bytes = MaxEncodedBytes(config.payload_bytes);
     options.segment_bytes = 0;
     const auto required = mino::SimpleNode::RequiredBytes(options);
     if (!required.ok()) {
@@ -148,17 +159,31 @@ int RunPub(std::string_view name, const Config& config) {
         return 1;
     }
     std::cerr << "segment " << created->size_bytes() << " bytes required "
-              << *required << " at " << name << "\n";
+              << *required << " max_payload " << options.max_payload_bytes
+              << " at " << name << "\n";
     auto pub = created->Advertise(kTopic);
     if (!pub.ok()) {
         std::cerr << "Advertise failed: " << pub.status().ToString() << "\n";
         return 1;
     }
-    std::vector<std::byte> payload(config.payload_bytes);
+    std::vector<std::byte> encoded;
     for (uint64_t seq = 0; seq < config.messages; ++seq) {
-        FillPayload(payload, seq, MonotonicNs());
+        SemanticFrame frame = InitializeSourceFrame(seq, *profile, true);
+        try {
+            codec.Encode(frame, &encoded);
+        } catch (const std::exception& ex) {
+            std::cerr << "Encode failed at seq " << seq << ": " << ex.what()
+                      << "\n";
+            return 1;
+        }
+        if (encoded.size() > options.max_payload_bytes) {
+            std::cerr << "encoded frame " << encoded.size()
+                      << " exceeds max_payload_bytes "
+                      << options.max_payload_bytes << "\n";
+            return 1;
+        }
         const mino::Status status = pub->Publish(
-            std::span<const std::byte>{payload.data(), payload.size()},
+            std::span<const std::byte>{encoded.data(), encoded.size()},
             mino::Deadline::FromNow(std::chrono::seconds(30)));
         if (!status.ok()) {
             std::cerr << "Publish failed at seq " << seq << ": "
@@ -166,20 +191,25 @@ int RunPub(std::string_view name, const Config& config) {
             return 1;
         }
     }
-    std::cerr << "published " << config.messages << " messages\n";
+    std::cerr << "published " << config.messages << " business frames\n";
     return 0;
 }
 
-uint64_t PercentileNs(std::vector<uint64_t>* latencies, int percent) {
-    if (latencies == nullptr || latencies->empty()) return 0;
-    std::sort(latencies->begin(), latencies->end());
-    const size_t n = latencies->size();
-    size_t index = (static_cast<size_t>(percent) * (n - 1)) / 100;
-    if (index >= n) index = n - 1;
-    return (*latencies)[index];
-}
-
 int RunSub(std::string_view name, const Config& config) {
+    const auto profile = ProfileFromPayload(config.payload_bytes);
+    if (!profile.has_value()) {
+        std::cerr << "unsupported payload-bytes for business profile\n";
+        return 1;
+    }
+    std::optional<SemanticCanonicalCodec> codec_holder;
+    try {
+        codec_holder = SemanticCanonicalCodec::FromDescriptorFile(
+            config.schema_descriptor);
+    } catch (const std::exception& ex) {
+        std::cerr << "schema load failed: " << ex.what() << "\n";
+        return 1;
+    }
+    SemanticCanonicalCodec& codec = *codec_holder;
     mino::Result<mino::SimpleNode> opened = mino::Status::Error(
         mino::StatusCode::kNotFound, "not opened");
     const auto open_deadline =
@@ -203,14 +233,14 @@ int RunSub(std::string_view name, const Config& config) {
     uint64_t received = 0;
     uint64_t lost = 0;
     uint64_t expected = 0;
-    bool pattern_ok = true;
+    bool frames_ok = true;
+    std::string frame_error;
     std::vector<uint64_t> latencies;
     latencies.reserve(static_cast<size_t>(
         std::min(config.messages, static_cast<uint64_t>(1 << 20))));
 
-    const uint64_t loop_start_ns = MonotonicNs();
-    const auto overall =
-        mino::Deadline::FromNow(std::chrono::seconds(90));
+    const uint64_t loop_start_ns = NowNs();
+    const auto overall = mino::Deadline::FromNow(std::chrono::seconds(90));
     while (received + lost < config.messages) {
         if (overall.expired()) {
             lost += config.messages - received - lost;
@@ -226,33 +256,33 @@ int RunSub(std::string_view name, const Config& config) {
             std::cerr << "Poll failed: " << message.status().ToString() << "\n";
             return 1;
         }
-        const auto bytes = message->bytes();
-        if (bytes.size() != config.payload_bytes || bytes.size() < 16) {
-            std::cerr << "unexpected payload size " << bytes.size() << "\n";
+        SemanticFrame frame;
+        try {
+            codec.Decode(message->bytes(), &frame);
+        } catch (const std::exception& ex) {
+            std::cerr << "Decode failed: " << ex.what() << "\n";
             (void)std::move(*message).Release();
             return 1;
         }
-        uint64_t origin_ns = 0;
-        uint64_t seq = 0;
-        std::memcpy(&origin_ns, bytes.data(), sizeof(origin_ns));
-        std::memcpy(&seq, bytes.data() + sizeof(origin_ns), sizeof(seq));
-        if (seq < expected) {
-            std::cerr << "out-of-order seq " << seq << " expected "
-                      << expected << "\n";
+        if (frame.sample_id < expected) {
+            std::cerr << "out-of-order sample_id " << frame.sample_id
+                      << " expected " << expected << "\n";
             (void)std::move(*message).Release();
             return 1;
         }
-        if (seq > expected) {
-            lost += seq - expected;
+        if (frame.sample_id > expected) lost += frame.sample_id - expected;
+        if (frame.payload.size() != config.payload_bytes) {
+            frames_ok = false;
+            frame_error = "payload size mismatch";
+        } else if (!ValidateSemanticFrame(frame, &frame_error)) {
+            frames_ok = false;
         }
-        if (!PayloadMatches(bytes, seq)) {
-            pattern_ok = false;
+        const uint64_t now_ns = NowNs();
+        if (frame.origin_timestamp_ns != 0 &&
+            now_ns >= frame.origin_timestamp_ns) {
+            latencies.push_back(now_ns - frame.origin_timestamp_ns);
         }
-        const uint64_t now_ns = MonotonicNs();
-        if (origin_ns != 0 && now_ns >= origin_ns) {
-            latencies.push_back(now_ns - origin_ns);
-        }
-        expected = seq + 1;
+        expected = frame.sample_id + 1;
         ++received;
         const mino::Status released = std::move(*message).Release();
         if (!released.ok()) {
@@ -260,7 +290,7 @@ int RunSub(std::string_view name, const Config& config) {
             return 1;
         }
     }
-    const uint64_t loop_end_ns = MonotonicNs();
+    const uint64_t loop_end_ns = NowNs();
     if (received + lost < config.messages) {
         lost += config.messages - received - lost;
     }
@@ -275,7 +305,8 @@ int RunSub(std::string_view name, const Config& config) {
 
     std::ostringstream json;
     json << std::fixed << std::setprecision(1);
-    json << "{\"codec\":\"raw\",\"received\":" << received
+    json << "{\"codec\":\"business\""
+         << ",\"received\":" << received
          << ",\"lost\":" << lost
          << ",\"expected\":" << config.messages
          << ",\"payload_bytes\":" << config.payload_bytes
@@ -286,13 +317,11 @@ int RunSub(std::string_view name, const Config& config) {
          << ",\"msgs_per_s\":" << msgs_per_s
          << "}\n";
     std::cout << json.str() << std::flush;
-    if (!pattern_ok) {
-        std::cerr << "payload pattern mismatch\n";
+    if (!frames_ok) {
+        std::cerr << "ValidateSemanticFrame failed: " << frame_error << "\n";
         return 1;
     }
-    if (received != config.messages || lost != 0) {
-        return 1;
-    }
+    if (received != config.messages || lost != 0) return 1;
     return 0;
 }
 
@@ -306,8 +335,13 @@ int main(int argc, char** argv) {
         Usage();
         return 2;
     }
-    if (mode == "pub") return RunPub(name, config);
-    if (mode == "sub") return RunSub(name, config);
+    try {
+        if (mode == "pub") return RunPub(name, config);
+        if (mode == "sub") return RunSub(name, config);
+    } catch (const std::exception& ex) {
+        std::cerr << ex.what() << "\n";
+        return 1;
+    }
     Usage();
     return 2;
 }
