@@ -65,6 +65,7 @@ struct Config {
     uint64_t messages = kDefaultMessages;
     uint32_t payload_bytes = kDefaultPayloadBytes;
     uint32_t queue_depth = kDefaultQueueDepth;
+    uint32_t hwm = kDefaultQueueDepth;
 };
 
 std::optional<Profile> ProfileFromPayload(uint32_t payload_bytes) {
@@ -77,13 +78,14 @@ std::optional<Profile> ProfileFromPayload(uint32_t payload_bytes) {
 void Usage() {
     std::cerr
         << "usage: zmq_ipc_business_stress pub|sub ipc-path "
-           "[--messages N] [--payload-bytes B] [--queue-depth D]\n"
+           "[--messages N] [--payload-bytes B] [--queue-depth D] [--hwm N]\n"
         << "  pub  Connect PUB after the SUB ready handshake and send N protobuf frames\n"
         << "  sub  Bind SUB, subscribe topic camera, check sequences, print JSON\n"
         << "  path is a filesystem Unix socket (ipc:// is added if omitted)\n"
         << "  defaults: N=" << kDefaultMessages
         << " B=" << kDefaultPayloadBytes
-        << " D=" << kDefaultQueueDepth << "\n";
+        << " D=" << kDefaultQueueDepth
+        << " HWM=D (1..1000000, not required to be power-of-two)\n";
 }
 
 bool ParseU64(std::string_view text, uint64_t* out) {
@@ -103,6 +105,7 @@ bool ParseArgs(int argc, char** argv, std::string_view* mode, std::string* name,
     *mode = argv[1];
     *name = argv[2];
     if (name->empty() || (*name)[0] == '-') return false;
+    bool hwm_set = false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view flag = argv[i] == nullptr ? "" : argv[i];
         if (i + 1 >= argc || argv[i + 1] == nullptr) return false;
@@ -122,10 +125,15 @@ bool ParseArgs(int argc, char** argv, std::string_view* mode, std::string* name,
                 return false;
             }
             config->queue_depth = static_cast<uint32_t>(value);
+        } else if (flag == "--hwm") {
+            if (value < 1 || value > kMaxMessages) return false;
+            config->hwm = static_cast<uint32_t>(value);
+            hwm_set = true;
         } else {
             return false;
         }
     }
+    if (!hwm_set) config->hwm = config->queue_depth;
     return true;
 }
 
@@ -410,7 +418,7 @@ int RunPub(const std::filesystem::path& path, const Config& config) {
     const std::string endpoint = IpcEndpoint(path);
     {
         ZmqSession session;
-        if (!OpenSocket(&session, ZMQ_PUB, static_cast<int>(config.queue_depth),
+        if (!OpenSocket(&session, ZMQ_PUB, static_cast<int>(config.hwm),
                         kSendTimeoutMs, kRecvTimeoutMs)) {
             return 1;
         }
@@ -475,7 +483,7 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
     UnlinkQuiet(PeerPath(path));
     UnlinkQuiet(DonePath(path));
     ZmqSession session;
-    if (!OpenSocket(&session, ZMQ_SUB, static_cast<int>(config.queue_depth),
+    if (!OpenSocket(&session, ZMQ_SUB, static_cast<int>(config.hwm),
                     kSendTimeoutMs, kRecvTimeoutMs)) {
         return 1;
     }
@@ -592,6 +600,7 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
          << ",\"expected\":" << config.messages
          << ",\"payload_bytes\":" << config.payload_bytes
          << ",\"queue_depth\":" << config.queue_depth
+         << ",\"hwm\":" << config.hwm
          << ",\"p50_ns\":" << p50
          << ",\"p95_ns\":" << p95
          << ",\"msgs_per_s\":" << msgs_per_s

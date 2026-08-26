@@ -16,7 +16,9 @@ namespace {
 class ZmqIpcBusinessMpStressTest : public ::testing::Test {
 protected:
     void RunProfile(uint32_t payload_bytes, uint64_t messages,
-                    uint32_t queue_depth, const char* tag) {
+                    uint32_t queue_depth, const char* tag,
+                    uint32_t hwm = 0) {
+        if (hwm == 0) hwm = queue_depth;
         const std::filesystem::path worker =
             mp_stress::FindWorker("examples/zmq_ipc_business_stress");
         ASSERT_TRUE(std::filesystem::exists(worker)) << worker;
@@ -25,13 +27,14 @@ protected:
         const std::string messages_s = std::to_string(messages);
         const std::string payload_s = std::to_string(payload_bytes);
         const std::string depth_s = std::to_string(queue_depth);
+        const std::string hwm_s = std::to_string(hwm);
         const std::vector<std::string> sub_args = {
             "sub", path.string(), "--messages", messages_s, "--payload-bytes",
-            payload_s, "--queue-depth", depth_s,
+            payload_s, "--queue-depth", depth_s, "--hwm", hwm_s,
         };
         const std::vector<std::string> pub_args = {
             "pub", path.string(), "--messages", messages_s, "--payload-bytes",
-            payload_s, "--queue-depth", depth_s,
+            payload_s, "--queue-depth", depth_s, "--hwm", hwm_s,
         };
 
         mp_stress::Child sub;
@@ -68,7 +71,8 @@ protected:
         std::cout << "transport=zmq-ipc socket=pubsub codec=business profile=" << tag
                   << " payload_bytes=" << payload_bytes
                   << " messages=" << messages
-                  << " queue_depth=" << queue_depth << "\n"
+                  << " queue_depth=" << queue_depth
+                  << " hwm=" << hwm << "\n"
                   << "json=" << json << "\n"
                   << "pub_err=" << pub_err << "\n"
                   << "sub_err=" << sub_err << "\n";
@@ -99,6 +103,9 @@ protected:
         ASSERT_TRUE(mp_stress::ExtractU64(json, "p95_ns", &p95_ns)) << json;
         ASSERT_TRUE(mp_stress::ExtractF64(json, "msgs_per_s", &msgs_per_s))
             << json;
+        uint64_t json_hwm = 0;
+        ASSERT_TRUE(mp_stress::ExtractU64(json, "hwm", &json_hwm)) << json;
+        EXPECT_EQ(json_hwm, hwm);
         EXPECT_EQ(codec, "business");
         EXPECT_EQ(socket, "pubsub");
         EXPECT_EQ(expected, messages);
@@ -115,10 +122,12 @@ protected:
             std::cout << "NOTE: ZMQ PUB mute-dropped lost=" << lost
                       << " received=" << received
                       << " first_seq=" << first_seq
-                      << " (HWM stays queue_depth=" << queue_depth << ")\n";
+                      << " (HWM=" << hwm
+                      << " queue_depth=" << queue_depth << ")\n";
         }
         RecordProperty("payload_bytes", static_cast<int>(payload_bytes));
         RecordProperty("messages", static_cast<int>(messages));
+        RecordProperty("hwm", static_cast<int>(hwm));
         RecordProperty("lost", std::to_string(lost));
         RecordProperty("p50_ns", std::to_string(p50_ns));
         RecordProperty("p95_ns", std::to_string(p95_ns));
@@ -132,6 +141,22 @@ TEST_F(ZmqIpcBusinessMpStressTest, SmallPayloadIndependentProcesses) {
 
 TEST_F(ZmqIpcBusinessMpStressTest, MediumPayloadIndependentProcesses) {
     RunProfile(64u * 1024u, 2000, 32, "m64k");
+}
+
+TEST_F(ZmqIpcBusinessMpStressTest, SmallPayloadHwm1024) {
+    RunProfile(256, 20000, 32, "s256h1k", 1024);
+}
+
+TEST_F(ZmqIpcBusinessMpStressTest, MediumPayloadHwm1024) {
+    RunProfile(64u * 1024u, 2000, 32, "m64kh1k", 1024);
+}
+
+TEST_F(ZmqIpcBusinessMpStressTest, SmallPayloadHwmMessages) {
+    RunProfile(256, 20000, 32, "s256hn", 20000);
+}
+
+TEST_F(ZmqIpcBusinessMpStressTest, MediumPayloadHwmMessages) {
+    RunProfile(64u * 1024u, 2000, 32, "m64khn", 2000);
 }
 
 }  // namespace

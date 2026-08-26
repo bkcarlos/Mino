@@ -48,8 +48,11 @@ The subscriber binds `ZMQ_SUB` on `ipc://` (Unix domain socket under `TEST_TMPDI
 or `/tmp`) and subscribes to topic `camera`. After bind+subscribe it writes a
 ready file; the publisher waits for that file, connects `ZMQ_PUB`, and waits for
 `ZMQ_EVENT_HANDSHAKE_SUCCEEDED` plus a peer file so it does not send into the
-slow-joiner window. Payloads are multipart (`camera` + body). HWM=`queue-depth`
-(32); PUB drops when mute rather than blocking like SimpleNode Publish.
+slow-joiner window. Payloads are multipart (`camera` + body). `--queue-depth`
+stays a compatibility knob (still 32 in the SimpleNode-matched profiles).
+`--hwm N` sets SNDHWM/RCVHWM independently (default = queue-depth; any integer
+1..1000000). PUB mute-drops when HWM is hit rather than blocking like
+SimpleNode Publish; raising HWM is how a 1-hop sweep measures that tradeoff.
 
 Raw payloads match SimpleNode (`origin_ns` + `seq` + pattern). Business payloads
 fill `SemanticFrame` and encode with protobuf on ZMQ / CanonicalWireCodec on
