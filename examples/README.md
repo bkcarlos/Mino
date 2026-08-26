@@ -44,8 +44,12 @@ bazel-bin/examples/simple_mp_pubsub_stress pub /mino_stress \
 ## ZMQ ipc:// comparison (independent processes)
 
 Same spawn model as the SimpleNode stress: two binaries, no fork-after-bind.
-The subscriber binds `ipc://` (Unix domain socket under `TEST_TMPDIR` or `/tmp`);
-the publisher connects PUSH with HWM=`queue-depth`.
+The subscriber binds `ZMQ_SUB` on `ipc://` (Unix domain socket under `TEST_TMPDIR`
+or `/tmp`) and subscribes to topic `camera`. After bind+subscribe it writes a
+ready file; the publisher waits for that file, connects `ZMQ_PUB`, and waits for
+`ZMQ_EVENT_HANDSHAKE_SUCCEEDED` plus a peer file so it does not send into the
+slow-joiner window. Payloads are multipart (`camera` + body). HWM=`queue-depth`
+(32); PUB drops when mute rather than blocking like SimpleNode Publish.
 
 Raw payloads match SimpleNode (`origin_ns` + `seq` + pattern). Business payloads
 fill `SemanticFrame` and encode with protobuf on ZMQ / CanonicalWireCodec on

@@ -16,6 +16,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -43,7 +44,11 @@ constexpr int kIoThreads = 1;
 constexpr int kSendTimeoutMs = 30000;
 constexpr int kRecvTimeoutMs = 10000;
 constexpr int kLingerMs = 30000;
+constexpr int kHandshakeTimeoutMs = 20000;
 constexpr auto kOverallTimeout = std::chrono::seconds(90);
+constexpr auto kHandshakeTimeout = std::chrono::seconds(20);
+constexpr char kTopic[] = "camera";
+constexpr int kTopicLen = static_cast<int>(sizeof(kTopic) - 1);
 
 using mino::benchmarks::pipeline::InitializeSourceFrame;
 using mino::benchmarks::pipeline::NowNs;
@@ -73,8 +78,8 @@ void Usage() {
     std::cerr
         << "usage: zmq_ipc_business_stress pub|sub ipc-path "
            "[--messages N] [--payload-bytes B] [--queue-depth D]\n"
-        << "  pub  Connect PUSH and send N protobuf SemanticFrame payloads\n"
-        << "  sub  Bind PULL, check sequences, print one JSON line\n"
+        << "  pub  Connect PUB after the SUB ready handshake and send N protobuf frames\n"
+        << "  sub  Bind SUB, subscribe topic camera, check sequences, print JSON\n"
         << "  path is a filesystem Unix socket (ipc:// is added if omitted)\n"
         << "  defaults: N=" << kDefaultMessages
         << " B=" << kDefaultPayloadBytes
@@ -139,6 +144,18 @@ std::string IpcEndpoint(const std::filesystem::path& path) {
     return "ipc://" + path.string();
 }
 
+std::filesystem::path ReadyPath(const std::filesystem::path& path) {
+    return std::filesystem::path(path.string() + ".ready");
+}
+
+std::filesystem::path PeerPath(const std::filesystem::path& path) {
+    return std::filesystem::path(path.string() + ".peer");
+}
+
+std::filesystem::path DonePath(const std::filesystem::path& path) {
+    return std::filesystem::path(path.string() + ".done");
+}
+
 bool PathFitsUnix(const std::filesystem::path& path) {
     struct sockaddr_un address {};
     return path.string().size() < sizeof(address.sun_path);
@@ -161,6 +178,54 @@ void RemoveStaleSocket(const std::filesystem::path& path) {
     }
 }
 
+void UnlinkQuiet(const std::filesystem::path& path) {
+    if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+        std::cerr << "unlink " << path << ": " << std::strerror(errno) << "\n";
+    }
+}
+
+bool WriteSignalFile(const std::filesystem::path& path) {
+    const std::filesystem::path tmp(path.string() + ".tmp");
+    const int fd =
+        ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        std::cerr << "open " << tmp << ": " << std::strerror(errno) << "\n";
+        return false;
+    }
+    const char payload[] = "1\n";
+    const ssize_t n = ::write(fd, payload, sizeof(payload) - 1);
+    const int saved = errno;
+    ::close(fd);
+    if (n != static_cast<ssize_t>(sizeof(payload) - 1)) {
+        UnlinkQuiet(tmp);
+        std::cerr << "write " << tmp << ": " << std::strerror(saved) << "\n";
+        return false;
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        const int rename_err = errno;
+        UnlinkQuiet(tmp);
+        std::cerr << "rename " << tmp << ": " << std::strerror(rename_err)
+                  << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool WaitForFile(const std::filesystem::path& path,
+                 std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct stat status {};
+        if (::lstat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) &&
+            status.st_size > 0) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::cerr << "timeout waiting for " << path << "\n";
+    return false;
+}
+
 std::string ZmqError(std::string_view operation) {
     return std::string(operation) + ": " + zmq_strerror(zmq_errno());
 }
@@ -176,8 +241,14 @@ bool SetInt(void* socket, int option, int value, std::string_view name) {
 struct ZmqSession {
     void* ctx = nullptr;
     void* sock = nullptr;
+    void* monitor = nullptr;
     ~ZmqSession() {
+        if (monitor != nullptr) {
+            static_cast<void>(zmq_close(monitor));
+            monitor = nullptr;
+        }
         if (sock != nullptr) {
+            static_cast<void>(zmq_socket_monitor(sock, nullptr, 0));
             static_cast<void>(zmq_close(sock));
             sock = nullptr;
         }
@@ -212,6 +283,119 @@ bool OpenSocket(ZmqSession* session, int type, int hwm, int snd_ms, int rcv_ms) 
            SetInt(session->sock, ZMQ_RCVTIMEO, rcv_ms, "RCVTIMEO");
 }
 
+bool StartMonitor(ZmqSession* session) {
+    const char* endpoint = "inproc://zmq-mon";
+    const int events = ZMQ_EVENT_CONNECTED | ZMQ_EVENT_ACCEPTED |
+                       ZMQ_EVENT_HANDSHAKE_SUCCEEDED |
+                       ZMQ_EVENT_HANDSHAKE_FAILED_NO_DETAIL |
+                       ZMQ_EVENT_HANDSHAKE_FAILED_PROTOCOL |
+                       ZMQ_EVENT_HANDSHAKE_FAILED_AUTH |
+                       ZMQ_EVENT_DISCONNECTED;
+    if (zmq_socket_monitor(session->sock, endpoint, events) != 0) {
+        std::cerr << ZmqError("zmq_socket_monitor") << "\n";
+        return false;
+    }
+    session->monitor = zmq_socket(session->ctx, ZMQ_PAIR);
+    if (session->monitor == nullptr) {
+        std::cerr << ZmqError("monitor zmq_socket") << "\n";
+        return false;
+    }
+    if (!SetInt(session->monitor, ZMQ_LINGER, 0, "monitor LINGER") ||
+        !SetInt(session->monitor, ZMQ_RCVTIMEO, kHandshakeTimeoutMs,
+                "monitor RCVTIMEO")) {
+        return false;
+    }
+    if (zmq_connect(session->monitor, endpoint) != 0) {
+        std::cerr << ZmqError("monitor zmq_connect") << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool WaitHandshake(void* monitor) {
+    const auto deadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        zmq_msg_t event_msg;
+        zmq_msg_init(&event_msg);
+        const int rc = zmq_msg_recv(&event_msg, monitor, 0);
+        if (rc < 0) {
+            zmq_msg_close(&event_msg);
+            const int err = zmq_errno();
+            if (err == EINTR) continue;
+            std::cerr << ZmqError("monitor recv") << "\n";
+            return false;
+        }
+        uint16_t event = 0;
+        if (zmq_msg_size(&event_msg) >= sizeof(event)) {
+            std::memcpy(&event, zmq_msg_data(&event_msg), sizeof(event));
+        }
+        zmq_msg_close(&event_msg);
+        zmq_msg_t addr_msg;
+        zmq_msg_init(&addr_msg);
+        static_cast<void>(zmq_msg_recv(&addr_msg, monitor, 0));
+        zmq_msg_close(&addr_msg);
+        if (event == ZMQ_EVENT_HANDSHAKE_SUCCEEDED) return true;
+        if (event == ZMQ_EVENT_HANDSHAKE_FAILED_NO_DETAIL ||
+            event == ZMQ_EVENT_HANDSHAKE_FAILED_PROTOCOL ||
+            event == ZMQ_EVENT_HANDSHAKE_FAILED_AUTH ||
+            event == ZMQ_EVENT_DISCONNECTED) {
+            std::cerr << "PUB/SUB handshake failed, monitor event=" << event
+                      << "\n";
+            return false;
+        }
+    }
+    std::cerr << "timeout waiting for ZMQ handshake\n";
+    return false;
+}
+
+bool SendMultipart(void* sock, const void* payload, size_t payload_size,
+                   uint64_t seq) {
+    for (;;) {
+        const int sent = zmq_send(sock, kTopic, static_cast<size_t>(kTopicLen),
+                                  ZMQ_SNDMORE);
+        if (sent == kTopicLen) break;
+        if (sent >= 0) {
+            std::cerr << "short topic send at seq " << seq << "\n";
+            return false;
+        }
+        const int err = zmq_errno();
+        if (err == EINTR) continue;
+        std::cerr << "Publish topic failed at seq " << seq << ": "
+                  << zmq_strerror(err) << "\n";
+        return false;
+    }
+    for (;;) {
+        const int sent = zmq_send(sock, payload, payload_size, 0);
+        if (sent == static_cast<int>(payload_size)) return true;
+        if (sent >= 0) {
+            std::cerr << "short zmq_send at seq " << seq << "\n";
+            return false;
+        }
+        const int err = zmq_errno();
+        if (err == EINTR) continue;
+        std::cerr << "Publish failed at seq " << seq << ": "
+                  << zmq_strerror(err) << "\n";
+        return false;
+    }
+}
+
+int RecvPayload(void* sock, void* buf, size_t buf_size) {
+    char topic[16];
+    const int tgot = zmq_recv(sock, topic, sizeof(topic), 0);
+    if (tgot < 0) return -1;
+    if (tgot != kTopicLen || std::memcmp(topic, kTopic, kTopicLen) != 0) {
+        std::cerr << "unexpected topic frame size " << tgot << "\n";
+        return -2;
+    }
+    int more = 0;
+    size_t more_size = sizeof(more);
+    if (zmq_getsockopt(sock, ZMQ_RCVMORE, &more, &more_size) != 0 || more == 0) {
+        std::cerr << "missing payload frame after topic\n";
+        return -2;
+    }
+    return zmq_recv(sock, buf, buf_size, 0);
+}
+
 int RunPub(const std::filesystem::path& path, const Config& config) {
     const auto profile = ProfileFromPayload(config.payload_bytes);
     if (!profile.has_value()) {
@@ -222,46 +406,43 @@ int RunPub(const std::filesystem::path& path, const Config& config) {
         std::cerr << "Unix IPC path is too long: " << path << "\n";
         return 1;
     }
-    ZmqSession session;
-    if (!OpenSocket(&session, ZMQ_PUSH, static_cast<int>(config.queue_depth),
-                    kSendTimeoutMs, kRecvTimeoutMs)) {
-        return 1;
-    }
+    if (!WaitForFile(ReadyPath(path), kHandshakeTimeout)) return 1;
     const std::string endpoint = IpcEndpoint(path);
-    if (zmq_connect(session.sock, endpoint.c_str()) != 0) {
-        std::cerr << ZmqError("zmq_connect " + endpoint) << "\n";
-        return 1;
-    }
-    for (uint64_t seq = 0; seq < config.messages; ++seq) {
-        SemanticFrame frame = InitializeSourceFrame(seq, *profile, true);
-        std::string bytes;
-        try {
-            bytes = SerializeFrame(frame);
-        } catch (const std::exception& ex) {
-            std::cerr << "SerializeFrame failed at seq " << seq << ": "
-                      << ex.what() << "\n";
+    {
+        ZmqSession session;
+        if (!OpenSocket(&session, ZMQ_PUB, static_cast<int>(config.queue_depth),
+                        kSendTimeoutMs, kRecvTimeoutMs)) {
             return 1;
         }
-        if (bytes.size() > static_cast<size_t>(INT_MAX)) {
-            std::cerr << "encoded frame exceeds zmq_send limit\n";
+        if (!StartMonitor(&session)) return 1;
+        if (zmq_connect(session.sock, endpoint.c_str()) != 0) {
+            std::cerr << ZmqError("zmq_connect " + endpoint) << "\n";
             return 1;
         }
-        for (;;) {
-            const int sent = zmq_send(session.sock, bytes.data(), bytes.size(), 0);
-            if (sent == static_cast<int>(bytes.size())) break;
-            if (sent >= 0) {
-                std::cerr << "short zmq_send at seq " << seq << "\n";
+        if (!WaitHandshake(session.monitor)) return 1;
+        if (!WaitForFile(PeerPath(path), kHandshakeTimeout)) return 1;
+        for (uint64_t seq = 0; seq < config.messages; ++seq) {
+            SemanticFrame frame = InitializeSourceFrame(seq, *profile, true);
+            std::string bytes;
+            try {
+                bytes = SerializeFrame(frame);
+            } catch (const std::exception& ex) {
+                std::cerr << "SerializeFrame failed at seq " << seq << ": "
+                          << ex.what() << "\n";
                 return 1;
             }
-            const int err = zmq_errno();
-            if (err == EINTR) continue;
-            std::cerr << "Publish failed at seq " << seq << ": "
-                      << zmq_strerror(err) << "\n";
-            return 1;
+            if (bytes.size() > static_cast<size_t>(INT_MAX)) {
+                std::cerr << "encoded frame exceeds zmq_send limit\n";
+                return 1;
+            }
+            if (!SendMultipart(session.sock, bytes.data(), bytes.size(), seq)) {
+                return 1;
+            }
         }
+        std::cerr << "published " << config.messages << " business frames via "
+                  << endpoint << " socket=pubsub handshake=ready+monitor\n";
     }
-    std::cerr << "published " << config.messages << " business frames via "
-              << endpoint << "\n";
+    if (!WriteSignalFile(DonePath(path))) return 1;
     return 0;
 }
 
@@ -290,21 +471,36 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
         std::cerr << ex.what() << "\n";
         return 1;
     }
+    UnlinkQuiet(ReadyPath(path));
+    UnlinkQuiet(PeerPath(path));
+    UnlinkQuiet(DonePath(path));
     ZmqSession session;
-    if (!OpenSocket(&session, ZMQ_PULL, static_cast<int>(config.queue_depth),
+    if (!OpenSocket(&session, ZMQ_SUB, static_cast<int>(config.queue_depth),
                     kSendTimeoutMs, kRecvTimeoutMs)) {
         return 1;
     }
+    if (zmq_setsockopt(session.sock, ZMQ_SUBSCRIBE, kTopic,
+                       static_cast<size_t>(kTopicLen)) != 0) {
+        std::cerr << ZmqError("ZMQ_SUBSCRIBE camera") << "\n";
+        return 1;
+    }
+    if (!StartMonitor(&session)) return 1;
     const std::string endpoint = IpcEndpoint(path);
     if (zmq_bind(session.sock, endpoint.c_str()) != 0) {
         std::cerr << ZmqError("zmq_bind " + endpoint) << "\n";
         return 1;
     }
-    std::cerr << "bound " << endpoint << "\n";
+    if (!WriteSignalFile(ReadyPath(path))) return 1;
+    std::cerr << "bound " << endpoint << " subscribed=" << kTopic << "\n";
+    if (!WaitHandshake(session.monitor)) return 1;
+    if (!WriteSignalFile(PeerPath(path))) return 1;
+    if (!SetInt(session.sock, ZMQ_RCVTIMEO, 100, "RCVTIMEO drain")) return 1;
 
     uint64_t received = 0;
     uint64_t lost = 0;
     uint64_t expected = 0;
+    uint64_t first_seq = 0;
+    uint64_t last_rx_ns = 0;
     bool frames_ok = true;
     std::string frame_error;
     std::vector<uint64_t> latencies;
@@ -321,13 +517,18 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
             lost += config.messages - received - lost;
             break;
         }
-        const int got = zmq_recv(session.sock, buf.data(), buf.size(), 0);
+        const int got = RecvPayload(session.sock, buf.data(), buf.size());
         if (got < 0) {
+            if (got == -2) return 1;
             const int err = zmq_errno();
             if (err == EINTR) continue;
             if (err == EAGAIN) {
-                lost += config.messages - received - lost;
-                break;
+                struct stat done_status {};
+                if (::lstat(DonePath(path).c_str(), &done_status) == 0) {
+                    lost += config.messages - received - lost;
+                    break;
+                }
+                continue;
             }
             std::cerr << ZmqError("zmq_recv") << "\n";
             return 1;
@@ -348,14 +549,16 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
                       << " expected " << expected << "\n";
             return 1;
         }
+        if (received == 0) first_seq = frame.sample_id;
         if (frame.sample_id > expected) lost += frame.sample_id - expected;
+        last_rx_ns = NowNs();
         if (frame.payload.size() != config.payload_bytes) {
             frames_ok = false;
             frame_error = "payload size mismatch";
         } else if (!ValidateSemanticFrame(frame, &frame_error)) {
             frames_ok = false;
         }
-        const uint64_t now_ns = NowNs();
+        const uint64_t now_ns = last_rx_ns != 0 ? last_rx_ns : NowNs();
         if (frame.origin_timestamp_ns != 0 &&
             now_ns >= frame.origin_timestamp_ns) {
             latencies.push_back(now_ns - frame.origin_timestamp_ns);
@@ -367,9 +570,11 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
     if (received + lost < config.messages) {
         lost += config.messages - received - lost;
     }
+    const uint64_t throughput_end_ns =
+        last_rx_ns != 0 ? last_rx_ns : loop_end_ns;
     const double elapsed_s =
-        loop_end_ns > loop_start_ns
-            ? static_cast<double>(loop_end_ns - loop_start_ns) / 1e9
+        throughput_end_ns > loop_start_ns
+            ? static_cast<double>(throughput_end_ns - loop_start_ns) / 1e9
             : 0.0;
     const double msgs_per_s =
         elapsed_s > 0.0 ? static_cast<double>(received) / elapsed_s : 0.0;
@@ -379,8 +584,11 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
     std::ostringstream json;
     json << std::fixed << std::setprecision(1);
     json << "{\"codec\":\"business\""
+         << ",\"socket\":\"pubsub\""
+         << ",\"handshake\":\"ready+monitor\""
          << ",\"received\":" << received
          << ",\"lost\":" << lost
+         << ",\"first_seq\":" << first_seq
          << ",\"expected\":" << config.messages
          << ",\"payload_bytes\":" << config.payload_bytes
          << ",\"queue_depth\":" << config.queue_depth
@@ -393,11 +601,14 @@ int RunSub(const std::filesystem::path& path, const Config& config) {
         RemoveStaleSocket(path);
     } catch (...) {
     }
+    UnlinkQuiet(ReadyPath(path));
+    UnlinkQuiet(PeerPath(path));
+    UnlinkQuiet(DonePath(path));
     if (!frames_ok) {
         std::cerr << "ValidateSemanticFrame failed: " << frame_error << "\n";
         return 1;
     }
-    if (received != config.messages || lost != 0) return 1;
+    // PUB mute-drops when HWM is hit; lost is the measured result.
     return 0;
 }
 

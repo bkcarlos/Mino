@@ -65,7 +65,7 @@ protected:
             pub.stdout_rd = -1;
         }
 
-        std::cout << "transport=zmq-ipc codec=business profile=" << tag
+        std::cout << "transport=zmq-ipc socket=pubsub codec=business profile=" << tag
                   << " payload_bytes=" << payload_bytes
                   << " messages=" << messages
                   << " queue_depth=" << queue_depth << "\n"
@@ -83,6 +83,7 @@ protected:
         EXPECT_EQ(sub_exit, 0) << sub_err << "\n" << json;
 
         std::string codec;
+        std::string socket;
         uint64_t received = 0;
         uint64_t lost = 0;
         uint64_t expected = 0;
@@ -90,6 +91,7 @@ protected:
         uint64_t p95_ns = 0;
         double msgs_per_s = 0.0;
         ASSERT_TRUE(mp_stress::ExtractQuoted(json, "codec", &codec)) << json;
+        ASSERT_TRUE(mp_stress::ExtractQuoted(json, "socket", &socket)) << json;
         ASSERT_TRUE(mp_stress::ExtractU64(json, "received", &received)) << json;
         ASSERT_TRUE(mp_stress::ExtractU64(json, "lost", &lost)) << json;
         ASSERT_TRUE(mp_stress::ExtractU64(json, "expected", &expected)) << json;
@@ -98,12 +100,26 @@ protected:
         ASSERT_TRUE(mp_stress::ExtractF64(json, "msgs_per_s", &msgs_per_s))
             << json;
         EXPECT_EQ(codec, "business");
+        EXPECT_EQ(socket, "pubsub");
         EXPECT_EQ(expected, messages);
-        EXPECT_EQ(received, messages);
-        EXPECT_EQ(lost, 0u);
+        EXPECT_EQ(received + lost, messages);
+        EXPECT_GT(received, 0u);
         EXPECT_GT(msgs_per_s, 0.0);
+        uint64_t first_seq = 0;
+        if (mp_stress::ExtractU64(json, "first_seq", &first_seq)) {
+            RecordProperty("first_seq", std::to_string(first_seq));
+            EXPECT_EQ(first_seq, 0u)
+                << "slow-joiner dropped the start of the stream";
+        }
+        if (lost != 0) {
+            std::cout << "NOTE: ZMQ PUB mute-dropped lost=" << lost
+                      << " received=" << received
+                      << " first_seq=" << first_seq
+                      << " (HWM stays queue_depth=" << queue_depth << ")\n";
+        }
         RecordProperty("payload_bytes", static_cast<int>(payload_bytes));
         RecordProperty("messages", static_cast<int>(messages));
+        RecordProperty("lost", std::to_string(lost));
         RecordProperty("p50_ns", std::to_string(p50_ns));
         RecordProperty("p95_ns", std::to_string(p95_ns));
         RecordProperty("msgs_per_s", std::to_string(msgs_per_s));
