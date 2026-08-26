@@ -38,7 +38,7 @@ namespace {
 
 constexpr uint64_t kCacheLine = 64;
 constexpr uint64_t kMagic = 0x4D494E4F534D5031ull;  // "MINOSMP1"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kMaxTopicSlots = 16;
 constexpr uint32_t kMaxTopicName = 63;
 constexpr uint32_t kMinQueueDepth = 2;
@@ -60,7 +60,8 @@ struct alignas(kCacheLine) TopicSlot {
     uint64_t channel_offset = 0;
     uint64_t channel_extent = 0;
     uint64_t capacity = 0;
-    uint32_t reserved[2]{};
+    std::atomic<uint32_t> publisher_claimed{0};
+    uint32_t reserved0 = 0;
     unsigned char pad[24]{};
 };
 
@@ -140,6 +141,15 @@ bool TopicEquals(const TopicSlot& slot, std::string_view topic) {
 void WriteTopicName(TopicSlot* slot, std::string_view topic) {
     std::memset(slot->name, 0, sizeof(slot->name));
     std::memcpy(slot->name, topic.data(), topic.size());
+}
+
+uint64_t TopicHash(std::string_view topic) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : topic) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 uint64_t HostPageSize() {
@@ -341,23 +351,62 @@ Status ValidateHeader(const SharedMemorySegment& segment,
     }
     if (header.topic_slots == 0 || header.topic_slots > kMaxTopicSlots ||
         header.queue_depth < kMinQueueDepth ||
+        header.queue_depth > kMaxQueueDepth ||
         (header.queue_depth & (header.queue_depth - 1)) != 0 ||
-        header.max_payload_bytes == 0) {
+        header.max_payload_bytes == 0 ||
+        header.max_payload_bytes > kMaxPayloadBytes) {
         return Status::Error(StatusCode::kCorruption,
                              "SimpleNode layout fields are invalid");
     }
+
+    const uint64_t channel_extent =
+        SpscChannel::RequiredSize(header.queue_depth);
+    uint64_t expected_channels_extent = 0;
     uint64_t alloc_end = 0;
     uint64_t chan_end = 0;
-    if (header.allocator_offset % kCacheLine != 0 ||
+    if (!CheckedMulU64(channel_extent, header.topic_slots,
+                       &expected_channels_extent) ||
+        header.allocator_offset < sizeof(ManifestHeader) ||
+        header.allocator_offset % kCacheLine != 0 ||
+        header.allocator_extent == 0 ||
         header.allocator_extent % kCacheLine != 0 ||
         header.channels_offset % kCacheLine != 0 ||
+        header.channels_extent != expected_channels_extent ||
         !CheckedAddU64(header.allocator_offset, header.allocator_extent,
                        &alloc_end) ||
         !CheckedAddU64(header.channels_offset, header.channels_extent,
                        &chan_end) ||
-        alloc_end > header.total_size || chan_end > header.total_size) {
+        alloc_end > header.channels_offset || chan_end > header.total_size) {
         return Status::Error(StatusCode::kCorruption,
                              "SimpleNode extents are invalid");
+    }
+
+    for (uint32_t i = 0; i < header.topic_slots; ++i) {
+        uint64_t offset_delta = 0;
+        uint64_t expected_offset = 0;
+        if (!CheckedMulU64(channel_extent, i, &offset_delta) ||
+            !CheckedAddU64(header.channels_offset, offset_delta,
+                           &expected_offset)) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "SimpleNode topic channel offset overflows");
+        }
+        const TopicSlot& slot = header.topics[i];
+        const uint32_t state = slot.state.load(std::memory_order_acquire);
+        const uint32_t publisher =
+            slot.publisher_claimed.load(std::memory_order_acquire);
+        const uint32_t subscriber =
+            slot.subscriber_claimed.load(std::memory_order_acquire);
+        if (state > kTopicReady || publisher > 1 || subscriber > 1 ||
+            (state == kTopicEmpty && (publisher != 0 || subscriber != 0)) ||
+            slot.reserved0 != 0 || slot.channel_offset != expected_offset ||
+            slot.channel_extent != channel_extent ||
+            slot.capacity != header.queue_depth ||
+            (state == kTopicReady &&
+             (slot.name[0] == '\0' ||
+              std::memchr(slot.name, '\0', sizeof(slot.name)) == nullptr))) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "SimpleNode topic slot is invalid");
+        }
     }
     return Status::Ok();
 }
@@ -366,10 +415,40 @@ std::byte* BytesOf(SharedMemorySegment& segment) {
     return static_cast<std::byte*>(segment.base());
 }
 
+struct SimpleNodeState {
+    std::optional<SharedMemorySegment> segment;
+    CentralSlabAllocator allocator;
+    ManifestHeader* header = nullptr;
+    std::string name;
+};
+
+struct PublisherClaim {
+    std::shared_ptr<SimpleNodeState> node;
+    TopicSlot* slot = nullptr;
+
+    ~PublisherClaim() {
+        if (slot != nullptr) {
+            slot->publisher_claimed.store(0, std::memory_order_release);
+        }
+    }
+};
+
+struct SubscriberClaim {
+    std::shared_ptr<SimpleNodeState> node;
+    TopicSlot* slot = nullptr;
+    std::atomic<bool> borrow_active{false};
+
+    ~SubscriberClaim() {
+        if (slot != nullptr) {
+            slot->subscriber_claimed.store(0, std::memory_order_release);
+        }
+    }
+};
+
 }  // namespace
 
 struct BorrowedBytes::Impl {
-    CentralSlabAllocator* allocator = nullptr;
+    std::shared_ptr<SubscriberClaim> claim;
     SpscChannel::Borrow borrow;
     const std::byte* data = nullptr;
     uint32_t size = 0;
@@ -381,8 +460,15 @@ BorrowedBytes::BorrowedBytes() noexcept = default;
 BorrowedBytes::BorrowedBytes(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 BorrowedBytes::BorrowedBytes(BorrowedBytes&& other) noexcept = default;
-BorrowedBytes& BorrowedBytes::operator=(BorrowedBytes&& other) noexcept =
-    default;
+BorrowedBytes& BorrowedBytes::operator=(BorrowedBytes&& other) noexcept {
+    if (this != &other) {
+        if (impl_ != nullptr && impl_->active) {
+            (void)std::move(*this).Release();
+        }
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
 BorrowedBytes::~BorrowedBytes() {
     if (impl_ && impl_->active) {
         (void)std::move(*this).Release();
@@ -408,20 +494,25 @@ Status BorrowedBytes::Release() && noexcept {
     impl_->active = false;
     const Status ack = std::move(impl_->borrow).Ack();
     Status reclaim = Status::Ok();
-    if (ack.ok() && impl_->allocator != nullptr && !impl_->handle.IsNull()) {
-        reclaim = impl_->allocator->Retire(impl_->handle);
+    if (ack.ok() && impl_->claim != nullptr &&
+        impl_->claim->node != nullptr && !impl_->handle.IsNull()) {
+        CentralSlabAllocator& allocator = impl_->claim->node->allocator;
+        reclaim = allocator.Retire(impl_->handle);
         if (reclaim.ok()) {
-            reclaim = impl_->allocator->Reclaim(impl_->handle);
+            reclaim = allocator.Reclaim(impl_->handle);
         }
     }
     impl_->data = nullptr;
-    impl_->allocator = nullptr;
+    if (impl_->claim != nullptr) {
+        impl_->claim->borrow_active.store(false, std::memory_order_release);
+        impl_->claim.reset();
+    }
     if (!ack.ok()) return ack;
     return reclaim;
 }
 
 struct SimplePublisher::Impl {
-    CentralSlabAllocator* allocator = nullptr;
+    std::shared_ptr<PublisherClaim> claim;
     SpscChannel channel;
     uint32_t max_payload_bytes = 0;
 };
@@ -435,10 +526,12 @@ SimplePublisher::~SimplePublisher() = default;
 
 Status SimplePublisher::Publish(std::span<const std::byte> payload,
                                 Deadline deadline) {
-    if (impl_ == nullptr || impl_->allocator == nullptr) {
+    if (impl_ == nullptr || impl_->claim == nullptr ||
+        impl_->claim->node == nullptr) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "publisher is not bound");
     }
+    CentralSlabAllocator& allocator = impl_->claim->node->allocator;
     if (payload.empty()) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "payload must not be empty");
@@ -460,23 +553,22 @@ Status SimplePublisher::Publish(std::span<const std::byte> payload,
         .layout_version = kSimpleLayoutVersion,
     };
     request.alignment = 1;
-    MINO_ASSIGN_OR_RETURN(ShmHandle handle,
-                          impl_->allocator->Allocate(request));
-    Result<MutableBuildView> build = impl_->allocator->BeginBuild(handle);
+    MINO_ASSIGN_OR_RETURN(ShmHandle handle, allocator.Allocate(request));
+    Result<MutableBuildView> build = allocator.BeginBuild(handle);
     if (!build.ok()) {
-        (void)impl_->allocator->Abort(handle);
+        (void)allocator.Abort(handle);
         return build.status();
     }
     if (build->data == nullptr || build->object_size != payload.size() ||
         build->capacity < payload.size()) {
-        (void)impl_->allocator->Abort(handle);
+        (void)allocator.Abort(handle);
         return Status::Error(StatusCode::kCorruption,
                              "allocator returned an invalid bytes view");
     }
     std::memcpy(build->data, payload.data(), payload.size());
-    Status published = impl_->allocator->Publish(handle);
+    Status published = allocator.Publish(handle);
     if (!published.ok()) {
-        (void)impl_->allocator->Abort(handle);
+        (void)allocator.Abort(handle);
         return published;
     }
 
@@ -496,19 +588,19 @@ Status SimplePublisher::Publish(std::span<const std::byte> payload,
             reserved.value()->flags = 0;
             const Status commit = std::move(reserved.value()).Commit();
             if (!commit.ok()) {
-                (void)impl_->allocator->Retire(handle);
-                (void)impl_->allocator->Reclaim(handle);
+                (void)allocator.Retire(handle);
+                (void)allocator.Reclaim(handle);
             }
             return commit;
         }
         if (reserved.status().code() != StatusCode::kResourceExhausted) {
-            (void)impl_->allocator->Retire(handle);
-            (void)impl_->allocator->Reclaim(handle);
+            (void)allocator.Retire(handle);
+            (void)allocator.Reclaim(handle);
             return reserved.status();
         }
         if (deadline.expired()) {
-            (void)impl_->allocator->Retire(handle);
-            (void)impl_->allocator->Reclaim(handle);
+            (void)allocator.Retire(handle);
+            (void)allocator.Reclaim(handle);
             return Status::Error(StatusCode::kTimeout,
                                  "publish deadline expired");
         }
@@ -517,7 +609,7 @@ Status SimplePublisher::Publish(std::span<const std::byte> payload,
 }
 
 struct SimpleSubscriber::Impl {
-    CentralSlabAllocator* allocator = nullptr;
+    std::shared_ptr<SubscriberClaim> claim;
     SpscChannel channel;
 };
 
@@ -530,34 +622,52 @@ SimpleSubscriber& SimpleSubscriber::operator=(
 SimpleSubscriber::~SimpleSubscriber() = default;
 
 Result<BorrowedBytes> SimpleSubscriber::TryPoll() {
-    if (impl_ == nullptr || impl_->allocator == nullptr) {
+    if (impl_ == nullptr || impl_->claim == nullptr ||
+        impl_->claim->node == nullptr) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "subscriber is not bound");
     }
-    MINO_ASSIGN_OR_RETURN(SpscChannel::Borrow borrow, impl_->channel.Poll());
+    bool expected = false;
+    if (!impl_->claim->borrow_active.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "subscriber already has an active borrow");
+    }
+
+    Result<SpscChannel::Borrow> polled = impl_->channel.Poll();
+    if (!polled.ok()) {
+        impl_->claim->borrow_active.store(false, std::memory_order_release);
+        return polled.status();
+    }
+    SpscChannel::Borrow borrow = std::move(*polled);
     const IndexSlotSnapshot& slot = *borrow.slot();
     if (slot.msg_type != kSimpleMsgType ||
         slot.schema_version != kSimpleSchemaVersion ||
         slot.schema_short_id != kSimpleSchemaShortId ||
         slot.schema_layout_version != kSimpleLayoutVersion) {
         (void)std::move(borrow).Ack();
+        impl_->claim->borrow_active.store(false, std::memory_order_release);
         return Status::Error(StatusCode::kSchemaMismatch,
                              "payload identity does not match SimpleNode bytes");
     }
-    Result<SlabView> view = impl_->allocator->Inspect(slot.payload);
+    Result<SlabView> view = impl_->claim->node->allocator.Inspect(slot.payload);
     if (!view.ok()) {
         (void)std::move(borrow).Ack();
+        impl_->claim->borrow_active.store(false, std::memory_order_release);
         return view.status();
     }
     if (view->state != ObjectState::kPublished || view->data == nullptr ||
         view->object_size != slot.payload_len ||
         view->capacity < slot.payload_len) {
         (void)std::move(borrow).Ack();
+        impl_->claim->borrow_active.store(false, std::memory_order_release);
         return Status::Error(StatusCode::kSchemaMismatch,
                              "payload slab does not match published bytes");
     }
-    auto borrowed = std::unique_ptr<BorrowedBytes::Impl>(new BorrowedBytes::Impl());
-    borrowed->allocator = impl_->allocator;
+    auto borrowed =
+        std::unique_ptr<BorrowedBytes::Impl>(new BorrowedBytes::Impl());
+    borrowed->claim = impl_->claim;
     borrowed->borrow = std::move(borrow);
     borrowed->data = static_cast<const std::byte*>(view->data);
     borrowed->size = slot.payload_len;
@@ -582,10 +692,7 @@ Result<BorrowedBytes> SimpleSubscriber::Poll(Deadline deadline) {
 }
 
 struct SimpleNode::Impl {
-    std::optional<SharedMemorySegment> segment;
-    CentralSlabAllocator allocator;
-    ManifestHeader* header = nullptr;
-    std::string name;
+    std::shared_ptr<SimpleNodeState> state;
 };
 
 SimpleNode::SimpleNode(std::unique_ptr<Impl> impl) noexcept
@@ -674,11 +781,13 @@ Result<SimpleNode> SimpleNode::Create(std::string_view name,
 
     header->magic.store(kMagic, std::memory_order_release);
 
+    auto state = std::make_shared<SimpleNodeState>();
+    state->segment = std::move(segment);
+    state->allocator = std::move(*allocator);
+    state->header = header;
+    state->name = std::string(name);
     auto impl = std::unique_ptr<Impl>(new Impl());
-    impl->segment = std::move(segment);
-    impl->allocator = std::move(*allocator);
-    impl->header = header;
-    impl->name = std::string(name);
+    impl->state = std::move(state);
     return SimpleNode(std::move(impl));
 }
 
@@ -706,11 +815,13 @@ Result<SimpleNode> SimpleNode::Open(std::string_view name) {
         CentralSlabAllocator allocator,
         CentralSlabAllocator::Attach(base + header->allocator_offset,
                                      header->allocator_extent));
+    auto state = std::make_shared<SimpleNodeState>();
+    state->segment = std::move(segment);
+    state->allocator = std::move(allocator);
+    state->header = header;
+    state->name = std::string(name);
     auto impl = std::unique_ptr<Impl>(new Impl());
-    impl->segment = std::move(segment);
-    impl->allocator = std::move(allocator);
-    impl->header = header;
-    impl->name = std::string(name);
+    impl->state = std::move(state);
     return SimpleNode(std::move(impl));
 }
 
@@ -721,78 +832,88 @@ Status SimpleNode::Unlink(std::string_view name) {
 
 Result<SimplePublisher> SimpleNode::Advertise(std::string_view topic) {
     MINO_RETURN_IF_ERROR(ValidateTopic(topic));
-    if (impl_ == nullptr || impl_->header == nullptr) {
+    if (impl_ == nullptr || impl_->state == nullptr ||
+        impl_->state->header == nullptr || !impl_->state->segment.has_value()) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "SimpleNode is not bound");
     }
-    ManifestHeader* header = impl_->header;
+    const std::shared_ptr<SimpleNodeState> state = impl_->state;
+    ManifestHeader* header = state->header;
     TopicSlot* claimed = nullptr;
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        claimed = nullptr;
-        bool waiting = false;
-        for (uint32_t i = 0; i < header->topic_slots; ++i) {
-            TopicSlot& slot = header->topics[i];
-            const uint32_t state = slot.state.load(std::memory_order_acquire);
-            if (state == kTopicEmpty) continue;
-            if (TopicEquals(slot, topic)) {
-                if (state == kTopicReady) {
-                    return Status::Error(StatusCode::kAlreadyExists,
-                                         "topic is already advertised");
-                }
-                waiting = true;
-            }
-        }
-        if (waiting) {
-            std::this_thread::yield();
-            continue;
-        }
-        for (uint32_t i = 0; i < header->topic_slots; ++i) {
-            TopicSlot& slot = header->topics[i];
-            uint32_t expected = kTopicEmpty;
-            if (slot.state.compare_exchange_strong(
-                    expected, kTopicClaiming, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                bool duplicate = false;
-                for (uint32_t j = 0; j < header->topic_slots; ++j) {
-                    if (j == i) continue;
-                    TopicSlot& other = header->topics[j];
-                    const uint32_t other_state =
-                        other.state.load(std::memory_order_acquire);
-                    if (other_state != kTopicEmpty &&
-                        TopicEquals(other, topic)) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) {
-                    slot.state.store(kTopicEmpty, std::memory_order_release);
-                    return Status::Error(StatusCode::kAlreadyExists,
-                                         "topic is already advertised");
-                }
-                WriteTopicName(&slot, topic);
-                slot.subscriber_claimed.store(0, std::memory_order_relaxed);
-                slot.state.store(kTopicReady, std::memory_order_release);
-                claimed = &slot;
+    auto claim = std::make_shared<PublisherClaim>();
+    claim->node = state;
+    const uint32_t start =
+        static_cast<uint32_t>(TopicHash(topic) % header->topic_slots);
+    const Deadline claim_deadline =
+        Deadline::FromNow(std::chrono::seconds(2));
+
+    while (claimed == nullptr) {
+        bool retry = false;
+        for (uint32_t probe = 0; probe < header->topic_slots; ++probe) {
+            TopicSlot& slot =
+                header->topics[(start + probe) % header->topic_slots];
+            const uint32_t slot_state =
+                slot.state.load(std::memory_order_acquire);
+            if (slot_state == kTopicClaiming) {
+                retry = true;
                 break;
             }
+            if (slot_state == kTopicReady) {
+                if (!TopicEquals(slot, topic)) continue;
+                uint32_t expected = 0;
+                if (!slot.publisher_claimed.compare_exchange_strong(
+                        expected, 1, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    return Status::Error(StatusCode::kAlreadyExists,
+                                         "topic already has a publisher");
+                }
+                claimed = &slot;
+                claim->slot = claimed;
+                break;
+            }
+            if (slot_state != kTopicEmpty) {
+                return Status::Error(StatusCode::kCorruption,
+                                     "topic slot state is invalid");
+            }
+
+            uint32_t expected = kTopicEmpty;
+            if (!slot.state.compare_exchange_strong(
+                    expected, kTopicClaiming, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                retry = true;
+                break;
+            }
+            WriteTopicName(&slot, topic);
+            slot.subscriber_claimed.store(0, std::memory_order_relaxed);
+            slot.publisher_claimed.store(1, std::memory_order_relaxed);
+            slot.state.store(kTopicReady, std::memory_order_release);
+            claimed = &slot;
+            claim->slot = claimed;
+            break;
         }
         if (claimed != nullptr) break;
-        if (attempt == 63) {
+        if (!retry) {
             return Status::Error(StatusCode::kResourceExhausted,
                                  "topic directory is full");
+        }
+        if (claim_deadline.expired()) {
+            return Status::Error(
+                StatusCode::kUnavailable,
+                "topic directory contains an unfinished advertisement");
         }
         std::this_thread::yield();
     }
 
-    std::byte* base = BytesOf(*impl_->segment);
+    std::byte* base = BytesOf(*state->segment);
     MINO_ASSIGN_OR_RETURN(SpscChannel channel,
                           SpscChannel::Attach(base + claimed->channel_offset));
     if (channel.capacity() != claimed->capacity) {
         return Status::Error(StatusCode::kCorruption,
                              "attached channel capacity mismatch");
     }
-    auto pub = std::unique_ptr<SimplePublisher::Impl>(new SimplePublisher::Impl());
-    pub->allocator = &impl_->allocator;
+    auto pub =
+        std::unique_ptr<SimplePublisher::Impl>(new SimplePublisher::Impl());
+    pub->claim = std::move(claim);
     pub->channel = channel;
     pub->max_payload_bytes = header->max_payload_bytes;
     return SimplePublisher(std::move(pub));
@@ -801,11 +922,13 @@ Result<SimplePublisher> SimpleNode::Advertise(std::string_view topic) {
 Result<SimpleSubscriber> SimpleNode::Subscribe(std::string_view topic,
                                                Deadline deadline) {
     MINO_RETURN_IF_ERROR(ValidateTopic(topic));
-    if (impl_ == nullptr || impl_->header == nullptr) {
+    if (impl_ == nullptr || impl_->state == nullptr ||
+        impl_->state->header == nullptr || !impl_->state->segment.has_value()) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "SimpleNode is not bound");
     }
-    ManifestHeader* header = impl_->header;
+    const std::shared_ptr<SimpleNodeState> state = impl_->state;
+    ManifestHeader* header = state->header;
     TopicSlot* found = nullptr;
     for (;;) {
         for (uint32_t i = 0; i < header->topic_slots; ++i) {
@@ -823,6 +946,8 @@ Result<SimpleSubscriber> SimpleNode::Subscribe(std::string_view topic,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    auto claim = std::make_shared<SubscriberClaim>();
+    claim->node = state;
     uint32_t expected = 0;
     if (!found->subscriber_claimed.compare_exchange_strong(
             expected, 1, std::memory_order_acq_rel,
@@ -830,22 +955,33 @@ Result<SimpleSubscriber> SimpleNode::Subscribe(std::string_view topic,
         return Status::Error(StatusCode::kAlreadyExists,
                              "topic already has a subscriber");
     }
-    std::byte* base = BytesOf(*impl_->segment);
+    claim->slot = found;
+
+    std::byte* base = BytesOf(*state->segment);
     MINO_ASSIGN_OR_RETURN(SpscChannel channel,
                           SpscChannel::Attach(base + found->channel_offset));
-    auto sub = std::unique_ptr<SimpleSubscriber::Impl>(new SimpleSubscriber::Impl());
-    sub->allocator = &impl_->allocator;
+    if (channel.capacity() != found->capacity) {
+        return Status::Error(StatusCode::kCorruption,
+                             "attached channel capacity mismatch");
+    }
+    auto sub =
+        std::unique_ptr<SimpleSubscriber::Impl>(new SimpleSubscriber::Impl());
+    sub->claim = std::move(claim);
     sub->channel = channel;
     return SimpleSubscriber(std::move(sub));
 }
 
 uint64_t SimpleNode::size_bytes() const noexcept {
-    return impl_ == nullptr ? 0 : impl_->segment->size();
+    return impl_ == nullptr || impl_->state == nullptr ||
+                   !impl_->state->segment.has_value()
+               ? 0
+               : impl_->state->segment->size();
 }
 
 const std::string& SimpleNode::name() const noexcept {
     static const std::string kEmpty;
-    return impl_ == nullptr ? kEmpty : impl_->name;
+    return impl_ == nullptr || impl_->state == nullptr ? kEmpty
+                                                       : impl_->state->name;
 }
 
 }  // namespace mino

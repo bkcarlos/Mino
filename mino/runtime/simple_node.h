@@ -33,6 +33,15 @@ namespace mino {
 //
 // Default Create() size is derived from (topic_slots, queue_depth,
 // max_payload_bytes). A 256 B / depth-32 demo fits in a few hundred KiB.
+// Publishers, subscribers, and borrowed messages retain the SHM mapping, so
+// they may safely outlive the SimpleNode object that created them. A topic may
+// have one live publisher and one live subscriber; destroying an endpoint
+// releases its claim so the endpoint can be recreated. A subscriber may hold
+// at most one BorrowedBytes at a time.
+//
+// This compact API does not run allocation-journal or process-lease recovery.
+// A process crash can therefore leave endpoint claims or allocations behind;
+// recreate the segment after a participant crash.
 
 struct SimpleNodeOptions {
     uint32_t topic_slots = 8;
