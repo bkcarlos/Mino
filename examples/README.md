@@ -20,3 +20,23 @@ bazel-bin/examples/simple_mp_pubsub sub /mino_demo
 # 终端 2：发布
 bazel-bin/examples/simple_mp_pubsub pub /mino_demo
 ```
+
+## 压测（独立进程）
+
+`simple_mp_pubsub_stress` 用 Create/Open 在两个独立进程间传带序号的 payload，
+不 fork、不假设 8GiB `/dev/shm`。Create 在段超过当前 `/dev/shm` 或 RLIMIT 时失败。
+
+```bash
+bazel build --config=release //examples:simple_mp_pubsub_stress
+
+# 终端 1
+bazel-bin/examples/simple_mp_pubsub_stress sub /mino_stress \
+  --messages 20000 --payload-bytes 256 --queue-depth 32
+
+# 终端 2
+bazel-bin/examples/simple_mp_pubsub_stress pub /mino_stress \
+  --messages 20000 --payload-bytes 256 --queue-depth 32
+```
+
+订阅端结束时在 stdout 打一行 JSON（`received` / `lost` / `p50_ns` / `p95_ns` / `msgs_per_s`）。
+64KiB payload 用 `--messages 2000`，队列深度仍须能放进默认 64MiB tmpfs。

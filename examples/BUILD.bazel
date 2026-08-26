@@ -7,3 +7,11 @@ cc_binary(
         "//mino/runtime:simple_node",
     ],
 )
+
+cc_binary(
+    name = "simple_mp_pubsub_stress",
+    srcs = ["simple_mp_pubsub_stress.cc"],
+    deps = [
+        "//mino/runtime:simple_node",
+    ],
+)

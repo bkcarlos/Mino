@@ -324,3 +324,20 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+# Independent-process stress: posix_spawn/exec of //examples:simple_mp_pubsub_stress
+# (publisher Create, subscriber Open). The test parent never maps the segment
+# and does not fork after Create. Sized to fit a 64 MiB /dev/shm.
+cc_test(
+    name = "simple_node_mp_stress_test",
+    size = "small",
+    srcs = ["simple_node_mp_stress_test.cc"],
+    data = ["//examples:simple_mp_pubsub_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":simple_node",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
