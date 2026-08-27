@@ -268,6 +268,16 @@ The profile must distinguish:
 Archive raw `perf.data` files and their hashes. Optimization claims must cite the
 before/after cycle share, not only wall-clock throughput.
 
+
+### P0/P1 closed on master (a1b76c3): same-host exclusive SHM hop
+
+Status: implemented. SPSC forwarders use `TakeExclusive` +
+`PublishLocal(ExclusiveMessage&&)`; sink/CANBus validates via payload span.
+Source first publish still `AllocateChild`+`memcpy`. Pin/broadcast/MPSC rejected.
+Destructor reclaims if not published; kill between Take and PublishLocal leaks
+until region recreate. See `docs/optimization-status.md`. Same-host medium
+saturation vs Fast DDS has **not** been re-measured on this commit.
+
 ## Remaining optimization backlog
 
 Items are ordered by expected value and implementation risk. Do not start a
@@ -285,8 +295,12 @@ Status: implemented, awaiting Linux same-host and two-host campaigns.
 
 ### P1: remove generic canonical encoder fixed allocations
 
-Status: implementation and benchmark integration complete; awaiting Linux
-allocation profiling, controlled codec benchmarks, and end-to-end campaigns.
+Status: implementation complete on master (`50dd0b9` / `a1b76c3` lineage).
+`DynamicValue::BytesView` + `EncodeInto` are available; length-delimited encode
+writes LEB128 then payload (nested via scratch) and no longer
+`vector::insert`-memmoves an already-written payload. Linux allocation profiling,
+controlled codec benchmarks, and end-to-end campaigns remain pending — do not
+invent speedups.
 
 Expected benefit: high for small messages; medium implementation risk.
 
@@ -296,7 +310,8 @@ Expected benefit: high for small messages; medium implementation risk.
 - merge unknown fields in canonical field-ID order instead of stable-sorting all
   fields;
 - encode bytes/string length and content directly without an intermediate
-  payload vector;
+  payload vector (**and without payload insert-memmove**);
+- prefer `BytesView` over owning `Bytes` on EncodeInto hot paths;
 - cache field tags and wire types in the prepared plan.
 
 Required validation: golden wire vectors, unknown-field round trips, fuzz corpus,
@@ -304,18 +319,23 @@ allocation counts, and Phase 1 benchmark.
 
 ### P1: validated WireFrame decode view and ownership-taking send
 
-Status: implementation and benchmark integration complete; selected Linux ASAN
-and end-to-end smoke passed on 2026-08-24. Fuzzing, TSAN, clean-ref wire
+Status: default data-path integration complete on master (`a1b76c3` closes the
+remaining receive-tail steal). `LengthPrefixedFrameDecoder::Push` uses
+`DecodeView`; Bridge data path uses `TrySendOwned` /
+`TrySendUntrackedOwned`; `TcpDriver` steals a trailing complete frame from the
+receive buffer (mid-buffer frames still `assign`). Control-plane
+`WireFrameCodec::Decode` may still copy into an owned `WireFrame`. The three
+TcpDriver mutexes are unchanged. `RetransmitWindow` still owns a frame copy for
+reliable multi-attempt resend (intentional). Fuzzing, TSAN, clean-ref wire
 qualification, and formal performance campaigns remain pending.
 
 Expected benefit: medium for small, CPU/memory reduction for large; medium risk.
 
-- add a decode API that validates header CRC, payload CRC, lengths, and flags but
-  exposes payload as a span into the owning received body;
+- decode API validates header CRC, payload CRC, lengths, and flags but exposes
+  payload as a span into the owning received body;
 - ensure the view cannot outlive the body;
-- let `TcpDriver` take ownership of an already encoded WireFrame body, retain it,
-  and add the TCP length prefix as a separate write segment so it does not copy
-  the complete frame into another queue buffer;
+- `TcpDriver` ownership-taking send keeps prefix and body as separate write
+  segments;
 - preserve current CRC and frame limits.
 
 Required validation: malformed-frame tests, lifetime tests, fuzzing, TSAN/ASAN,

@@ -66,3 +66,12 @@ bazel test --config=release \
   //mino/runtime:zmq_ipc_business_mp_stress_test
 ```
 
+## 产品 API 要点（master / a1b76c3）
+
+- 头文件：`mino/runtime/simple_node.h`（Create / Open / Advertise / Subscribe / Publish / TryPoll）。
+- 同机类型化流水线独占 hop：`BorrowedMessage::TakeExclusive` → `ExclusiveMessage` →
+  `Publisher::PublishLocal(ExclusiveMessage&&)`（**仅 SPSC**；见 `docs/optimization-status.md`）。
+- 编码：`DynamicValue::BytesView` + `EncodeInto`，避免默认 owning `Bytes` 整段堆拷。
+- **没有** `Bus::CreatePublisher<T>`；不要抄根 README 过期预览。
+
+优化关闭状态：`docs/optimization-status.md`。
