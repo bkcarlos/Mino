@@ -108,6 +108,9 @@ SemanticFrame InitializeSourceFrameAt(uint64_t sample_id, Profile profile,
                                       uint64_t origin_timestamp_ns);
 
 bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error);
+bool ValidateSemanticFrame(const SemanticFrame& frame,
+                           std::span<const uint8_t> payload,
+                           std::string* error);
 // Bridge-only validation for canonical transit. This deliberately validates
 // transport structure, sequencing, phase, profile, exact payload size, stage
 // mask, and timestamp shape without re-running deterministic business-field,
@@ -120,14 +123,25 @@ bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
                                 std::string* error);
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
                            std::string* error);
+bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
+                           std::span<const uint8_t> payload,
+                           std::string* error);
 // Explicit timestamp form is useful when the backend timestamps immediately
 // after receive/deserialize. CANBus validates only and leaves frame unchanged.
 bool ApplyStage(Role role, SemanticFrame* frame, uint64_t timestamp_ns,
                 std::string* error);
 bool ApplyStage(Role role, SemanticFrame* frame, std::string* error);
+bool ApplyStage(Role role, SemanticFrame* frame,
+                std::span<const uint8_t> payload, uint64_t timestamp_ns,
+                std::string* error);
+bool ApplyStage(Role role, SemanticFrame* frame,
+                std::span<const uint8_t> payload, std::string* error);
 // Independent-host mode validates timestamp presence but never orders or
 // subtracts CLOCK_MONOTONIC values from different boot clock domains.
 bool ApplyStageForClockMode(Role role, SemanticFrame* frame, ClockMode mode,
+                            std::string* error);
+bool ApplyStageForClockMode(Role role, SemanticFrame* frame,
+                            std::span<const uint8_t> payload, ClockMode mode,
                             std::string* error);
 
 struct CommonOptions {
