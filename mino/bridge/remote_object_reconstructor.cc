@@ -22,18 +22,18 @@ bool SameIdentity(const schema::SchemaIdentity& lhs,
            lhs.layout_version() == rhs.layout_version();
 }
 
-Status ValidateDataFrame(const WireFrame& frame) noexcept {
-    if (frame.header.frame_type != FrameType::kData ||
-        HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame)) {
+Status ValidateDataFrame(const WireFrameHeader& header) noexcept {
+    if (header.frame_type != FrameType::kData ||
+        HasFrameFlag(header.flags, FrameFlag::kControlFrame)) {
         return Status::Error(StatusCode::kInvalidArgument);
     }
     return Status::Ok();
 }
 
-Status ValidateActiveTopic(const WireFrame& frame,
+Status ValidateActiveTopic(const WireFrameHeader& header,
                            const RemoteObjectBinding& binding) noexcept {
     if (binding.topic == nullptr ||
-        binding.topic->topic_id != TopicId{frame.header.topic_id}) {
+        binding.topic->topic_id != TopicId{header.topic_id}) {
         return Status::Error(StatusCode::kSchemaMismatch);
     }
     if (binding.topic->state != registry::TopicState::kActive) {
@@ -53,12 +53,12 @@ bool TopicAcceptsSchema(const registry::TopicMetadata& topic,
 }
 
 Status ValidateIdentityAndBinding(
-    const WireFrame& frame, const schema::SchemaIdentity& negotiated,
+    const WireFrameHeader& header, const schema::SchemaIdentity& negotiated,
     const RemoteObjectBinding& binding) noexcept {
-    if (frame.header.connection_schema_ref == 0 ||
-        frame.header.msg_type != static_cast<uint32_t>(negotiated.short_id()) ||
-        frame.header.schema_version != negotiated.schema_version() ||
-        frame.header.layout_version != negotiated.layout_version()) {
+    if (header.connection_schema_ref == 0 ||
+        header.msg_type != static_cast<uint32_t>(negotiated.short_id()) ||
+        header.schema_version != negotiated.schema_version() ||
+        header.layout_version != negotiated.layout_version()) {
         return Status::Error(StatusCode::kSchemaMismatch);
     }
     if (binding.schema_handle == nullptr || binding.layout_plan == nullptr ||
@@ -69,7 +69,7 @@ Status ValidateIdentityAndBinding(
     if (!TopicAcceptsSchema(*binding.topic, negotiated) ||
         !SameIdentity(binding.schema_handle->identity(), negotiated) ||
         binding.layout_plan->layout_version() != negotiated.layout_version() ||
-        binding.type_id.value != frame.header.msg_type ||
+        binding.type_id.value != header.msg_type ||
         binding.layout_plan->object_size() == 0 ||
         binding.layout_plan->object_size() >
             std::numeric_limits<uint32_t>::max()) {
@@ -88,6 +88,11 @@ Status RollbackWith(schema::PreparedDynamicObject& object,
 
 Status RemoteObjectReconstructor::DecodeValidatePublish(
     const WireFrame& frame) noexcept {
+    return DecodeValidatePublish(frame.header, frame.payload);
+}
+
+Status RemoteObjectReconstructor::DecodeValidatePublish(
+    const WireFrameHeader& header, std::span<const std::byte> payload) noexcept {
     try {
         if (schema_negotiator_ == nullptr || binding_resolver_ == nullptr) {
             return Status::Error(StatusCode::kInvalidArgument);
@@ -96,31 +101,31 @@ Status RemoteObjectReconstructor::DecodeValidatePublish(
         // Keep this order aligned with detailed design section 16.3: data frame,
         // active Topic, full negotiated identity/version, bounded wire decode,
         // Slab construction/validation, then local publication.
-        const Status data_status = ValidateDataFrame(frame);
+        const Status data_status = ValidateDataFrame(header);
         if (!data_status.ok()) return data_status;
 
         auto identity = schema_negotiator_->IdentityForRemoteRef(
-            frame.header.connection_schema_ref);
+            header.connection_schema_ref);
         if (!identity.ok()) return identity.status();
         auto binding_result = binding_resolver_->Resolve(
-            TopicId{frame.header.topic_id}, *identity);
+            TopicId{header.topic_id}, *identity);
         if (!binding_result.ok()) return binding_result.status();
         RemoteObjectBinding binding = std::move(*binding_result);
 
-        const Status topic_status = ValidateActiveTopic(frame, binding);
+        const Status topic_status = ValidateActiveTopic(header, binding);
         if (!topic_status.ok()) return topic_status;
 
         const Status identity_status =
-            ValidateIdentityAndBinding(frame, *identity, binding);
+            ValidateIdentityAndBinding(header, *identity, binding);
         if (!identity_status.ok()) return identity_status;
 
-        if (frame.payload.size() > options_.wire_limits.max_frame_bytes ||
+        if (payload.size() > options_.wire_limits.max_frame_bytes ||
             binding.descriptor_closure.size() >
                 options_.max_descriptor_closure) {
             return Status::Error(StatusCode::kResourceExhausted);
         }
         auto message = schema::CanonicalWireCodec::Decode(
-            *binding.schema_handle, frame.payload,
+            *binding.schema_handle, payload,
             binding.descriptor_closure, options_.wire_limits);
         if (!message.ok()) return message.status();
 
@@ -135,11 +140,11 @@ Status RemoteObjectReconstructor::DecodeValidatePublish(
         if (!prepared.ok()) return prepared.status();
 
         const DynamicPublicationMetadata metadata{
-            .message_type = frame.header.msg_type,
+            .message_type = header.msg_type,
             .schema_version = identity->schema_version(),
             .schema_short_id = identity->short_id(),
             .layout_version = identity->layout_version(),
-            .timestamp_ns = frame.header.timestamp_ns,
+            .timestamp_ns = header.timestamp_ns,
             .payload_size = static_cast<uint32_t>(
                 binding.layout_plan->object_size()),
             .index_flags = binding.layout_plan->max_dynamic_children() == 0

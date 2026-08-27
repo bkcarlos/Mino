@@ -103,7 +103,10 @@ Status FuzzFrameStream(std::span<const std::byte> input) noexcept {
                 }
                 return Status::Ok();
             }
-            for (const WireFrame& frame : *frames) {
+            for (const ValidatedWireFrameView& view : *frames) {
+                WireFrame frame;
+                frame.header = view.header;
+                frame.payload.assign(view.payload.begin(), view.payload.end());
                 const Status checked = CheckFrameRoundTrip(frame, limits);
                 if (!checked.ok()) return checked;
             }

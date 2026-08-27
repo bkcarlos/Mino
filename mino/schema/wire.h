@@ -47,6 +47,7 @@ private:
     friend class PreparedCanonicalWireCodec;
 
     std::vector<std::vector<size_t>> unknown_field_order_;
+    std::vector<std::vector<std::byte>> nested_payloads_;
 };
 
 // Appends/reads the shortest unsigned LEB128 representation. Decode rejects
@@ -69,7 +70,9 @@ public:
 
     // Reuse-oriented variants. output/message are cleared before use and are
     // empty on failure while retaining their allocated capacity. A decode
-    // target must use the same unknown-field limits as limits.
+    // target must use the same unknown-field limits as limits. Bytes fields
+    // may be supplied as BytesView so EncodeInto copies payload once into
+    // the canonical output instead of first owning a DynamicValue vector.
     static Status EncodeInto(
         const SchemaDescriptor& descriptor, const DynamicMessage& message,
         CanonicalWireScratch& scratch, std::vector<std::byte>& output,

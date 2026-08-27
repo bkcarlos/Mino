@@ -61,6 +61,9 @@ public:
     // Success means the decoded object is committed to the local publication
     // channel and the receiver may advance dedup and emit Accepted ACK.
     virtual Status DecodeValidatePublish(const WireFrame& frame) = 0;
+    // Zero-copy ingress path. The default copies payload into a WireFrame.
+    virtual Status DecodeValidatePublish(const WireFrameHeader& header,
+                                         std::span<const std::byte> payload);
 };
 
 struct BridgePipelineOptions {
@@ -178,9 +181,19 @@ private:
     };
 
     struct PendingInbound {
-        WireFrame frame;
+        WireFrameHeader header;
+        std::vector<std::byte> owned_payload;
+        std::optional<ValidatedWireFrameView> view;
         size_t wire_bytes = 0;
         bool schema_resolved = false;
+
+        const WireFrameHeader& Header() const noexcept {
+            return view.has_value() ? view->header : header;
+        }
+        std::span<const std::byte> Payload() const noexcept {
+            return view.has_value() ? view->payload
+                                    : std::span<const std::byte>(owned_payload);
+        }
     };
 
     struct PendingReliable {
@@ -234,15 +247,21 @@ private:
                                  BridgePumpResult* result) noexcept;
     Status QueuePendingInbound(WireFrame frame, size_t wire_bytes,
                                bool schema_resolved = false) noexcept;
+    Status QueuePendingInbound(ValidatedWireFrameView view, size_t wire_bytes,
+                               bool schema_resolved = false) noexcept;
     Status AuthorizeInboundData(
         const WireFrameHeader& header) const noexcept;
     Status StageReadyFrames(std::vector<WireFrame>* frames) noexcept;
-    Status HandleFrame(const WireFrame& frame, uint64_t now_ns,
+    Status HandleFrame(const WireFrameHeader& header,
+                       std::span<const std::byte> payload, uint64_t now_ns,
                        BridgePumpResult* result) noexcept;
-    Status HandleData(const WireFrame& frame, uint64_t now_ns) noexcept;
-    Status HandleAck(const WireFrame& frame) noexcept;
-    Status HandleHello(const WireFrame& frame, uint64_t now_ns) noexcept;
-    Status EmitAck(const WireFrame& data, const DedupCheckResult& state,
+    Status HandleData(const WireFrameHeader& header,
+                      std::span<const std::byte> payload,
+                      uint64_t now_ns) noexcept;
+    Status HandleAck(std::span<const std::byte> payload) noexcept;
+    Status HandleHello(std::span<const std::byte> payload,
+                       uint64_t now_ns) noexcept;
+    Status EmitAck(const WireFrameHeader& header, const DedupCheckResult& state,
                    AckDisposition disposition) noexcept;
     Status AddAttempt(Attempt attempt) noexcept;
     void RemoveAttempt(AttemptMap::iterator attempt) noexcept;
