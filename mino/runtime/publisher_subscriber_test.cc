@@ -1730,5 +1730,324 @@ TEST_F(RuntimeSpscTest, PollDeadlineAndCallbackAck) {
     EXPECT_EQ(allocator_.Inspect(handle).status().code(), StatusCode::kNotFound);
 }
 
+
+TEST_F(RuntimeSpscTest, ExclusiveSpscHopTransfersLeafWithoutCopyAndReclaimsOnce) {
+    auto hop_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
+    auto hop = SpscChannel::Init(hop_memory.get(), kChannelCapacity);
+    ASSERT_TRUE(hop.ok()) << hop.status().ToString();
+
+    Publisher<RuntimeTestMessage> producer(allocator_, *channel_);
+    Subscriber<RuntimeTestMessage> hop_in(allocator_, *channel_);
+    Publisher<RuntimeTestMessage> hop_out(allocator_, *hop);
+    Subscriber<RuntimeTestMessage> sink(allocator_, *hop);
+
+    auto builder = producer.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 11;
+    (*builder)->value = 22;
+    const ShmHandle root = builder->handle();
+    ASSERT_TRUE(producer.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = hop_in.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(channel_->IsEmpty());
+    EXPECT_EQ(exclusive->handle(), root);
+    (*exclusive)->id = 33;
+    ASSERT_TRUE(hop_out.PublishLocal(std::move(*exclusive)).ok());
+
+    auto received = sink.TryPoll();
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->metadata().payload, root);
+    EXPECT_EQ((*received)->id, 33u);
+    EXPECT_EQ((*received)->value, 22u);
+    ASSERT_TRUE(std::move(*received).Ack().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(RuntimeSpscTest, ExclusiveReleaseWithoutPublishReclaimsGraph) {
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> publisher(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x901;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    std::memset(child_build->data, 0x5A, child_build->object_size);
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    const auto before = allocator_.local_cache_stats();
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = subscriber.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(channel_->IsEmpty());
+    EXPECT_EQ(allocator_.Inspect(root)->state, ObjectState::kPublished);
+    EXPECT_EQ(allocator_.Inspect(child)->state, ObjectState::kPublished);
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims);
+
+    ASSERT_TRUE(std::move(*exclusive).Release().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+}
+
+TEST_F(RuntimeSpscTest, ExclusiveHopTransfersChildHandleWithoutPayloadCopy) {
+    auto hop_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
+    auto hop = SpscChannel::Init(hop_memory.get(), kChannelCapacity);
+    ASSERT_TRUE(hop.ok()) << hop.status().ToString();
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> producer(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> hop_in(allocator_, *channel_);
+    Publisher<RuntimeGraphMessage> hop_out(allocator_, *hop, *journal);
+    Subscriber<RuntimeGraphMessage> sink(allocator_, *hop);
+
+    auto builder = producer.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x902;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    std::memset(child_build->data, 0x5A, child_build->object_size);
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    const auto before = allocator_.local_cache_stats();
+    ASSERT_TRUE(producer.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = hop_in.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    (*exclusive)->id = 0x903;
+    ASSERT_TRUE(hop_out.PublishLocal(std::move(*exclusive)).ok());
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims);
+
+    auto received = sink.TryPoll();
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->metadata().payload, root);
+    EXPECT_EQ((*received)->id, 0x903u);
+    EXPECT_EQ((*received)->child_offset, child.offset);
+    EXPECT_EQ((*received)->child_generation, child.generation);
+    EXPECT_EQ((*received)->child_region_id, child.region_id);
+    auto child_view = allocator_.Inspect(child);
+    ASSERT_TRUE(child_view.ok());
+    EXPECT_EQ(child_view->state, ObjectState::kPublished);
+    const auto* bytes = static_cast<const uint8_t*>(child_view->data);
+    for (size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(bytes[i], 0x5A) << i;
+    }
+    ASSERT_TRUE(std::move(*received).Ack().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+
+    auto reused = producer.Allocate();
+    ASSERT_TRUE(reused.ok()) << reused.status().ToString();
+    EXPECT_TRUE(producer.Abort(std::move(*reused)).ok());
+}
+
+TEST_F(RuntimeSpscTest, ExclusiveHopTwoHopsThenFinalAck) {
+    auto mid_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
+    auto mid = SpscChannel::Init(mid_memory.get(), kChannelCapacity);
+    ASSERT_TRUE(mid.ok()) << mid.status().ToString();
+    auto out_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
+    auto out = SpscChannel::Init(out_memory.get(), kChannelCapacity);
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> producer(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> first_in(allocator_, *channel_);
+    Publisher<RuntimeGraphMessage> first_out(allocator_, *mid, *journal);
+    Subscriber<RuntimeGraphMessage> second_in(allocator_, *mid);
+    Publisher<RuntimeGraphMessage> second_out(allocator_, *out, *journal);
+    Subscriber<RuntimeGraphMessage> sink(allocator_, *out);
+
+    auto builder = producer.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0xA01;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok());
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    const auto before = allocator_.local_cache_stats();
+    ASSERT_TRUE(producer.PublishLocal(std::move(*builder)).ok());
+
+    Publisher<RuntimeGraphMessage>* hops[] = {&first_out, &second_out};
+    Subscriber<RuntimeGraphMessage>* inputs[] = {&first_in, &second_in};
+    for (size_t i = 0; i < 2; ++i) {
+        auto borrowed = inputs[i]->TryPoll();
+        ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+        auto exclusive = std::move(*borrowed).TakeExclusive();
+        ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+        (*exclusive)->id = 0xA02 + i;
+        ASSERT_TRUE(hops[i]->PublishLocal(std::move(*exclusive)).ok());
+        EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+                  before.published_graph_reclaims);
+    }
+
+    auto received = sink.TryPoll();
+    ASSERT_TRUE(received.ok());
+    EXPECT_EQ((*received)->id, 0xA03u);
+    EXPECT_EQ(received->metadata().payload, root);
+    EXPECT_EQ((*received)->child_offset, child.offset);
+    ASSERT_TRUE(std::move(*received).Ack().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+}
+
+TEST(RuntimeGeneratedGraphLifecycleTest,
+     ExclusiveSpscHopKeepsChildUntilFinalAck) {
+    constexpr uint64_t kAllocatorBytes = 1u << 20;
+    auto allocator_memory = AllocateAligned(kAllocatorBytes);
+    auto allocator = CentralSlabAllocator::Create(
+        allocator_memory.get(), kAllocatorBytes,
+        GeneratedGraphAllocatorConfig());
+    ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+
+    auto in_memory = AllocateAligned(SpscChannel::RequiredSize(2));
+    auto in_channel = SpscChannel::Init(in_memory.get(), 2);
+    ASSERT_TRUE(in_channel.ok());
+    auto out_memory = AllocateAligned(SpscChannel::RequiredSize(2));
+    auto out_channel = SpscChannel::Init(out_memory.get(), 2);
+    ASSERT_TRUE(out_channel.ok());
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, *allocator);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<golden::Telemetry> producer(*allocator, *in_channel, *journal);
+    Subscriber<golden::Telemetry> hop_in(*allocator, *in_channel);
+    Publisher<golden::Telemetry> hop_out(*allocator, *out_channel, *journal);
+    Subscriber<golden::Telemetry> sink(*allocator, *out_channel);
+
+    auto graph = AllocateGeneratedGraph(producer, 0xB01);
+    ASSERT_TRUE(graph.ok()) << graph.status().ToString();
+    const ShmHandle root = graph->root.handle();
+    const ShmHandle child = graph->child;
+    const auto before = allocator->local_cache_stats();
+    ASSERT_TRUE(producer.PublishLocal(std::move(graph->root)).ok());
+
+    auto borrowed = hop_in.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    golden::TelemetryAccessor accessor(*exclusive->get());
+    EXPECT_EQ(accessor.payload().offset, child.offset);
+    EXPECT_EQ(accessor.payload().generation, child.generation);
+    EXPECT_EQ(accessor.payload().region_id, child.region_id);
+    auto child_view = allocator->Inspect(child);
+    ASSERT_TRUE(child_view.ok());
+    const auto* bytes = static_cast<const uint8_t*>(child_view->data);
+    EXPECT_EQ(bytes[0], 0x5A);
+    ASSERT_TRUE(hop_out.PublishLocal(std::move(*exclusive)).ok());
+    EXPECT_EQ(allocator->local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims);
+
+    auto received = sink.TryPoll();
+    ASSERT_TRUE(received.ok());
+    EXPECT_EQ(received->metadata().payload, root);
+    golden::TelemetryAccessor received_accessor(**received);
+    EXPECT_EQ(received_accessor.payload().offset, child.offset);
+    ASSERT_TRUE(std::move(*received).Ack().ok());
+    EXPECT_EQ(allocator->Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator->Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator->local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+}
+
+TEST(RuntimeGeneratedGraphLifecycleTest,
+     TakeExclusiveRejectsPinTableAndBroadcast) {
+    constexpr uint64_t kAllocatorBytes = 1u << 20;
+    auto allocator_memory = AllocateAligned(kAllocatorBytes);
+    auto allocator = CentralSlabAllocator::Create(
+        allocator_memory.get(), kAllocatorBytes,
+        GeneratedGraphAllocatorConfig());
+    ASSERT_TRUE(allocator.ok()) << allocator.status().ToString();
+
+    auto spsc_memory = AllocateAligned(SpscChannel::RequiredSize(2));
+    auto spsc = SpscChannel::Init(spsc_memory.get(), 2);
+    ASSERT_TRUE(spsc.ok());
+    auto broadcast_memory = AllocateAligned(BroadcastChannel::RequiredSize(2));
+    auto broadcast = BroadcastChannel::Init(broadcast_memory.get(), 2);
+    ASSERT_TRUE(broadcast.ok());
+    auto subscriber_handle = broadcast->RegisterSubscriber(SubscriberId{0});
+    ASSERT_TRUE(subscriber_handle.ok());
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, *allocator);
+    ASSERT_TRUE(journal.ok());
+    auto pin_memory = AllocateAligned(ShmPinTable::RequiredSize());
+    auto pins = ShmPinTable::Init(pin_memory.get(), ShmPinTable::RequiredSize(),
+                                  *allocator);
+    ASSERT_TRUE(pins.ok());
+
+    Publisher<golden::Telemetry> spsc_publisher(
+        *allocator, *spsc, *journal);
+    Subscriber<golden::Telemetry> pinned(
+        *allocator, *spsc, &*pins, ProcessIdentity::Current());
+    auto graph = AllocateGeneratedGraph(spsc_publisher, 0xC01);
+    ASSERT_TRUE(graph.ok()) << graph.status().ToString();
+    ASSERT_TRUE(spsc_publisher.PublishLocal(std::move(graph->root)).ok());
+    auto pinned_borrow = pinned.TryPoll();
+    ASSERT_TRUE(pinned_borrow.ok()) << pinned_borrow.status().ToString();
+    EXPECT_EQ(std::move(*pinned_borrow).TakeExclusive().status().code(),
+              StatusCode::kUnsupported);
+
+    Publisher<golden::Telemetry> broadcast_publisher(
+        *allocator, *broadcast, *pins, *journal);
+    Subscriber<golden::Telemetry> broadcast_subscriber(
+        *allocator, *broadcast, *subscriber_handle, *pins);
+    auto broadcast_graph = AllocateGeneratedGraph(broadcast_publisher, 0xC02);
+    ASSERT_TRUE(broadcast_graph.ok()) << broadcast_graph.status().ToString();
+    ASSERT_TRUE(broadcast_publisher.PublishLocal(
+                    std::move(broadcast_graph->root)).ok());
+    auto borrowed = broadcast_subscriber.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    EXPECT_EQ(std::move(*borrowed).TakeExclusive().status().code(),
+              StatusCode::kUnsupported);
+}
+
 }  // namespace
 }  // namespace mino
