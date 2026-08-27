@@ -2832,11 +2832,34 @@ private:
                 connection.last_valid_receive = Clock::now();
             }
 
+            // Steal a complete trailing frame out of the receive buffer when
+            // possible so the ready queue owns the bytes without an extra
+            // assign/memcpy. Mid-buffer frames still copy; mutex layout is
+            // unchanged.
             std::vector<std::byte> payload;
+            bool stole_receive_tail = false;
             if (!is_canonical_heartbeat) {
-                payload.assign(body.begin(), body.end());
+                const size_t body_begin = connection.receive_offset;
+                const size_t body_end =
+                    body_begin + connection.expected_body_size;
+                if (body_end == connection.receive_buffer.size()) {
+                    payload = std::move(connection.receive_buffer);
+                    connection.receive_buffer.clear();
+                    if (body_begin != 0) {
+                        payload.erase(
+                            payload.begin(),
+                            payload.begin() +
+                                static_cast<ptrdiff_t>(body_begin));
+                    }
+                    connection.receive_offset = 0;
+                    stole_receive_tail = true;
+                } else {
+                    payload.assign(body.begin(), body.end());
+                }
             }
-            connection.receive_offset += connection.expected_body_size;
+            if (!stole_receive_tail) {
+                connection.receive_offset += connection.expected_body_size;
+            }
             const bool held_tls_write_turn =
                 connection.tls && connection.tls_write_frame_credits != 0;
             // An application frame always transfers the TLS write turn. A

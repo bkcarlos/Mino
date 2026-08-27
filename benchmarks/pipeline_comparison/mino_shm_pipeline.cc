@@ -839,16 +839,6 @@ void WriteGeneratedScalars(const SemanticFrame& source, Frame* destination,
     }
 }
 
-template <typename Frame>
-SemanticFrame GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
-                                  const CentralSlabAllocator& allocator,
-                                  Profile expected_profile) {
-    SemanticFrame destination = GeneratedScalarsToSemantic(source);
-    const std::span<const uint8_t> payload = InspectGeneratedPayload(
-        source, root_handle, allocator, expected_profile);
-    destination.payload.assign(payload.begin(), payload.end());
-    return destination;
-}
 
 uint64_t TotalFrames(const CommonOptions& options) {
     return AddOrThrow(options.warmup_messages, options.messages,
@@ -1017,11 +1007,14 @@ void RunSink(const CommonOptions& options, CentralSlabAllocator* allocator,
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         BorrowedMessage<Frame> borrowed =
             PollBounded(&subscriber, deadline, statistics);
-        SemanticFrame semantic = GeneratedToSemantic(
+        // Final hop validates in place against the published child span; do not
+        // assign+memcpy payload into SemanticFrame just to run CANBus checks.
+        SemanticFrame semantic = GeneratedScalarsToSemantic(*borrowed);
+        const std::span<const uint8_t> payload = InspectGeneratedPayload(
             *borrowed, borrowed.metadata().payload, *allocator, options.profile);
         ValidateSequenceAndPhase(options, semantic, expected_id, statistics);
         std::string error;
-        if (!ApplyStageForClockMode(Role::kCanbus, &semantic,
+        if (!ApplyStageForClockMode(Role::kCanbus, &semantic, payload,
                                     options.clock_mode, &error)) {
             ++statistics->corrupt;
             throw std::runtime_error("canbus stage rejected frame: " + error);

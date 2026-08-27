@@ -61,6 +61,10 @@ public:
                         uint64_t remote_session_epoch,
                         uint64_t now_ns) noexcept;
 
+    // Reliability requires retaining an owned frame copy for multi-attempt
+    // resend after reconnect; ResendPending therefore cannot move the only
+    // copy into TrySendOwned. First-transmit paths that already hold a unique
+    // owned body use TrySendOwned separately.
     Status Add(const SourceIdentity& source, uint64_t sequence,
                std::span<const std::byte> encoded_frame,
                uint64_t now_ns) noexcept;

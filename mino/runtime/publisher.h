@@ -238,8 +238,15 @@ private:
 // CRC-covered identity to a new journal transaction is intentionally
 // unsupported: two live roots must not share a child, and rewriting immutable
 // header fields would be unsafe. Pin-based Transfer() retires the root and
-// cannot be republished. Crash between TakeExclusive and PublishLocal can leak
-// the graph; it must not double-free.
+// cannot be republished.
+//
+// Fail-closed crash window: after the original PublishLocal FinalizeCommit,
+// the journal no longer tracks the graph. TakeExclusive ACKs the SPSC slot, so
+// JournalChannelRecoveryCoordinator also cannot see it. A process kill between
+// TakeExclusive and PublishLocal therefore leaks the published slabs until the
+// SHM region is recreated. Normal C++ unwind must reclaim via this RAII
+// destructor (or Release()) exactly once — never double-free, never rely on
+// journal epoch recovery to close the hop window.
 template <typename T>
 class ExclusiveMessage {
 public:

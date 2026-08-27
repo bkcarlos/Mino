@@ -1809,6 +1809,107 @@ TEST_F(RuntimeSpscTest, ExclusiveReleaseWithoutPublishReclaimsGraph) {
               before.published_graph_reclaims + 1);
 }
 
+// Documents the fail-closed hop crash window: after PublishLocal FinalizeCommit
+// the journal slot is free, and TakeExclusive ACKs the channel, so recovery
+// cannot reclaim a process-killed ExclusiveMessage. RAII Release must reclaim
+// exactly once; do not invent a second free path.
+TEST_F(RuntimeSpscTest,
+       ExclusiveDetachedGraphInvisibleToJournalRecoveryUntilRelease) {
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    JournalChannelRecoveryCoordinator recovery(*journal);
+    ASSERT_TRUE(recovery.RegisterChannel(1, *channel_).ok());
+
+    Publisher<RuntimeGraphMessage> publisher(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x911;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 0u);
+
+    auto borrowed = subscriber.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(channel_->IsEmpty());
+    EXPECT_EQ(allocator_.Inspect(root)->state, ObjectState::kPublished);
+    EXPECT_EQ(allocator_.Inspect(child)->state, ObjectState::kPublished);
+
+    // Owner appears dead, but finalized journal + empty channel => no reclaim.
+    EXPECT_EQ(recovery.RecoverOrphans(
+                  [](const ProcessIdentity&, void*) noexcept {
+                      return ProcessLiveness::kDead;
+                  }),
+              0u);
+    EXPECT_EQ(allocator_.Inspect(root)->state, ObjectState::kPublished);
+    EXPECT_EQ(allocator_.Inspect(child)->state, ObjectState::kPublished);
+
+    ASSERT_TRUE(std::move(*exclusive).Release().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+}
+
+// Codegen Builder may zero the root on hop. Restoring child-handle metadata
+// before Release/PublishLocal is required so typed reclaim always sees the child.
+TEST_F(RuntimeSpscTest, ExclusiveZeroRootRestoreChildThenReleaseReclaimsGraph) {
+    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 1, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> publisher(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x912;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    const auto before = allocator_.local_cache_stats();
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = subscriber.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+
+    RuntimeGraphMessage saved = **exclusive;
+    std::memset(exclusive->get(), 0, sizeof(RuntimeGraphMessage));
+    EXPECT_EQ((*exclusive)->child_offset, 0u);
+    (*exclusive)->id = saved.id;
+    SetGraphChild(**exclusive, child);
+    EXPECT_EQ((*exclusive)->child_offset, child.offset);
+
+    ASSERT_TRUE(std::move(*exclusive).Release().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.local_cache_stats().published_graph_reclaims,
+              before.published_graph_reclaims + 1);
+}
+
 TEST_F(RuntimeSpscTest, ExclusiveHopTransfersChildHandleWithoutPayloadCopy) {
     auto hop_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
     auto hop = SpscChannel::Init(hop_memory.get(), kChannelCapacity);
