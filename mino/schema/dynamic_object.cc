@@ -548,10 +548,12 @@ struct DynamicBuilder::Impl {
                     if (string == nullptr) return Mismatch("string value has wrong type");
                     bytes = std::as_bytes(std::span(string->value));
                     if (!IsValidUtf8(bytes)) return Mismatch("string is not valid UTF-8");
-                } else {
-                    const auto* raw = value.bytes();
-                    if (raw == nullptr) return Mismatch("bytes value has wrong type");
+                } else if (const auto* raw = value.bytes()) {
                     bytes = raw->value;
+                } else if (const auto* view = value.bytes_view()) {
+                    bytes = view->value;
+                } else {
+                    return Mismatch("bytes value has wrong type");
                 }
                 if (!constraints.max_bytes().has_value()) {
                     return Mismatch("dynamic bytes field is missing max_bytes");

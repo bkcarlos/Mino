@@ -633,7 +633,7 @@ void LengthPrefixedFrameDecoder::ReleaseFrameBuffer() noexcept {
     expected_frame_length_ = 0;
 }
 
-Result<std::vector<WireFrame>> LengthPrefixedFrameDecoder::Fail(
+Result<std::vector<ValidatedWireFrameView>> LengthPrefixedFrameDecoder::Fail(
     Status status) noexcept {
     failed_ = true;
     prefix_size_ = 0;
@@ -641,14 +641,14 @@ Result<std::vector<WireFrame>> LengthPrefixedFrameDecoder::Fail(
     return status;
 }
 
-Result<std::vector<WireFrame>> LengthPrefixedFrameDecoder::Push(
+Result<std::vector<ValidatedWireFrameView>> LengthPrefixedFrameDecoder::Push(
     std::span<const std::byte> bytes) noexcept {
     try {
         if (failed_) {
             return Corruption("stream decoder is failed; call Reset");
         }
 
-        std::vector<WireFrame> frames;
+        std::vector<ValidatedWireFrameView> frames;
         size_t decoded_payload_bytes = 0;
         size_t work_bytes = 0;
         size_t input_offset = 0;
@@ -712,7 +712,8 @@ Result<std::vector<WireFrame>> LengthPrefixedFrameDecoder::Push(
             }
             work_bytes += frame_buffer_.size();
 
-            auto decoded = WireFrameCodec::Decode(frame_buffer_, limits_);
+            auto decoded = WireFrameCodec::DecodeView(std::move(frame_buffer_),
+                                                      limits_);
             if (!decoded.ok()) return Fail(decoded.status());
             if (ExceedsBudget(decoded_payload_bytes, decoded->payload.size(),
                               limits_.max_decoded_payload_bytes_per_push)) {
@@ -722,7 +723,6 @@ Result<std::vector<WireFrame>> LengthPrefixedFrameDecoder::Push(
             decoded_payload_bytes += decoded->payload.size();
             frames.push_back(std::move(*decoded));
             prefix_size_ = 0;
-            frame_buffer_.clear();
             expected_frame_length_ = 0;
         }
         return frames;

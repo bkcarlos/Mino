@@ -447,6 +447,41 @@ Result<SchemaNegotiationResult> SchemaNegotiator::HandleControlFrame(
     }
 }
 
+Status SchemaNegotiator::ReadyToPublishData(
+    const WireFrameHeader& header) const noexcept {
+    try {
+        if (failed_) {
+            return Error(StatusCode::kUnavailable,
+                         "schema negotiator is failed; call Reset");
+        }
+        if (header.frame_type != FrameType::kData ||
+            HasFrameFlag(header.flags, FrameFlag::kControlFrame)) {
+            return Invalid("HandleDataFrame requires a data frame");
+        }
+        if (header.connection_schema_ref == 0) {
+            return Error(StatusCode::kSchemaMismatch,
+                         "data frame schema ref must be nonzero");
+        }
+        const auto binding = remote_bindings_.find(header.connection_schema_ref);
+        if (binding == remote_bindings_.end() || !binding->second.ready) {
+            return Status::Error(StatusCode::kNotFound);
+        }
+        if (header.schema_version != binding->second.identity.schema_version() ||
+            header.layout_version != binding->second.identity.layout_version() ||
+            header.msg_type !=
+                static_cast<uint32_t>(binding->second.identity.short_id())) {
+            return Error(
+                StatusCode::kSchemaMismatch,
+                "data frame header does not match negotiated full identity");
+        }
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (...) {
+        return Status::Error(StatusCode::kInternal);
+    }
+}
+
 Result<schema::SchemaIdentity> SchemaNegotiator::IdentityForRemoteRef(
     uint32_t connection_schema_ref) const noexcept {
     try {

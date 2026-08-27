@@ -94,6 +94,8 @@ public:
           options_(options) {}
 
     Status DecodeValidatePublish(const WireFrame& frame) noexcept override;
+    Status DecodeValidatePublish(const WireFrameHeader& header,
+                                 std::span<const std::byte> payload) noexcept override;
 
 private:
     SchemaNegotiator* schema_negotiator_ = nullptr;

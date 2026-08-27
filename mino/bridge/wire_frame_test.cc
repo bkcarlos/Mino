@@ -57,6 +57,14 @@ std::string Hex(std::span<const std::byte> bytes) {
     return result;
 }
 
+bool MatchesWireFrame(const ValidatedWireFrameView& view,
+                      const WireFrame& frame) {
+    return view.header == frame.header &&
+           view.payload.size() == frame.payload.size() &&
+           std::equal(view.payload.begin(), view.payload.end(),
+                      frame.payload.begin(), frame.payload.end());
+}
+
 void ExpectBytesAt(std::span<const std::byte> actual, size_t offset,
                    std::initializer_list<uint8_t> expected,
                    std::string_view field) {
@@ -693,7 +701,7 @@ TEST(LengthPrefixedFrameDecoderTest, HandlesEveryByteAsAPartialRead) {
         ASSERT_TRUE(frames.ok()) << frames.status().ToString();
         if (i + 1 == encoded->size()) {
             ASSERT_EQ(frames->size(), 1u);
-            EXPECT_EQ((*frames)[0], expected);
+            EXPECT_TRUE(MatchesWireFrame((*frames)[0], expected));
         } else {
             EXPECT_TRUE(frames->empty());
             EXPECT_LE(decoder.buffered_bytes(), encoded->size());
@@ -717,8 +725,8 @@ TEST(LengthPrefixedFrameDecoderTest, ReturnsMultipleConsecutiveFrames) {
     auto frames = decoder.Push(stream);
     ASSERT_TRUE(frames.ok()) << frames.status().ToString();
     ASSERT_EQ(frames->size(), 2u);
-    EXPECT_EQ((*frames)[0], first);
-    EXPECT_EQ((*frames)[1], second);
+    EXPECT_TRUE(MatchesWireFrame((*frames)[0], first));
+    EXPECT_TRUE(MatchesWireFrame((*frames)[1], second));
     EXPECT_TRUE(decoder.Finish().ok());
 }
 
@@ -835,7 +843,7 @@ TEST(LengthPrefixedFrameDecoderTest, EnforcesWorkBudgetPerPush) {
 
     WireFrameLimits limits;
     // Input bytes are consumed once; the complete body is then revisited by
-    // validation, CRC, and payload copying.
+    // validation and CRC.
     limits.max_work_bytes_per_push =
         encoded->size() + (encoded->size() - kLengthPrefixSize) - 1;
     LengthPrefixedFrameDecoder decoder(limits);

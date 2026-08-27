@@ -842,9 +842,7 @@ class PipelineSchema final {
         Set(message, 17, DynamicValue::Unsigned(frame.payload_checksum));
         const auto payload = std::as_bytes(
             std::span(frame.payload.data(), frame.payload.size()));
-        auto bytes = DynamicValue::Bytes(payload);
-        if (!bytes.ok()) ThrowStatus("create dynamic payload", bytes.status());
-        Set(message, 18, std::move(*bytes));
+        Set(message, 18, DynamicValue::BytesView(payload));
         const Status encoded =
             prepared_codec_->EncodeInto(message, encode_scratch_, *output);
         if (!encoded.ok()) ThrowStatus("CanonicalWireCodec::EncodeInto", encoded);

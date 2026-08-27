@@ -148,7 +148,7 @@ struct WireFrameLimits {
 
     // Per-Push limits. Decoded payload excludes the control opcode. Work bytes
     // count bytes consumed from the Push input plus complete frame bodies
-    // revisited for validation, CRC, and decoded-payload copying.
+    // revisited for validation and CRC.
     size_t max_frames_per_push = 1024;
     size_t max_decoded_payload_bytes_per_push = 64u * 1024u * 1024u;
     size_t max_work_bytes_per_push = 64u * 1024u * 1024u;
@@ -198,7 +198,7 @@ public:
     explicit LengthPrefixedFrameDecoder(WireFrameLimits limits = {}) noexcept
         : limits_(limits) {}
 
-    Result<std::vector<WireFrame>> Push(
+    Result<std::vector<ValidatedWireFrameView>> Push(
         std::span<const std::byte> bytes) noexcept;
 
     // Signals end-of-stream. An incomplete prefix or frame is corruption.
@@ -215,7 +215,7 @@ public:
     }
 
 private:
-    Result<std::vector<WireFrame>> Fail(Status status) noexcept;
+    Result<std::vector<ValidatedWireFrameView>> Fail(Status status) noexcept;
     void ReleaseFrameBuffer() noexcept;
 
     WireFrameLimits limits_;

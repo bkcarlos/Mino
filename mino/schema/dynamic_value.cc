@@ -52,6 +52,11 @@ Result<DynamicValue> DynamicValue::Bytes(
     }
 }
 
+DynamicValue DynamicValue::BytesView(
+    std::span<const std::byte> value) noexcept {
+    return DynamicValue(BytesViewValue{value});
+}
+
 Result<DynamicValue> DynamicValue::Message(
     std::shared_ptr<DynamicMessage> value) noexcept {
     try {
@@ -106,6 +111,9 @@ const StringValue* DynamicValue::string() const noexcept {
 }
 const BytesValue* DynamicValue::bytes() const noexcept {
     return std::get_if<BytesValue>(&value_);
+}
+const BytesViewValue* DynamicValue::bytes_view() const noexcept {
+    return std::get_if<BytesViewValue>(&value_);
 }
 const MessageValue* DynamicValue::message() const noexcept {
     return std::get_if<MessageValue>(&value_);
