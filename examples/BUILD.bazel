@@ -1,0 +1,56 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "simple_mp_pubsub",
+    srcs = ["simple_mp_pubsub.cc"],
+    deps = [
+        "//mino/runtime:simple_node",
+    ],
+)
+
+cc_binary(
+    name = "simple_mp_pubsub_stress",
+    srcs = ["simple_mp_pubsub_stress.cc"],
+    deps = [
+        "//mino/runtime:simple_node",
+    ],
+)
+
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+cc_binary(
+    name = "zmq_ipc_pubsub_stress",
+    srcs = ["zmq_ipc_pubsub_stress.cc"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        "@libzmq",
+    ],
+)
+
+cc_binary(
+    name = "zmq_ipc_business_stress",
+    srcs = ["zmq_ipc_business_stress.cc"],
+    copts = ["-Wno-error"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        "//benchmarks/pipeline_comparison:pipeline_common",
+        "//benchmarks/pipeline_comparison:semantic_protobuf_codec",
+        "@libzmq",
+    ],
+)
+
+cc_binary(
+    name = "simple_mp_business_stress",
+    srcs = ["simple_mp_business_stress.cc"],
+    data = ["//benchmarks/pipeline_comparison:autonomy_pipeline_descriptor"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        "//benchmarks/pipeline_comparison:pipeline_common",
+        "//benchmarks/pipeline_comparison:semantic_canonical_codec",
+        "//mino/runtime:simple_node",
+    ],
+)
+

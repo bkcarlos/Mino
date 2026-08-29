@@ -25,6 +25,7 @@
 #include "mino/runtime/deadline.h"
 #include "mino/runtime/delivery_receipt.h"
 #include "mino/runtime/journal_channel_recovery.h"
+#include "mino/runtime/message.h"
 #include "mino/runtime/message_traits.h"
 #include "mino/runtime/shm_shared_ptr.h"
 #include "mino/shm/allocator/central_slab.h"
@@ -37,6 +38,9 @@ namespace mino {
 
 template <typename T>
 class Publisher;
+
+template <typename T>
+class BorrowedMessage;
 
 // Exclusive construction window for one fixed-layout SHM object. An active
 // builder owns an unpublished allocator slot; destruction follows the RAII
@@ -224,6 +228,171 @@ private:
     AllocationJournal* journal_ = nullptr;
     AllocationTransaction transaction_;
     bool journal_committed_ = false;
+    bool active_ = false;
+};
+
+// Exclusive ownership of one published SHM graph after it has been detached
+// from its SPSC slot. Destruction reclaims the graph unless Publisher::
+// PublishLocal consumes it. The hop keeps the original root and child handles
+// (generation, owner epoch, transaction id). Re-stamping a live child's
+// CRC-covered identity to a new journal transaction is intentionally
+// unsupported: two live roots must not share a child, and rewriting immutable
+// header fields would be unsafe. Pin-based Transfer() retires the root and
+// cannot be republished.
+//
+// Fail-closed crash window: after the original PublishLocal FinalizeCommit,
+// the journal no longer tracks the graph. TakeExclusive ACKs the SPSC slot, so
+// JournalChannelRecoveryCoordinator also cannot see it. A process kill between
+// TakeExclusive and PublishLocal therefore leaks the published slabs until the
+// SHM region is recreated. Normal C++ unwind must reclaim via this RAII
+// destructor (or Release()) exactly once — never double-free, never rely on
+// journal epoch recovery to close the hop window.
+template <typename T>
+class ExclusiveMessage {
+public:
+    ExclusiveMessage() noexcept = default;
+    ExclusiveMessage(const ExclusiveMessage&) = delete;
+    ExclusiveMessage& operator=(const ExclusiveMessage&) = delete;
+
+    ExclusiveMessage(ExclusiveMessage&& other) noexcept { MoveFrom(other); }
+
+    ExclusiveMessage& operator=(ExclusiveMessage&& other) noexcept {
+        if (this != &other) {
+            ReleaseIfActive();
+            MoveFrom(other);
+        }
+        return *this;
+    }
+
+    ~ExclusiveMessage() { ReleaseIfActive(); }
+
+    T* get() noexcept { return value_; }
+    const T* get() const noexcept { return value_; }
+    T* operator->() noexcept { return value_; }
+    const T* operator->() const noexcept { return value_; }
+    T& operator*() noexcept { return *value_; }
+    const T& operator*() const noexcept { return *value_; }
+
+    bool active() const noexcept { return active_; }
+    ShmHandle handle() const noexcept { return metadata_.payload; }
+    const MessageMetadata& metadata() const noexcept { return metadata_; }
+
+    Status Release() && noexcept {
+        if (!active_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "exclusive message is not active");
+        }
+        return ReclaimGraph();
+    }
+
+private:
+    friend class Publisher<T>;
+    friend class BorrowedMessage<T>;
+
+    ExclusiveMessage(CentralSlabAllocator* allocator, T* value,
+                     MessageMetadata metadata) noexcept
+        : allocator_(allocator),
+          value_(value),
+          metadata_(metadata),
+          active_(true) {}
+
+    void Disarm() noexcept {
+        active_ = false;
+        allocator_ = nullptr;
+        value_ = nullptr;
+    }
+
+    void ReleaseIfActive() noexcept {
+        if (active_) {
+            ReclaimGraph().ok();
+        }
+    }
+
+    void MoveFrom(ExclusiveMessage& other) noexcept {
+        allocator_ = other.allocator_;
+        value_ = other.value_;
+        metadata_ = other.metadata_;
+        active_ = other.active_;
+        other.allocator_ = nullptr;
+        other.value_ = nullptr;
+        other.active_ = false;
+    }
+
+    static constexpr bool SupportsOwnedGraphCollection() noexcept {
+        if constexpr (requires {
+                          StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+                          StaticMessageTraits<T>::kMaxOwnedGraphHandles;
+                      }) {
+            return StaticMessageTraits<T>::kOwnedGraphCollectionSupported;
+        }
+        return false;
+    }
+
+    static constexpr size_t OwnedGraphCapacity() noexcept {
+        if constexpr (SupportsOwnedGraphCollection()) {
+            static_assert(StaticMessageTraits<T>::kMaxOwnedGraphHandles > 0,
+                          "owned graph collector must have root capacity");
+            return StaticMessageTraits<T>::kMaxOwnedGraphHandles;
+        }
+        return 1;
+    }
+
+    Status FallbackRootCleanup() noexcept {
+        const Status retire = allocator_->Retire(metadata_.payload);
+        if (!retire.ok()) return retire;
+        return allocator_->Reclaim(metadata_.payload);
+    }
+
+    Status ReclaimGraph() noexcept {
+        active_ = false;
+        if (allocator_ == nullptr || value_ == nullptr ||
+            metadata_.payload.IsNull()) {
+            allocator_ = nullptr;
+            value_ = nullptr;
+            return Status::Error(StatusCode::kInternal,
+                                 "exclusive message is incomplete");
+        }
+
+        std::array<ShmHandle, OwnedGraphCapacity()> manifest{};
+        size_t manifest_count = 0;
+        Status graph_collection = Status::Ok();
+        if constexpr (SupportsOwnedGraphCollection()) {
+            graph_collection = CollectOwnedGraph(
+                metadata_.payload, *value_, manifest, manifest_count);
+            if (graph_collection.ok() &&
+                (manifest_count == 0 || manifest_count > manifest.size())) {
+                graph_collection = Status::Error(
+                    StatusCode::kCorruption,
+                    "owned graph collector returned an invalid size");
+            }
+        }
+
+        Status typed_reclaim = Status::Ok();
+        Status fallback_cleanup = Status::Ok();
+        bool reclaimed_by_manifest = false;
+        if constexpr (SupportsOwnedGraphCollection()) {
+            if (graph_collection.ok()) {
+                typed_reclaim = allocator_->ReclaimPublishedGraph(
+                    metadata_.payload,
+                    std::span<const ShmHandle>(manifest.data(),
+                                               manifest_count));
+                reclaimed_by_manifest = typed_reclaim.ok();
+            }
+        }
+        if (!reclaimed_by_manifest) {
+            fallback_cleanup = FallbackRootCleanup();
+        }
+
+        allocator_ = nullptr;
+        value_ = nullptr;
+        if (!graph_collection.ok()) return graph_collection;
+        if (!typed_reclaim.ok()) return typed_reclaim;
+        return fallback_cleanup;
+    }
+
+    CentralSlabAllocator* allocator_ = nullptr;
+    T* value_ = nullptr;
+    MessageMetadata metadata_;
     bool active_ = false;
 };
 
@@ -441,6 +610,14 @@ public:
         return PublishLocalImpl(builder, deadline, nullptr, nullptr);
     }
 
+    // Republishes an exclusive SPSC graph without allocating a new root or
+    // copying child bytes. The object must already be Published; this path
+    // never rewrites slab generation, owner epoch, or transaction identity.
+    Status PublishLocal(ExclusiveMessage<T>&& exclusive,
+                        Deadline deadline = Deadline::Infinite()) noexcept {
+        return PublishExclusiveImpl(exclusive, deadline);
+    }
+
     // Bounded ordered publish. The span size is the requested capacity and may
     // not exceed kMaxBatchMessages. Every item independently executes the same
     // Validate -> Journal publish/bind -> Reserve -> Commit pipeline as
@@ -599,6 +776,118 @@ public:
     }
 
 private:
+    Status PublishExclusiveImpl(ExclusiveMessage<T>& exclusive,
+                                Deadline deadline) noexcept {
+        if (!exclusive.active() || exclusive.allocator_ != allocator_) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "exclusive message does not belong to this publisher");
+        }
+        if (!std::holds_alternative<SpscChannel*>(channel_)) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "exclusive publish requires an SPSC publisher");
+        }
+        if (deadline.expired()) {
+            return Status::Error(StatusCode::kTimeout,
+                                 "publish deadline expired");
+        }
+
+        const Status validation = StaticMessageTraits<T>::Validate(*exclusive);
+        if (!validation.ok()) {
+            return validation;
+        }
+        const Status graph = ValidatePublishedOwnedGraph(exclusive);
+        if (!graph.ok()) {
+            return graph;
+        }
+
+        Result<SpscChannel::Reservation> reservation = ReserveSpsc(deadline);
+        if (!reservation.ok()) {
+            if (reservation.status().code() == StatusCode::kDegraded) {
+                dropped_count_.fetch_add(1, std::memory_order_relaxed);
+                return Status::Ok();
+            }
+            return reservation.status();
+        }
+
+        IndexSlot* slot = reservation->slot();
+        slot->msg_type = StaticMessageTraits<T>::message_type;
+        slot->schema_version = StaticMessageTraits<T>::schema_version;
+        slot->schema_short_id = StaticMessageTraits<T>::schema_short_id;
+        slot->schema_layout_version = StaticMessageTraits<T>::layout_version;
+        slot->reserved0 = 0;
+        slot->timestamp_ns = MonotonicNowNs();
+        slot->payload = exclusive.handle();
+        slot->payload_len = sizeof(T);
+        slot->flags = StaticMessageTraits<T>::index_flags;
+
+        const Status committed = std::move(*reservation).Commit();
+        if (!committed.ok()) {
+            return committed;
+        }
+        exclusive.Disarm();
+        published_count_.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok();
+    }
+
+    Status ValidatePublishedOwnedGraph(ExclusiveMessage<T>& exclusive) noexcept {
+        Result<SlabView> root = allocator_->Inspect(exclusive.handle());
+        if (!root.ok()) {
+            return root.status();
+        }
+        if (root->state != ObjectState::kPublished ||
+            root->object_size != sizeof(T) || root->capacity < sizeof(T) ||
+            root->type_id != StaticMessageTraits<T>::type_id ||
+            root->schema_short_id != StaticMessageTraits<T>::schema_short_id ||
+            root->layout_version != StaticMessageTraits<T>::layout_version ||
+            root->data == nullptr) {
+            return Status::Error(
+                StatusCode::kSchemaMismatch,
+                "exclusive payload slab does not match static message traits");
+        }
+
+        if constexpr (!SupportsOwnedGraphCollection()) {
+            return Status::Ok();
+        } else {
+            static_assert(StaticMessageTraits<T>::kMaxOwnedGraphHandles > 0,
+                          "owned graph collector must have root capacity");
+            std::array<ShmHandle, StaticMessageTraits<T>::kMaxOwnedGraphHandles>
+                reachable{};
+            size_t handle_count = 0;
+            MINO_RETURN_IF_ERROR(CollectOwnedGraph(
+                exclusive.handle(), *exclusive.value_, reachable, handle_count));
+            if (handle_count == 0 || handle_count > reachable.size()) {
+                return Status::Error(
+                    StatusCode::kCorruption,
+                    "owned graph collector returned an invalid size");
+            }
+            if (reachable.front() != exclusive.handle()) {
+                return Status::Error(StatusCode::kCorruption,
+                                     "owned graph collector is not root-first");
+            }
+
+            const uint64_t owner_epoch = root->owner_epoch;
+            const uint64_t transaction_id = root->allocation_transaction_id;
+            for (size_t i = 0; i < handle_count; ++i) {
+                const ShmHandle handle = reachable[i];
+                MINO_ASSIGN_OR_RETURN(SlabView slab, allocator_->Inspect(handle));
+                const uint32_t expected_role =
+                    i == 0 ? kAllocationFlagTransactionRoot
+                           : kAllocationFlagTransactionChild;
+                if (slab.state != ObjectState::kPublished ||
+                    (slab.allocation_flags & expected_role) == 0 ||
+                    slab.owner_epoch != owner_epoch ||
+                    slab.allocation_transaction_id != transaction_id) {
+                    return Status::Error(
+                        StatusCode::kCorruption,
+                        "exclusive graph handle is not a published owned allocation");
+                }
+            }
+            return Status::Ok();
+        }
+    }
+
     Status AbortBatchRemainder(std::span<MessageBuilder<T>> builders,
                                size_t first) noexcept {
         Status first_error = Status::Ok();

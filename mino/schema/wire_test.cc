@@ -409,6 +409,43 @@ message M {
     EXPECT_EQ(status.code(), StatusCode::kInvalidArgument);
 }
 
+TEST(PreparedCanonicalWireCodecTest, BytesViewMatchesOwnedBytesCanonicalOutput) {
+    auto descriptor = CompileOne(R"idl(
+package p;
+message M {
+  optional uint32 known = 1;
+  bytes blob = 2 [max_bytes = 64];
+}
+)idl");
+    ASSERT_NE(descriptor, nullptr);
+    auto prepared = PreparedCanonicalWireCodec::Create(descriptor);
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+
+    const auto blob_bytes = Bytes({0x00, 0xff, 0x7f, 0x80});
+    DynamicMessage owned_message;
+    ASSERT_TRUE(owned_message.SetField(1, DynamicValue::Unsigned(9)).ok());
+    auto owned_blob = DynamicValue::Bytes(blob_bytes);
+    ASSERT_TRUE(owned_blob.ok());
+    ASSERT_TRUE(owned_message.SetField(2, std::move(*owned_blob)).ok());
+
+    DynamicMessage view_message;
+    ASSERT_TRUE(view_message.SetField(1, DynamicValue::Unsigned(9)).ok());
+    ASSERT_TRUE(view_message.SetField(2, DynamicValue::BytesView(blob_bytes)).ok());
+
+    CanonicalWireScratch scratch;
+    std::vector<std::byte> owned_output;
+    std::vector<std::byte> view_output;
+    ASSERT_TRUE(prepared->EncodeInto(owned_message, scratch, owned_output).ok());
+    ASSERT_TRUE(prepared->EncodeInto(view_message, scratch, view_output).ok());
+    EXPECT_EQ(view_output, owned_output);
+
+    std::vector<std::byte> generic_output;
+    ASSERT_TRUE(CanonicalWireCodec::EncodeInto(
+                    *descriptor, view_message, scratch, generic_output)
+                    .ok());
+    EXPECT_EQ(generic_output, owned_output);
+}
+
 TEST(CanonicalWireScratchTest,
      FailedPartialEncodeDoesNotLeakUnknownOrderIntoNestedReuse) {
     CompileOptions options;

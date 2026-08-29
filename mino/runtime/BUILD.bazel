@@ -89,6 +89,7 @@ cc_library(
     name = "subscriber",
     hdrs = ["subscriber.h"],
     deps = [
+        ":publisher",
         ":runtime_types",
         ":shm_shared_ptr",
         "//mino/common:result",
@@ -287,3 +288,104 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+cc_library(
+    name = "simple_node",
+    srcs = ["simple_node.cc"],
+    hdrs = ["simple_node.h"],
+    deps = [
+        ":runtime_types",
+        "//mino/abi:shm_abi",
+        "//mino/common:checked_arithmetic",
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:shared_memory",
+        "//mino/shm/allocator:bitmap",
+        "//mino/shm/allocator:central_slab",
+        "//mino/shm/allocator:class_table",
+        "//mino/shm/allocator:slab_header",
+        "//mino/shm/channel:queue_full_policy",
+        "//mino/shm/channel:spsc",
+    ],
+)
+
+cc_test(
+    name = "simple_node_test",
+    srcs = ["simple_node_test.cc"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":simple_node",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Independent-process stress: posix_spawn/exec of //examples:simple_mp_pubsub_stress
+# (publisher Create, subscriber Open). The test parent never maps the segment
+# and does not fork after Create. Sized to fit a 64 MiB /dev/shm.
+cc_test(
+    name = "simple_node_mp_stress_test",
+    size = "small",
+    srcs = ["simple_node_mp_stress_test.cc"],
+    data = ["//examples:simple_mp_pubsub_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":simple_node",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "mp_stress_harness",
+    testonly = True,
+    hdrs = ["mp_stress_harness.h"],
+)
+
+cc_test(
+    name = "zmq_ipc_mp_stress_test",
+    size = "small",
+    srcs = ["zmq_ipc_mp_stress_test.cc"],
+    data = ["//examples:zmq_ipc_pubsub_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "zmq_ipc_business_mp_stress_test",
+    size = "small",
+    srcs = ["zmq_ipc_business_mp_stress_test.cc"],
+    data = ["//examples:zmq_ipc_business_stress"],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "simple_node_business_mp_stress_test",
+    size = "small",
+    srcs = ["simple_node_business_mp_stress_test.cc"],
+    data = [
+        "//benchmarks/pipeline_comparison:autonomy_pipeline_descriptor",
+        "//examples:simple_mp_business_stress",
+    ],
+    target_compatible_with = LINUX_ONLY,
+    deps = [
+        ":mp_stress_harness",
+        ":simple_node",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+

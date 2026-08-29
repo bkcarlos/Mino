@@ -22,6 +22,7 @@
 #include "mino/runtime/deadline.h"
 #include "mino/runtime/message.h"
 #include "mino/runtime/message_traits.h"
+#include "mino/runtime/publisher.h"
 #include "mino/runtime/shm_shared_ptr.h"
 #include "mino/shm/allocator/central_slab.h"
 #include "mino/shm/channel/broadcast_channel.h"
@@ -129,6 +130,49 @@ public:
             return ack;
         }
         return pinned;
+    }
+
+
+    // Detaches this SPSC borrow from the channel without reclaiming the
+    // published graph. The returned ExclusiveMessage owns the same root and
+    // child handles so a hop can mutate root scalars and republish without a
+    // payload memcpy. Pin-table and Broadcast/MPSC borrows are rejected.
+    Result<ExclusiveMessage<T>> TakeExclusive() && noexcept {
+        if (!active_) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "borrowed message is not active");
+        }
+        if (!std::holds_alternative<SpscChannel::Borrow>(borrow_)) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "exclusive transfer requires an SPSC subscriber");
+        }
+        if (payload_cleanup_by_channel_ || pin_table_ != nullptr ||
+            borrow_pin_.active()) {
+            return Status::Error(
+                StatusCode::kUnsupported,
+                "exclusive transfer does not use Pin-table lifetime");
+        }
+        if (allocator_ == nullptr || value_ == nullptr ||
+            metadata_.payload.IsNull()) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "borrowed message payload is incomplete");
+        }
+
+        ExclusiveMessage<T> exclusive(
+            allocator_, const_cast<T*>(value_), metadata_);
+        active_ = false;
+        value_ = nullptr;
+        const Status channel_ack = std::visit(
+            [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
+        allocator_ = nullptr;
+        pin_table_ = nullptr;
+        pin_owner_ = {};
+        if (!channel_ack.ok()) {
+            exclusive.Disarm();
+            return channel_ack;
+        }
+        return exclusive;
     }
 
     Status Ack() && noexcept {

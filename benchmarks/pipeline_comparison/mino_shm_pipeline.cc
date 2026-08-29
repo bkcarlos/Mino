@@ -18,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -736,14 +737,40 @@ void PopulateGeneratedFrame(const SemanticFrame& source,
 }
 
 template <typename Frame>
-SemanticFrame GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
-                                  const CentralSlabAllocator& allocator,
-                                  Profile expected_profile) {
+SemanticFrame GeneratedScalarsToSemantic(const Frame& source) {
     const GeneratedAutonomyFrameAccessor accessor(source);
     if (!accessor.valid()) {
         throw std::runtime_error("generated Mino root object is invalid");
     }
+    SemanticFrame destination;
+    destination.sample_id = accessor.sample_id();
+    destination.origin_timestamp_ns = accessor.origin_timestamp_ns();
+    destination.perception_timestamp_ns = accessor.perception_timestamp_ns();
+    destination.prediction_timestamp_ns = accessor.prediction_timestamp_ns();
+    destination.planning_timestamp_ns = accessor.planning_timestamp_ns();
+    destination.control_timestamp_ns = accessor.control_timestamp_ns();
+    destination.guardian_timestamp_ns = accessor.guardian_timestamp_ns();
+    destination.completed_stage_mask = accessor.completed_stage_mask();
+    destination.profile = accessor.profile();
+    destination.object_count = accessor.object_count();
+    destination.trajectory_point_count = accessor.trajectory_point_count();
+    destination.ego_speed_mps = accessor.ego_speed_mps();
+    destination.steering_angle_rad = accessor.steering_angle_rad();
+    destination.acceleration_mps2 = accessor.acceleration_mps2();
+    destination.brake_percentage = accessor.brake_percentage();
+    destination.emergency_stop = accessor.emergency_stop();
+    destination.payload_checksum = accessor.payload_checksum();
+    return destination;
+}
 
+template <typename Frame>
+std::span<const uint8_t> InspectGeneratedPayload(
+    const Frame& source, ShmHandle root_handle,
+    const CentralSlabAllocator& allocator, Profile expected_profile) {
+    const GeneratedAutonomyFrameAccessor accessor(source);
+    if (!accessor.valid()) {
+        throw std::runtime_error("generated Mino root object is invalid");
+    }
     const GeneratedVariableMetadata payload = accessor.payload();
     const size_t expected_payload_bytes =
         ProfilePayloadBytes(expected_profile);
@@ -776,30 +803,42 @@ SemanticFrame GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
         throw std::runtime_error(
             "generated Mino payload child does not belong to the root graph");
     }
-
-    SemanticFrame destination;
-    destination.sample_id = accessor.sample_id();
-    destination.origin_timestamp_ns = accessor.origin_timestamp_ns();
-    destination.perception_timestamp_ns = accessor.perception_timestamp_ns();
-    destination.prediction_timestamp_ns = accessor.prediction_timestamp_ns();
-    destination.planning_timestamp_ns = accessor.planning_timestamp_ns();
-    destination.control_timestamp_ns = accessor.control_timestamp_ns();
-    destination.guardian_timestamp_ns = accessor.guardian_timestamp_ns();
-    destination.completed_stage_mask = accessor.completed_stage_mask();
-    destination.profile = accessor.profile();
-    destination.object_count = accessor.object_count();
-    destination.trajectory_point_count = accessor.trajectory_point_count();
-    destination.ego_speed_mps = accessor.ego_speed_mps();
-    destination.steering_angle_rad = accessor.steering_angle_rad();
-    destination.acceleration_mps2 = accessor.acceleration_mps2();
-    destination.brake_percentage = accessor.brake_percentage();
-    destination.emergency_stop = accessor.emergency_stop();
-    destination.payload_checksum = accessor.payload_checksum();
     const auto* payload_bytes = static_cast<const uint8_t*>(child->data);
-    destination.payload.assign(payload_bytes,
-                               payload_bytes + payload.length);
-    return destination;
+    return std::span<const uint8_t>(payload_bytes, payload.length);
 }
+
+template <typename Frame>
+void WriteGeneratedScalars(const SemanticFrame& source, Frame* destination,
+                           const GeneratedVariableMetadata& payload_meta) {
+    if (destination == nullptr) {
+        throw std::invalid_argument("generated SHM frame must not be null");
+    }
+    // Codegen Builder zeros the whole root. Restore child-handle metadata so
+    // the hop keeps the published payload slab without copying its bytes.
+    GeneratedAutonomyFrameBuilder builder(*destination);
+    builder.set_sample_id(source.sample_id);
+    builder.set_origin_timestamp_ns(source.origin_timestamp_ns);
+    builder.set_perception_timestamp_ns(source.perception_timestamp_ns);
+    builder.set_prediction_timestamp_ns(source.prediction_timestamp_ns);
+    builder.set_planning_timestamp_ns(source.planning_timestamp_ns);
+    builder.set_control_timestamp_ns(source.control_timestamp_ns);
+    builder.set_guardian_timestamp_ns(source.guardian_timestamp_ns);
+    builder.set_completed_stage_mask(source.completed_stage_mask);
+    builder.set_profile(source.profile);
+    builder.set_object_count(source.object_count);
+    builder.set_trajectory_point_count(source.trajectory_point_count);
+    builder.set_ego_speed_mps(source.ego_speed_mps);
+    builder.set_steering_angle_rad(source.steering_angle_rad);
+    builder.set_acceleration_mps2(source.acceleration_mps2);
+    builder.set_brake_percentage(source.brake_percentage);
+    builder.set_emergency_stop(source.emergency_stop);
+    builder.set_payload_checksum(source.payload_checksum);
+    if (!builder.set_payload(payload_meta)) {
+        throw std::runtime_error(
+            "generated Mino builder rejected restored payload child metadata");
+    }
+}
+
 
 uint64_t TotalFrames(const CommonOptions& options) {
     return AddOrThrow(options.warmup_messages, options.messages,
@@ -833,6 +872,20 @@ void ValidateSequenceAndPhase(const CommonOptions& options,
     if (frame.profile != static_cast<uint32_t>(options.profile)) {
         ++statistics->corrupt;
         throw std::runtime_error("frame profile does not match --profile");
+    }
+}
+
+template <typename Frame>
+void PublishExclusiveBounded(Publisher<Frame>* publisher,
+                             ExclusiveMessage<Frame> exclusive,
+                             Deadline deadline) {
+    if (deadline.expired()) {
+        throw std::runtime_error("deadline expired before exclusive SHM publish");
+    }
+    const Status published =
+        publisher->PublishLocal(std::move(exclusive), deadline);
+    if (!published.ok()) {
+        ThrowStatus("Publisher::PublishLocal exclusive", published);
     }
 }
 
@@ -912,19 +965,29 @@ void RunForwarder(const CommonOptions& options,
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         BorrowedMessage<Frame> borrowed =
             PollBounded(&subscriber, deadline, statistics);
-        SemanticFrame semantic = GeneratedToSemantic(
+        // Exclusive SPSC transfer keeps the published graph intact. TakeExclusive
+        // ACKs the input slot without reclaiming; PublishLocal republishes the same
+        // root and child handles. Only root scalars are rewritten.
+        SemanticFrame semantic = GeneratedScalarsToSemantic(*borrowed);
+        const std::span<const uint8_t> payload = InspectGeneratedPayload(
             *borrowed, borrowed.metadata().payload, *allocator, options.profile);
         ValidateSequenceAndPhase(options, semantic, expected_id, statistics);
         std::string error;
-        if (!ApplyStageForClockMode(options.role, &semantic,
+        if (!ApplyStageForClockMode(options.role, &semantic, payload,
                                     options.clock_mode, &error)) {
             ++statistics->corrupt;
             throw std::runtime_error(std::string(RoleName(options.role)) +
                                      " stage rejected frame: " + error);
         }
-        PublishBounded(&publisher, semantic, deadline);
-        const Status ack = std::move(borrowed).Ack();
-        if (!ack.ok()) ThrowStatus("Subscriber input Ack", ack);
+        const GeneratedVariableMetadata payload_meta =
+            GeneratedAutonomyFrameAccessor(*borrowed).payload();
+        Result<ExclusiveMessage<Frame>> exclusive =
+            std::move(borrowed).TakeExclusive();
+        if (!exclusive.ok()) {
+            ThrowStatus("BorrowedMessage::TakeExclusive", exclusive.status());
+        }
+        WriteGeneratedScalars(semantic, exclusive->get(), payload_meta);
+        PublishExclusiveBounded(&publisher, std::move(*exclusive), deadline);
         if (expected_id >= options.warmup_messages) {
             ++statistics->measured_completed;
         }
@@ -944,11 +1007,14 @@ void RunSink(const CommonOptions& options, CentralSlabAllocator* allocator,
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         BorrowedMessage<Frame> borrowed =
             PollBounded(&subscriber, deadline, statistics);
-        SemanticFrame semantic = GeneratedToSemantic(
+        // Final hop validates in place against the published child span; do not
+        // assign+memcpy payload into SemanticFrame just to run CANBus checks.
+        SemanticFrame semantic = GeneratedScalarsToSemantic(*borrowed);
+        const std::span<const uint8_t> payload = InspectGeneratedPayload(
             *borrowed, borrowed.metadata().payload, *allocator, options.profile);
         ValidateSequenceAndPhase(options, semantic, expected_id, statistics);
         std::string error;
-        if (!ApplyStageForClockMode(Role::kCanbus, &semantic,
+        if (!ApplyStageForClockMode(Role::kCanbus, &semantic, payload,
                                     options.clock_mode, &error)) {
             ++statistics->corrupt;
             throw std::runtime_error("canbus stage rejected frame: " + error);
@@ -997,7 +1063,7 @@ std::string BackendDetails(uint64_t capacity, uint64_t segment_bytes,
            "\"clock_mode\":\"" + std::string(ClockModeName(clock_mode)) +
            "\",\"one_way_latency_valid\":" +
            (clock_mode == ClockMode::kSameHost ? "true" : "false") +
-           ",\"stage_processing\":\"semantic-conversion-and-full-payload-copy\"}";
+           ",\"stage_processing\":\"exclusive-spsc-graph-transfer\"}";
 }
 
 template <typename Frame>

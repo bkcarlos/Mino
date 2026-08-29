@@ -133,6 +133,9 @@ public:
 
     Result<schema::SchemaIdentity> IdentityForRemoteRef(
         uint32_t connection_schema_ref) const noexcept;
+    // Ok when the ref is bound and the data header matches. kNotFound means
+    // the frame must be buffered. Other errors fail the frame.
+    Status ReadyToPublishData(const WireFrameHeader& header) const noexcept;
 
     // Schema requests remain provisional until the exact returned control frame
     // is admitted by the upper control queue. If admission fails, do not call

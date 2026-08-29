@@ -31,6 +31,9 @@ struct Float64Value { uint64_t bits = 0; };
 struct BooleanValue { bool value = false; };
 struct StringValue { std::string value; };
 struct BytesValue { std::vector<std::byte> value; };
+// Non-owning bytes for EncodeInto. The span must remain valid for the
+// duration of the encode call that reads this DynamicValue.
+struct BytesViewValue { std::span<const std::byte> value; };
 struct MessageValue { std::shared_ptr<DynamicMessage> value; };
 struct VectorValue { std::shared_ptr<DynamicVector> value; };
 
@@ -46,6 +49,7 @@ public:
         kBytes,
         kMessage,
         kVector,
+        kBytesView,
     };
 
     explicit DynamicValue(SignedIntegerValue value) noexcept : value_(value) {}
@@ -55,6 +59,7 @@ public:
     explicit DynamicValue(BooleanValue value) noexcept : value_(value) {}
     explicit DynamicValue(StringValue value) : value_(std::move(value)) {}
     explicit DynamicValue(BytesValue value) : value_(std::move(value)) {}
+    explicit DynamicValue(BytesViewValue value) noexcept : value_(value) {}
     explicit DynamicValue(MessageValue value) noexcept : value_(std::move(value)) {}
     explicit DynamicValue(VectorValue value) noexcept : value_(std::move(value)) {}
 
@@ -65,6 +70,7 @@ public:
     static DynamicValue Boolean(bool value) noexcept;
     static Result<DynamicValue> String(std::string_view value) noexcept;
     static Result<DynamicValue> Bytes(std::span<const std::byte> value) noexcept;
+    static DynamicValue BytesView(std::span<const std::byte> value) noexcept;
     static Result<DynamicValue> Message(
         std::shared_ptr<DynamicMessage> value) noexcept;
     static Result<DynamicValue> Vector(
@@ -78,6 +84,7 @@ public:
     const BooleanValue* boolean() const noexcept;
     const StringValue* string() const noexcept;
     const BytesValue* bytes() const noexcept;
+    const BytesViewValue* bytes_view() const noexcept;
     const MessageValue* message() const noexcept;
     const VectorValue* vector() const noexcept;
 
@@ -85,7 +92,7 @@ private:
     using Storage = std::variant<SignedIntegerValue, UnsignedIntegerValue,
                                  Float32Value, Float64Value, BooleanValue,
                                  StringValue, BytesValue, MessageValue,
-                                 VectorValue>;
+                                 VectorValue, BytesViewValue>;
     Storage value_;
 };
 

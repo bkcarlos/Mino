@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <span>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -666,7 +667,9 @@ SemanticFrame InitializeSourceFrameAt(uint64_t sample_id, Profile profile,
     return frame;
 }
 
-bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error) {
+bool ValidateSemanticFrame(const SemanticFrame& frame,
+                           std::span<const uint8_t> payload,
+                           std::string* error) {
     const std::optional<Profile> profile = ProfileFromWire(frame.profile);
     if (!profile.has_value()) return Fail("invalid frame profile", error);
     if ((frame.completed_stage_mask & ~kFinalStageMask) != 0) {
@@ -697,24 +700,28 @@ bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error) {
     if (frame.emergency_stop != expected.emergency_stop) {
         return Fail("emergency_stop mismatch", error);
     }
-    const PayloadInspection payload =
-        InspectDeterministicPayload(frame.sample_id, *profile, frame.payload);
-    if (frame.payload_checksum != payload.checksum) {
+    const PayloadInspection inspected =
+        InspectDeterministicPayload(frame.sample_id, *profile, payload);
+    if (frame.payload_checksum != inspected.checksum) {
         return Fail("payload checksum mismatch", error);
     }
     const size_t expected_size = ProfilePayloadBytes(*profile);
-    if (frame.payload.size() != expected_size) {
+    if (payload.size() != expected_size) {
         return Fail("payload size mismatch: expected " +
                         std::to_string(expected_size) + ", got " +
-                        std::to_string(frame.payload.size()),
+                        std::to_string(payload.size()),
                     error);
     }
-    if (payload.first_mismatch.has_value()) {
+    if (inspected.first_mismatch.has_value()) {
         return Fail("payload byte mismatch at index " +
-                        std::to_string(*payload.first_mismatch),
+                        std::to_string(*inspected.first_mismatch),
                     error);
     }
     return true;
+}
+
+bool ValidateSemanticFrame(const SemanticFrame& frame, std::string* error) {
+    return ValidateSemanticFrame(frame, frame.payload, error);
 }
 
 bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
@@ -785,8 +792,9 @@ bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
 }
 
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
+                           std::span<const uint8_t> payload,
                            std::string* error) {
-    if (!ValidateSemanticFrame(frame, error)) return false;
+    if (!ValidateSemanticFrame(frame, payload, error)) return false;
     const uint32_t expected_mask = ExpectedMask(role);
     if (frame.completed_stage_mask != expected_mask) {
         return Fail("stage mask mismatch for " + std::string(RoleName(role)) +
@@ -813,6 +821,11 @@ bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
         }
     }
     return true;
+}
+
+bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
+                           std::string* error) {
+    return ValidateFrameForStage(role, frame, frame.payload, error);
 }
 
 namespace {
@@ -854,31 +867,45 @@ bool StampValidatedStage(Role role, SemanticFrame* frame,
 
 }  // namespace
 
-bool ApplyStage(Role role, SemanticFrame* frame, uint64_t timestamp_ns,
+bool ApplyStage(Role role, SemanticFrame* frame,
+                std::span<const uint8_t> payload, uint64_t timestamp_ns,
                 std::string* error) {
     if (frame == nullptr) return Fail("frame must not be null", error);
-    if (!ValidateFrameForStage(role, *frame, error)) return false;
+    if (!ValidateFrameForStage(role, *frame, payload, error)) return false;
     return StampValidatedStage(role, frame, timestamp_ns, error);
 }
 
-bool ApplyStage(Role role, SemanticFrame* frame, std::string* error) {
+bool ApplyStage(Role role, SemanticFrame* frame, uint64_t timestamp_ns,
+                std::string* error) {
     if (frame == nullptr) return Fail("frame must not be null", error);
-    if (!ValidateFrameForStage(role, *frame, error)) return false;
+    return ApplyStage(role, frame, frame->payload, timestamp_ns, error);
+}
+
+bool ApplyStage(Role role, SemanticFrame* frame,
+                std::span<const uint8_t> payload, std::string* error) {
+    if (frame == nullptr) return Fail("frame must not be null", error);
+    if (!ValidateFrameForStage(role, *frame, payload, error)) return false;
     // The production overload timestamps only after complete semantic and
     // payload validation. Tests may still inject an explicit timestamp above.
     return StampValidatedStage(role, frame, NowNs(), error);
 }
 
-bool ApplyStageForClockMode(Role role, SemanticFrame* frame, ClockMode mode,
+bool ApplyStage(Role role, SemanticFrame* frame, std::string* error) {
+    if (frame == nullptr) return Fail("frame must not be null", error);
+    return ApplyStage(role, frame, frame->payload, error);
+}
+
+bool ApplyStageForClockMode(Role role, SemanticFrame* frame,
+                            std::span<const uint8_t> payload, ClockMode mode,
                             std::string* error) {
     if (mode == ClockMode::kSameHost) {
-        return ApplyStage(role, frame, error);
+        return ApplyStage(role, frame, payload, error);
     }
     if (mode != ClockMode::kIndependentHosts) {
         return Fail("invalid clock mode", error);
     }
     if (frame == nullptr) return Fail("frame must not be null", error);
-    if (!ValidateSemanticFrame(*frame, error)) return false;
+    if (!ValidateSemanticFrame(*frame, payload, error)) return false;
     if (frame->completed_stage_mask != ExpectedMask(role)) {
         return Fail("stage mask mismatch for " + std::string(RoleName(role)),
                     error);
@@ -916,6 +943,12 @@ bool ApplyStageForClockMode(Role role, SemanticFrame* frame, ClockMode mode,
     }
     frame->completed_stage_mask |= RoleBit(role);
     return true;
+}
+
+bool ApplyStageForClockMode(Role role, SemanticFrame* frame, ClockMode mode,
+                            std::string* error) {
+    if (frame == nullptr) return Fail("frame must not be null", error);
+    return ApplyStageForClockMode(role, frame, frame->payload, mode, error);
 }
 
 CommonOptions ParseCommonOptions(int argc, char** argv) {

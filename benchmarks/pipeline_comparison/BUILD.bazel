@@ -66,6 +66,40 @@ cc_test(
     ],
 )
 
+filegroup(
+    name = "autonomy_pipeline_descriptor",
+    srcs = [":autonomy_pipeline_mino_codegen"],
+    output_group = "descriptor",
+)
+
+cc_library(
+    name = "semantic_canonical_codec",
+    srcs = ["semantic_canonical_codec.cc"],
+    hdrs = ["semantic_canonical_codec.h"],
+    copts = PIPELINE_COPTS,
+    deps = [
+        ":pipeline_common",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/schema:descriptor",
+        "//mino/schema:dynamic_value",
+        "//mino/schema:wire",
+        "//mino/schema/codegen:artifact_codec",
+    ],
+)
+
+cc_library(
+    name = "semantic_protobuf_codec",
+    srcs = ["semantic_protobuf_codec.cc"],
+    hdrs = ["semantic_protobuf_codec.h"],
+    copts = PIPELINE_COPTS + ["-Wno-error"],
+    deps = [
+        ":autonomy_pipeline_cc_proto",
+        ":pipeline_common",
+        "@protobuf",
+    ],
+)
+
 proto_library(
     name = "autonomy_pipeline_proto",
     srcs = ["autonomy_pipeline.proto"],
@@ -87,8 +121,9 @@ cc_binary(
     deps = [
         ":autonomy_pipeline_cc_proto",
         ":pipeline_common",
+        ":semantic_protobuf_codec",
         "@libzmq",
-        "@protobuf//:protobuf",
+        "@protobuf",
     ],
 )
 
@@ -181,8 +216,8 @@ cc_library(
     copts = PIPELINE_COPTS,
     tags = ["manual"],
     deps = [
-        "@fastcdr//:fastcdr",
-        "@fastdds//:fastdds",
+        "@fastcdr",
+        "@fastdds",
     ],
 )
 
@@ -195,7 +230,7 @@ cc_binary(
     deps = [
         ":autonomy_pipeline_fastdds_type",
         ":pipeline_common",
-        "@fastdds//:fastdds",
+        "@fastdds",
     ],
 )
 

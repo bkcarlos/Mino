@@ -1,0 +1,223 @@
+{
+  "generated_utc": "2026-08-25T16:00:03Z",
+  "generated_shanghai": "2026-08-26 00:00:03 CST",
+  "commit": "c977bd18ab67b17aa98406674ba482817e812beb",
+  "lockfile_mode_error": true,
+  "compiler": "g++-14.2.0",
+  "gcc12_config_used": false,
+  "release_bazel_test": {
+    "command": "bazel test --lockfile_mode=error --config=release --jobs=4 //... --test_output=errors",
+    "targets_total": 141,
+    "first_pass": {
+      "executed": 112,
+      "pass": 114,
+      "fail_to_build": 1,
+      "skipped_no_status": 26,
+      "elapsed_s": 261.282,
+      "log": "/workspace/mino-results/full-release-test.log"
+    },
+    "rerun": {
+      "command_note": "failed target + 26 NO STATUS with --keep_going",
+      "pass": 26,
+      "fail_to_build": 1,
+      "log": "/workspace/mino-results/full-release-test-rerun.log"
+    },
+    "combined": {
+      "pass": 140,
+      "fail_to_build": 1,
+      "skip": 0,
+      "fail_target": "//mino/transport:transport_driver_test",
+      "fail_error": "/usr/include/c++/14/bits/stl_algobase.h:452:30: error: 'void* __builtin_memmove(void*, const void*, long unsigned int)' forming offset 1 is out of the bounds [0, 1] [-Werror=array-bounds=]",
+      "fail_note": "GCC 14 -O2 -Werror=array-bounds false positive on std::vector<std::byte> copy in TransportDriverTest.OwnedFallbackConsumesOnlySuccessfulAdmissions (transport_driver_test.cc:600/614/628). Reran once, same compile error."
+    }
+  },
+  "pipeline_network_fastdds": {
+    "outcome": "passed",
+    "profile": "small",
+    "messages": 50,
+    "p50_ns": 1455789,
+    "p95_ns": 1903685,
+    "p99_ns": 1968440,
+    "samples": 50,
+    "msgs_per_s": 23004.34966243417,
+    "dir": "/workspace/mino-results/pipeline-network-fastdds"
+  },
+  "pipeline_network_cyclonedds": {
+    "outcome": "passed",
+    "profile": "small",
+    "messages": 50,
+    "p50_ns": 971225,
+    "p95_ns": 1017078,
+    "p99_ns": 1019792,
+    "samples": 50,
+    "msgs_per_s": 35424.990063290286,
+    "dir": "/workspace/mino-results/pipeline-network-cyclonedds"
+  },
+  "pipeline_hybrid_onehost": {
+    "outcome": "passed",
+    "all_shm": true,
+    "unique_boot_ids": 1,
+    "boot_id": "94d19f59-bf49-46e3-aa23-edfee7d49371",
+    "edge_transports": [
+      "shm",
+      "shm",
+      "shm",
+      "shm",
+      "shm"
+    ],
+    "p50_ns": 290985,
+    "p95_ns": 806934,
+    "p99_ns": 821866,
+    "samples": 50,
+    "msgs_per_s": 35332.69263384024,
+    "dir": "/workspace/mino-results/pipeline-hybrid-onehost"
+  },
+  "pipeline_paced_smoke": {
+    "outcome": "failed",
+    "pass": 11,
+    "fail": 1,
+    "total": 12,
+    "fail_run": "medium/round-1/protobuf_zmq_pipeline",
+    "fail_error": "paced source fell more than one interval behind schedule",
+    "dir": "/workspace/mino-results/pipeline-paced-smoke",
+    "runs": [
+      {
+        "backend": "fastdds_pipeline",
+        "profile": "small",
+        "outcome": "passed",
+        "p50_ns": 860344,
+        "samples": 100,
+        "msgs_per_s": 100.93796574386093
+      },
+      {
+        "backend": "cyclonedds_pipeline",
+        "profile": "small",
+        "outcome": "passed",
+        "p50_ns": 625046,
+        "samples": 100,
+        "msgs_per_s": 100.88859445561484
+      },
+      {
+        "backend": "protobuf_zmq_pipeline",
+        "profile": "small",
+        "outcome": "passed",
+        "p50_ns": 928064,
+        "samples": 100,
+        "msgs_per_s": 100.89987574361922
+      },
+      {
+        "backend": "mino_shm_pipeline",
+        "profile": "small",
+        "outcome": "passed",
+        "p50_ns": 69609,
+        "samples": 100,
+        "msgs_per_s": 101.00359546033886
+      },
+      {
+        "backend": "mino_shm_pipeline",
+        "profile": "medium",
+        "outcome": "passed",
+        "p50_ns": 1039310,
+        "samples": 40,
+        "msgs_per_s": 20.50280219178564
+      },
+      {
+        "backend": "fastdds_pipeline",
+        "profile": "medium",
+        "outcome": "passed",
+        "p50_ns": 2800348,
+        "samples": 40,
+        "msgs_per_s": 20.40632966288338
+      },
+      {
+        "backend": "cyclonedds_pipeline",
+        "profile": "medium",
+        "outcome": "passed",
+        "p50_ns": 2221765,
+        "samples": 40,
+        "msgs_per_s": 20.496481043973752
+      },
+      {
+        "backend": "protobuf_zmq_pipeline",
+        "profile": "medium",
+        "outcome": "failed",
+        "p50_ns": null,
+        "samples": null,
+        "msgs_per_s": null
+      },
+      {
+        "backend": "mino_shm_pipeline",
+        "profile": "large",
+        "outcome": "passed",
+        "p50_ns": 14430131,
+        "samples": 10,
+        "msgs_per_s": 10.925949518085922
+      },
+      {
+        "backend": "cyclonedds_pipeline",
+        "profile": "large",
+        "outcome": "passed",
+        "p50_ns": 49794799,
+        "samples": 10,
+        "msgs_per_s": 9.507445327022072
+      },
+      {
+        "backend": "protobuf_zmq_pipeline",
+        "profile": "large",
+        "outcome": "passed",
+        "p50_ns": 27346606,
+        "samples": 10,
+        "msgs_per_s": 11.658715213034503
+      },
+      {
+        "backend": "fastdds_pipeline",
+        "profile": "large",
+        "outcome": "passed",
+        "p50_ns": 26691153,
+        "samples": 10,
+        "msgs_per_s": 10.732003930815372
+      }
+    ]
+  },
+  "asan_subset": {
+    "command": "bazel test --lockfile_mode=error --config=asan --jobs=2 //tests:sanity_test //tests/litmus:atomic_abi_test //mino/shm/...",
+    "first_pass": {
+      "pass": 27,
+      "fail": 2,
+      "total": 29,
+      "log": "/workspace/mino-results/asan-subset.log",
+      "fail_targets": [
+        "//mino/shm/region:handle_resolver_test",
+        "//mino/shm/region:recovery_test"
+      ],
+      "fail_error": "3: shared-memory object already exists"
+    },
+    "rerun_jobs1": {
+      "pass": 2,
+      "fail": 0,
+      "log": "/workspace/mino-results/asan-subset-rerun.log"
+    },
+    "combined": {
+      "pass": 29,
+      "fail": 0,
+      "total": 29
+    }
+  },
+  "tla": {
+    "outcome": "skipped",
+    "reason": "java not found; no tla2tools.jar / TLC"
+  },
+  "skipped_no_hardware": [
+    "physical two-host / SSH 192.168.31.x",
+    "72-hour soak",
+    "real RDMA NIC qualification (unit tests rdma_* did PASS in release //...)",
+    "real Fabric NIC qualification (unit tests fabric_* did PASS in release //...)",
+    "native AArch64 (x86_64 box; aarch64 contract smokes PASS in release)",
+    "PTP cross-host one-way latency",
+    "tsan full suite",
+    "full asan //... (OOM risk on 15GiB)",
+    "TLA+ / TLC (no Java)",
+    "--config=gcc12 (gcc-12 not installed)"
+  ],
+  "report": "/workspace/mino-results/REMAINING-TESTS.md"
+}

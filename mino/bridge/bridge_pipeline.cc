@@ -60,16 +60,28 @@ bool SourceBelongsToLane(const SourceIdentity& source, uint16_t lane_index,
     return BridgeLaneFor(source, lane_count) == lane_index;
 }
 
-size_t RetainedFrameBytes(const WireFrame& frame) noexcept {
-    size_t bytes = kWireBaseHeaderLength + frame.payload.size();
-    if (frame.header.perf_trace.has_value()) {
+size_t RetainedFrameBytes(const WireFrameHeader& header,
+                          size_t payload_size) noexcept {
+    size_t bytes = kWireBaseHeaderLength + payload_size;
+    if (header.perf_trace.has_value()) {
         bytes += kWirePerfTraceContextLength;
     }
-    if (HasFrameFlag(frame.header.flags,
-                     FrameFlag::kPayloadCrcPresent)) {
+    if (HasFrameFlag(header.flags, FrameFlag::kPayloadCrcPresent)) {
         bytes += kWirePayloadCrcLength;
     }
     return bytes;
+}
+
+size_t RetainedFrameBytes(const WireFrame& frame) noexcept {
+    return RetainedFrameBytes(frame.header, frame.payload.size());
+}
+
+WireFrame OwnedWireFrame(const WireFrameHeader& header,
+                         std::span<const std::byte> payload) {
+    WireFrame frame;
+    frame.header = header;
+    frame.payload.assign(payload.begin(), payload.end());
+    return frame;
 }
 
 WireFrame ControlFrame(FrameType type, std::vector<std::byte> payload) {
@@ -82,6 +94,17 @@ WireFrame ControlFrame(FrameType type, std::vector<std::byte> payload) {
 }
 
 }  // namespace
+
+Status BridgeIngressPort::DecodeValidatePublish(
+    const WireFrameHeader& header, std::span<const std::byte> payload) {
+    try {
+        return DecodeValidatePublish(OwnedWireFrame(header, payload));
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
 
 bool BridgePipeline::AttemptKeyLess::operator()(
     const AttemptKey& left, const AttemptKey& right) const noexcept {
@@ -505,16 +528,14 @@ Status BridgePipeline::FlushAcks(BridgePumpBudget budget,
         MINO_ASSIGN_OR_RETURN(
             auto body, WireFrameCodec::Encode(frame, options_.wire_limits));
         if (body.size() > budget.max_bytes - result->bytes) break;
-        auto sent = driver_->SendUntracked(transport::UntrackedSendRequest{
-            .connection_id = connection_id_,
-            .payload = body,
-            .traffic_class =
-                transport::UntrackedTrafficClass::kProtocolControl,
-        });
+        const size_t body_size = body.size();
+        auto sent = driver_->TrySendUntrackedOwned(
+            connection_id_, std::move(body),
+            transport::UntrackedTrafficClass::kProtocolControl);
         if (!sent.ok()) {
             return IsWouldBlock(sent.status()) ? Status::Ok() : sent.status();
         }
-        result->bytes += body.size();
+        result->bytes += body_size;
         ++result->outbound_frames;
         result->made_progress = true;
         RemovePendingAck(pending_acks_.begin());
@@ -526,20 +547,18 @@ Status BridgePipeline::FlushControls(BridgePumpBudget budget,
                                      BridgePumpResult* result) noexcept {
     while (!control_queue_.empty() &&
            result->outbound_frames < budget.max_outbound_frames) {
-        const std::vector<std::byte>& body = control_queue_.front();
+        std::vector<std::byte>& body = control_queue_.front();
         if (body.size() > budget.max_bytes - result->bytes) break;
-        auto sent = driver_->SendUntracked(transport::UntrackedSendRequest{
-            .connection_id = connection_id_,
-            .payload = body,
-            .traffic_class =
-                transport::UntrackedTrafficClass::kProtocolControl,
-        });
+        const size_t body_size = body.size();
+        auto sent = driver_->TrySendUntrackedOwned(
+            connection_id_, std::move(body),
+            transport::UntrackedTrafficClass::kProtocolControl);
         if (!sent.ok()) {
             if (IsWouldBlock(sent.status())) return Status::Ok();
             return sent.status();
         }
-        control_bytes_ -= body.size();
-        result->bytes += body.size();
+        control_bytes_ -= body_size;
+        result->bytes += body_size;
         ++result->outbound_frames;
         result->made_progress = true;
         control_queue_.pop_front();
@@ -650,7 +669,37 @@ Status BridgePipeline::QueuePendingInbound(WireFrame frame,
             return Exhausted("bridge pending inbound queue is full");
         }
         pending_inbound_.push_back(PendingInbound{
-            .frame = std::move(frame),
+            .header = std::move(frame.header),
+            .owned_payload = std::move(frame.payload),
+            .view = std::nullopt,
+            .wire_bytes = charge,
+            .schema_resolved = schema_resolved,
+        });
+        pending_inbound_bytes_ += charge;
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
+Status BridgePipeline::QueuePendingInbound(ValidatedWireFrameView view,
+                                           size_t wire_bytes,
+                                           bool schema_resolved) noexcept {
+    try {
+        const size_t charge =
+            wire_bytes != 0
+                ? wire_bytes
+                : RetainedFrameBytes(view.header, view.payload.size());
+        if (pending_inbound_.size() >=
+                options_.max_pending_inbound_frames ||
+            charge > options_.max_pending_inbound_bytes -
+                         pending_inbound_bytes_) {
+            return Exhausted("bridge pending inbound queue is full");
+        }
+        pending_inbound_.push_back(PendingInbound{
+            .header = {},
+            .owned_payload = {},
+            .view = std::move(view),
             .wire_bytes = charge,
             .schema_resolved = schema_resolved,
         });
@@ -687,7 +736,9 @@ Status BridgePipeline::StageReadyFrames(
         for (WireFrame& frame : *frames) {
             const size_t charge = RetainedFrameBytes(frame);
             staged_ready_.push_back(PendingInbound{
-                .frame = std::move(frame),
+                .header = std::move(frame.header),
+                .owned_payload = std::move(frame.payload),
+                .view = std::nullopt,
                 .wire_bytes = charge,
                 .schema_resolved = true,
             });
@@ -706,13 +757,14 @@ Status BridgePipeline::ProcessPendingInbound(
         staged_ready_.clear();
         processing_inbound_wire_bytes_ =
             pending_inbound_.front().wire_bytes;
-        const Status handled = pending_inbound_.front().schema_resolved
-                                   ? HandleData(
-                                         pending_inbound_.front().frame,
-                                         budget.now_ns)
-                                   : HandleFrame(
-                                         pending_inbound_.front().frame,
-                                         budget.now_ns, result);
+        const PendingInbound& inbound = pending_inbound_.front();
+        const Status handled = inbound.schema_resolved
+                                   ? HandleData(inbound.Header(),
+                                                inbound.Payload(),
+                                                budget.now_ns)
+                                   : HandleFrame(inbound.Header(),
+                                                 inbound.Payload(),
+                                                 budget.now_ns, result);
         if (!handled.ok()) {
             staged_ready_.clear();
             processing_inbound_wire_bytes_ = 0;
@@ -770,12 +822,23 @@ Status BridgePipeline::DrainInbound(const BridgePumpBudget& budget,
             message.payload, options_.wire_limits);
         if (!inspected.ok()) return inspected.status();
         MINO_RETURN_IF_ERROR(AuthorizeInboundData(*inspected));
-        auto decoded = WireFrameCodec::Decode(message.payload,
-                                              options_.wire_limits);
-        if (!decoded.ok()) return decoded.status();
         const size_t wire_bytes = message.payload.size();
-        MINO_RETURN_IF_ERROR(
-            QueuePendingInbound(std::move(*decoded), wire_bytes));
+        const bool control =
+            HasFrameFlag(inspected->flags, FrameFlag::kControlFrame) ||
+            inspected->frame_type != FrameType::kData;
+        if (control) {
+            auto decoded = WireFrameCodec::Decode(message.payload,
+                                                  options_.wire_limits);
+            if (!decoded.ok()) return decoded.status();
+            MINO_RETURN_IF_ERROR(
+                QueuePendingInbound(std::move(*decoded), wire_bytes));
+        } else {
+            auto decoded = WireFrameCodec::DecodeView(
+                std::move(message.payload), options_.wire_limits);
+            if (!decoded.ok()) return decoded.status();
+            MINO_RETURN_IF_ERROR(
+                QueuePendingInbound(std::move(*decoded), wire_bytes));
+        }
         result->bytes += wire_bytes;
         ++result->inbound_frames;
         result->made_progress = true;
@@ -783,19 +846,21 @@ Status BridgePipeline::DrainInbound(const BridgePumpBudget& budget,
     return ProcessPendingInbound(budget, result);
 }
 
-Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
+Status BridgePipeline::HandleFrame(const WireFrameHeader& header,
+                                   std::span<const std::byte> payload,
+                                   uint64_t now_ns,
                                    BridgePumpResult*) noexcept {
-    if (frame.header.frame_type == FrameType::kSessionHello) {
-        return HandleHello(frame, now_ns);
+    if (header.frame_type == FrameType::kSessionHello) {
+        return HandleHello(payload, now_ns);
     }
     if (!session_ready_) {
         return Corruption("bridge frame arrived before session handshake");
     }
-    if (frame.header.frame_type == FrameType::kAck) {
-        return HandleAck(frame);
+    if (header.frame_type == FrameType::kAck) {
+        return HandleAck(payload);
     }
-    if (frame.header.frame_type == FrameType::kData) {
-        const SourceIdentity source = SourceFrom(frame.header);
+    if (header.frame_type == FrameType::kData) {
+        const SourceIdentity source = SourceFrom(header);
         if (!ValidSource(source)) {
             return Corruption("bridge data source identity is incomplete");
         }
@@ -804,15 +869,20 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
             return Corruption("bridge data source belongs to another lane");
         }
         if (schema_negotiator_ == nullptr) {
-            return HandleData(frame, now_ns);
+            return HandleData(header, payload, now_ns);
         }
         if (pending_schema_controls_.size() >=
             options_.max_control_frames) {
             return Status::Error(StatusCode::kWouldBlock,
                                  "bridge pending schema control queue is full");
         }
-        auto negotiated =
-            schema_negotiator_->HandleDataFrame(frame, now_ns);
+        const Status ready = schema_negotiator_->ReadyToPublishData(header);
+        if (ready.ok()) {
+            return HandleData(header, payload, now_ns);
+        }
+        if (ready.code() != StatusCode::kNotFound) return ready;
+        auto negotiated = schema_negotiator_->HandleDataFrame(
+            OwnedWireFrame(header, payload), now_ns);
         if (!negotiated.ok()) return negotiated.status();
         MINO_RETURN_IF_ERROR(
             QueueNegotiatedControls(negotiated->outbound_control_frames));
@@ -821,10 +891,12 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
         }
         return negotiated->ready_frames.empty()
                    ? Status::Ok()
-                   : HandleData(negotiated->ready_frames.front(), now_ns);
+                   : HandleData(negotiated->ready_frames.front().header,
+                                negotiated->ready_frames.front().payload,
+                                now_ns);
     }
-    if (frame.header.frame_type == FrameType::kSchemaAnnounce ||
-        frame.header.frame_type == FrameType::kSchemaRequest) {
+    if (header.frame_type == FrameType::kSchemaAnnounce ||
+        header.frame_type == FrameType::kSchemaRequest) {
         if (schema_negotiator_ == nullptr) {
             return Corruption("schema control frame has no negotiator");
         }
@@ -833,7 +905,7 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
             return Status::Error(StatusCode::kWouldBlock,
                                  "bridge pending schema control queue is full");
         }
-        if (frame.header.frame_type == FrameType::kSchemaAnnounce) {
+        if (header.frame_type == FrameType::kSchemaAnnounce) {
             const size_t retained_frames = pending_inbound_.size() - 1;
             const size_t retained_bytes =
                 pending_inbound_bytes_ - processing_inbound_wire_bytes_;
@@ -846,8 +918,8 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
                     "schema-ready batch has no inbound reservation");
             }
         }
-        auto negotiated =
-            schema_negotiator_->HandleControlFrame(frame, now_ns);
+        auto negotiated = schema_negotiator_->HandleControlFrame(
+            OwnedWireFrame(header, payload), now_ns);
         if (!negotiated.ok()) return negotiated.status();
         MINO_RETURN_IF_ERROR(
             QueueNegotiatedControls(negotiated->outbound_control_frames));
@@ -855,13 +927,14 @@ Status BridgePipeline::HandleFrame(const WireFrame& frame, uint64_t now_ns,
     }
     // Heartbeats are consumed by TCP; receiving one from another transport is
     // harmless and does not affect protocol state.
-    if (frame.header.frame_type == FrameType::kHeartbeat) return Status::Ok();
+    if (header.frame_type == FrameType::kHeartbeat) return Status::Ok();
     return Corruption("bridge control frame type is unsupported");
 }
 
-Status BridgePipeline::HandleData(const WireFrame& frame,
+Status BridgePipeline::HandleData(const WireFrameHeader& header,
+                                  std::span<const std::byte> payload,
                                   uint64_t now_ns) noexcept {
-    const SourceIdentity source = SourceFrom(frame.header);
+    const SourceIdentity source = SourceFrom(header);
     if (!ValidSource(source)) {
         return Corruption("bridge data source identity is incomplete");
     }
@@ -870,13 +943,13 @@ Status BridgePipeline::HandleData(const WireFrame& frame,
         return Corruption("bridge data source belongs to another lane");
     }
     auto checked = dedup_->Check(options_.remote_session_epoch, source,
-                                 frame.header.sequence_num, now_ns);
+                                 header.sequence_num, now_ns);
     if (!checked.ok()) return checked.status();
     if (checked->decision == DedupDecision::kStaleSession) {
         return Corruption("bridge data belongs to a stale session");
     }
     if (checked->decision == DedupDecision::kDuplicateAccepted) {
-        return EmitAck(frame, *checked, AckDisposition::kAccepted);
+        return EmitAck(header, *checked, AckDisposition::kAccepted);
     }
     const bool degraded_baseline =
         checked->decision == DedupDecision::kNackWithHighest &&
@@ -885,21 +958,21 @@ Status BridgePipeline::HandleData(const WireFrame& frame,
         !dedup_->HasSource(source);
     if (checked->decision == DedupDecision::kNackWithHighest &&
         !degraded_baseline) {
-        return EmitAck(frame, *checked, AckDisposition::kNackWithHighest);
+        return EmitAck(header, *checked, AckDisposition::kNackWithHighest);
     }
 
     uint64_t prospective_highest =
         checked->highest_contiguous_sequence.value_or(0);
     if (degraded_baseline ||
         (prospective_highest != std::numeric_limits<uint64_t>::max() &&
-         frame.header.sequence_num == prospective_highest + 1)) {
-        prospective_highest = frame.header.sequence_num;
+         header.sequence_num == prospective_highest + 1)) {
+        prospective_highest = header.sequence_num;
     }
     if (!CanQueueAck(AckPayload{
             .sender_session_epoch = options_.local_session_epoch,
             .receiver_session_epoch = options_.remote_session_epoch,
             .source = source,
-            .observed_sequence = frame.header.sequence_num,
+            .observed_sequence = header.sequence_num,
             .highest_contiguous_sequence = prospective_highest,
             .disposition = AckDisposition::kAccepted,
         })) {
@@ -909,30 +982,30 @@ Status BridgePipeline::HandleData(const WireFrame& frame,
 
     MINO_RETURN_IF_ERROR(dedup_->PrepareSource(
         options_.remote_session_epoch, source, now_ns));
-    MINO_RETURN_IF_ERROR(ingress_->DecodeValidatePublish(frame));
+    MINO_RETURN_IF_ERROR(ingress_->DecodeValidatePublish(header, payload));
     if (degraded_baseline) {
         MINO_RETURN_IF_ERROR(dedup_->SeedAccepted(
             options_.remote_session_epoch, source,
-            frame.header.sequence_num, now_ns));
+            header.sequence_num, now_ns));
     } else {
         MINO_RETURN_IF_ERROR(dedup_->CommitAccepted(
             options_.remote_session_epoch, source,
-            frame.header.sequence_num, now_ns));
+            header.sequence_num, now_ns));
     }
     auto committed = dedup_->Check(options_.remote_session_epoch, source,
-                                   frame.header.sequence_num, now_ns);
+                                   header.sequence_num, now_ns);
     if (!committed.ok()) return committed.status();
-    return EmitAck(frame, *committed, AckDisposition::kAccepted);
+    return EmitAck(header, *committed, AckDisposition::kAccepted);
 }
 
-Status BridgePipeline::EmitAck(const WireFrame& data,
+Status BridgePipeline::EmitAck(const WireFrameHeader& header,
                                const DedupCheckResult& state,
                                AckDisposition disposition) noexcept {
     AckPayload ack{
         .sender_session_epoch = options_.local_session_epoch,
         .receiver_session_epoch = options_.remote_session_epoch,
-        .source = SourceFrom(data.header),
-        .observed_sequence = data.header.sequence_num,
+        .source = SourceFrom(header),
+        .observed_sequence = header.sequence_num,
         .highest_contiguous_sequence =
             state.highest_contiguous_sequence,
         .disposition = disposition,
@@ -1042,9 +1115,9 @@ Status BridgePipeline::RetireAcknowledgedAttempts(
     return Status::Ok();
 }
 
-Status BridgePipeline::HandleAck(const WireFrame& frame) noexcept {
+Status BridgePipeline::HandleAck(std::span<const std::byte> payload) noexcept {
     try {
-        auto ack = ControlPayloadCodec::DecodeAck(frame.payload);
+        auto ack = ControlPayloadCodec::DecodeAck(payload);
         if (!ack.ok()) return ack.status();
         if (!SourceBelongsToLane(ack->source, options_.lane_index,
                                  options_.lane_count)) {
@@ -1084,10 +1157,10 @@ Status BridgePipeline::HandleAck(const WireFrame& frame) noexcept {
     }
 }
 
-Status BridgePipeline::HandleHello(const WireFrame& frame,
+Status BridgePipeline::HandleHello(std::span<const std::byte> payload,
                                    uint64_t) noexcept {
     try {
-        auto hello = ControlPayloadCodec::DecodeSessionHello(frame.payload);
+        auto hello = ControlPayloadCodec::DecodeSessionHello(payload);
         if (!hello.ok()) return hello.status();
         if (hello->sender_session_epoch != options_.remote_session_epoch ||
             hello->receiver_session_epoch != options_.local_session_epoch) {
@@ -1340,19 +1413,43 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
              attempts_.size() >= options_.retransmit.max_entries)) {
             return Status::Ok();
         }
+        const size_t body_size = body.size();
         if (existing_attempt != attempts_.end()) {
-            auto sent = driver_->SendUntracked(
-                transport::UntrackedSendRequest{
-                    .connection_id = connection_id_,
-                    .payload = body,
-                    .traffic_class =
-                        transport::UntrackedTrafficClass::kData,
-                });
+            if (!rebound_body.empty()) {
+                auto sent = driver_->TrySendUntrackedOwned(
+                    connection_id_, std::move(rebound_body),
+                    transport::UntrackedTrafficClass::kData);
+                if (!sent.ok()) {
+                    return IsWouldBlock(sent.status()) ? Status::Ok()
+                                                       : sent.status();
+                }
+            } else {
+                auto sent = driver_->SendUntracked(
+                    transport::UntrackedSendRequest{
+                        .connection_id = connection_id_,
+                        .payload = body,
+                        .traffic_class =
+                            transport::UntrackedTrafficClass::kData,
+                    });
+                if (!sent.ok()) {
+                    return IsWouldBlock(sent.status()) ? Status::Ok()
+                                                       : sent.status();
+                }
+            }
+            existing_attempt->second.retry_requested = false;
+        } else if (!rebound_body.empty()) {
+            auto sent = driver_->TrySendOwned(
+                connection_id_, std::move(rebound_body));
             if (!sent.ok()) {
                 return IsWouldBlock(sent.status()) ? Status::Ok()
                                                    : sent.status();
             }
-            existing_attempt->second.retry_requested = false;
+            MINO_RETURN_IF_ERROR(AddAttempt(Attempt{
+                .source = entry.source,
+                .sequence = entry.sequence,
+                .operation = sent->operation,
+                .retry_requested = false,
+            }));
         } else {
             auto sent = driver_->Send(transport::SendRequest{
                 .connection_id = connection_id_,
@@ -1371,7 +1468,7 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
             }));
         }
         if (pending != nullptr) pending->transmitted = true;
-        result->bytes += body.size();
+        result->bytes += body_size;
         ++result->outbound_frames;
         if (retransmission) ++result->retransmitted_frames;
         result->made_progress = true;
@@ -1478,11 +1575,8 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
             return Corruption("admitted reliable frame lost its logical index");
         }
         *ownership_transferred = true;
-        auto sent = driver_->Send(transport::SendRequest{
-            .connection_id = connection_id_,
-            .payload = body,
-            .target_stage = DeliveryStage::kRemoteAccepted,
-        });
+        const size_t body_size = body.size();
+        auto sent = driver_->TrySendOwned(connection_id_, std::move(body));
         if (!sent.ok()) {
             resend_pending_ = true;
             // The frame is retained in the retransmit window, but later
@@ -1498,22 +1592,24 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
             .operation = sent->operation,
             .retry_requested = false,
         }));
-    } else {
-        auto sent = driver_->SendUntracked(transport::UntrackedSendRequest{
-            .connection_id = connection_id_,
-            .payload = body,
-            .traffic_class = transport::UntrackedTrafficClass::kData,
-        });
-        if (!sent.ok()) {
-            if (IsWouldBlock(sent.status()) && outbound.allow_drop) {
-                *ownership_transferred = true;
-                return Status::Ok();
-            }
-            return sent.status();
-        }
-        *ownership_transferred = true;
+        result->bytes += body_size;
+        ++result->outbound_frames;
+        result->made_progress = true;
+        return Status::Ok();
     }
-    result->bytes += body.size();
+    const size_t body_size = body.size();
+    auto sent = driver_->TrySendUntrackedOwned(
+        connection_id_, std::move(body),
+        transport::UntrackedTrafficClass::kData);
+    if (!sent.ok()) {
+        if (IsWouldBlock(sent.status()) && outbound.allow_drop) {
+            *ownership_transferred = true;
+            return Status::Ok();
+        }
+        return sent.status();
+    }
+    *ownership_transferred = true;
+    result->bytes += body_size;
     ++result->outbound_frames;
     result->made_progress = true;
     return Status::Ok();

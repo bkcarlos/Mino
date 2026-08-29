@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <new>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -352,8 +353,20 @@ struct CodecContext {
     const WireLimits& limits;
     const FieldPlanCache* plans = nullptr;
     std::vector<std::vector<size_t>>* unknown_orders = nullptr;
+    std::vector<std::vector<std::byte>>* nested_payloads = nullptr;
     size_t decoded_elements = 0;
 };
+
+std::optional<std::span<const std::byte>> BytesPayload(
+    const DynamicValue& value) noexcept {
+    if (const auto* bytes = value.bytes()) {
+        return std::span<const std::byte>(bytes->value);
+    }
+    if (const auto* view = value.bytes_view()) {
+        return view->value;
+    }
+    return std::nullopt;
+}
 
 const MessagePlan* FindMessagePlan(const SchemaDescriptor& descriptor,
                                    const CodecContext& context) noexcept {
@@ -436,11 +449,11 @@ Status EncodeLengthDelimitedValue(const TypeDescriptor& type,
                 return Mismatch("string is not valid UTF-8");
             }
         } else {
-            const auto* byte_value = value.bytes();
-            if (byte_value == nullptr) {
+            auto byte_value = BytesPayload(value);
+            if (!byte_value.has_value()) {
                 return Mismatch("bytes value has the wrong dynamic type");
             }
-            bytes = byte_value->value;
+            bytes = *byte_value;
         }
         if (constraints.max_bytes().has_value() &&
             bytes.size() > *constraints.max_bytes()) {
@@ -460,37 +473,33 @@ Status EncodeLengthDelimitedValue(const TypeDescriptor& type,
         return status;
     }
 
-    const size_t payload_start = output.size();
+    if (context.nested_payloads == nullptr) {
+        return Status::Error(StatusCode::kInternal,
+                             "canonical wire scratch is unavailable");
+    }
+    if (context.nested_payloads->size() <= depth) {
+        context.nested_payloads->resize(depth + 1);
+    }
+    auto& nested = (*context.nested_payloads)[depth];
+    nested.clear();
     Status status =
-        EncodeValue(type, constraints, value, depth, context, output);
+        EncodeValue(type, constraints, value, depth, context, nested);
     if (!status.ok()) {
-        output.resize(start);
+        nested.clear();
         return status;
     }
-    const size_t payload_size = output.size() - payload_start;
-    if (payload_size > context.limits.max_length_bytes) {
-        output.resize(start);
+    if (nested.size() > context.limits.max_length_bytes) {
+        nested.clear();
         return Resource("length-delimited value exceeds max_length_bytes");
     }
-    std::array<std::byte, 10> prefix{};
-    size_t prefix_size = 0;
-    uint64_t length = payload_size;
-    do {
-        uint8_t byte = static_cast<uint8_t>(length & 0x7fu);
-        length >>= 7;
-        if (length != 0) byte |= 0x80u;
-        prefix[prefix_size++] = static_cast<std::byte>(byte);
-    } while (length != 0);
-    if (prefix_size > context.limits.max_frame_bytes -
-                          std::min(output.size(),
-                                   context.limits.max_frame_bytes)) {
-        output.resize(start);
-        return Resource("canonical frame exceeds max_frame_bytes");
+    status = AppendLeb128(nested.size(), context.limits.max_frame_bytes,
+                          output);
+    if (status.ok()) {
+        status = Append(nested, context.limits.max_frame_bytes, output);
     }
-    output.insert(output.begin() + static_cast<std::ptrdiff_t>(payload_start),
-                  prefix.begin(), prefix.begin() +
-                                      static_cast<std::ptrdiff_t>(prefix_size));
-    return Status::Ok();
+    if (!status.ok()) output.resize(start);
+    nested.clear();
+    return status;
 }
 
 Status EncodeValue(const TypeDescriptor& type, const ConstraintSet& constraints,
@@ -612,15 +621,15 @@ Status EncodeValue(const TypeDescriptor& type, const ConstraintSet& constraints,
             return Append(bytes, context.limits.max_frame_bytes, output);
         }
         case ScalarType::kBytes: {
-            const auto* bytes = value.bytes();
-            if (bytes == nullptr) {
+            auto bytes = BytesPayload(value);
+            if (!bytes.has_value()) {
                 return Mismatch("bytes value has the wrong dynamic type");
             }
             if (constraints.max_bytes().has_value() &&
-                bytes->value.size() > *constraints.max_bytes()) {
+                bytes->size() > *constraints.max_bytes()) {
                 return Resource("bytes exceeds descriptor max_bytes");
             }
-            return Append(bytes->value, context.limits.max_frame_bytes, output);
+            return Append(*bytes, context.limits.max_frame_bytes, output);
         }
     }
     return Mismatch("unsupported scalar type");
@@ -1056,6 +1065,7 @@ public:
 
 void CanonicalWireScratch::Clear() noexcept {
     for (auto& order : unknown_field_order_) order.clear();
+    for (auto& payload : nested_payloads_) payload.clear();
 }
 
 uint64_t ZigZagEncode(int64_t value) noexcept {
@@ -1149,7 +1159,8 @@ Status CanonicalWireCodec::EncodeInto(
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
         DescriptorResolver resolver(descriptor, descriptors);
         CodecContext context{resolver, limits, nullptr,
-                             &scratch.unknown_field_order_, 0};
+                             &scratch.unknown_field_order_,
+                             &scratch.nested_payloads_, 0};
         Status status = EncodeMessage(descriptor, message, 0, context, output);
         if (!status.ok()) output.clear();
         return status;
@@ -1179,7 +1190,7 @@ Status CanonicalWireCodec::DecodeInto(
         MINO_RETURN_IF_ERROR(ValidateDescriptorClosure(descriptor, descriptors));
         DescriptorResolver resolver(descriptor, descriptors);
         CodecContext context{resolver, limits, nullptr,
-                             &scratch.unknown_field_order_, 0};
+                             &scratch.unknown_field_order_, nullptr, 0};
         Status status =
             DecodeMessageInto(descriptor, bytes, 0, context, message);
         if (!status.ok()) message.Clear();
@@ -1248,7 +1259,8 @@ Status PreparedCanonicalWireCodec::EncodeInto(
     scratch.Clear();
     try {
         CodecContext context{state_->resolver, state_->limits, &state_->plans,
-                             &scratch.unknown_field_order_, 0};
+                             &scratch.unknown_field_order_,
+                             &scratch.nested_payloads_, 0};
         Status status =
             EncodeMessage(*state_->root, message, 0, context, output);
         if (!status.ok()) output.clear();
@@ -1274,7 +1286,7 @@ Status PreparedCanonicalWireCodec::DecodeInto(
                 "decode target has different unknown-field limits");
         }
         CodecContext context{state_->resolver, state_->limits, &state_->plans,
-                             &scratch.unknown_field_order_, 0};
+                             &scratch.unknown_field_order_, nullptr, 0};
         Status status = DecodeMessageInto(*state_->root, bytes, 0, context,
                                           message);
         if (!status.ok()) message.Clear();

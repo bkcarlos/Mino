@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <mutex>
 #include <new>
 #include <span>
@@ -19,6 +20,18 @@
 
 namespace mino::transport {
 namespace {
+
+std::vector<std::byte> BytesOf(std::initializer_list<unsigned char> values) {
+    // Build via push_back so GCC 14 -O2 does not false-positive
+    // -Werror=array-bounds on std::vector<std::byte> copy construction of
+    // tiny initializer-list vectors (see OwnedFallbackConsumesOnlySuccessfulAdmissions).
+    std::vector<std::byte> out;
+    out.reserve(values.size());
+    for (unsigned char value : values) {
+        out.push_back(static_cast<std::byte>(value));
+    }
+    return out;
+}
 
 EndpointDescriptor MakeIpv4(uint8_t last_octet, uint16_t port) {
     const std::array<std::byte, 4> address = {
@@ -589,15 +602,14 @@ TEST(TransportDriverTest, OwnedFallbackConsumesOnlySuccessfulAdmissions) {
     config.max_queued_sends = 1;
     ASSERT_TRUE(driver.Start(config).ok());
 
-    std::vector<std::byte> owned = {
-        std::byte{1}, std::byte{2}, std::byte{3}};
-    const std::vector<std::byte> expected = owned;
+    std::vector<std::byte> owned = BytesOf({1, 2, 3});
+    const std::vector<std::byte> expected = BytesOf({1, 2, 3});
     auto sent = driver.TrySendOwned(1, std::move(owned));
     ASSERT_TRUE(sent.ok()) << sent.status().ToString();
     EXPECT_TRUE(owned.empty());
 
-    std::vector<std::byte> queue_full = {std::byte{4}};
-    const std::vector<std::byte> queue_full_expected = queue_full;
+    std::vector<std::byte> queue_full = BytesOf({4});
+    const std::vector<std::byte> queue_full_expected = BytesOf({4});
     auto blocked = driver.TrySendOwned(1, std::move(queue_full));
     ASSERT_FALSE(blocked.ok());
     EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
@@ -610,22 +622,22 @@ TEST(TransportDriverTest, OwnedFallbackConsumesOnlySuccessfulAdmissions) {
     ASSERT_TRUE(driver.PollCompletions({}).ok());
 
     driver.return_bad_send_result(true);
-    std::vector<std::byte> invalid_admission = {std::byte{5}};
-    const std::vector<std::byte> invalid_expected = invalid_admission;
+    std::vector<std::byte> invalid_admission = BytesOf({5});
+    const std::vector<std::byte> invalid_expected = BytesOf({5});
     auto invalid = driver.TrySendOwned(1, std::move(invalid_admission));
     ASSERT_FALSE(invalid.ok());
     EXPECT_EQ(invalid.status().code(), StatusCode::kInternal);
     EXPECT_EQ(invalid_admission, invalid_expected);
     driver.return_bad_send_result(false);
 
-    std::vector<std::byte> untracked = {std::byte{6}, std::byte{7}};
+    std::vector<std::byte> untracked = BytesOf({6, 7});
     auto untracked_sent = driver.TrySendUntrackedOwned(
         1, std::move(untracked), UntrackedTrafficClass::kData);
     ASSERT_TRUE(untracked_sent.ok()) << untracked_sent.status().ToString();
     EXPECT_TRUE(untracked.empty());
 
-    std::vector<std::byte> missing = {std::byte{8}};
-    const std::vector<std::byte> missing_expected = missing;
+    std::vector<std::byte> missing = BytesOf({8});
+    const std::vector<std::byte> missing_expected = BytesOf({8});
     auto missing_sent = driver.TrySendUntrackedOwned(99, std::move(missing));
     ASSERT_FALSE(missing_sent.ok());
     EXPECT_EQ(missing_sent.status().code(), StatusCode::kNotFound);

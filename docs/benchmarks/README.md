@@ -9,6 +9,8 @@ Benchmark methodology and result reports.
 - `Storage_Partition_Qualification.md`: D6-09/V-24 multi-process,
   multi-round NVMe/ext4 qualification, artifact contract, and fail-closed SLA
   policy.
+- `kvm-2026-08-25/`: 2026-08-25 same-machine KVM campaign (pipeline comparison, remaining tests, unimplemented inventory, 72h soak start).
+- `../optimization-status.md`: master `a1b76c3` 后 SHM hop / BytesView / DecodeView / owned-send 关闭状态（无新测量数字）。
 - `NUMA_Allocator_Qualification.md`: D6-02 local/interleave/remote method,
   provenance contract, and fail-closed physical-host qualification.
 - `../large-object-pool.md`: D6-08 ordinary/HugePage/device-registration

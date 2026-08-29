@@ -76,6 +76,14 @@ build:pipeline_comparison --host_per_file_copt=external/fastdds.*/.*@-std=c++17
 # Generated protobuf code and its direct benchmark consumer include third-party
 # headers that warn differently under GCC and Clang. Keep those warnings visible
 # without passing compiler-specific warning names or weakening other sources.
+# Generated protobuf for the ZMQ business IPC comparison is pulled into
+# default test builds. Keep warnings visible without failing -Werror.
+build --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error
+build --per_file_copt=external/protobuf.*@-Wno-error
+build --host_per_file_copt=external/protobuf.*@-Wno-error
+build --per_file_copt=external/abseil-cpp.*@-Wno-error
+build --host_per_file_copt=external/abseil-cpp.*@-Wno-error
+
 build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error
 build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/protobuf_zmq_pipeline.cc@-Wno-error
 

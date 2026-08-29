@@ -44,6 +44,11 @@ Protobuf are comparison-only dependencies.
   message/scratch/output reuse, zero-copy WireFrame decode views, ownership-taking
   TCP sends, bounded receive batching, deadline-bounded SHM publication, and
   structural bridge validation/artifacts are implemented.
+- Master `a1b76c3` closes same-host SPSC exclusive hop (no forwarder payload
+  memcpy), `BytesView`/length-delimited encode without payload insert-memmove,
+  stream `DecodeView`, Bridge owned send, and TcpDriver trailing-frame steal.
+  See `docs/optimization-status.md`. Historical medium Fast DDS vs Mino numbers
+  predate the hop change and are not a post-`a1b76c3` claim.
 - A candidate-only Linux validation is recorded in
   `RESULTS_LINUX_VALIDATION_20260824.md`: 225 functional tests and 134 selected
   ASAN tests passed, Mino TCP passed all three `-c opt` saturation profiles, and
