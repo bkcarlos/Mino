@@ -86,6 +86,8 @@ namespace mino {
 
 class MpscChannel {
 public:
+    using PayloadRetireObserver = Status (*)(ShmHandle, void*) noexcept;
+
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "MpscChannel requires lock-free 64-bit atomics");
 
@@ -440,7 +442,10 @@ public:
                             "MPSC wedged on a stalled slot; kDropOldest cannot "
                             "retire an unfinished reservation");
                     }
-                    TryForceDropOldest();
+                    {
+                        const Status dropped = TryForceDropOldest();
+                        if (!dropped.ok()) return dropped;
+                    }
                     continue;
                 case QueueFullPolicy::kSample: {
                     const uint32_t rate = sample_rate == 0 ? 1 : sample_rate;
@@ -822,6 +827,21 @@ public:
 
     uint64_t capacity() const noexcept { return capacity_; }
 
+    // Snapshot used by deadline-aware Runtime QoS wrappers. Concurrent
+    // producers may advance it immediately after the load; callers must
+    // re-evaluate sampling after every failed TryReserve.
+    uint64_t next_sequence() const noexcept {
+        return control_->reservation_cursor.load(std::memory_order_acquire);
+    }
+
+    // Process-local callback used by runtimes that pair kDropOldest with a
+    // Pin table. It is not part of the shared-memory layout.
+    void SetPayloadRetireObserver(PayloadRetireObserver observer,
+                                  void* context) noexcept {
+        payload_retire_observer_ = observer;
+        payload_retire_context_ = context;
+    }
+
 private:
     enum class ClaimPhase : uint8_t {
         kInitializing = 1,
@@ -886,21 +906,34 @@ private:
     // advance the consumer past an unfinished sequence and corrupt the
     // ordered prefix, so those are left for recovery instead. A consumer
     // holding a Borrow of the victim keeps a valid snapshot; its late Ack
-    // reports kNotFound. The payload is NOT reclaimed here (only after no
-    // borrows remain).
-    void TryForceDropOldest() noexcept {
+    // reports kNotFound. A process-local observer may retire the payload;
+    // Pins keep a concurrent Borrow safe until its late ACK/release.
+    Status TryForceDropOldest() noexcept {
         const uint64_t cons =
             control_->consumer_cursor.load(std::memory_order_acquire);
         IndexSlot* oldest = &slots_[cons & mask_];
         if (oldest->state.load(std::memory_order_acquire) !=
-            static_cast<uint32_t>(SlotState::kReady)) {
-            return;
+            static_cast<uint32_t>(SlotState::kReady) ||
+            oldest->sequence_num.load(std::memory_order_acquire) != cons) {
+            return Status::Ok();
+        }
+        const ShmHandle payload = oldest->payload;
+        uint64_t expected = cons;
+        if (!control_->consumer_cursor.compare_exchange_strong(
+                expected, cons + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return Status::Ok();
+        }
+        Status retired = Status::Ok();
+        if (payload_retire_observer_ != nullptr && !payload.IsNull()) {
+            retired = payload_retire_observer_(payload,
+                                               payload_retire_context_);
         }
         // Release: pairs with the producer's acquire probe so the consumer's
         // prior reads of this slot happen-before its reuse in a new era.
         oldest->turn.store(cons + capacity_, std::memory_order_release);
-        AdvanceConsumerPast(cons);
         ReleaseClaim(cons);
+        return retired;
     }
 
     // Vyukov per-slot-turn probe-then-claim. Probes slot[res % capacity].turn
@@ -1195,6 +1228,8 @@ private:
     MpscReservationMeta* metas_ = nullptr;
     uint64_t capacity_ = 0;
     uint64_t mask_ = 0;
+    PayloadRetireObserver payload_retire_observer_ = nullptr;
+    void* payload_retire_context_ = nullptr;
     PersistenceHook persistence_hook_ = nullptr;
     void* persistence_hook_context_ = nullptr;
 };
