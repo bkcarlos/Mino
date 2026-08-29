@@ -1,9 +1,27 @@
 # 简单跨进程 SHM Pub/Sub
 
-主题目录、slab 和 SPSC 通道都在**同一块 POSIX shm** 里，没有独立的发现服务或 SHM 管理进程。
+主题目录、slab、恢复 journal、Pin 表和通道都在**同一块 POSIX shm** 里，没有独立的发现服务或 SHM 管理进程。
 
-段大小按 `topic 数 × 队列深度 × 最大 payload` 计算，256B / 深度 32 的演示大约几百 KiB。
-实验室里把 `/dev/shm` 扩到 8GiB 只是大帧压测旋钮，嵌入式和默认 64MiB tmpfs **不要**按那个去开段。
+段大小按 topic、队列深度、最大 payload 及恢复容量计算；默认配置包含固定的崩溃安全 Pin 表，仍小于 8 MiB。实验室里把 `/dev/shm` 扩到 8GiB 只是大帧压测旋钮，嵌入式和默认 64MiB tmpfs **不要**按那个去开段。
+
+## Topic 模式、QoS 与类型
+
+默认 `Advertise("camera")` 保持 SPSC（一个 publisher、一个 subscriber）。也可在首次发布声明 topic 模式和队列满策略；配置写入 manifest，后续同名 publisher 必须完全匹配：
+
+```cpp
+mino::SimpleTopicOptions options;
+options.mode = mino::SimpleTopicMode::kMpsc;  // 多 publisher、单 subscriber
+options.queue_full_policy = mino::QueueFullPolicy::kDropNewest;
+auto publisher = node.Advertise("jobs", options);
+```
+
+- `kSpsc`：单 publisher、单 subscriber。
+- `kMpsc`：多 publisher、单 subscriber；`queue_depth` 至少为 64。
+- `kBroadcast`：单 publisher、最多 64 个 subscriber，每个订阅者独立 ACK。
+- QoS 支持 `kBlock`、`kFail`、`kDropNewest`、`kDropOldest` 和 `kSample`；阻塞及被采样接纳后的等待都遵守 publish deadline。
+- `Advertise<T>`、`Subscribe<T>`、`Publish(T)` 和 `Poll<T>` 使用 `StaticMessageTraits<T>` 校验固定布局 schema，并保持 payload 零拷贝借用。带 owned child slabs 的生成类型应使用完整 `Publisher<T>` API。
+
+`SimpleNode::Recover()` 会立即清理已证明死亡的 endpoint、Broadcast lease/borrow/Pin 及孤儿 allocation；普通发布/轮询也会自动执行保守恢复。manifest v3 与旧 SimpleNode segment 不兼容，升级后需重新创建共享段。
 
 ## 编译
 

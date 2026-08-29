@@ -135,6 +135,8 @@ inline void SpinPause() noexcept {
 // doc 10, 11, 12).
 class SpscChannel {
 public:
+    using PayloadRetireObserver = Status (*)(ShmHandle, void*) noexcept;
+
     // The channel requires lock-free 64-bit atomics to be implementable.
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
                   "SpscChannel requires lock-free 64-bit atomics");
@@ -433,18 +435,28 @@ public:
                         StatusCode::kDegraded,
                         "SPSC queue full: newest message dropped");
                 case QueueFullPolicy::kDropOldest: {
-                    // Forcibly advance the consumer cursor past the oldest
-                    // unconsumed slot. The slot header is recycled below; a
-                    // consumer still holding a Borrow of it keeps a valid
-                    // snapshot and its late Ack reports kNotFound. The
-                    // payload is NOT reclaimed here (design doc 9.8: only
-                    // after no borrows remain).
+                    // Claim the cursor transition with CAS: the consumer may
+                    // ACK concurrently, and a plain store could otherwise
+                    // regress or double-advance the cursor. A configured
+                    // observer retires the payload before this physical slot
+                    // is made reusable; Pins keep an outstanding Borrow safe.
                     IndexSlot* oldest = &slots_[cons & mask_];
-                    oldest->state.store(
-                        static_cast<uint32_t>(SlotState::kRetired),
-                        std::memory_order_relaxed);
-                    control_->consumer_cursor.store(
-                        cons + 1, std::memory_order_release);
+                    const ShmHandle payload = oldest->payload;
+                    uint64_t expected = cons;
+                    if (control_->consumer_cursor.compare_exchange_strong(
+                            expected, cons + 1, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        Status retired = Status::Ok();
+                        if (payload_retire_observer_ != nullptr &&
+                            !payload.IsNull()) {
+                            retired = payload_retire_observer_(
+                                payload, payload_retire_context_);
+                        }
+                        oldest->state.store(
+                            static_cast<uint32_t>(SlotState::kRetired),
+                            std::memory_order_release);
+                        if (!retired.ok()) return retired;
+                    }
                     break;
                 }
                 case QueueFullPolicy::kSample: {
@@ -686,6 +698,14 @@ public:
     // Observers
     // -----------------------------------------------------------------------
 
+    // Process-local callback used by runtimes that pair kDropOldest with a
+    // Pin table. It is not part of the shared-memory layout.
+    void SetPayloadRetireObserver(PayloadRetireObserver observer,
+                                  void* context) noexcept {
+        payload_retire_observer_ = observer;
+        payload_retire_context_ = context;
+    }
+
     enum class PublicationVisibility : uint32_t {
         kNotVisible = 0,
         kVisible = 1,
@@ -749,6 +769,12 @@ public:
 
     uint64_t capacity() const noexcept { return capacity_; }
 
+    // Snapshot used by deadline-aware Runtime QoS wrappers. Only the single
+    // producer advances this cursor, so it is exact for SPSC.
+    uint64_t next_sequence() const noexcept {
+        return control_->producer_cursor.load(std::memory_order_acquire);
+    }
+
 private:
     SpscChannel(ControlBlock* control, IndexSlot* slots,
                 uint64_t capacity) noexcept
@@ -811,6 +837,8 @@ private:
     IndexSlot* slots_ = nullptr;
     uint64_t capacity_ = 0;
     uint64_t mask_ = 0;
+    PayloadRetireObserver payload_retire_observer_ = nullptr;
+    void* payload_retire_context_ = nullptr;
 };
 
 static_assert(std::is_trivially_copyable_v<SpscChannel>,

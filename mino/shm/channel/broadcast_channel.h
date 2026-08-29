@@ -1705,6 +1705,12 @@ public:
 
     uint64_t capacity() const noexcept { return capacity_; }
 
+    // Snapshot used by deadline-aware Runtime QoS wrappers. Broadcast has one
+    // publisher, so this is the exact next publication sequence.
+    uint64_t next_sequence() const noexcept {
+        return control_->publisher_cursor.load(std::memory_order_acquire);
+    }
+
 private:
     BroadcastChannel(ControlBlock* control, IndexSlot* slots,
                      BroadcastSlotMeta* metas, BroadcastEraMeta* era_metas,
