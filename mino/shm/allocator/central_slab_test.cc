@@ -111,7 +111,7 @@ protected:
         // selection with a deterministic fake topology.
         auto result = CentralSlabAllocator::Create(
             region_.get(), kRegionSize, TestConfig(),
-            {.prefer_local_shards = false});
+            {.placement = {}, .prefer_local_shards = false});
         ASSERT_TRUE(result.ok()) << result.status().ToString();
         alloc_ = result.value();
     }
