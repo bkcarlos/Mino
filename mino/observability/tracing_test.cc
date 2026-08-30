@@ -130,11 +130,13 @@ TEST(TelemetryControlTest, ConcurrentPublicationNeverTearsPolicy) {
         PerfTelemetryMode::kFullDebug, 0, 654, 321};
     TelemetryControl control(first);
     std::atomic<bool> done{false};
-    std::atomic<bool> invalid{false};
+    std::atomic<bool> writer_failed{false};
+    bool torn = false;
+    PerfTelemetryPolicy torn_policy;
     std::thread writer([&] {
         for (size_t i = 0; i < 100'000; ++i) {
             if (!control.SetPolicy((i & 1u) == 0 ? second : first)) {
-                invalid.store(true, std::memory_order_relaxed);
+                writer_failed.store(true, std::memory_order_relaxed);
             }
         }
         done.store(true, std::memory_order_release);
@@ -153,12 +155,19 @@ TEST(TelemetryControlTest, ConcurrentPublicationNeverTearsPolicy) {
             policy.slow_threshold_ns == second.slow_threshold_ns &&
             policy.max_events_per_second == second.max_events_per_second;
         if (!is_first && !is_second) {
-            invalid.store(true, std::memory_order_relaxed);
+            torn = true;
+            torn_policy = policy;
             break;
         }
     }
     writer.join();
-    EXPECT_FALSE(invalid.load(std::memory_order_relaxed));
+    EXPECT_FALSE(writer_failed.load(std::memory_order_relaxed));
+    EXPECT_FALSE(torn) << "mode=" << static_cast<int>(torn_policy.mode)
+                       << " sample_rate_ppm=" << torn_policy.sample_rate_ppm
+                       << " slow_threshold_ns="
+                       << torn_policy.slow_threshold_ns
+                       << " max_events_per_second="
+                       << torn_policy.max_events_per_second;
 }
 
 TEST(BoundedQueueTest, PreservesAllValuesWithConcurrentProducers) {

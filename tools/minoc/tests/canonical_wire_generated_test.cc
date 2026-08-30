@@ -88,6 +88,7 @@ void ExpectScalarMessagesEqual(
                 break;
             case mino::schema::DynamicValue::Kind::kString:
             case mino::schema::DynamicValue::Kind::kBytes:
+            case mino::schema::DynamicValue::Kind::kBytesView:
             case mino::schema::DynamicValue::Kind::kMessage:
             case mino::schema::DynamicValue::Kind::kVector:
                 FAIL() << "fixed-scalar test received a non-scalar value";

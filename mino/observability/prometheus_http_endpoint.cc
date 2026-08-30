@@ -74,6 +74,7 @@ public:
     }
 
     std::string_view view() const noexcept { return {bytes_.data(), size_}; }
+    void Reset() noexcept { size_ = 0; }
 
 private:
     std::array<char, kPrometheusMaximumResponseBytes> bytes_{};
@@ -318,6 +319,11 @@ public:
         bound_port_.store(ntohs(address.sin_port), std::memory_order_release);
         stopping_.store(false, std::memory_order_release);
         try {
+            response_sinks_.reserve(options_.worker_threads);
+            for (size_t worker = 0; worker < options_.worker_threads; ++worker) {
+                response_sinks_.push_back(std::make_unique<FixedTextSink>(
+                    options_.response_bytes_limit));
+            }
             workers_.reserve(options_.worker_threads);
             for (size_t worker = 0; worker < options_.worker_threads; ++worker) {
                 workers_.emplace_back([this, worker] { WorkerLoop(worker); });
@@ -332,6 +338,7 @@ public:
                 if (worker.joinable()) worker.join();
             }
             workers_.clear();
+            response_sinks_.clear();
             return Status::Error(StatusCode::kResourceExhausted,
                                  "cannot start Prometheus endpoint threads");
         }
@@ -360,6 +367,7 @@ public:
             if (worker.joinable()) worker.join();
         }
         workers_.clear();
+        response_sinks_.clear();
         int queued = -1;
         while (connections_.TryPop(&queued)) CloseSocket(queued);
         outstanding_.store(0, std::memory_order_release);
@@ -569,7 +577,8 @@ private:
                     std::chrono::system_clock::now().time_since_epoch())
                     .count());
             registry_.TakeSnapshot(now_ns, &snapshot);
-            FixedTextSink sink(options_.response_bytes_limit);
+            FixedTextSink& sink = *response_sinks_[worker];
+            sink.Reset();
             PrometheusTextExporter exporter(sink);
             const Status status = exporter.Export(snapshot);
             if (!status.ok()) {
@@ -608,6 +617,7 @@ private:
     std::atomic<size_t> outstanding_{0};
     std::thread accept_thread_;
     std::vector<std::thread> workers_;
+    std::vector<std::unique_ptr<FixedTextSink>> response_sinks_;
     std::mutex work_mutex_;
     std::condition_variable work_cv_;
     std::mutex active_mutex_;

@@ -1,5 +1,10 @@
 package(default_visibility = ["//visibility:public"])
 
+LINUX_ONLY = select({
+    "@platforms//os:linux": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
 cc_library(
     name = "upgrade",
     srcs = [
@@ -41,6 +46,7 @@ cc_test(
 cc_test(
     name = "rolling_upgrade_integration_test",
     srcs = ["rolling_upgrade_integration_test.cc"],
+    target_compatible_with = LINUX_ONLY,
     deps = [
         ":upgrade",
         "//mino/common:status",

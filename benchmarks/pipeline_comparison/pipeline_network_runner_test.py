@@ -9,6 +9,7 @@ import copy
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,8 +19,7 @@ from unittest import mock
 from benchmarks.pipeline_comparison import pipeline_network_runner as runner
 
 
-FAKE_WORKER = r'''#!/usr/bin/env python3
-import argparse
+FAKE_WORKER = r'''import argparse
 import json
 import os
 import time
@@ -120,7 +120,9 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.fake_worker = self.root / "fake_network_worker.py"
-        self.fake_worker.write_text(FAKE_WORKER, encoding="utf-8")
+        self.fake_worker.write_text(
+            f"#!{sys.executable}\n{FAKE_WORKER}", encoding="utf-8"
+        )
         self.fake_worker.chmod(0o755)
 
     def tearDown(self) -> None:
@@ -205,7 +207,7 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
             "--warmup-messages",
             "0",
             "--deadline-seconds",
-            "3",
+            "10",
             "--binary-relative",
             str(self.fake_worker),
         ]

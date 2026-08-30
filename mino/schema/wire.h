@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <vector>
@@ -47,7 +48,7 @@ private:
     friend class PreparedCanonicalWireCodec;
 
     std::vector<std::vector<size_t>> unknown_field_order_;
-    std::vector<std::vector<std::byte>> nested_payloads_;
+    std::deque<std::vector<std::byte>> nested_payloads_;
 };
 
 // Appends/reads the shortest unsigned LEB128 representation. Decode rejects

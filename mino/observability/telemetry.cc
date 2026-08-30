@@ -88,6 +88,9 @@ bool TelemetryControl::TryLoadPolicy(PerfTelemetryPolicy* policy,
             slow_threshold_ns_.load(std::memory_order_relaxed);
         candidate.max_events_per_second =
             max_events_per_second_.load(std::memory_order_relaxed);
+        // Keep every field load before the final generation check. This read
+        // barrier is required by the seqlock protocol on weakly ordered CPUs.
+        std::atomic_thread_fence(std::memory_order_acquire);
         const uint64_t after = sequence_.load(std::memory_order_acquire);
         if (before == after) {
             *policy = candidate;
@@ -110,6 +113,7 @@ bool TelemetryControl::Refresh(TelemetryThreadCache* cache) const noexcept {
             slow_threshold_ns_.load(std::memory_order_relaxed);
         policy.max_events_per_second =
             max_events_per_second_.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
         const uint64_t after = sequence_.load(std::memory_order_acquire);
         if (before != after) continue;
         cache->policy_ = policy;

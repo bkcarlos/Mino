@@ -174,7 +174,7 @@ TEST(TlsTest, HandshakeFailsWhenPeerCloses) {
     struct sigaction ignored{};
     struct sigaction previous{};
     ignored.sa_handler = SIG_IGN;
-    ASSERT_EQ(::sigemptyset(&ignored.sa_mask), 0);
+    ASSERT_EQ(sigemptyset(&ignored.sa_mask), 0);
     ASSERT_EQ(::sigaction(SIGPIPE, &ignored, &previous), 0);
     sockets.CloseSecond();
     auto step = (*client)->Handshake();

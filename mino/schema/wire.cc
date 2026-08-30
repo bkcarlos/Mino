@@ -353,7 +353,7 @@ struct CodecContext {
     const WireLimits& limits;
     const FieldPlanCache* plans = nullptr;
     std::vector<std::vector<size_t>>* unknown_orders = nullptr;
-    std::vector<std::vector<std::byte>>* nested_payloads = nullptr;
+    std::deque<std::vector<std::byte>>* nested_payloads = nullptr;
     size_t decoded_elements = 0;
 };
 

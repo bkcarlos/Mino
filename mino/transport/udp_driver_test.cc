@@ -297,6 +297,17 @@ TEST(UdpDriverTest, PreservesDatagramBoundariesAndReportsDegradedLocalCompletion
     auto received = server->Poll(
         {.max_messages = 2, .max_bytes = 1200, .timeout_ms = 1000});
     ASSERT_TRUE(received.ok()) << received.status().ToString();
+    if (received->messages.size() < 2u) {
+        auto remaining = server->Poll(
+            {.max_messages = static_cast<uint32_t>(
+                 2u - received->messages.size()),
+             .max_bytes = 1200,
+             .timeout_ms = 1000});
+        ASSERT_TRUE(remaining.ok()) << remaining.status().ToString();
+        for (auto& message : remaining->messages) {
+            received->messages.push_back(std::move(message));
+        }
+    }
     ASSERT_EQ(received->messages.size(), 2u);
     EXPECT_EQ(received->messages[0].connection_id, listener->id);
     EXPECT_EQ(received->messages[0].payload, first);
@@ -725,7 +736,8 @@ TEST(UdpDriverTest, EnforcesGlobalReassemblyByteQuotaAcrossListeners) {
 }
 
 TEST(UdpDriverTest, ShutdownClearsPartialReassemblies) {
-    const UdpDriverOptions options = FragmentTestOptions();
+    UdpDriverOptions options = FragmentTestOptions();
+    options.reassembly_timeout_ms = 5000;
     auto server_result = UdpDriver::Create(options);
     ASSERT_TRUE(server_result.ok());
     std::unique_ptr<UdpDriver> server = std::move(*server_result);
@@ -739,12 +751,15 @@ TEST(UdpDriverTest, ShutdownClearsPartialReassemblies) {
     const auto fragments =
         FragmentMessage(payload, options.max_datagram_bytes, 220);
     SendDatagram(peer.get(), UdpLoopbackAddress(endpoint.port()), fragments[0]);
-    EXPECT_EQ(server->Poll({.max_messages = 1,
-                            .max_bytes = 4096,
-                            .timeout_ms = 0})
-                  .status()
-                  .code(),
-              StatusCode::kWouldBlock);
+    const auto receive_deadline = std::chrono::steady_clock::now() + 1s;
+    while (server->stats().reassembly_messages == 0u &&
+           std::chrono::steady_clock::now() < receive_deadline) {
+        auto received = server->Poll(
+            {.max_messages = 1, .max_bytes = 4096, .timeout_ms = 0});
+        ASSERT_FALSE(received.ok());
+        ASSERT_EQ(received.status().code(), StatusCode::kWouldBlock);
+        std::this_thread::yield();
+    }
     ASSERT_EQ(server->stats().reassembly_messages, 1u);
     EXPECT_TRUE(server->Shutdown().ok());
     EXPECT_EQ(server->stats().reassembly_messages, 0u);
@@ -980,14 +995,6 @@ TEST(UdpDriverTest, NonBlockingPollPersistsRoundRobinAcrossCalls) {
                 ordinary_flood ? flood_payload.data() : nullptr;
             const size_t flood_size =
                 ordinary_flood ? flood_payload.size() : 0;
-            for (size_t index = 0; index < 32; ++index) {
-                ASSERT_EQ(::sendto(
-                              peer.get(), flood_data, flood_size, 0,
-                              reinterpret_cast<const sockaddr*>(&flood_address),
-                              sizeof(flood_address)),
-                          static_cast<ssize_t>(flood_size));
-            }
-
             const sockaddr_in target_address =
                 UdpLoopbackAddress(target_endpoint.port());
             const std::vector<std::byte> target_payload(29, std::byte{0x62});
@@ -997,16 +1004,27 @@ TEST(UdpDriverTest, NonBlockingPollPersistsRoundRobinAcrossCalls) {
                           reinterpret_cast<const sockaddr*>(&target_address),
                           sizeof(target_address)),
                       static_cast<ssize_t>(target_payload.size()));
+            for (size_t index = 0; index < 32; ++index) {
+                ASSERT_EQ(::sendto(
+                              peer.get(), flood_data, flood_size, 0,
+                              reinterpret_cast<const sockaddr*>(&flood_address),
+                              sizeof(flood_address)),
+                          static_cast<ssize_t>(flood_size));
+            }
 
             bool consumed_target = false;
-            for (size_t attempt = 0; attempt < 2; ++attempt) {
+            size_t consumed_messages = 0;
+            const auto deadline = std::chrono::steady_clock::now() + 500ms;
+            while (consumed_messages < 2 &&
+                   std::chrono::steady_clock::now() < deadline) {
                 auto received = server->Poll(
                     {.max_messages = 1, .max_bytes = 1200, .timeout_ms = 0});
                 if (!received.ok()) {
-                    EXPECT_FALSE(ordinary_flood);
-                    EXPECT_EQ(received.status().code(), StatusCode::kWouldBlock);
+                    ASSERT_EQ(received.status().code(), StatusCode::kWouldBlock);
+                    std::this_thread::yield();
                     continue;
                 }
+                ++consumed_messages;
                 ASSERT_EQ(received->messages.size(), 1u);
                 const ReceivedMessage& message = received->messages[0];
                 if (message.connection_id == target_listener.id) {

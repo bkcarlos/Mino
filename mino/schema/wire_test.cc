@@ -144,6 +144,58 @@ message Payload {
     }
 }
 
+TEST(CanonicalWireTest, EncodesVectorOfNestedMessagesWithReusableScratch) {
+    CompileOptions options;
+    options.allow_implicit_schema_version = true;
+    auto compiled = SchemaCompiler::Compile(R"idl(
+package p;
+message Child { required uint32 id = 1; }
+message Root {
+  required vector<Child> children = 1 [max_capacity = 2];
+}
+)idl",
+                                            options);
+    ASSERT_TRUE(compiled.ok()) << compiled.status().ToString();
+    std::shared_ptr<const SchemaDescriptor> root;
+    for (const auto& type : compiled->types()) {
+        if (type->aggregate().full_name() == "p.Root") root = type;
+    }
+    ASSERT_NE(root, nullptr);
+
+    auto child = std::make_shared<DynamicMessage>();
+    ASSERT_TRUE(child->SetField(1, DynamicValue::Unsigned(9)).ok());
+    auto child_value = DynamicValue::Message(child);
+    ASSERT_TRUE(child_value.ok());
+    auto children = std::make_shared<DynamicVector>();
+    ASSERT_TRUE(children->Add(std::move(*child_value)).ok());
+    auto children_value = DynamicValue::Vector(children);
+    ASSERT_TRUE(children_value.ok());
+    DynamicMessage message;
+    ASSERT_TRUE(message.SetField(1, std::move(*children_value)).ok());
+
+    const auto exercise = [&](auto&& encode_into) {
+        CanonicalWireScratch scratch;
+        std::vector<std::byte> output;
+        ASSERT_TRUE(encode_into(message, scratch, output).ok());
+        EXPECT_EQ(Hex(output), "0a0401020809");
+        ASSERT_TRUE(encode_into(message, scratch, output).ok());
+        EXPECT_EQ(Hex(output), "0a0401020809");
+    };
+
+    exercise([&](const DynamicMessage& input, CanonicalWireScratch& scratch,
+                 std::vector<std::byte>& output) {
+        return CanonicalWireCodec::EncodeInto(
+            *root, input, scratch, output, compiled->types());
+    });
+
+    auto prepared = PreparedCanonicalWireCodec::Create(root, compiled->types());
+    ASSERT_TRUE(prepared.ok()) << prepared.status().ToString();
+    exercise([&](const DynamicMessage& input, CanonicalWireScratch& scratch,
+                 std::vector<std::byte>& output) {
+        return prepared->EncodeInto(input, scratch, output);
+    });
+}
+
 TEST(CanonicalWireTest, RejectsMalformedCanonicalInputs) {
     auto descriptor = CompileOne(
         "package p; message M { optional uint32 id = 1; "

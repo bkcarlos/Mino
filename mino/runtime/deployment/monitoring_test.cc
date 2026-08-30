@@ -363,7 +363,7 @@ TEST(MonitoringDeploymentTest,
     struct sigaction ignored {};
     struct sigaction previous {};
     ignored.sa_handler = SIG_IGN;
-    ASSERT_EQ(::sigemptyset(&ignored.sa_mask), 0);
+    ASSERT_EQ(sigemptyset(&ignored.sa_mask), 0);
     ASSERT_EQ(::sigaction(SIGPIPE, &ignored, &previous), 0);
     EXPECT_FALSE((*tls)->Handshake().ok());
     ASSERT_EQ(::sigaction(SIGPIPE, &previous, nullptr), 0);

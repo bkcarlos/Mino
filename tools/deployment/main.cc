@@ -711,7 +711,7 @@ int RunChild(const NodeDeploymentConfig& config,
              const std::vector<std::string>& command) {
     struct sigaction action {};
     action.sa_handler = ForwardSignal;
-    ::sigemptyset(&action.sa_mask);
+    sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
     if (::sigaction(SIGTERM, &action, nullptr) != 0 ||
         ::sigaction(SIGINT, &action, nullptr) != 0) {
@@ -728,7 +728,7 @@ int RunChild(const NodeDeploymentConfig& config,
     if (child == 0) {
         struct sigaction reset {};
         reset.sa_handler = SIG_DFL;
-        ::sigemptyset(&reset.sa_mask);
+        sigemptyset(&reset.sa_mask);
         (void)::sigaction(SIGTERM, &reset, nullptr);
         (void)::sigaction(SIGINT, &reset, nullptr);
         std::vector<char*> arguments;

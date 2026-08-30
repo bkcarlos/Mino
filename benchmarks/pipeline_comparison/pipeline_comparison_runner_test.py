@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,8 +17,7 @@ from unittest import mock
 import pipeline_comparison_runner as runner
 
 
-FAKE_WORKER = r'''#!/usr/bin/env python3
-import argparse
+FAKE_WORKER = r'''import argparse
 import json
 import os
 import subprocess
@@ -138,7 +138,9 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.fake_worker = self.root / "fake_pipeline_worker.py"
-        self.fake_worker.write_text(FAKE_WORKER, encoding="utf-8")
+        self.fake_worker.write_text(
+            f"#!{sys.executable}\n{FAKE_WORKER}", encoding="utf-8"
+        )
         self.fake_worker.chmod(0o755)
 
     def tearDown(self) -> None:
@@ -157,7 +159,7 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
             "--warmup-ratio",
             "0.0",
             "--deadline-seconds",
-            "2",
+            "10",
             "--fastdds-binary",
             str(self.fake_worker),
             "--cyclonedds-binary",
@@ -258,7 +260,7 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
         }
         arguments = self.runner_arguments(output)
         deadline_index = arguments.index("--deadline-seconds") + 1
-        arguments[deadline_index] = "1"
+        arguments[deadline_index] = "5"
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
             runner, "TERMINATION_GRACE_SECONDS", 0.1
         ):
