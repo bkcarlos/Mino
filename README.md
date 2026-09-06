@@ -74,7 +74,7 @@ auto msg = sub->Poll();                               // BorrowedBytes；可读 
 
 ### 仍残留的拷贝
 
-源端首发、跨机 Hybrid 桥、控制面 decode、部分 TCP/RDMA 路径等仍有拷贝；清单见 [`docs/optimization-status.md`](docs/optimization-status.md)。
+源端首发物化、可靠重传自持、Bus Broadcast 槽位、RDMA 通用 span staging 等为 **intentional KEEP**；Hybrid 中间 SemanticFrame.assign 与可控 TCP/控制面路径已关。清单见 [`docs/optimization-status.md`](docs/optimization-status.md)；仍 incomplete（代码外置 / 硬件资格 / KEEP）见 [`docs/benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md`](docs/benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md)。
 
 ## 适用场景
 
@@ -104,6 +104,7 @@ Mino/
 | 文档 | 内容 |
 |---|---|
 | [优化状态](docs/optimization-status.md) | tip HEAD 对照、已关闭的同机 hop/codec 项、SimpleNode 能力、仍残留拷贝 |
+| [未实现/未资格清单](docs/benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md) | A1–A12、资格门、intentional KEEP（对照 tip） |
 | [示例说明](examples/README.md) | SimpleNode Create/Open、topic 模式、Recover、与 ZMQ 对照压测 |
 | [架构设计文档](docs/Mino_架构设计文档.md) | 设计目标、总体架构、SHM 布局与寻址、Index RingBuffer 协议、Slab 内存池、IDL、端到端流程、故障恢复、安全、可观测性、性能目标与实施路线图 |
 | [详细设计文档](docs/Mino_详细设计文档.md) | Bazel 工程边界、部署拓扑、公共 API 与错误模型、Channel/Allocator/生命周期、静态与动态 Schema、Registry/Bridge、Recorder/Storage、测试要求 |

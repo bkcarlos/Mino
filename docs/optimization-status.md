@@ -1,11 +1,14 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/opt-closeout`（代码 closeout `7f0b243`；基于 `b471a98`；文档 tip = 本分支 HEAD）
+- HEAD 对照：`master` tip **`d36603e`**（`fix: restore release-suite green for SimpleNode and known GCC/py flakes`；声称 `//...` release 154/154 green；相对 `origin/master` 超前）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
+- 仍 incomplete 总表（代码缺口 / 硬件资格 / intentional KEEP）：见
+  [`docs/benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md`](benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md)
+  文首「仍 incomplete 速览」。
 
-## 已关闭（opt-complete / a1b76c3 + opt-closeout）
+## 已关闭（opt-complete / a1b76c3 + opt-closeout + tip）
 
 | 项 | 状态 | 代码入口 |
 |---|---|---|
@@ -17,6 +20,13 @@
 | 长度定界 payload `insert` memmove（A3） | **DONE** | `EncodeLengthDelimitedValue`：Leb128 前缀 + `Append`；嵌套走 scratch 再 Append |
 | 流式 DecodeView / owned send / 尾帧 steal（A4） | **DONE** | `LengthPrefixedFrameDecoder::Push`→`DecodeView`；Bridge `TrySendOwned` / `TrySendUntrackedOwned`；TcpDriver 收缓冲**尾部**完整帧 `move` steal |
 | RDMA owned Send 免 `assign` | **DONE（opt-closeout）** | `RdmaDriver::DoTrySendOwned` / `PostOwned`：`vector&&` 移入 pending；可选 `pre_registered` MR 跳过 Register/Deregister。span `Send` 仍需 staging 拷 |
+| Wire 帧 AEAD | **DONE（帧层）** | `mino/bridge/wire_aead.*` AES-256-GCM + 可注入 `WireAeadKeyring`；会话密钥交换仍外置（见 UNIMPLEMENTED A1） |
+| 嵌套 owned-graph 遍历 | **DONE** | 生成 `CollectOwnedGraph` / `AppendOwnedChildren`（深度上限 32） |
+| Hybrid 跨机图所有权转发（P8） | **DONE** | `graph_ownership_forward.*`；中间 SemanticFrame.assign 已消；真跨机 SHM 零拷贝仍需 RDMA/Fabric MR |
+| Region ID Attach | **DONE** | `region_name_registry.*`：空 name + region_id 经持久 registry 解析 |
+| 持久 Dedup Store | **DONE** | `dedup_store.*` + BridgePipeline 种子化 / HWM 持久化 |
+| SharedHostDomain v2 | **DONE（拓扑）** | MPSC/Broadcast、borrow、typed、`Recover()`；**不**接 CentralSlab（KEEP deferred） |
+| P9 PTP + RDMA/Fabric 参考插件 | **DONE（软件路径）** | `PtpClockClient`；`libmino_rdma_{software_loopback,verbs}.so`；`libmino_fabric_software_loopback.so`；**不算** V-25 硬件资格 |
 
 ### Exclusive hop 契约（勿写错）
 
@@ -29,7 +39,7 @@
 - 与 `Transfer()`（Pin→`ShmSharedPtr`）不同：Transfer **不能**再发布
 - **不在** `SimpleNode` 上：SimpleNode 走 `Advertise` / `Subscribe` / `Publish` / `Poll`，无 `TakeExclusive`
 
-### SimpleNode（tip / e333069+）
+### SimpleNode（tip / `d36603e`）
 
 `mino/runtime/simple_node.h`：同一 POSIX shm 内含 discovery、allocator journal、endpoint 所有权、channels、subscriber leases 与 payload Pins；无独立协调进程。
 
@@ -51,7 +61,7 @@
   无注册内存时**不存在**跨主机真零拷贝
 - 资格：单元测试已覆盖完整性；双机 hybrid 性能战役仍待跑
 
-### P9 PTP + RDMA/Fabric 参考插件（本分支）
+### P9 PTP + RDMA/Fabric 参考插件
 
 - PTP：`PtpClockClient`（PHC / `clock_gettime`）；无合格同步不报跨机单向延迟
 - RDMA：`libmino_rdma_software_loopback.so` + `libmino_rdma_verbs.so`（绝对路径 `dlopen`）
@@ -59,6 +69,8 @@
 - **不**声称 V-25 硬件资格；软件 provenance 含 `NOT-QUALIFICATION-ELIGIBLE`
 
 ## 仍残留的拷贝 / 成本（仅 physics KEEP / intentional KEEP）
+
+下列为**有意保留**的物理/设计成本，不是未完工 stub。诚实标注：
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
@@ -77,6 +89,8 @@
 
 ## 相关文档
 
+- `docs/benchmarks/kvm-2026-08-25/UNIMPLEMENTED.md` — A1–A12 / 资格门 / KEEP 仍 incomplete 清单（对照 tip）
 - `examples/README.md` — SimpleNode / ZMQ 对照
 - `benchmarks/pipeline_comparison/PERFORMANCE_FOLLOWUP.md` — 战役与 backlog（已与本状态对齐关键 P1）
 - `docs/benchmarks/README.md` — 基准索引
+- `docs/rdma-driver.md` / `docs/fabric-driver.md` — P9 参考插件与 V-25 资格边界

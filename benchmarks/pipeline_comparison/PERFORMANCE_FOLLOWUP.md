@@ -272,14 +272,18 @@ Archive raw `perf.data` files and their hashes. Optimization claims must cite th
 before/after cycle share, not only wall-clock throughput.
 
 
-### P0/P1 closed on master (a1b76c3): same-host exclusive SHM hop
+### P0/P1 closed on master (a1b76c3 + tip): same-host exclusive SHM hop
 
 Status: implemented. SPSC forwarders use `TakeExclusive` +
 `PublishLocal(ExclusiveMessage&&)`; sink/CANBus validates via payload span.
-Source first publish still `AllocateChild`+`memcpy`. Pin/broadcast/MPSC rejected.
-Destructor reclaims if not published; kill between Take and PublishLocal leaks
-until region recreate. See `docs/optimization-status.md`. Same-host medium
-saturation vs Fast DDS has **not** been re-measured on this commit.
+Source first publish still `AllocateChild`+`memcpy` (intentional KEEP).
+Pin/broadcast/MPSC rejected. Destructor/`Release` reclaims if not published.
+Journal-backed subscribers adopt a durable `kExclusiveHop` lease **before** SPSC
+ACK (opt-closeout): crash recovery Finalizes if the source slot is still Visible,
+otherwise Rollbacks the graph — do **not** claim kill always leaks until Region
+recreate on the journal path. No-journal subscribers still RAII-only.
+See `docs/optimization-status.md`. Same-host medium saturation vs Fast DDS has
+**not** been re-measured on tip `d36603e`.
 
 ## Remaining optimization backlog
 
@@ -326,9 +330,9 @@ Status: default data-path integration complete on master (`a1b76c3` closes the
 remaining receive-tail steal). `LengthPrefixedFrameDecoder::Push` uses
 `DecodeView`; Bridge data path uses `TrySendOwned` /
 `TrySendUntrackedOwned`; `TcpDriver` steals a trailing complete frame from the
-receive buffer (mid-buffer frames still `assign`). Control-plane
-`WireFrameCodec::Decode` may still copy into an owned `WireFrame`. The three
-TcpDriver mutexes are unchanged. `RetransmitWindow` still owns a frame copy for
+receive buffer (mid-buffer frames still `assign`). Bridge inbound control+data uses `DecodeView` on the owning path
+(opt-closeout); `Decode(span)` still assigns when the caller does not own the
+body. The three TcpDriver mutexes remain an intentional KEEP. `RetransmitWindow` still owns a frame copy for
 reliable multi-attempt resend (intentional). Fuzzing, TSAN, clean-ref wire
 qualification, and formal performance campaigns remain pending.
 
@@ -445,7 +449,7 @@ Expected benefit: potentially high if allocator scans remain visible; high risk.
 
 ### P3: safe generated graph ownership forwarding
 
-Status: implemented on branch `feature/hybrid-cross-host-zc` (P8). True
+Status: implemented on master tip (P8 / `da5d44b`+). True
 cross-host SHM zero-copy remains impossible without RDMA/Fabric registration;
 this item removes the hybrid bridge's graph↔SemanticFrame↔wire *intermediate*
 payload copies.
