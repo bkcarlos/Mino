@@ -84,12 +84,12 @@ bazel test --config=release \
   //mino/runtime:zmq_ipc_business_mp_stress_test
 ```
 
-## 产品 API 要点（master / a1b76c3）
+## 产品 API 要点（master tip）
 
-- 头文件：`mino/runtime/simple_node.h`（Create / Open / Advertise / Subscribe / Publish / TryPoll）。
+- 头文件：`mino/runtime/simple_node.h`（Create / Open / Unlink；字节与 typed Advertise/Subscribe；Publish；TryPoll/Poll；`Recover()`；`SimpleTopicMode` / `SimpleTopicOptions`）。上文 Topic 模式一节已写能力细节，此处不重复。
 - 同机类型化流水线独占 hop：`BorrowedMessage::TakeExclusive` → `ExclusiveMessage` →
-  `Publisher::PublishLocal(ExclusiveMessage&&)`（**仅 SPSC**；见 `docs/optimization-status.md`）。
+  `Publisher::PublishLocal(ExclusiveMessage&&)`（**仅 SPSC**，在完整 `Publisher<T>` 路径，**不在** SimpleNode；见 `docs/optimization-status.md`）。
 - 编码：`DynamicValue::BytesView` + `EncodeInto`，避免默认 owning `Bytes` 整段堆拷。
-- **没有** `Bus::CreatePublisher<T>`；不要抄根 README 过期预览。
+- **没有** `Bus::CreatePublisher<T>`（`Bus` 为非模板 `CreatePublisher(topic, SchemaIdentity)`）。
 
-优化关闭状态：`docs/optimization-status.md`。
+优化关闭状态与残留拷贝：`docs/optimization-status.md`。

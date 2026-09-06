@@ -1,8 +1,8 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`a1b76c38c7731f1eb6f62a4a800df95526fbdabf`
-  （`perf: close opt-complete SHM hop and codec residual copies`）
-- 更新日期：2026-08-27（Asia/Shanghai）
+- HEAD 对照：`91b92f829fa7182103e7ff1b90ca33f69f5badda`
+  （`fix: initialize NUMA placement in allocator test`；含 `e333069` SimpleNode 扩展与更早的 `a1b76c3` opt-complete）
+- 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
 
@@ -18,17 +18,24 @@
 
 ### Exclusive hop 契约（勿写错）
 
-- **仅 SPSC**；pin table / Broadcast / MPSC → `kUnsupported`
+- **仅**完整 typed `Publisher<T>` / `Subscriber<T>` 路径上的 SPSC；`TakeExclusive` → `PublishLocal(ExclusiveMessage&&)`
+- pin table / Broadcast / MPSC → `kUnsupported`
 - 未 `PublishLocal` 的 `ExclusiveMessage` 析构 reclaim
 - `TakeExclusive` 与 `PublishLocal` 之间进程被杀：journal 已不跟踪、槽位已 ACK → **泄漏到 Region 重建**
 - 与 `Transfer()`（Pin→`ShmSharedPtr`）不同：Transfer **不能**再发布
+- **不在** `SimpleNode` 上：SimpleNode 走 `Advertise` / `Subscribe` / `Publish` / `Poll`，无 `TakeExclusive`
 
-### SimpleNode（更早合入 master）
+### SimpleNode（tip / e333069+）
 
-`mino/runtime/simple_node.h`：`Create` / `Open` / `Advertise` / `Subscribe` / `Publish` / `TryPoll`（及 `Poll`）。
-示例：`examples/simple_mp_pubsub*`。无 journal/lease 恢复；崩溃后重建段。
+`mino/runtime/simple_node.h`：同一 POSIX shm 内含 discovery、allocator journal、endpoint 所有权、channels、subscriber leases 与 payload Pins；无独立协调进程。
 
-**不存在** `Bus::CreatePublisher<T>`（根 README 预览过期）。
+- 模式：`SimpleTopicMode::{kSpsc,kMpsc,kBroadcast}`（默认 SPSC）；`SimpleTopicOptions` 还含 `queue_full_policy`、`sample_rate`
+- API：`Create` / `Open` / `Unlink`；字节与 typed `Advertise` / `Advertise<T>`、`Subscribe` / `Subscribe<T>`；`Publish(bytes)` / `Publish(T)`；`TryPoll` / `Poll` 与 `BorrowedBytes::As<T>` / `BorrowedValue<T>`
+- 恢复：`SimpleNode::Recover()` 显式回收已证明死亡的 endpoint、MPSC reservation、Broadcast lease/borrow、Pin 与 allocation journal；公开 publish/poll 也会自动做保守恢复
+- 兼容：manifest **v3**，与旧 SimpleNode segment **不兼容**（升级需重建共享段）
+- 示例：`examples/simple_mp_pubsub*`、`examples/README.md`
+
+**不存在** `Bus::CreatePublisher<T>`。`Bus` 只有非模板 `CreatePublisher(topic, SchemaIdentity)` → `BusPublisher`；类型化零拷贝请用 `Publisher<T>` / `Subscriber<T>` 或 `SimpleNode`。
 
 ## 仍残留的拷贝 / 成本
 
@@ -42,7 +49,7 @@
 
 ## 历史测量
 
-同机 medium「Fast DDS 3571 vs Mino 2925」等数字来自 hop 改造**前**战役；**不要**写成 a1b76c3 后已反超。复测前只当方向性参考。
+同机 medium「Fast DDS 3571 vs Mino 2925」等数字来自 hop 改造**前**战役；**不要**写成 a1b76c3 / 当前 tip 后已反超。复测前只当方向性参考。
 
 ## 相关文档
 

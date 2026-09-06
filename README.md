@@ -12,7 +12,7 @@ Mino 是一个面向高性能系统的统一通信框架，通过统一的类型
 - **远程节点**：Bridge 提取有效字段，编码成紧凑网络数据后发送；
 - **应用层**：使用相同的 IDL 类型和 Publisher/Subscriber API，不感知底层路径差异。
 
-**当前状态**：概念设计完成，处于设计评审与原型验证前阶段。仓库当前包含完整的设计文档与架构决策记录（ADR），代码实现按实施路线图（P0–P6）推进中。
+**当前状态**：Runtime / Schema / Bridge / Recorder 等核心代码已在 master 落地；同机 SHM 优化关闭项与残留拷贝见 [`docs/optimization-status.md`](docs/optimization-status.md)。设计文档与 ADR 仍是协议与架构真源；实现细节以 `.h/.cc` 为准。
 
 ## 设计目标
 
@@ -49,27 +49,32 @@ Mino 是一个面向高性能系统的统一通信框架，通过统一的类型
 - macOS/Darwin：仅用于编译和非持久 SHM 测试；POSIX SHM marker/supervisor 锁语义不满足首版协议，相关 Bazel 测试明确标记为 Linux-only
 - 工具链：Runtime、Schema Compiler、`minoc`（代码生成）与 `mino`（运维工具）
 
-## API 预览
+## API 入口（以代码为准）
+
+**没有** `Bus::CreatePublisher<T>`。`Bus` 提供的是按 `SchemaIdentity` 的非模板 `CreatePublisher` / `CreateSubscriber`（返回 `BusPublisher` / `BusSubscriber`）。类型化同机路径用 `Publisher<T>` / `Subscriber<T>`；紧凑多进程 SHM 用 `SimpleNode`。
+
+### SimpleNode（同一 POSIX shm，无协调进程）
 
 ```cpp
-// 发布
-Publisher<SensorFrame> pub =
-    bus.CreatePublisher<SensorFrame>("sensor/front_lidar", policy);
+#include "mino/runtime/simple_node.h"
 
-auto builder = pub.Allocate();
-builder->set_frame_id(1001);
-builder->set_device_name("Front_Lidar_Node");
-builder->points().push_back({1.0f, 2.0f, 3.0f});
-pub.Publish(std::move(builder));
+auto node = mino::SimpleNode::Create("/mino_demo");
+auto pub = node->Advertise("camera");                 // 默认 SPSC 字节 API
+// 或：Advertise<T> / Subscribe<T> + Publish(T) + Poll<T>()
+// 模式：SimpleTopicMode::{kSpsc,kMpsc,kBroadcast} + SimpleTopicOptions
+pub->Publish(std::as_bytes(std::span{payload}));
 
-// 订阅
-Subscriber<SensorFrame> sub =
-    bus.CreateSubscriber<SensorFrame>("sensor/front_lidar", policy);
-
-sub.Poll([](BorrowedMessage<SensorFrame> msg) {
-    Process(msg->frame_id(), msg->points());
-});
+auto peer = mino::SimpleNode::Open("/mino_demo");
+auto sub = peer->Subscribe("camera");
+auto msg = sub->Poll();                               // BorrowedBytes；可读 As<T>()
+(void)node->Recover();                                // 显式恢复已证明死亡的 endpoint/lease/Pin/journal
 ```
+
+示例与压测说明见 [`examples/README.md`](examples/README.md)。独占 hop（`TakeExclusive` → `PublishLocal`）在完整 `Publisher<T>` 路径上，**不在** SimpleNode。
+
+### 仍残留的拷贝
+
+源端首发、跨机 Hybrid 桥、控制面 decode、部分 TCP/RDMA 路径等仍有拷贝；清单见 [`docs/optimization-status.md`](docs/optimization-status.md)。
 
 ## 适用场景
 
@@ -84,11 +89,13 @@ sub.Poll([](BorrowedMessage<SensorFrame> msg) {
 
 ```text
 Mino/
+├── mino/                       # Runtime / Schema / SHM / Bridge / Transport …
+├── examples/                   # SimpleNode 多进程示例与对照压测
 ├── docs/
+│   ├── optimization-status.md  # 同机优化关闭项与残留拷贝（对照 tip HEAD）
 │   ├── Mino_架构设计文档.md    # 总体架构：目标、边界、SHM 布局、协议、路线图
 │   ├── Mino_详细设计文档.md    # 模块级设计：接口、状态机、线程模型、工程约束
-│   └── adr/                    # 架构决策记录（0001–0013）
-│       └── README.md           # ADR 状态流转规则
+│   └── adr/                    # 架构决策记录
 └── README.md
 ```
 
@@ -96,6 +103,8 @@ Mino/
 
 | 文档 | 内容 |
 |---|---|
+| [优化状态](docs/optimization-status.md) | tip HEAD 对照、已关闭的同机 hop/codec 项、SimpleNode 能力、仍残留拷贝 |
+| [示例说明](examples/README.md) | SimpleNode Create/Open、topic 模式、Recover、与 ZMQ 对照压测 |
 | [架构设计文档](docs/Mino_架构设计文档.md) | 设计目标、总体架构、SHM 布局与寻址、Index RingBuffer 协议、Slab 内存池、IDL、端到端流程、故障恢复、安全、可观测性、性能目标与实施路线图 |
 | [详细设计文档](docs/Mino_详细设计文档.md) | Bazel 工程边界、部署拓扑、公共 API 与错误模型、Channel/Allocator/生命周期、静态与动态 Schema、Registry/Bridge、Recorder/Storage、测试要求 |
 | [开发计划](docs/Mino_开发计划.md) | D0~D6 阶段工作分解、关键路径、里程碑、验证跟踪、团队配置与风险管理 |
@@ -131,8 +140,8 @@ ADR 按 `PROPOSED → ACCEPTED → VALIDATED → FROZEN` 状态推进，冻结�
 
 ## 贡献
 
-项目处于早期设计阶段，当前最重要的贡献方式是参与设计评审：
+代码与文档以 master tip 为准；设计变更仍走 ADR：
 
-1. 阅读 [架构设计文档](docs/Mino_架构设计文档.md) 与相关 ADR；
-2. 针对未冻结的决策在 ADR 评审记录中提出意见；
+1. 阅读 [架构设计文档](docs/Mino_架构设计文档.md)、[优化状态](docs/optimization-status.md) 与相关 ADR；
+2. 针对未冻结的决策在 ADR 评审记录中提出意见；实现与文档冲突时以 `.h/.cc` 为准并更新配套说明；
 3. 已冻结 ADR 的不兼容变更需创建新 ADR 并升级协议版本。
