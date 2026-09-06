@@ -12,6 +12,7 @@
 #include <span>
 #include <vector>
 
+#include "mino/bridge/wire_aead.h"
 #include "mino/common/result.h"
 
 namespace mino::bridge {
@@ -26,6 +27,8 @@ inline constexpr uint32_t kLengthPrefixSize = 4;
 // section 16.2. No extra field, padding, process pointer, ShmHandle, or region
 // offset exists between these documented fields.
 inline constexpr uint32_t kWireBaseHeaderLength = 80;
+// Shared optional 4-byte header slot: payload CRC32C when PAYLOAD_CRC_PRESENT,
+// or AEAD key_id when AEAD_PRESENT. The two flags are mutually exclusive.
 inline constexpr uint32_t kWirePayloadCrcLength = 4;
 inline constexpr uint32_t kWireControlOpcodeLength = 4;
 inline constexpr uint32_t kWirePerfTraceContextLength = 40;
@@ -160,33 +163,46 @@ public:
     // Successful validation performs no allocation, payload copying, or CRC
     // calculation. The header-only overload is useful when a caller knows a
     // canonical payload's size without materializing its bytes.
+    // When AEAD_PRESENT is set, aead must supply encode key material (fail-closed).
     static Result<size_t> EncodedSize(
-        const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
+        const WireFrame& frame, const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
     static Result<size_t> EncodedSize(
         const WireFrameHeader& header, size_t payload_size,
-        const WireFrameLimits& limits = {}) noexcept;
+        const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
 
     // Encodes/decodes exactly one frame body. Decode rejects extra trailing
     // bytes. The length-prefixed form is for byte-stream transports.
+    // AEAD_PRESENT encrypts the logical data payload with AES-256-GCM. Wire
+    // payload layout is [control opcode?][nonce 12][ciphertext][tag 16]. The
+    // optional 4-byte header field stores key_id. AAD covers the canonical
+    // header (header_crc bytes zeroed) plus any clear control opcode.
     static Result<std::vector<std::byte>> Encode(
-        const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
+        const WireFrame& frame, const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
     static Result<std::vector<std::byte>> EncodeLengthPrefixed(
-        const WireFrame& frame, const WireFrameLimits& limits = {}) noexcept;
+        const WireFrame& frame, const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
     // Validates canonical header structure, header CRC, body length, flags, and
     // control opcode without copying or allocating payload bytes. Payload CRC
-    // and payload decoding remain Decode's responsibility.
+    // and AEAD open remain Decode's responsibility. Under AEAD, the clear
+    // control opcode (when CONTROL_FRAME) is still readable without keys.
     static Result<WireFrameHeader> InspectHeader(
         std::span<const std::byte> frame_body,
         const WireFrameLimits& limits = {}) noexcept;
     static Result<WireFrame> Decode(
         std::span<const std::byte> frame_body,
-        const WireFrameLimits& limits = {}) noexcept;
+        const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
 
     // Takes ownership of one frame body after performing exactly Decode's full
-    // validation. On success payload aliases the retained body without copying.
+    // validation. On success payload aliases the retained body without copying
+    // (AEAD decrypts ciphertext in place).
     static Result<ValidatedWireFrameView> DecodeView(
         std::vector<std::byte>&& frame_body,
-        const WireFrameLimits& limits = {}) noexcept;
+        const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
 };
 
 // Incremental decoder for a sequence of 4-byte-big-endian-length-prefixed
@@ -197,6 +213,11 @@ class LengthPrefixedFrameDecoder {
 public:
     explicit LengthPrefixedFrameDecoder(WireFrameLimits limits = {}) noexcept
         : limits_(limits) {}
+
+    // Optional AEAD keyring for decoding frames with AEAD_PRESENT. Not owned.
+    // Null (default) keeps the flag-off path unchanged and fail-closes AEAD.
+    void SetAeadKeyring(const WireAeadKeyring* aead) noexcept { aead_ = aead; }
+    const WireAeadKeyring* aead_keyring() const noexcept { return aead_; }
 
     Result<std::vector<ValidatedWireFrameView>> Push(
         std::span<const std::byte> bytes) noexcept;
@@ -219,6 +240,7 @@ private:
     void ReleaseFrameBuffer() noexcept;
 
     WireFrameLimits limits_;
+    const WireAeadKeyring* aead_ = nullptr;
     std::array<std::byte, kLengthPrefixSize> prefix_{};
     size_t prefix_size_ = 0;
     std::vector<std::byte> frame_buffer_;

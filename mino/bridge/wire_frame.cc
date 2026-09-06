@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "mino/bridge/crc32c.h"
+#include "mino/bridge/wire_aead.h"
 #include "mino/common/status.h"
 
 namespace mino::bridge {
@@ -125,8 +126,12 @@ Status ValidateFlags(uint16_t flags, bool has_perf_trace, bool encoding) {
         return encoding ? Invalid("frame contains unknown flag bits")
                         : Corruption("frame contains unknown flag bits");
     }
-    if (HasFrameFlag(flags, FrameFlag::kAeadPresent)) {
-        return Unsupported("AEAD framing is not implemented");
+    if (HasFrameFlag(flags, FrameFlag::kAeadPresent) &&
+        HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent)) {
+        return encoding
+                   ? Invalid("AEAD and payload CRC flags are mutually exclusive")
+                   : Corruption(
+                         "AEAD and payload CRC flags are mutually exclusive");
     }
     if (HasFrameFlag(flags, FrameFlag::kPerfTraceSampled) != has_perf_trace) {
         return encoding
@@ -134,6 +139,34 @@ Status ValidateFlags(uint16_t flags, bool has_perf_trace, bool encoding) {
                    : Corruption("noncanonical PERF_TRACE_SAMPLED flag");
     }
     return Status::Ok();
+}
+
+Status RequireAeadEncodeKey(const WireAeadKeyring* aead, uint16_t flags) {
+    if (!HasFrameFlag(flags, FrameFlag::kAeadPresent)) return Status::Ok();
+    if (aead == nullptr || aead->EncodeKey(nullptr) == nullptr) {
+        return Invalid("AEAD key material is required");
+    }
+    return Status::Ok();
+}
+
+// Builds AAD over the canonical header with header_crc bytes zeroed, matching
+// HeaderCrc's coverage, plus any clear control opcode that precedes ciphertext.
+std::vector<std::byte> BuildAeadAad(std::span<const std::byte> header,
+                                    std::span<const std::byte> clear_opcode) {
+    std::vector<std::byte> aad(header.size() + clear_opcode.size());
+    std::copy(header.begin(), header.end(), aad.begin());
+    // Zero the header_crc field inside the AAD copy.
+    if (aad.size() >= kHeaderCrcOffset + 4) {
+        aad[kHeaderCrcOffset] = std::byte{0};
+        aad[kHeaderCrcOffset + 1] = std::byte{0};
+        aad[kHeaderCrcOffset + 2] = std::byte{0};
+        aad[kHeaderCrcOffset + 3] = std::byte{0};
+    }
+    if (!clear_opcode.empty()) {
+        std::copy(clear_opcode.begin(), clear_opcode.end(),
+                  aad.begin() + static_cast<std::ptrdiff_t>(header.size()));
+    }
+    return aad;
 }
 
 Status ValidateFrameType(uint16_t flags, FrameType type, bool encoding) {
@@ -190,18 +223,30 @@ PerfTraceContext DecodeTrace(std::span<const std::byte> input,
 
 Result<std::vector<std::byte>> EncodeWithPrefix(
     const WireFrame& frame, size_t prefix_size,
-    const WireFrameLimits& limits) {
+    const WireFrameLimits& limits, const WireAeadKeyring* aead) {
     MINO_ASSIGN_OR_RETURN(const size_t body_length,
-                          WireFrameCodec::EncodedSize(frame, limits));
+                          WireFrameCodec::EncodedSize(frame, limits, aead));
     const bool is_control =
         HasFrameFlag(frame.header.flags, FrameFlag::kControlFrame);
     const bool has_payload_crc =
         HasFrameFlag(frame.header.flags, FrameFlag::kPayloadCrcPresent);
+    const bool has_aead =
+        HasFrameFlag(frame.header.flags, FrameFlag::kAeadPresent);
+    const size_t control_length = is_control ? kWireControlOpcodeLength : 0u;
+    const size_t aead_overhead = has_aead ? kWireAeadOverhead : 0u;
     const size_t wire_payload_length =
-        frame.payload.size() +
-        (is_control ? kWireControlOpcodeLength : 0u);
+        control_length + frame.payload.size() + aead_overhead;
     const uint32_t header_length =
         CanonicalHeaderLength(frame.header.flags);
+
+    uint32_t aead_key_id = 0;
+    const WireAeadKeyMaterial* aead_key = nullptr;
+    if (has_aead) {
+        aead_key = aead->EncodeKey(&aead_key_id);
+        if (aead_key == nullptr) {
+            return Invalid("AEAD key material is required");
+        }
+    }
 
     std::vector<std::byte> output(prefix_size + body_length);
     std::span<std::byte> bytes(output);
@@ -231,29 +276,10 @@ Result<std::vector<std::byte>> EncodeWithPrefix(
               static_cast<uint32_t>(wire_payload_length));
     WriteBe32(body, kHeaderCrcOffset, 0);
 
-    Crc32cAccumulator payload_crc;
-    size_t payload_offset = header_length;
-    if (is_control) {
-        WriteBe32(body, payload_offset,
-                  static_cast<uint32_t>(frame.header.frame_type));
-        if (has_payload_crc) {
-            payload_crc.Update(body.subspan(payload_offset,
-                                            kWireControlOpcodeLength));
-        }
-        payload_offset += kWireControlOpcodeLength;
-    }
-    std::span<std::byte> payload_output =
-        body.subspan(payload_offset, frame.payload.size());
-    if (has_payload_crc) {
-        payload_crc.CopyAndUpdate(frame.payload, payload_output);
-    } else {
-        std::copy(frame.payload.begin(), frame.payload.end(),
-                  payload_output.begin());
-    }
-
     size_t optional_offset = kOptionalHeaderOffset;
-    if (has_payload_crc) {
-        WriteBe32(body, optional_offset, payload_crc.Finish());
+    if (has_payload_crc || has_aead) {
+        // Placeholder; CRC filled after payload copy, key_id written now.
+        WriteBe32(body, optional_offset, has_aead ? aead_key_id : 0u);
         optional_offset += kWirePayloadCrcLength;
     }
     if (frame.header.perf_trace.has_value()) {
@@ -265,20 +291,66 @@ Result<std::vector<std::byte>> EncodeWithPrefix(
                              "canonical header construction mismatch");
     }
 
-    WriteBe32(body, kHeaderCrcOffset,
-              HeaderCrc(std::span<const std::byte>(body).first(
-                  header_length)));
+    Crc32cAccumulator payload_crc;
+    size_t payload_offset = header_length;
+    std::span<const std::byte> clear_opcode;
+    if (is_control) {
+        WriteBe32(body, payload_offset,
+                  static_cast<uint32_t>(frame.header.frame_type));
+        clear_opcode = std::span<const std::byte>(body).subspan(
+            payload_offset, kWireControlOpcodeLength);
+        if (has_payload_crc) {
+            payload_crc.Update(clear_opcode);
+        }
+        payload_offset += kWireControlOpcodeLength;
+    }
+
+    if (has_aead) {
+        // Finalize header CRC before sealing so AAD matches the on-wire header
+        // (aside from the zeroed CRC bytes inside BuildAeadAad).
+        WriteBe32(body, kHeaderCrcOffset,
+                  HeaderCrc(std::span<const std::byte>(body).first(
+                      header_length)));
+        auto aad = BuildAeadAad(
+            std::span<const std::byte>(body).first(header_length),
+            clear_opcode);
+        auto sealed = SealWireAead(*aead_key, aad, frame.payload);
+        if (!sealed.ok()) return sealed.status();
+        if (sealed->size() != frame.payload.size() + kWireAeadOverhead) {
+            return Status::Error(StatusCode::kInternal,
+                                 "AEAD sealed length mismatch");
+        }
+        std::copy(sealed->begin(), sealed->end(),
+                  body.begin() + static_cast<std::ptrdiff_t>(payload_offset));
+    } else {
+        std::span<std::byte> payload_output =
+            body.subspan(payload_offset, frame.payload.size());
+        if (has_payload_crc) {
+            payload_crc.CopyAndUpdate(frame.payload, payload_output);
+            WriteBe32(body, kOptionalHeaderOffset, payload_crc.Finish());
+        } else {
+            std::copy(frame.payload.begin(), frame.payload.end(),
+                      payload_output.begin());
+        }
+        WriteBe32(body, kHeaderCrcOffset,
+                  HeaderCrc(std::span<const std::byte>(body).first(
+                      header_length)));
+    }
     return output;
 }
 
 struct DecodedFrameParts {
     WireFrameHeader header;
     std::span<const std::byte> payload;
+    // When AEAD decrypts in place, owns the plaintext buffer that payload
+    // aliases. Empty for the CRC/clear path where payload aliases frame_body.
+    std::vector<std::byte> owned_plaintext;
 };
 
 Result<DecodedFrameParts> DecodeFrameBody(
-    std::span<const std::byte> frame_body,
-    const WireFrameLimits& limits) {
+    std::span<const std::byte> frame_body, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead, bool allow_inplace_aead,
+    std::vector<std::byte>* mutable_body) {
     const uint64_t maximum_body_length =
         static_cast<uint64_t>(kWireMaximumHeaderLength) +
         limits.max_payload_length;
@@ -298,6 +370,7 @@ Result<DecodedFrameParts> DecodeFrameBody(
     const uint16_t flags = ReadBe16(frame_body, kFlagsOffset);
     const bool has_trace =
         HasFrameFlag(flags, FrameFlag::kPerfTraceSampled);
+    const bool has_aead = HasFrameFlag(flags, FrameFlag::kAeadPresent);
     Status validation = ValidateFlags(flags, has_trace, false);
     if (!validation.ok()) return validation;
 
@@ -331,9 +404,16 @@ Result<DecodedFrameParts> DecodeFrameBody(
 
     size_t optional_offset = kOptionalHeaderOffset;
     std::optional<uint32_t> stored_payload_crc;
+    uint32_t aead_key_id = 0;
     if (HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent)) {
         stored_payload_crc = ReadBe32(frame_body, optional_offset);
         optional_offset += kWirePayloadCrcLength;
+    } else if (has_aead) {
+        aead_key_id = ReadBe32(frame_body, optional_offset);
+        optional_offset += kWirePayloadCrcLength;
+        if (aead_key_id == 0) {
+            return Corruption("AEAD key_id must be non-zero");
+        }
     }
 
     std::optional<PerfTraceContext> trace;
@@ -354,6 +434,8 @@ Result<DecodedFrameParts> DecodeFrameBody(
 
     FrameType frame_type = FrameType::kData;
     auto decoded_payload = wire_payload;
+    std::span<const std::byte> clear_opcode;
+    size_t sealed_offset_in_body = header_length;
     if (HasFrameFlag(flags, FrameFlag::kControlFrame)) {
         if (wire_payload.size() < kWireControlOpcodeLength) {
             return Corruption("control payload is missing its opcode");
@@ -361,10 +443,12 @@ Result<DecodedFrameParts> DecodeFrameBody(
         frame_type = static_cast<FrameType>(ReadBe32(wire_payload, 0));
         validation = ValidateFrameType(flags, frame_type, false);
         if (!validation.ok()) return validation;
+        clear_opcode = wire_payload.first(kWireControlOpcodeLength);
         decoded_payload = wire_payload.subspan(kWireControlOpcodeLength);
+        sealed_offset_in_body += kWireControlOpcodeLength;
     }
 
-    return DecodedFrameParts{
+    DecodedFrameParts parts{
         .header = WireFrameHeader{
             .frame_type = frame_type,
             .flags = flags,
@@ -384,7 +468,51 @@ Result<DecodedFrameParts> DecodeFrameBody(
             .perf_trace = trace,
         },
         .payload = decoded_payload,
+        .owned_plaintext = {},
     };
+
+    if (has_aead) {
+        if (aead == nullptr) {
+            return Invalid("AEAD key material is required");
+        }
+        const WireAeadKeyMaterial* key = aead->FindKey(aead_key_id);
+        if (key == nullptr) {
+            return Invalid("AEAD key material is required");
+        }
+        if (decoded_payload.size() < kWireAeadOverhead) {
+            return Corruption("AEAD sealed payload is truncated");
+        }
+        const size_t plaintext_size =
+            decoded_payload.size() - kWireAeadOverhead;
+        auto aad = BuildAeadAad(frame_body.first(header_length), clear_opcode);
+
+        if (allow_inplace_aead && mutable_body != nullptr &&
+            mutable_body->data() == frame_body.data()) {
+            // Decrypt ciphertext in place inside the owned body buffer.
+            std::span<std::byte> sealed_mut =
+                std::span<std::byte>(*mutable_body)
+                    .subspan(sealed_offset_in_body, decoded_payload.size());
+            std::span<std::byte> plaintext_mut =
+                sealed_mut.subspan(kWireAeadNonceLength, plaintext_size);
+            // OpenWireAead needs separate plaintext buffer that may alias
+            // ciphertext; copy nonce|ct|tag aside then decrypt into ct region.
+            std::vector<std::byte> sealed_copy(sealed_mut.begin(),
+                                               sealed_mut.end());
+            Status opened =
+                OpenWireAead(*key, aad, sealed_copy, plaintext_mut);
+            if (!opened.ok()) return opened;
+            parts.payload = std::span<const std::byte>(plaintext_mut);
+        } else {
+            parts.owned_plaintext.resize(plaintext_size);
+            Status opened = OpenWireAead(
+                *key, aad, decoded_payload,
+                std::span<std::byte>(parts.owned_plaintext));
+            if (!opened.ok()) return opened;
+            parts.payload = std::span<const std::byte>(parts.owned_plaintext);
+        }
+    }
+
+    return parts;
 }
 
 }  // namespace
@@ -433,30 +561,37 @@ void ValidatedWireFrameView::RebindPayload() noexcept {
 }
 
 Result<size_t> WireFrameCodec::EncodedSize(
-    const WireFrame& frame, const WireFrameLimits& limits) noexcept {
-    return EncodedSize(frame.header, frame.payload.size(), limits);
+    const WireFrame& frame, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
+    return EncodedSize(frame.header, frame.payload.size(), limits, aead);
 }
 
 Result<size_t> WireFrameCodec::EncodedSize(
     const WireFrameHeader& header, size_t payload_size,
-    const WireFrameLimits& limits) noexcept {
+    const WireFrameLimits& limits, const WireAeadKeyring* aead) noexcept {
     try {
         Status validation =
             ValidateFlags(header.flags, header.perf_trace.has_value(), true);
         if (!validation.ok()) return validation;
         validation = ValidateFrameType(header.flags, header.frame_type, true);
         if (!validation.ok()) return validation;
+        validation = RequireAeadEncodeKey(aead, header.flags);
+        if (!validation.ok()) return validation;
 
         const size_t control_length =
             HasFrameFlag(header.flags, FrameFlag::kControlFrame)
                 ? kWireControlOpcodeLength
                 : 0u;
-        if (payload_size >
-            std::numeric_limits<uint32_t>::max() - control_length) {
+        const size_t aead_overhead =
+            HasFrameFlag(header.flags, FrameFlag::kAeadPresent)
+                ? kWireAeadOverhead
+                : 0u;
+        if (payload_size > std::numeric_limits<uint32_t>::max() -
+                               control_length - aead_overhead) {
             return Resource("wire payload exceeds max_payload_length");
         }
-        const uint32_t wire_payload_length =
-            static_cast<uint32_t>(payload_size + control_length);
+        const uint32_t wire_payload_length = static_cast<uint32_t>(
+            payload_size + control_length + aead_overhead);
         if (wire_payload_length > limits.max_payload_length) {
             return Resource("wire payload exceeds max_payload_length");
         }
@@ -475,9 +610,10 @@ Result<size_t> WireFrameCodec::EncodedSize(
 }
 
 Result<std::vector<std::byte>> WireFrameCodec::Encode(
-    const WireFrame& frame, const WireFrameLimits& limits) noexcept {
+    const WireFrame& frame, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
     try {
-        return EncodeWithPrefix(frame, 0, limits);
+        return EncodeWithPrefix(frame, 0, limits, aead);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {
@@ -486,9 +622,10 @@ Result<std::vector<std::byte>> WireFrameCodec::Encode(
 }
 
 Result<std::vector<std::byte>> WireFrameCodec::EncodeLengthPrefixed(
-    const WireFrame& frame, const WireFrameLimits& limits) noexcept {
+    const WireFrame& frame, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
     try {
-        return EncodeWithPrefix(frame, kLengthPrefixSize, limits);
+        return EncodeWithPrefix(frame, kLengthPrefixSize, limits, aead);
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {
@@ -543,7 +680,8 @@ Result<WireFrameHeader> WireFrameCodec::InspectHeader(
         }
 
         size_t optional_offset = kOptionalHeaderOffset;
-        if (HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent)) {
+        if (HasFrameFlag(flags, FrameFlag::kPayloadCrcPresent) ||
+            HasFrameFlag(flags, FrameFlag::kAeadPresent)) {
             optional_offset += kWirePayloadCrcLength;
         }
         std::optional<PerfTraceContext> trace;
@@ -591,10 +729,11 @@ Result<WireFrameHeader> WireFrameCodec::InspectHeader(
 }
 
 Result<WireFrame> WireFrameCodec::Decode(
-    std::span<const std::byte> frame_body,
-    const WireFrameLimits& limits) noexcept {
+    std::span<const std::byte> frame_body, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
     try {
-        auto decoded = DecodeFrameBody(frame_body, limits);
+        auto decoded =
+            DecodeFrameBody(frame_body, limits, aead, false, nullptr);
         if (!decoded.ok()) return decoded.status();
 
         WireFrame frame;
@@ -609,11 +748,22 @@ Result<WireFrame> WireFrameCodec::Decode(
 }
 
 Result<ValidatedWireFrameView> WireFrameCodec::DecodeView(
-    std::vector<std::byte>&& frame_body,
-    const WireFrameLimits& limits) noexcept {
+    std::vector<std::byte>&& frame_body, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
     try {
-        auto decoded = DecodeFrameBody(frame_body, limits);
+        auto decoded =
+            DecodeFrameBody(frame_body, limits, aead, true, &frame_body);
         if (!decoded.ok()) return decoded.status();
+
+        // AEAD may place plaintext in owned_plaintext when in-place is
+        // unavailable; fold it into the retained body so the view aliases it.
+        if (!decoded->owned_plaintext.empty()) {
+            const size_t payload_size = decoded->owned_plaintext.size();
+            frame_body = std::move(decoded->owned_plaintext);
+            return ValidatedWireFrameView(std::move(frame_body),
+                                          std::move(decoded->header), 0,
+                                          payload_size);
+        }
 
         const size_t payload_offset = static_cast<size_t>(
             decoded->payload.data() - frame_body.data());
@@ -713,7 +863,7 @@ Result<std::vector<ValidatedWireFrameView>> LengthPrefixedFrameDecoder::Push(
             work_bytes += frame_buffer_.size();
 
             auto decoded = WireFrameCodec::DecodeView(std::move(frame_buffer_),
-                                                      limits_);
+                                                      limits_, aead_);
             if (!decoded.ok()) return Fail(decoded.status());
             if (ExceedsBudget(decoded_payload_bytes, decoded->payload.size(),
                               limits_.max_decoded_payload_bytes_per_push)) {

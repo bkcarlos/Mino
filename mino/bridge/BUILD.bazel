@@ -9,11 +9,23 @@ cc_library(
 )
 
 cc_library(
+    name = "wire_aead",
+    srcs = ["wire_aead.cc"],
+    hdrs = ["wire_aead.h"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+        "@openssl//:crypto",
+    ],
+)
+
+cc_library(
     name = "wire_frame",
     srcs = ["wire_frame.cc"],
     hdrs = ["wire_frame.h"],
     deps = [
         ":crc32c",
+        ":wire_aead",
         "//mino/common:result",
         "//mino/common:status",
     ],

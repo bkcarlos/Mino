@@ -12,9 +12,11 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 ## A. 功能尚未实现（缺代码 / stub / 仅 mock / 明确延期）
 
-### A1. Wire 帧 AEAD 未实现
+### A1. Wire 帧 AEAD — 帧编解码已实现；会话密钥交换仍外置
 
-`mino/bridge/wire_frame.cc` 对 `FrameFlag::kAeadPresent` 直接返回 `Unsupported("AEAD framing is not implemented")`。TLS 1.3 mTLS 走的是 OpenSSL 套接字层（`mino/security/tls.cc` 引入 `openssl/ssl.h`），不是帧内 AEAD。
+**已实现（P1）**：`FrameFlag::kAeadPresent` 走 AES-256-GCM（OpenSSL EVP，`mino/bridge/wire_aead.*`）。可选 4 字节头字段存 `key_id`；wire payload 为 `[control opcode?][nonce 12][ciphertext][tag 16]`；AAD 覆盖 canonical header（header_crc 按零）与明文 control opcode。无密钥 fail-closed（`InvalidArgument`）。`WireAeadKeyring` 提供可注入的 encode/decode 密钥 API。
+
+**未实现 / 外置**：没有帧内密钥交换或 PKI。会话密钥需由握手/运维侧注入 keyring（pipeline 尚未自动挂载）。TLS 1.3 mTLS 仍是套接字层（`mino/security/tls.cc`），与帧内 AEAD 正交。
 
 ### A2. RDMA 硬件路径仅 mock：仓库没有 verbs 插件
 
@@ -177,7 +179,7 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 在 `mino/ tools/ tests/ examples/` 内检索 `TODO|FIXME|NYI|待实现|未实现|not implemented`：
 
-- 生产代码唯一硬 `not implemented`：`AEAD framing is not implemented`
+- 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD 见 A1；会话密钥交换仍外置）
 - 另外两处明确 unsupported：嵌套 owned-graph、writable non-supervisor / ID-only Attach
 
 没有大面积 TODO stub。缺功能主要来自 **外部设备插件缺失、明确延期项、以及资格未关**，而不是空函数。

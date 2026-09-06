@@ -686,7 +686,15 @@ TEST(WireFrameCodecTest, EncoderRejectsInconsistentOrUnsupportedFlags) {
     frame.header.flags |= FlagValue(FrameFlag::kAeadPresent);
     result = WireFrameCodec::Encode(frame);
     ASSERT_FALSE(result.ok());
-    EXPECT_EQ(result.status().code(), StatusCode::kUnsupported);
+    EXPECT_EQ(result.status().code(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(result.status().message(), "AEAD key material is required");
+
+    frame = GoldenFrame();
+    frame.header.flags |= FlagValue(FrameFlag::kAeadPresent) |
+                          FlagValue(FrameFlag::kPayloadCrcPresent);
+    result = WireFrameCodec::Encode(frame);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), StatusCode::kInvalidArgument);
 }
 
 TEST(LengthPrefixedFrameDecoderTest, HandlesEveryByteAsAPartialRead) {
@@ -853,6 +861,147 @@ TEST(LengthPrefixedFrameDecoderTest, EnforcesWorkBudgetPerPush) {
     EXPECT_TRUE(decoder.failed());
     EXPECT_EQ(decoder.buffered_bytes(), 0u);
     EXPECT_EQ(decoder.retained_capacity(), 0u);
+}
+
+
+WireAeadKeyring MakeTestKeyring(uint32_t key_id = 1) {
+    WireAeadKeyring keyring;
+    std::array<std::byte, kWireAeadKeyLength> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<std::byte>((i * 17u + key_id) & 0xffu);
+    }
+    auto material = WireAeadKeyMaterial::FromBytes(bytes);
+    EXPECT_TRUE(material.ok()) << material.status().ToString();
+    WireAeadKey key;
+    key.key_id = key_id;
+    key.material = std::move(*material);
+    EXPECT_TRUE(keyring.SetEncodeKey(std::move(key)).ok());
+    return keyring;
+}
+
+TEST(WireFrameCodecTest, AeadRoundTripEncryptsAndDecrypts) {
+    WireAeadKeyring keyring = MakeTestKeyring();
+    WireFrame frame = GoldenFrame();
+    frame.header.flags = FlagValue(FrameFlag::kAeadPresent);
+    auto encoded_no_key = WireFrameCodec::Encode(frame);
+    ASSERT_FALSE(encoded_no_key.ok());
+    EXPECT_EQ(encoded_no_key.status().code(), StatusCode::kInvalidArgument);
+    auto sized_no_key = WireFrameCodec::EncodedSize(frame);
+    ASSERT_FALSE(sized_no_key.ok());
+    EXPECT_EQ(sized_no_key.status().code(), StatusCode::kInvalidArgument);
+
+    auto encoded = WireFrameCodec::Encode(frame, {}, &keyring);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    auto sized = WireFrameCodec::EncodedSize(frame, {}, &keyring);
+    ASSERT_TRUE(sized.ok()) << sized.status().ToString();
+    EXPECT_EQ(*sized, encoded->size());
+    EXPECT_EQ(encoded->size(),
+              kWireBaseHeaderLength + kWireAeadKeyIdLength +
+                  frame.payload.size() + kWireAeadOverhead);
+    // Ciphertext must not equal plaintext.
+    const auto body_payload =
+        std::span<const std::byte>(*encoded).subspan(
+            kWireBaseHeaderLength + kWireAeadKeyIdLength + kWireAeadNonceLength,
+            frame.payload.size());
+    EXPECT_FALSE(std::equal(body_payload.begin(), body_payload.end(),
+                            frame.payload.begin(), frame.payload.end()));
+
+    auto decoded_missing = WireFrameCodec::Decode(*encoded);
+    ASSERT_FALSE(decoded_missing.ok());
+    EXPECT_EQ(decoded_missing.status().code(), StatusCode::kInvalidArgument);
+
+    auto decoded = WireFrameCodec::Decode(*encoded, {}, &keyring);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(*decoded, frame);
+
+    std::vector<std::byte> owned = *encoded;
+    auto view = WireFrameCodec::DecodeView(std::move(owned), {}, &keyring);
+    ASSERT_TRUE(view.ok()) << view.status().ToString();
+    EXPECT_TRUE(MatchesWireFrame(*view, frame));
+}
+
+TEST(WireFrameCodecTest, AeadDetectsTampering) {
+    WireAeadKeyring keyring = MakeTestKeyring();
+    WireFrame frame = GoldenFrame();
+    frame.header.flags = FlagValue(FrameFlag::kAeadPresent) |
+                         FlagValue(FrameFlag::kPerfTraceSampled);
+    frame.header.perf_trace = PerfTraceContext{
+        .trace_id_high = 9,
+        .trace_id_low = 8,
+        .sample_flags = 7,
+        .clock_domain_id = 6,
+        .origin_wall_time_ns = 5,
+        .origin_monotonic_ns = 4,
+    };
+    auto body = WireFrameCodec::Encode(frame, {}, &keyring);
+    ASSERT_TRUE(body.ok()) << body.status().ToString();
+
+    std::vector<std::byte> flip_header = *body;
+    flip_header[12] ^= std::byte{0x01};
+    auto bad_header = WireFrameCodec::Decode(flip_header, {}, &keyring);
+    ASSERT_FALSE(bad_header.ok());
+    EXPECT_EQ(bad_header.status().code(), StatusCode::kCorruption);
+
+    std::vector<std::byte> flip_cipher = *body;
+    flip_cipher.back() ^= std::byte{0x01};
+    auto bad_tag = WireFrameCodec::Decode(flip_cipher, {}, &keyring);
+    ASSERT_FALSE(bad_tag.ok());
+    EXPECT_EQ(bad_tag.status().code(), StatusCode::kCorruption);
+    EXPECT_EQ(bad_tag.status().message(), "AEAD authentication failed");
+
+    std::vector<std::byte> flip_key_id = *body;
+    // key_id sits at optional header offset 80.
+    flip_key_id[83] ^= std::byte{0x01};
+    // Header CRC covers key_id, so this fails CRC before AEAD.
+    auto bad_key_id = WireFrameCodec::Decode(flip_key_id, {}, &keyring);
+    ASSERT_FALSE(bad_key_id.ok());
+    EXPECT_EQ(bad_key_id.status().code(), StatusCode::kCorruption);
+}
+
+TEST(WireFrameCodecTest, AeadControlFrameRoundTripKeepsClearOpcode) {
+    WireAeadKeyring keyring = MakeTestKeyring(7);
+    WireFrame frame = GoldenFrame();
+    frame.header.frame_type = FrameType::kHeartbeat;
+    frame.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                         FlagValue(FrameFlag::kAeadPresent);
+    auto encoded = WireFrameCodec::Encode(frame, {}, &keyring);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    ExpectBytesAt(*encoded, kWireBaseHeaderLength + kWireAeadKeyIdLength,
+                  {0x00, 0x00, 0x00, 0x04}, "clear control opcode");
+
+    auto inspected = WireFrameCodec::InspectHeader(*encoded);
+    ASSERT_TRUE(inspected.ok()) << inspected.status().ToString();
+    EXPECT_EQ(inspected->frame_type, FrameType::kHeartbeat);
+    EXPECT_TRUE(HasFrameFlag(inspected->flags, FrameFlag::kAeadPresent));
+
+    auto decoded = WireFrameCodec::Decode(*encoded, {}, &keyring);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(*decoded, frame);
+}
+
+TEST(WireFrameCodecTest, FlagOffPathUnchangedWithoutKeyring) {
+    WireFrame frame = GoldenFrame();
+    auto encoded = WireFrameCodec::Encode(frame);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    auto decoded = WireFrameCodec::Decode(*encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(*decoded, frame);
+}
+
+TEST(LengthPrefixedFrameDecoderTest, AeadStreamRoundTrip) {
+    WireAeadKeyring keyring = MakeTestKeyring(3);
+    WireFrame frame = GoldenFrame();
+    frame.header.flags = FlagValue(FrameFlag::kAeadPresent);
+    auto encoded = WireFrameCodec::EncodeLengthPrefixed(frame, {}, &keyring);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+    LengthPrefixedFrameDecoder decoder;
+    decoder.SetAeadKeyring(&keyring);
+    auto frames = decoder.Push(*encoded);
+    ASSERT_TRUE(frames.ok()) << frames.status().ToString();
+    ASSERT_EQ(frames->size(), 1u);
+    EXPECT_TRUE(MatchesWireFrame((*frames)[0], frame));
+    EXPECT_TRUE(decoder.Finish().ok());
 }
 
 TEST(WireFrameCodecTest, FuzzLikeMalformedInputsDoNotCrash) {

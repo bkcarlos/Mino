@@ -329,12 +329,17 @@ bool IsMinimallyStructuredWireFrame(
     }
 
     const uint16_t flags = LoadBe16(body.subspan<kFlagsOffset, 2>());
-    if ((flags & ~bridge::kKnownFrameFlags) != 0 ||
-        bridge::HasFrameFlag(flags, bridge::FrameFlag::kAeadPresent)) {
+    if ((flags & ~bridge::kKnownFrameFlags) != 0) {
+        return false;
+    }
+    // AEAD and payload CRC share the optional 4-byte header slot.
+    if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kAeadPresent) &&
+        bridge::HasFrameFlag(flags, bridge::FrameFlag::kPayloadCrcPresent)) {
         return false;
     }
     uint32_t canonical_header_length = bridge::kWireBaseHeaderLength;
-    if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kPayloadCrcPresent)) {
+    if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kPayloadCrcPresent) ||
+        bridge::HasFrameFlag(flags, bridge::FrameFlag::kAeadPresent)) {
         canonical_header_length += bridge::kWirePayloadCrcLength;
     }
     if (bridge::HasFrameFlag(flags, bridge::FrameFlag::kPerfTraceSampled)) {
