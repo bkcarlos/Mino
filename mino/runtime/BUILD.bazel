@@ -339,10 +339,14 @@ cc_test(
 cc_test(
     name = "simple_node_mp_stress_test",
     size = "small",
+    # exclusive: share /dev/shm; linux-sandbox PID namespaces otherwise collide
+    # across parallel test actions even with unique name salts.
+    tags = ["exclusive"],
     srcs = ["simple_node_mp_stress_test.cc"],
     data = ["//examples:simple_mp_pubsub_stress"],
     target_compatible_with = LINUX_ONLY,
     deps = [
+        ":mp_stress_harness",
         ":simple_node",
         "//mino/common:status",
         "@googletest//:gtest_main",
@@ -382,6 +386,9 @@ cc_test(
 cc_test(
     name = "simple_node_business_mp_stress_test",
     size = "small",
+    # exclusive: share /dev/shm; linux-sandbox PID namespaces otherwise collide
+    # across parallel test actions even with unique name salts.
+    tags = ["exclusive"],
     srcs = ["simple_node_business_mp_stress_test.cc"],
     data = [
         "//benchmarks/pipeline_comparison:autonomy_pipeline_descriptor",

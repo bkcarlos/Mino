@@ -368,8 +368,12 @@ TEST(ReplayEngineTest, RepartitionGenerationsMergeDeterministicallyAndFilter) {
     EXPECT_EQ(merged.messages[1].metadata.original_partition_generation, 2u);
 
     ReplayOptions filtered_options;
-    filtered_options.filter.partition_ids = {0};
-    filtered_options.filter.partition_generations = {2};
+    // Named locals avoid a GCC 12 -O2 -Warray-bounds false positive on the
+    // temporary const unsigned int[1] produced by brace-init assignment.
+    const std::vector<uint32_t> partition_ids{0};
+    const std::vector<uint64_t> partition_generations{2};
+    filtered_options.filter.partition_ids = partition_ids;
+    filtered_options.filter.partition_generations = partition_generations;
     filtered_options.filter.ingestion_sequence.minimum = 1;
     CapturingPublisher filtered;
     auto filtered_engine = ReplayEngine::Create(

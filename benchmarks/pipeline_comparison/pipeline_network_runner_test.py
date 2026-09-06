@@ -8,6 +8,7 @@ import contextlib
 import copy
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -119,9 +120,15 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.fake_worker = self.root / "fake_network_worker.py"
+        # See pipeline_comparison_runner_test: long Bazel python shebangs
+        # exceed the kernel limit and yield ENOEXEC. Use a /bin/sh shim.
+        self.fake_worker = self.root / "fake_network_worker"
+        impl = self.root / "fake_network_worker_impl.py"
+        impl.write_text(FAKE_WORKER, encoding="utf-8")
         self.fake_worker.write_text(
-            f"#!{sys.executable}\n{FAKE_WORKER}", encoding="utf-8"
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(impl))} \"$@\"\n",
+            encoding="utf-8",
         )
         self.fake_worker.chmod(0o755)
 

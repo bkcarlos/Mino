@@ -429,6 +429,10 @@ int RunPub(const std::filesystem::path& path, const Config& config) {
         }
         if (!WaitHandshake(session.monitor)) return 1;
         if (!WaitForFile(PeerPath(path), kHandshakeTimeout)) return 1;
+        // CONNECTED/ACCEPT does not guarantee subscription filters are live on
+        // the PUB socket yet (classic ZMQ slow-joiner). Settle briefly so the
+        // measured stream starts at sample_id 0 under tight HWM.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         for (uint64_t seq = 0; seq < config.messages; ++seq) {
             SemanticFrame frame = InitializeSourceFrame(seq, *profile, true);
             std::string bytes;

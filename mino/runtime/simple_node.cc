@@ -1400,22 +1400,6 @@ Result<SimpleNode> SimpleNode::Create(std::string_view name,
         {.slot_size = normalized.max_payload_bytes,
          .slot_count = layout.allocator_slot_count},
     };
-    MINO_ASSIGN_OR_RETURN(
-        CentralSlabAllocator allocator,
-        CentralSlabAllocator::Create(base + layout.allocator_offset,
-                                     layout.allocator_extent,
-                                     allocator_config));
-    MINO_ASSIGN_OR_RETURN(
-        AllocationJournal journal,
-        AllocationJournal::Init(base + layout.journal_offset,
-                                layout.journal_extent,
-                                layout.journal_capacity,
-                                /*handles_per_transaction=*/1, allocator));
-    MINO_ASSIGN_OR_RETURN(
-        ShmPinTable pins,
-        ShmPinTable::Init(base + layout.pins_offset, layout.pins_extent,
-                          allocator));
-
     for (uint32_t i = 0; i < normalized.topic_slots; ++i) {
         TopicSlot& slot = header->topics[i];
         slot.channel_offset =
@@ -1426,15 +1410,31 @@ Result<SimpleNode> SimpleNode::Create(std::string_view name,
         slot.capacity = normalized.queue_depth;
         slot.channel_id = i + 1;
     }
-    header->magic.store(kMagic, std::memory_order_release);
 
+    // Journal and pin table store raw pointers to the allocator facade. Bind
+    // them only after the allocator lives in SimpleNodeState so moves cannot
+    // leave dangling allocator_ pointers.
     auto state = std::make_shared<SimpleNodeState>();
     state->segment = std::move(segment);
-    state->allocator = std::move(allocator);
-    state->journal = std::move(journal);
-    state->pins = std::move(pins);
     state->header = header;
     state->name = std::string(name);
+    MINO_ASSIGN_OR_RETURN(
+        state->allocator,
+        CentralSlabAllocator::Create(base + layout.allocator_offset,
+                                     layout.allocator_extent,
+                                     allocator_config));
+    MINO_ASSIGN_OR_RETURN(
+        state->journal,
+        AllocationJournal::Init(base + layout.journal_offset,
+                                layout.journal_extent,
+                                layout.journal_capacity,
+                                /*handles_per_transaction=*/1,
+                                *state->allocator));
+    MINO_ASSIGN_OR_RETURN(
+        state->pins,
+        ShmPinTable::Init(base + layout.pins_offset, layout.pins_extent,
+                          *state->allocator));
+    header->magic.store(kMagic, std::memory_order_release);
     auto impl = std::unique_ptr<Impl>(new Impl());
     impl->state = std::move(state);
     return SimpleNode(std::move(impl));
@@ -1459,26 +1459,22 @@ Result<SimpleNode> SimpleNode::Open(std::string_view name) {
         WaitForMagic(header, Deadline::FromNow(std::chrono::seconds(2))));
     MINO_RETURN_IF_ERROR(ValidateHeader(segment, *header));
     std::byte* base = BytesOf(segment);
+    auto state = std::make_shared<SimpleNodeState>();
+    state->segment = std::move(segment);
+    state->header = header;
+    state->name = std::string(name);
     MINO_ASSIGN_OR_RETURN(
-        CentralSlabAllocator allocator,
+        state->allocator,
         CentralSlabAllocator::Attach(base + header->allocator_offset,
                                      header->allocator_extent));
     MINO_ASSIGN_OR_RETURN(
-        AllocationJournal journal,
+        state->journal,
         AllocationJournal::Attach(base + header->journal_offset,
-                                  header->journal_extent, allocator));
+                                  header->journal_extent, *state->allocator));
     MINO_ASSIGN_OR_RETURN(
-        ShmPinTable pins,
+        state->pins,
         ShmPinTable::Attach(base + header->pins_offset, header->pins_extent,
-                            allocator));
-
-    auto state = std::make_shared<SimpleNodeState>();
-    state->segment = std::move(segment);
-    state->allocator = std::move(allocator);
-    state->journal = std::move(journal);
-    state->pins = std::move(pins);
-    state->header = header;
-    state->name = std::string(name);
+                            *state->allocator));
     MINO_RETURN_IF_ERROR(RecoverState(state));
     auto impl = std::unique_ptr<Impl>(new Impl());
     impl->state = std::move(state);

@@ -3,6 +3,7 @@
 // Licensed under the GNU Lesser General Public License, Version 3.0.
 
 #include "mino/runtime/simple_node.h"
+#include "mino/runtime/mp_stress_harness.h"
 
 #include <gtest/gtest.h>
 
@@ -56,9 +57,7 @@ std::filesystem::path WorkerPath() {
 }
 
 std::string UniqueName(const char* tag) {
-    static std::atomic<uint32_t> sequence{0};
-    return std::string("/mns") + std::to_string(::getpid()) + "_" +
-           std::to_string(sequence.fetch_add(1) + 1) + "_" + tag;
+    return mp_stress::UniqueShmName(tag);
 }
 
 std::filesystem::path TmpPath(const std::string& file) {

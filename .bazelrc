@@ -84,6 +84,14 @@ build --host_per_file_copt=external/protobuf.*@-Wno-error
 build --per_file_copt=external/abseil-cpp.*@-Wno-error
 build --host_per_file_copt=external/abseil-cpp.*@-Wno-error
 
+# GCC 12 -O2 false positives under -Werror. Prefer these narrow per-file
+# demotions over the broader --config=gcc12 -Wno-maybe-uninitialized hammer.
+# result_test: libstdc++ std::variant destructor path through Status's string.
+# replay_engine_test: brace-init of tiny filter arrays triggers -Warray-bounds
+# on __builtin_memcpy in <algorithm> (same class as protobuf AuxEntry warnings).
+build --per_file_copt=mino/common/result_test.cc@-Wno-error=maybe-uninitialized
+build --per_file_copt=mino/storage/replay_engine_test.cc@-Wno-error=array-bounds
+
 build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/autonomy_pipeline.pb.cc@-Wno-error
 build:pipeline_comparison --per_file_copt=benchmarks/pipeline_comparison/protobuf_zmq_pipeline.cc@-Wno-error
 

@@ -5,6 +5,8 @@
 #ifndef MINO_RUNTIME_MP_STRESS_HARNESS_H_
 #define MINO_RUNTIME_MP_STRESS_HARNESS_H_
 
+#include <cstdio>
+#include <random>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -49,9 +51,25 @@ inline std::filesystem::path FindWorker(std::string_view relative) {
 }
 
 inline std::string UniqueShmName(const char* tag) {
+    // linux-sandbox remaps PIDs into a small namespace, so getpid()-only names
+    // collide across parallel test actions that share /dev/shm. Mix TEST_TMPDIR
+    // (unique per action) and a random salt.
     static std::atomic<uint32_t> sequence{0};
-    return std::string("/mns") + std::to_string(::getpid()) + "_" +
-           std::to_string(sequence.fetch_add(1) + 1) + "_" + tag;
+    static const uint32_t kSalt = [] {
+        std::random_device rd;
+        uint32_t salt = rd() ^ (rd() << 1) ^ static_cast<uint32_t>(::getpid());
+        if (const char* tmp = std::getenv("TEST_TMPDIR"); tmp != nullptr) {
+            for (const char* p = tmp; *p != '\0'; ++p) {
+                salt = salt * 16777619u ^ static_cast<unsigned char>(*p);
+            }
+        }
+        return salt ? salt : 0x6d696e6fu;  // "mino"
+    }();
+    char buf[64];
+    std::snprintf(
+        buf, sizeof(buf), "/mns%x_%u_%s", kSalt,
+        sequence.fetch_add(1) + 1, tag == nullptr ? "t" : tag);
+    return buf;
 }
 
 inline std::filesystem::path UniqueIpcPath(const char* tag) {

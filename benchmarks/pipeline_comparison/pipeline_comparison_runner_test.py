@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 import os
 import subprocess
 import sys
@@ -137,9 +138,16 @@ class PipelineComparisonRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.fake_worker = self.root / "fake_pipeline_worker.py"
+        # Kernel shebang length is ~127 bytes; Bazel rules_python interpreters
+        # exceed that and produce ENOEXEC when used as `#!{sys.executable}`.
+        # Launch through /bin/sh so the long interpreter path is an argv word.
+        self.fake_worker = self.root / "fake_pipeline_worker"
+        impl = self.root / "fake_pipeline_worker_impl.py"
+        impl.write_text(FAKE_WORKER, encoding="utf-8")
         self.fake_worker.write_text(
-            f"#!{sys.executable}\n{FAKE_WORKER}", encoding="utf-8"
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(impl))} \"$@\"\n",
+            encoding="utf-8",
         )
         self.fake_worker.chmod(0o755)
 

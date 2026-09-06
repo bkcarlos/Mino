@@ -11,7 +11,10 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <optional>
 #include <span>
 #include <string>
@@ -53,9 +56,23 @@ constexpr int kChildPayload = 4;
 constexpr int kChildCount = 5;
 
 std::string UniqueName(const char* tag) {
+    // See mp_stress_harness::UniqueShmName — sandbox PID namespaces collide.
     static std::atomic<uint32_t> sequence{0};
-    return std::string("/mnp") + std::to_string(::getpid()) + "_" +
-           std::to_string(sequence.fetch_add(1) + 1) + "_" + tag;
+    static const uint32_t kSalt = [] {
+        std::random_device rd;
+        uint32_t salt = rd() ^ (rd() << 1) ^ static_cast<uint32_t>(::getpid());
+        if (const char* tmp = std::getenv("TEST_TMPDIR"); tmp != nullptr) {
+            for (const char* p = tmp; *p != '\0'; ++p) {
+                salt = salt * 16777619u ^ static_cast<unsigned char>(*p);
+            }
+        }
+        return salt ? salt : 0x6d6e70u;  // "mnp"
+    }();
+    char buf[64];
+    std::snprintf(
+        buf, sizeof(buf), "/mnp%x_%u_%s", kSalt,
+        sequence.fetch_add(1) + 1, tag == nullptr ? "t" : tag);
+    return buf;
 }
 
 class SimpleNodeTest : public ::testing::Test {
