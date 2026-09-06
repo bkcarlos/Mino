@@ -3,8 +3,10 @@
 
 Remote mode assumes the repository and requested binaries already exist at each
 role's configured workdir. SSH is non-interactive. Cross-host runs use
-independent-host clock semantics and never report one-way latency unless a
-future runner adds an explicit PTP qualification contract.
+independent-host clock semantics and leave one-way latency unreported unless
+`--ptp-sync-quality-path` points at a live mino.ptp_sync_quality.v1 file that
+keeps PtpClockClient::AllowsCrossNodeOneWayReporting() true (fail-closed).
+Physical two-host PTP hardware qualification remains out of band.
 """
 
 from __future__ import annotations
@@ -174,6 +176,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--schema-descriptor-relative",
         default=DEFAULT_DESCRIPTOR,
         help="repository-relative minoc descriptor for mino_tcp",
+    )
+    parser.add_argument(
+        "--ptp-sync-quality-path",
+        type=Path,
+        default=None,
+        help=(
+            "absolute path to a mino.ptp_sync_quality.v1 file on each role host; "
+            "enables gated cross-host one-way latency for mino_tcp when the "
+            "sidecar publishes synchronized quality (fail-closed otherwise)"
+        ),
+    )
+    parser.add_argument(
+        "--ptp-clock-domain-id",
+        type=_bounded_int("--ptp-clock-domain-id", 1, 4_294_967_295),
+        default=1,
+        help="PTP clock_domain_id passed to mino_tcp workers when quality path is set",
     )
     parser.add_argument("--keep-remote-runtime", action="store_true")
     return parser
@@ -470,7 +488,7 @@ def _common_arguments(
     output: Path,
     same_host: bool,
 ) -> list[str]:
-    return [
+    arguments = [
         "--role",
         role,
         "--profile",
@@ -491,6 +509,25 @@ def _common_arguments(
         str(runtime_dir),
         "--output",
         str(output),
+    ]
+    return arguments
+
+
+def _ptp_arguments(args: argparse.Namespace, same_host: bool) -> list[str]:
+    if args.ptp_sync_quality_path is None:
+        return []
+    if same_host:
+        raise ConfigurationError(
+            "--ptp-sync-quality-path requires a multi-boot (independent-hosts) topology"
+        )
+    path = args.ptp_sync_quality_path.expanduser()
+    if not path.is_absolute():
+        raise ConfigurationError("--ptp-sync-quality-path must be absolute")
+    return [
+        "--ptp-sync-quality-path",
+        str(path),
+        "--ptp-clock-domain-id",
+        str(args.ptp_clock_domain_id),
     ]
 
 
@@ -527,7 +564,7 @@ def _backend_arguments(
             "--port-base", str(args.port_base),
             "--hwm", str(args.zmq_hwm),
         ]
-    return [
+    arguments = [
         "--listen-address",
         topology[role].data_address if same_host else "0.0.0.0",
         "--peer-address",
@@ -539,6 +576,13 @@ def _backend_arguments(
         "--receive-batch-size",
         str(args.receive_batch_size),
     ]
+    if args.backend == "mino_tcp":
+        arguments.extend(_ptp_arguments(args, same_host))
+    elif getattr(args, "ptp_sync_quality_path", None) is not None:
+        raise ConfigurationError(
+            "--ptp-sync-quality-path is only supported for mino_tcp"
+        )
+    return arguments
 
 
 def create_workers(
@@ -840,6 +884,17 @@ def collect_results(
     return errors
 
 
+def _ptp_one_way_requested(args: argparse.Namespace) -> bool:
+    return getattr(args, "ptp_sync_quality_path", None) is not None
+
+
+def _document_one_way_latency_valid(document: Mapping[str, Any]) -> bool:
+    details = document.get("backend_details")
+    if not isinstance(details, dict):
+        return False
+    return bool(details.get("one_way_latency_valid"))
+
+
 def validate_result(
     document: Any,
     *,
@@ -849,6 +904,13 @@ def validate_result(
     same_host: bool,
     expected_boot_id: str,
 ) -> dict[str, Any]:
+    expect_sink_latency = same_host
+    if (
+        not same_host
+        and _ptp_one_way_requested(args)
+        and worker.host.role == "canbus"
+    ):
+        expect_sink_latency = _document_one_way_latency_valid(document)
     validated = validate_worker_result(
         document,
         expected_backend=BACKEND_WORKER_NAMES[args.backend],
@@ -862,7 +924,7 @@ def validate_result(
         expected_clock_mode="same-host" if same_host else "independent-hosts",
         expected_runtime_directory=worker.runtime_dir,
         expected_output=worker.remote_result,
-        expect_sink_latency=same_host,
+        expect_sink_latency=expect_sink_latency,
     )
     if validated["clock"]["boot_id"] != expected_boot_id:
         raise ValueError("clock.boot_id differs from the preflight host identity")
@@ -895,8 +957,12 @@ def validate_results(
             clock = validated["clock"]
             clocks.append((clock["name"], clock["resolution_ns"], clock["boot_id"]))
             if worker.host.role == "canbus":
+                report_latency = same_host or (
+                    _ptp_one_way_requested(args)
+                    and _document_one_way_latency_valid(validated)
+                )
                 sink = {
-                    "latency_ns": validated["latency_ns"] if same_host else None,
+                    "latency_ns": validated["latency_ns"] if report_latency else None,
                     "elapsed_ns": validated["elapsed_ns"],
                     "throughput_messages_per_second": validated[
                         "throughput_messages_per_second"
@@ -981,7 +1047,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "backend": args.backend,
             "profile": args.profile,
             "clock_mode": "same-host" if same_host else "independent-hosts",
-            "one_way_latency_valid": same_host and not errors,
+            "one_way_latency_valid": (
+                (
+                    same_host
+                    or (
+                        _ptp_one_way_requested(args)
+                        and sink is not None
+                        and _document_one_way_latency_valid(sink.get("backend_details") or {})
+                    )
+                )
+                and not errors
+            ),
+            "ptp_sync_quality_path": (
+                str(args.ptp_sync_quality_path)
+                if args.ptp_sync_quality_path is not None
+                else None
+            ),
             "host_identity_source": "Linux boot ID read through each role execution path",
             "config": {
                 "messages": args.messages,

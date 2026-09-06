@@ -26,7 +26,7 @@
 | Region ID Attach | **DONE** | `region_name_registry.*`：空 name + region_id 经持久 registry 解析 |
 | 持久 Dedup Store | **DONE** | `dedup_store.*` + BridgePipeline 种子化 / HWM 持久化 |
 | SharedHostDomain v3 | **DONE** | MPSC/Broadcast、borrow、typed、`Recover()`；**CentralSlab + AllocationJournal + ShmPinTable**（ABI `MINOSHD3`，与 v1/v2 不兼容） |
-| P9 PTP + RDMA/Fabric 参考插件 | **DONE（软件路径）** | `PtpClockClient`；`libmino_rdma_{software_loopback,verbs}.so`；`libmino_fabric_software_loopback.so`；**不算** V-25 硬件资格 |
+| P9 PTP + RDMA/Fabric 参考插件 | **DONE（软件路径）** | `PtpClockClient` + `PtpSyncSidecar` + pipeline 门控；RDMA/Fabric 参考插件；**不算** V-25 / 双机 PTP 硬件资格 |
 
 ### Exclusive hop 契约（勿写错）
 
@@ -63,7 +63,7 @@
 
 ### P9 PTP + RDMA/Fabric 参考插件
 
-- PTP：`PtpClockClient`（PHC / `clock_gettime`）；无合格同步不报跨机单向延迟
+- PTP：`PtpClockClient` + `PtpSyncSidecar`（`mino.ptp_sync_quality.v1`）；无合格同步不报跨机单向延迟；物理双机 PTP qual 仍缺
 - RDMA：`libmino_rdma_software_loopback.so` + `libmino_rdma_verbs.so`（绝对路径 `dlopen`）
 - Fabric：`libmino_fabric_software_loopback.so`
 - **不**声称 V-25 硬件资格；软件 provenance 含 `NOT-QUALIFICATION-ELIGIBLE`

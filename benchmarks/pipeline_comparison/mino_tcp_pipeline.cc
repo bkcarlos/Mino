@@ -6,6 +6,8 @@
 
 #include <arpa/inet.h>
 
+#include <time.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -30,6 +32,8 @@
 #include <vector>
 
 #include "mino/bridge/wire_frame.h"
+#include "mino/observability/ptp_clock.h"
+#include "mino/observability/ptp_sync_sidecar.h"
 #include "mino/common/result.h"
 #include "mino/common/status.h"
 #include "mino/schema/codegen/artifact_codec.h"
@@ -75,6 +79,9 @@ struct BackendOptions {
     std::filesystem::path descriptor;
     uint32_t receive_batch_size = 1;
     bool independent_host_clocks = false;
+    // Absolute quality file for PtpSyncSidecar (empty = PTP one-way disabled).
+    std::filesystem::path ptp_sync_quality_path;
+    uint32_t ptp_clock_domain_id = 1;
 };
 
 struct RunStatistics {
@@ -87,6 +94,78 @@ struct RunStatistics {
     uint64_t first_measured_completion_ns = 0;
     uint64_t last_measured_completion_ns = 0;
     std::vector<uint64_t> latencies_ns;
+};
+
+// Optional PTP sync-quality session for cross-host one-way latency. Fail-closed
+// unless the sidecar publishes synchronized quality within thresholds.
+class PtpReportingSession {
+  public:
+    static std::unique_ptr<PtpReportingSession> MaybeCreate(
+        const BackendOptions& backend) {
+        if (backend.ptp_sync_quality_path.empty()) return nullptr;
+        if (!backend.independent_host_clocks) {
+            throw std::runtime_error(
+                "--ptp-sync-quality-path requires --clock-mode=independent-hosts");
+        }
+        const std::string path = backend.ptp_sync_quality_path.string();
+        if (path.empty() || path.front() != '/') {
+            throw std::runtime_error(
+                "--ptp-sync-quality-path must be an absolute path");
+        }
+        observability::PtpClockClientOptions options;
+        options.clock_domain_id = backend.ptp_clock_domain_id;
+        options.clock_id = CLOCK_REALTIME;
+        options.clock_id_explicit = true;
+        options.maximum_uncertainty_ns = 1'000'000ull;
+        options.maximum_sync_age_ns = 2'000'000'000ull;
+        auto client = observability::PtpClockClient::Create(options);
+        if (!client.ok()) {
+            throw std::runtime_error("PTP clock client create failed: " +
+                                     client.status().ToString());
+        }
+        auto session = std::unique_ptr<PtpReportingSession>(
+            new PtpReportingSession(std::move(*client), path));
+        session->PollOrThrow();
+        return session;
+    }
+
+    void PollOrThrow() {
+        const Status status = sidecar_.PollOnce();
+        if (!status.ok()) {
+            throw std::runtime_error("PTP sync sidecar poll failed: " +
+                                     status.ToString());
+        }
+    }
+
+    bool AllowsCrossNodeOneWayReporting() const {
+        return client_.AllowsCrossNodeOneWayReporting();
+    }
+
+    uint64_t NowWallNsOrThrow() const {
+        const auto wall = client_.NowWallNs();
+        if (!wall.ok()) {
+            throw std::runtime_error("PTP wall clock sample failed: " +
+                                     wall.status().ToString());
+        }
+        return *wall;
+    }
+
+  private:
+    PtpReportingSession(observability::PtpClockClient client, std::string path)
+        : client_(std::move(client)),
+          sidecar_(&client_, MakeSidecarOptions(std::move(path))) {}
+
+    static observability::PtpSyncSidecarOptions MakeSidecarOptions(
+        std::string path) {
+        observability::PtpSyncSidecarOptions options;
+        options.quality_path = std::move(path);
+        options.maximum_file_age_ns = 5'000'000'000ull;
+        options.publish_unsynchronized_on_failure = true;
+        return options;
+    }
+
+    observability::PtpClockClient client_;
+    observability::PtpSyncSidecar sidecar_;
 };
 
 uint64_t AbsoluteDeadline(const CommonOptions& options) {
@@ -202,6 +281,8 @@ BackendOptions ParseBackendOptions(int argc, char** argv) {
     bool descriptor_seen = false;
     bool receive_batch_seen = false;
     bool clock_seen = false;
+    bool ptp_path_seen = false;
+    bool ptp_domain_seen = false;
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) {
             throw std::invalid_argument("argv contains a null argument");
@@ -279,10 +360,42 @@ BackendOptions ParseBackendOptions(int argc, char** argv) {
                 throw std::runtime_error(
                     "--clock-mode must be same-host or independent-hosts");
             }
+            continue;
+        }
+        if (const auto value = OptionValue(
+                &index, argc, argv, "--ptp-sync-quality-path")) {
+            if (ptp_path_seen) {
+                throw std::runtime_error(
+                    "--ptp-sync-quality-path may be specified only once");
+            }
+            ptp_path_seen = true;
+            options.ptp_sync_quality_path = std::filesystem::path(*value);
+            continue;
+        }
+        if (const auto value = OptionValue(
+                &index, argc, argv, "--ptp-clock-domain-id")) {
+            if (ptp_domain_seen) {
+                throw std::runtime_error(
+                    "--ptp-clock-domain-id may be specified only once");
+            }
+            ptp_domain_seen = true;
+            const uint64_t parsed =
+                ParseUnsigned(*value, "--ptp-clock-domain-id");
+            if (parsed == 0 || parsed > 0xffffffffull) {
+                throw std::runtime_error(
+                    "--ptp-clock-domain-id must be in [1, 4294967295]");
+            }
+            options.ptp_clock_domain_id = static_cast<uint32_t>(parsed);
+            continue;
         }
     }
     if (!descriptor_seen) {
         throw std::runtime_error("--schema-descriptor is required");
+    }
+    if (!options.ptp_sync_quality_path.empty() &&
+        !options.independent_host_clocks) {
+        throw std::runtime_error(
+            "--ptp-sync-quality-path requires --clock-mode=independent-hosts");
     }
     return options;
 }
@@ -927,7 +1040,8 @@ uint64_t TotalFrames(const CommonOptions& options) {
 
 void RunSource(const CommonOptions& options, const BackendOptions& backend,
                MinoTcpPipeline* transport, PipelineSchema& schema,
-               uint64_t deadline_ns, RunStatistics* statistics) {
+               uint64_t deadline_ns, RunStatistics* statistics,
+               PtpReportingSession* ptp) {
     const size_t output_edge = *OutputEdge(options.role);
     const uint64_t total = TotalFrames(options);
     const uint64_t schedule_start_ns = NowNs();
@@ -937,6 +1051,15 @@ void RunSource(const CommonOptions& options, const BackendOptions& backend,
         const bool measured = sample_id >= options.warmup_messages;
         SemanticFrame frame =
             InitializeSourceFrame(sample_id, options.profile, measured);
+        // Cross-host one-way latency requires a shared PTP wall domain. When the
+        // sidecar gate allows reporting, overwrite the monotonic origin with a
+        // wall sample; otherwise keep not-reporting at the sink.
+        if (measured && ptp != nullptr) {
+            ptp->PollOrThrow();
+            if (ptp->AllowsCrossNodeOneWayReporting()) {
+                frame.origin_timestamp_ns = ptp->NowWallNsOrThrow();
+            }
+        }
         std::string error;
         if (!ApplyConfiguredStage(backend, Role::kPerception, &frame, &error)) {
             ++statistics->corrupt;
@@ -983,7 +1106,8 @@ void RunForwarder(const CommonOptions& options, const BackendOptions& backend,
 
 void RunSink(const CommonOptions& options, const BackendOptions& backend,
              MinoTcpPipeline* transport, PipelineSchema& schema,
-             uint64_t deadline_ns, RunStatistics* statistics) {
+             uint64_t deadline_ns, RunStatistics* statistics,
+             PtpReportingSession* ptp) {
     const size_t input_edge = *InputEdge(options.role);
     statistics->latencies_ns.reserve(static_cast<size_t>(std::min(
         options.messages, kMaximumInitialLatencyReserve)));
@@ -1017,6 +1141,18 @@ void RunSink(const CommonOptions& options, const BackendOptions& backend,
             }
             statistics->latencies_ns.push_back(
                 completion_ns - frame.origin_timestamp_ns);
+        } else if (ptp != nullptr) {
+            ptp->PollOrThrow();
+            if (ptp->AllowsCrossNodeOneWayReporting()) {
+                const uint64_t wall_completion = ptp->NowWallNsOrThrow();
+                if (wall_completion < frame.origin_timestamp_ns) {
+                    ++statistics->corrupt;
+                    throw std::runtime_error(
+                        "PTP sink wall completion precedes frame origin");
+                }
+                statistics->latencies_ns.push_back(
+                    wall_completion - frame.origin_timestamp_ns);
+            }
         }
         ++statistics->measured_completed;
     }
@@ -1024,13 +1160,15 @@ void RunSink(const CommonOptions& options, const BackendOptions& backend,
 
 std::string BackendDetails(const BackendOptions& backend,
                            const PipelineSchema& schema,
-                           const MinoTcpPipeline& transport) {
+                           const MinoTcpPipeline& transport,
+                           bool cross_host_one_way_reporting_allowed) {
     const auto& identity = schema.descriptor().identity();
     return BuildMinoTcpBackendDetails(
         identity.short_id(), identity.schema_version(), identity.layout_version(),
         backend.independent_host_clocks ? ClockMode::kIndependentHosts
                                         : ClockMode::kSameHost,
-        backend.receive_batch_size, transport.EndpointsJson());
+        backend.receive_batch_size, transport.EndpointsJson(),
+        cross_host_one_way_reporting_allowed);
 }
 
 void PopulateResult(const CommonOptions& options,
@@ -1115,7 +1253,12 @@ int PipelineMain(int argc, char** argv) {
         PipelineSchema schema(backend.descriptor);
         const uint64_t deadline_ns = AbsoluteDeadline(common);
         MinoTcpPipeline transport(common, backend);
-        result.backend_details = BackendDetails(backend, schema, transport);
+        std::unique_ptr<PtpReportingSession> ptp =
+            PtpReportingSession::MaybeCreate(backend);
+        const bool ptp_allows =
+            ptp != nullptr && ptp->AllowsCrossNodeOneWayReporting();
+        result.backend_details =
+            BackendDetails(backend, schema, transport, ptp_allows);
         WriteReadyFile(common.runtime_dir, kBackend, common.role, common.run_id);
         if (!WaitForStartFile(common.runtime_dir, common.run_id, deadline_ns)) {
             throw std::runtime_error("deadline expired waiting for start file");
@@ -1124,7 +1267,7 @@ int PipelineMain(int argc, char** argv) {
         switch (common.role) {
             case Role::kPerception:
                 RunSource(common, backend, &transport, schema, deadline_ns,
-                          &statistics);
+                          &statistics, ptp.get());
                 break;
             case Role::kPrediction:
             case Role::kPlanning:
@@ -1135,7 +1278,7 @@ int PipelineMain(int argc, char** argv) {
                 break;
             case Role::kCanbus:
                 RunSink(common, backend, &transport, schema, deadline_ns,
-                        &statistics);
+                        &statistics, ptp.get());
                 break;
         }
         if (statistics.measured_completed != common.messages) {
@@ -1144,7 +1287,19 @@ int PipelineMain(int argc, char** argv) {
         }
         transport.Complete(TotalFrames(common), deadline_ns);
         transport.CloseOrThrow();
+        if (ptp != nullptr) {
+            ptp->PollOrThrow();
+        }
+        const bool ptp_allows_final =
+            ptp != nullptr && ptp->AllowsCrossNodeOneWayReporting();
+        result.backend_details =
+            BackendDetails(backend, schema, transport, ptp_allows_final);
         PopulateResult(common, backend, statistics, true, &result);
+        // Independent hosts without a live PTP gate must not report one-way
+        // samples even if a transient gate briefly allowed recording.
+        if (backend.independent_host_clocks && !ptp_allows_final) {
+            result.latency_ns = Distribution{};
+        }
         WriteSinkResult(result);
         return 0;
     } catch (const std::exception& exception) {

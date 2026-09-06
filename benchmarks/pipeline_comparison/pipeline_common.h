@@ -237,10 +237,14 @@ bool WriteBridgeParseFailureArtifactFromArgs(int argc, char** argv,
                                              std::string_view parse_error);
 
 // Pure JSON builder shared by the Mino TCP worker and regression tests.
+// Same-host always sets one_way_latency_valid=true. Independent hosts set it
+// true only when cross_host_one_way_reporting_allowed is true (PTP sync gate /
+// PtpClockClient::AllowsCrossNodeOneWayReporting). Otherwise false.
 std::string BuildMinoTcpBackendDetails(
     uint64_t schema_short_id, uint32_t schema_version,
     uint32_t layout_version, ClockMode clock_mode,
-    uint32_t receive_batch_size, std::string_view endpoints_json);
+    uint32_t receive_batch_size, std::string_view endpoints_json,
+    bool cross_host_one_way_reporting_allowed = false);
 
 // Writes via a temporary sibling and atomic rename. Count inconsistencies and
 // malformed backend_details force a failure artifact rather than suppressing it.

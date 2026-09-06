@@ -193,9 +193,11 @@ port bases and empty output directories.
 | medium | 5,000 | 500 | 180 s |
 | large | 500 | 50 | 180 s |
 
-Without qualified PTP, report only reliability, encoded size, CPU/resource
-metrics, and independent-host sink completion throughput. Do not report
-cross-host one-way latency.
+Without a live PTP sync-quality gate (`mino.ptp_sync_quality.v1` /
+`AllowsCrossNodeOneWayReporting()`), report only reliability, encoded size,
+CPU/resource metrics, and independent-host sink completion throughput. Do not
+report cross-host one-way latency. Physical two-host PTP qualification remains
+hardware-bound even when the software sidecar is present.
 
 Primary success criteria:
 

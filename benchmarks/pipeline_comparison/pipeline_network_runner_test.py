@@ -169,6 +169,8 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
             receive_batch_size=1,
             binary_relative=None,
             schema_descriptor_relative=runner.DEFAULT_DESCRIPTOR,
+            ptp_sync_quality_path=None,
+            ptp_clock_domain_id=1,
             keep_remote_runtime=False,
         )
 
@@ -533,6 +535,56 @@ class PipelineNetworkRunnerTest(unittest.TestCase):
                 same_host=False,
                 expected_boot_id="boot-b",
             )
+
+    def test_independent_host_ptp_gate_allows_latency(self) -> None:
+        args = self.arguments()
+        args.ptp_sync_quality_path = Path("/tmp/mino-ptp-quality")
+        args.ptp_clock_domain_id = 17
+        host = runner.RoleHost(
+            role="canbus",
+            ssh_host="host-b",
+            data_address="10.0.0.2",
+            workdir=runner.REPOSITORY_ROOT,
+            environment={},
+        )
+        runtime = Path("/tmp/mino-network-test-canbus")
+        remote_result = runtime / "result.json"
+        worker = runner.Worker(
+            host=host,
+            runtime_dir=runtime,
+            remote_result=remote_result,
+            local_result=self.root / "canbus.json",
+            stdout_path=self.root / "stdout.log",
+            stderr_path=self.root / "stderr.log",
+            command=[],
+            launcher_command=[],
+        )
+        document = self.valid_result(args, worker, same_host=False)
+        document["latency_ns"] = {
+            "samples": args.messages,
+            "p50": 10,
+            "p95": 20,
+            "p99": 30,
+            "p99_9": 40,
+            "max": 50,
+        }
+        document["backend_details"] = {
+            "one_way_latency_valid": True,
+            "ptp_one_way_reporting": True,
+        }
+        # Independent throughput uses messages-1 elapsed basis.
+        document["elapsed_ns"] = 1_000
+        document["throughput_messages_per_second"] = float(args.messages - 1) * 1e9 / 1_000
+        validated = runner.validate_result(
+            document,
+            args=args,
+            worker=worker,
+            run_id="run-1",
+            same_host=False,
+            expected_boot_id="boot-b",
+        )
+        self.assertEqual(args.messages, validated["latency_ns"]["samples"])
+
 
     def test_strict_worker_schema_rejects_missing_payload_bytes(self) -> None:
         args = self.arguments()

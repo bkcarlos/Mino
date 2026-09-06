@@ -1261,7 +1261,8 @@ bool WriteBridgeParseFailureArtifactFromArgs(
 std::string BuildMinoTcpBackendDetails(
     uint64_t schema_short_id, uint32_t schema_version,
     uint32_t layout_version, ClockMode clock_mode,
-    uint32_t receive_batch_size, std::string_view endpoints_json) {
+    uint32_t receive_batch_size, std::string_view endpoints_json,
+    bool cross_host_one_way_reporting_allowed) {
     const std::string endpoints = Trim(endpoints_json);
     if (!JsonParser(endpoints).ParseObjectDocument()) {
         throw std::invalid_argument("Mino TCP endpoints must be a JSON object");
@@ -1271,6 +1272,8 @@ std::string BuildMinoTcpBackendDetails(
     }
     const bool independent = clock_mode == ClockMode::kIndependentHosts;
     (void)ClockModeName(clock_mode);
+    const bool one_way_valid =
+        independent ? cross_host_one_way_reporting_allowed : true;
 
     std::ostringstream json;
     json << "{\"transport\":"
@@ -1285,7 +1288,9 @@ std::string BuildMinoTcpBackendDetails(
          << "\"layout_version\":" << layout_version << ','
          << "\"clock_mode\":\"" << ClockModeName(clock_mode) << "\","
          << "\"one_way_latency_valid\":"
-         << (independent ? "false" : "true") << ','
+         << (one_way_valid ? "true" : "false") << ','
+         << "\"ptp_one_way_reporting\":"
+         << (cross_host_one_way_reporting_allowed ? "true" : "false") << ','
          << "\"completion_barrier\":\"reverse hop-by-hop ACK\","
          << "\"receive_batch_size\":" << receive_batch_size << ','
          << "\"receive_cache\":\"per-connection ordered\","

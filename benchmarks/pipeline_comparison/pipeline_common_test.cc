@@ -518,6 +518,26 @@ TEST(PipelineCommonTest,
     std::filesystem::remove_all(directory);
 }
 
+TEST(PipelineCommonTest, MinoTcpBackendDetailsGatesIndependentOneWay) {
+    const std::string closed = BuildMinoTcpBackendDetails(
+        1, 1, 1, ClockMode::kIndependentHosts, 1,
+        "{\"listen\":\"127.0.0.1:24000\",\"peer\":null}");
+    EXPECT_NE(closed.find("\"one_way_latency_valid\":false"), std::string::npos);
+    EXPECT_NE(closed.find("\"ptp_one_way_reporting\":false"), std::string::npos);
+
+    const std::string open = BuildMinoTcpBackendDetails(
+        1, 1, 1, ClockMode::kIndependentHosts, 1,
+        "{\"listen\":\"127.0.0.1:24000\",\"peer\":null}",
+        /*cross_host_one_way_reporting_allowed=*/true);
+    EXPECT_NE(open.find("\"one_way_latency_valid\":true"), std::string::npos);
+    EXPECT_NE(open.find("\"ptp_one_way_reporting\":true"), std::string::npos);
+
+    const std::string same = BuildMinoTcpBackendDetails(
+        1, 1, 1, ClockMode::kSameHost, 1,
+        "{\"listen\":\"127.0.0.1:24000\",\"peer\":null}");
+    EXPECT_NE(same.find("\"one_way_latency_valid\":true"), std::string::npos);
+}
+
 TEST(PipelineCommonTest, MinoTcpBackendDetailsRemainsValidJson) {
     const std::filesystem::path directory =
         CreateTestDirectory("pipeline-mino-tcp-details-test");

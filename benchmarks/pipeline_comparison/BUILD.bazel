@@ -138,6 +138,7 @@ cc_binary(
         "//mino/bridge:wire_frame",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/observability",
         "//mino/schema:descriptor",
         "//mino/schema:dynamic_value",
         "//mino/schema:wire",

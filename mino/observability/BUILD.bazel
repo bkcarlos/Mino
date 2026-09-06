@@ -6,6 +6,7 @@ cc_library(
     srcs = [
         "clock.cc",
         "ptp_clock.cc",
+        "ptp_sync_sidecar.cc",
         "metrics.cc",
         "operational_metrics.cc",
         "otlp_exporter.cc",
@@ -18,6 +19,7 @@ cc_library(
         "bounded_queue.h",
         "clock.h",
         "ptp_clock.h",
+        "ptp_sync_sidecar.h",
         "exporter.h",
         "metrics.h",
         "operational_metrics.h",
@@ -67,6 +69,15 @@ cc_test(
 cc_test(
     name = "ptp_clock_test",
     srcs = ["ptp_clock_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ptp_sync_sidecar_test",
+    srcs = ["ptp_sync_sidecar_test.cc"],
     deps = [
         ":observability",
         "@googletest//:gtest_main",

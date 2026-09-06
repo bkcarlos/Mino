@@ -28,7 +28,7 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 | 项 | 状态 | 说明 |
 |---|---|---|
 | A8 subordinate writable / multi-writer Attach | **未实现（ADR-0014）** | 需 attachment registry + layout bump；tip 仅 fail-closed 探测 |
-| A10 ptp4l/pmc 侧车、双机 PTP 资格、pipeline 单向延迟字段 | **残留集成/资格** | `PtpClockClient` 已落地；无合格同步仍 fail-closed |
+| A10 双机 PTP 硬件资格 | **硬件资格残留** | pmc/ptp4l 侧车 + pipeline 门控已落地；无合格同步仍 fail-closed；物理双机 PTP qual 仍缺 |
 | A12 IPsec 传输 | **未做（架构选项）** | D6 落地 TLS；树内无 IPsec 驱动 |
 | SharedHostDomain → CentralSlab | **DONE（v3）** | ABI `MINOSHD3`；Publish 分配 / PollBorrow pin / Recover journal+pins；复用 SimpleNode 模式 |
 
@@ -135,15 +135,15 @@ Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region I
 
 `mino/bridge/dedup_store.*`：CRC 保护的主机本地 HWM 快照（write + fdatasync/fsync + rename + 目录 fsync），损坏/截断 fail-closed。`BridgePipeline` 在 Create/Rebind 时从 store 种子化 `DedupWindow`，并在接收路径 `CommitAccepted`/`SeedAccepted` 之后、发 ACK 之前持久化 HWM；成功恢复时清除 `local_dedup_state_lost`（degraded → durable）。未配置 store 时仍保留原 `kDegraded` 路径。
 
-### A10. PTP / 跨机时钟：客户端路径已落地；无合格同步仍 fail-closed（P9）
+### A10. PTP / 跨机时钟：客户端 + pmc/ptp4l 侧车门控已落地；物理双机资格仍缺
 
-`ClockQuality` / `CrossNodeLatencyRecorder`（`mino/observability/clock.h`）之外，P9 增加 `PtpClockClient`（`mino/observability/ptp_clock.*`）：
-- 配置绝对 PHC 路径（`/dev/ptpN` + `clock_gettime(FD_TO_CLOCKID)`）或显式 `clock_id`
-- `PublishSync` / 可选 `assume_synchronized` 发布质量；`AllowsCrossNodeOneWayReporting()` 仅在 synchronized + 不确定度/新鲜度阈值内为真
-- 未配置或未同步：fail-closed，不报告跨机单向延迟（架构 15.4 / pipeline README 不变）
-- 测试：`//mino/observability:ptp_clock_test`（含 clock_gettime 路径；PHC 不可读时 SKIP）
+`ClockQuality` / `CrossNodeLatencyRecorder`（`mino/observability/clock.h`）之外：
+- `PtpClockClient`（`ptp_clock.*`）：PHC `/dev/ptpN` 或显式 `clock_id`；`PublishSync` / `AllowsCrossNodeOneWayReporting()`；未同步 fail-closed
+- `PtpSyncSidecar`（`ptp_sync_sidecar.*`）：读取文档化 `mino.ptp_sync_quality.v1` 文件（operator 包装 pmc/ptp4l），调用 `PublishSync`；缺失/过期/解析失败/域不匹配 **fail-closed** 发布 unsynchronized；测试可 `ApplySample` 注入（无需真实 PHC）
+- pipeline / network runner：`mino_tcp` 可选 `--ptp-sync-quality-path`；仅当 `AllowsCrossNodeOneWayReporting()` 为真时填充跨机单向延迟并置 `one_way_latency_valid=true`，否则字段保持 not-reported
+- 测试：`//mino/observability:ptp_clock_test`、`//mino/observability:ptp_sync_sidecar_test`；network runner 门控单测
 
-**仍未关闭**：与 `ptp4l`/pmc 的生产侧车集成、双机 PTP 资格契约、以及在 pipeline 结果中正式启用跨机单向延迟字段。
+**仍未关闭（硬件）**：真实双机 PTP 资格契约（批准 PHC/网卡、双机 offset/uncertainty 实测、V- 级 clean-ref）。软件侧车与门控**不算**物理 PTP qualification。
 
 ### A11. 128-bit 原子不进入 v1 ABI（明确非目标）
 
@@ -216,7 +216,7 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 ## C. 文档写明的测量 / 产品边界（不是缺模块）
 
 1. **无合格 PTP 同步 ⇒ 不报告跨机单向延迟**  
-   `PtpClockClient` 可打开 PHC/`clock_gettime` 并在 `PublishSync` 后放行；未配置或未同步仍 fail-closed。pipeline README / `RESULTS_TWO_HOST_*` 在未具备 PTP 资格契约前继续不写跨机单向延迟字段。
+   `PtpClockClient` + `PtpSyncSidecar` 可在 `PublishSync` / 质量文件门控后放行；未配置或未同步仍 fail-closed。未开 sidecar 门控时 pipeline / `RESULTS_TWO_HOST_*` 继续不写跨机单向延迟；物理双机 PTP 资格仍独立于软件门控。
 
 2. **Bus 发现不覆盖 6 进程拓扑**  
    同 README Important scope boundary：SHM backend 测的是生产 allocator/SPSC/Publisher/Subscriber，**不声称**测到 `Bus` discovery 或 Region supervisor 生命周期。同机动态发现请用 `SharedHostDomain` / `SimpleNode`，不要写成「全栈无动态发现」。

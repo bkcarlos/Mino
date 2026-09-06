@@ -48,12 +48,25 @@ Local stage durations use monotonic timestamps supplied by the caller. `CrossNod
 
 Without a configured source or while unsynchronized/degraded/stale, reporting stays disabled. Opening a PHC alone does **not** imply a qualified PTP contract.
 
+### PTP sync-quality sidecar (`PtpSyncSidecar`)
+
+`ptp_sync_sidecar.h` publishes `PtpClockClient::PublishSync` from a documented file:
+
+- Schema token: `mino.ptp_sync_quality.v1`
+- Required keys: `state`, `offset_ns`, `uncertainty_ns` (optional `clock_domain_id`)
+- Operators wrap `pmc` / `ptp4l` output into this file via atomic replace
+- Missing, stale, unparseable, or domain-mismatched input **fail-closed** (publish unsynchronized)
+- Unit tests inject samples in-process without a PHC (`ApplySample`)
+
+`AllowsCrossNodeOneWayReporting()` / `CrossNodeLatencyRecorder` remain the sole gate for populating cross-host one-way latency fields.
+
 ## Validation
 
 - `//mino/observability:metrics_test`
 - `//mino/observability:tracing_test`
 - `//mino/observability:clock_test`
 - `//mino/observability:ptp_clock_test`
+- `//mino/observability:ptp_sync_sidecar_test`
 - `//mino/observability:exporter_test`
 - `//mino/observability:prometheus_http_endpoint_test`
 - `//mino/observability:monitoring_drill_test`

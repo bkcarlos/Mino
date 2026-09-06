@@ -34,8 +34,10 @@ Protobuf are comparison-only dependencies.
   path to decide whether one-way latency is valid. Different boot IDs force
   `independent-hosts` mode.
 - Multi-host mode measures message conservation, corruption, ordering, encoded
-  size, and sink throughput. It intentionally emits no cross-host one-way
-  latency without a future PTP qualification contract.
+  size, and sink throughput. Cross-host one-way latency stays unreported unless
+  `--ptp-sync-quality-path` feeds a live `mino.ptp_sync_quality.v1` file that
+  keeps `PtpClockClient::AllowsCrossNodeOneWayReporting()` true (fail-closed).
+  Physical two-host PTP hardware qualification is still a separate campaign.
 - A physical two-host capability campaign is recorded in
   `RESULTS_TWO_HOST_20260816.md`; it covers all three payload profiles with
   Mino TCP, Mino hybrid, Protobuf+ZeroMQ, Fast DDS, and Cyclone DDS. These are
@@ -358,8 +360,9 @@ Before a physical run, verify:
    or TCP port range.
 
 A multi-host manifest uses `independent-hosts`, sets
-`one_way_latency_valid=false`, and stores `latency_ns=null` in sink metrics.
-Without a measured PTP offset/error bound, only reliability and sink throughput
+`one_way_latency_valid=false`, and stores `latency_ns=null` in sink metrics
+unless the optional PTP sync-quality sidecar gate is open. Without that gate
+(or when it fail-closes), only reliability and sink throughput
 are reportable.
 
 ### Saturation versus paced latency
