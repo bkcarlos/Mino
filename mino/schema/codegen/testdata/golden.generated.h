@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mino/runtime/message_traits.h"
+#include "mino/shm/allocator/central_slab.h"
 #include "mino/shm/channel/index_slot.h"
 #include "mino/schema/dynamic_object.h"
 #include "mino/schema/wire.h"
@@ -302,9 +303,55 @@ template <> struct StaticMessageTraits<::golden::Telemetry> {
         return ::golden::TelemetryAccessor(value).valid() ? Status::Ok() :
             Status::Error(StatusCode::kSchemaMismatch, "invalid generated SHM object");
     }
+    static Status AppendOwnedChildren(
+        const ::golden::TelemetryAccessor& accessor,
+        OwnedGraphCollector& collector,
+        const CentralSlabAllocator* allocator,
+        std::size_t depth) noexcept {
+        if (depth > 32u) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "owned graph depth limit exceeded");
+        }
+        Status status = Status::Ok();
+        const auto collect_child = [&collector](const auto& metadata) {
+            if (metadata.offset == 0) return Status::Ok();
+            return collector.AddOwnedChild(
+                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});
+        };
+        const auto require_allocator = [allocator]() {
+            if (allocator == nullptr) {
+                return Status::Error(StatusCode::kUnsupported,
+                                     "nested owned graph requires allocator");
+            }
+            return Status::Ok();
+        };
+        static_cast<void>(allocator);
+        static_cast<void>(require_allocator);
+        if (accessor.has_label()) {
+            {
+                const auto metadata = accessor.label();
+                status = collect_child(metadata);
+                if (!status.ok()) return status;
+            }
+        }
+        {
+            const auto metadata = accessor.payload();
+            status = collect_child(metadata);
+            if (!status.ok()) return status;
+        }
+        {
+            const auto metadata = accessor.samples();
+            status = collect_child(metadata);
+            if (!status.ok()) return status;
+        }
+        status = collect_child(accessor.unknown_fields());
+        if (!status.ok()) return status;
+        return Status::Ok();
+    }
     static Status CollectOwnedGraph(
         ShmHandle root, const ::golden::Telemetry& value,
-        std::span<ShmHandle> output, std::size_t& handle_count) noexcept {
+        std::span<ShmHandle> output, std::size_t& handle_count,
+        const CentralSlabAllocator* allocator = nullptr) noexcept {
         handle_count = 0;
         const ::golden::TelemetryAccessor accessor(value);
         if (!accessor.valid()) {
@@ -314,20 +361,7 @@ template <> struct StaticMessageTraits<::golden::Telemetry> {
         OwnedGraphCollector collector(output);
         Status status = collector.AddRoot(root);
         if (!status.ok()) return status;
-        const auto collect_child = [&collector](const auto& metadata) {
-            if (metadata.offset == 0) return Status::Ok();
-            return collector.AddOwnedChild(
-                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});
-        };
-        if (accessor.has_label()) {
-            status = collect_child(accessor.label());
-            if (!status.ok()) return status;
-        }
-        status = collect_child(accessor.payload());
-        if (!status.ok()) return status;
-        status = collect_child(accessor.samples());
-        if (!status.ok()) return status;
-        status = collect_child(accessor.unknown_fields());
+        status = AppendOwnedChildren(accessor, collector, allocator, 0u);
         if (!status.ok()) return status;
         handle_count = collector.size();
         return Status::Ok();

@@ -248,7 +248,7 @@ TEST(CodeGeneratorTest, CollectOwnedGraphRejectsDuplicateCycleAndStaleShape) {
               StatusCode::kSchemaMismatch);
 }
 
-TEST(CodeGeneratorTest, ComplexNestedOwnedGraphIsExplicitlyUnsupported) {
+TEST(CodeGeneratorTest, ComplexNestedOwnedGraphEmitsAllocatorBackedWalk) {
     auto generated = Generate(R"idl(
 syntax = "v1";
 package nested_graph;
@@ -261,12 +261,36 @@ message Root { Child child = 1; }
         "StaticMessageTraits<::nested_graph::Root>");
     ASSERT_NE(root_traits, std::string::npos);
     const std::string root_contract =
-        generated->header.substr(root_traits, 2400u);
+        generated->header.substr(root_traits);
     EXPECT_NE(root_contract.find(
-                  "kOwnedGraphCollectionSupported = false"),
+                  "kOwnedGraphCollectionSupported = true"),
+              std::string::npos);
+    EXPECT_NE(root_contract.find("AppendOwnedChildren"), std::string::npos);
+    EXPECT_NE(root_contract.find(
+                  "StaticMessageTraits<::nested_graph::Child>::AppendOwnedChildren"),
               std::string::npos);
     EXPECT_NE(root_contract.find(
+                  "nested owned graph requires allocator"),
+              std::string::npos);
+    EXPECT_EQ(root_contract.find(
                   "generated owned graph requires nested traversal"),
+              std::string::npos);
+}
+
+TEST(CodeGeneratorTest, NestedOwnedGraphCollectsChildHandlesWithAllocator) {
+    // Structural metadata-only collect for a nested message whose child has a
+    // further variable leaf. Uses a tiny in-process allocator so Inspect can
+    // resolve the nested Child slab bytes.
+    auto generated = Generate(R"idl(
+syntax = "v1";
+package nested_collect;
+option schema_version = "1.0";
+message Child { bytes payload = 1 [max_bytes = 8]; }
+message Root { Child child = 1; }
+)idl", "nested_collect.generated.h");
+    ASSERT_TRUE(generated.ok()) << generated.status().ToString();
+    EXPECT_NE(generated->header.find(
+                  "kOwnedGraphCollectionSupported = true"),
               std::string::npos);
 }
 
@@ -281,11 +305,12 @@ TEST(CodeGeneratorTest, SameInputIsByteForByteDeterministic) {
     EXPECT_EQ(first->source, second->source);
     EXPECT_EQ(first->descriptor, second->descriptor);
 
-    const size_t label = first->header.find("collect_child(accessor.label())");
+    const size_t label =
+        first->header.find("const auto metadata = accessor.label();");
     const size_t payload =
-        first->header.find("collect_child(accessor.payload())");
+        first->header.find("const auto metadata = accessor.payload();");
     const size_t samples =
-        first->header.find("collect_child(accessor.samples())");
+        first->header.find("const auto metadata = accessor.samples();");
     const size_t unknown =
         first->header.find("collect_child(accessor.unknown_fields())");
     ASSERT_NE(label, std::string::npos);

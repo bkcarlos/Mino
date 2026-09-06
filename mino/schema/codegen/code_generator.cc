@@ -379,25 +379,105 @@ size_t NestedObjectSize(
     return plan == plans.end() ? 0 : plan->second->object_size();
 }
 
-// A direct variable allocation is a leaf only when its payload cannot contain
-// more variable metadata. User-defined and recursively variable containers are
-// intentionally unsupported until codegen can safely walk their nested shape.
-bool IsDirectOwnedLeaf(const FieldDescriptor& field,
-                       const FieldLayout& layout) {
+// A direct variable allocation is a leaf when its payload cannot contain more
+// owned handles (string/bytes bytes, or a vector of fixed scalars / inline
+// structs). Nested messages and recursively variable containers need a further
+// walk of child slabs via the allocator.
+bool IsDirectOwnedLeaf(
+    const FieldDescriptor& field, const FieldLayout& layout,
+    const std::map<std::string, const SchemaDescriptor*, std::less<>>&
+        descriptors) {
     if (layout.storage_kind() != FieldStorageKind::kVariable) return false;
     if (field.type().kind() == TypeDescriptor::Kind::kScalar) return true;
     if (field.type().kind() != TypeDescriptor::Kind::kVector) return false;
     const TypeDescriptor& element = *field.type().element_type();
-    return element.kind() == TypeDescriptor::Kind::kScalar &&
-           element.scalar() != ScalarType::kString &&
-           element.scalar() != ScalarType::kBytes;
+    if (element.kind() == TypeDescriptor::Kind::kScalar) {
+        return element.scalar() != ScalarType::kString &&
+               element.scalar() != ScalarType::kBytes;
+    }
+    if (element.kind() == TypeDescriptor::Kind::kUserDefined) {
+        const auto it = descriptors.find(element.name());
+        return it != descriptors.end() &&
+               it->second->aggregate().kind() == AggregateKind::kStruct;
+    }
+    return false;
 }
 
-bool RequiresUnsupportedOwnedGraphTraversal(const FieldDescriptor& field,
-                                             const FieldLayout& layout) {
-    if (layout.storage_kind() == FieldStorageKind::kScalar) return false;
-    if (IsDirectOwnedLeaf(field, layout)) return false;
+bool NestedTypePayloadNeedsWalk(
+    const TypeDescriptor& type,
+    const std::map<std::string, const LayoutPlan*, std::less<>>& plans,
+    const std::map<std::string, const SchemaDescriptor*, std::less<>>&
+        descriptors) {
+    if (type.kind() == TypeDescriptor::Kind::kScalar) return false;
+    if (type.kind() == TypeDescriptor::Kind::kUserDefined) {
+        const auto plan = plans.find(type.name());
+        return plan != plans.end() && plan->second->max_dynamic_children() > 0;
+    }
+    if (type.kind() != TypeDescriptor::Kind::kVector ||
+        type.element_type() == nullptr) {
+        return true;
+    }
+    const TypeDescriptor& element = *type.element_type();
+    if (element.kind() == TypeDescriptor::Kind::kScalar) {
+        return element.scalar() == ScalarType::kString ||
+               element.scalar() == ScalarType::kBytes;
+    }
+    if (element.kind() == TypeDescriptor::Kind::kUserDefined) {
+        const auto it = descriptors.find(element.name());
+        if (it != descriptors.end() &&
+            it->second->aggregate().kind() == AggregateKind::kStruct) {
+            return false;
+        }
+        return true;
+    }
     return true;
+}
+
+bool RequiresUnsupportedOwnedGraphTraversal(
+    const FieldDescriptor& field, const FieldLayout& layout,
+    const std::map<std::string, const LayoutPlan*, std::less<>>& plans,
+    const std::map<std::string, const SchemaDescriptor*, std::less<>>&
+        descriptors,
+    const std::map<std::string, std::string, std::less<>>& type_names) {
+    if (layout.storage_kind() == FieldStorageKind::kScalar) return false;
+    if (layout.storage_kind() == FieldStorageKind::kInlineStruct) return false;
+    if (IsDirectOwnedLeaf(field, layout, descriptors)) return false;
+    if (!NestedTypePayloadNeedsWalk(field.type(), plans, descriptors)) {
+        return false;
+    }
+    // Nested walks call generated AppendOwnedChildren on local types only.
+    if (field.type().kind() == TypeDescriptor::Kind::kUserDefined) {
+        return !type_names.contains(std::string(field.type().name()));
+    }
+    if (field.type().kind() == TypeDescriptor::Kind::kVector &&
+        field.type().element_type() != nullptr) {
+        const TypeDescriptor& element = *field.type().element_type();
+        if (element.kind() == TypeDescriptor::Kind::kUserDefined) {
+            const auto it = descriptors.find(element.name());
+            if (it != descriptors.end() &&
+                it->second->aggregate().kind() == AggregateKind::kMessage) {
+                return !type_names.contains(std::string(element.name()));
+            }
+        }
+        if (element.kind() == TypeDescriptor::Kind::kVector) {
+            // vector<vector<...>>: walk is generated without other traits.
+            return false;
+        }
+        if (element.kind() == TypeDescriptor::Kind::kScalar) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string QualifiedGeneratedName(
+    std::string_view full_name,
+    const std::map<std::string, std::string, std::less<>>& type_names) {
+    const auto it = type_names.find(full_name);
+    if (it == type_names.end()) return {};
+    const auto parts = SplitName(full_name);
+    const std::string ns = NamespaceName(parts);
+    return ns.empty() ? "::" + it->second : "::" + ns + "::" + it->second;
 }
 
 std::string HeaderGuard(std::string_view include,
@@ -743,6 +823,471 @@ std::string DynamicScalarExpression(ScalarType scalar,
             return {};
     }
     return {};
+}
+
+void EmitOwnedFieldWalk(
+    std::string& header, const FieldDescriptor& field,
+    const FieldLayout& field_layout, const std::string& name,
+    const std::string& metadata_name, const std::string& indent,
+    bool optional,
+    const std::map<std::string, const LayoutPlan*, std::less<>>& plans,
+    const std::map<std::string, const SchemaDescriptor*, std::less<>>&
+        descriptors,
+    const std::map<std::string, std::string, std::less<>>& type_names) {
+    const std::string body_indent = optional ? indent + "    " : indent;
+    if (optional) {
+        Line(header, indent + "if (accessor.has_" + name + "()) {");
+    }
+    Line(header, body_indent + "{");
+    Line(header, body_indent + "    const auto metadata = accessor." + name + "();");
+    Line(header, body_indent + "    status = collect_child(metadata);");
+    Line(header, body_indent + "    if (!status.ok()) return status;");
+    if (IsDirectOwnedLeaf(field, field_layout, descriptors) ||
+        !NestedTypePayloadNeedsWalk(field.type(), plans, descriptors)) {
+        Line(header, body_indent + "}");
+        if (optional) Line(header, indent + "}");
+        return;
+    }
+    Line(header, body_indent + "    if (metadata.offset != 0u) {");
+    Line(header, body_indent + "        if (depth >= 32u) {");
+    Line(header, body_indent +
+         "            return Status::Error(StatusCode::kResourceExhausted,");
+    Line(header, body_indent +
+         "                                 \"owned graph depth limit exceeded\");");
+    Line(header, body_indent + "        }");
+    Line(header, body_indent + "        status = require_allocator();");
+    Line(header, body_indent + "        if (!status.ok()) return status;");
+    const std::string handle_expr =
+        "ShmHandle{metadata.offset, metadata.generation, metadata.region_id}";
+    if (field.type().kind() == TypeDescriptor::Kind::kUserDefined) {
+        const std::string nested_q =
+            QualifiedGeneratedName(field.type().name(), type_names);
+        const size_t nested_size = NestedObjectSize(field.type(), plans);
+        Line(header, body_indent + "        auto slab = allocator->Inspect(" +
+                         handle_expr + ");");
+        Line(header, body_indent + "        if (!slab.ok()) return slab.status();");
+        Line(header, body_indent + "        if (slab->data == nullptr || slab->object_size != " +
+                         std::to_string(nested_size) + "u) {");
+        Line(header, body_indent +
+             "            return Status::Error(StatusCode::kCorruption,");
+        Line(header, body_indent +
+             "                                 \"nested owned message slab size mismatch\");");
+        Line(header, body_indent + "        }");
+        Line(header, body_indent + "        const " + nested_q +
+                         "Accessor nested(static_cast<const std::byte*>(slab->data),");
+        Line(header, body_indent +
+             "                                   static_cast<std::size_t>(slab->object_size));");
+        Line(header, body_indent + "        if (!nested.valid()) {");
+        Line(header, body_indent +
+             "            return Status::Error(StatusCode::kSchemaMismatch,");
+        Line(header, body_indent +
+             "                                 \"nested owned message metadata is invalid\");");
+        Line(header, body_indent + "        }");
+        Line(header, body_indent +
+             "        status = StaticMessageTraits<" + nested_q +
+             ">::AppendOwnedChildren(");
+        Line(header, body_indent +
+             "            nested, collector, allocator, depth + 1u);");
+        Line(header, body_indent + "        if (!status.ok()) return status;");
+    } else if (field.type().kind() == TypeDescriptor::Kind::kVector &&
+               field.type().element_type() != nullptr) {
+        const TypeDescriptor& element = *field.type().element_type();
+        const size_t element_size =
+            ElementSize(element, plans, descriptors);
+        Line(header, body_indent + "        auto slab = allocator->Inspect(" +
+                         handle_expr + ");");
+        Line(header, body_indent + "        if (!slab.ok()) return slab.status();");
+        Line(header, body_indent +
+             "        const auto* bytes = static_cast<const std::byte*>(slab->data);");
+        Line(header, body_indent +
+             "        const std::size_t byte_size = static_cast<std::size_t>(slab->object_size);");
+        Line(header, body_indent +
+             "        if (bytes == nullptr || metadata.element_size != " +
+             std::to_string(element_size) + "u ||");
+        Line(header, body_indent +
+             "            metadata.length > metadata.capacity ||");
+        Line(header, body_indent +
+             "            metadata.capacity > (byte_size / " +
+             std::to_string(element_size) + "u)) {");
+        Line(header, body_indent +
+             "            return Status::Error(StatusCode::kCorruption,");
+        Line(header, body_indent +
+             "                                 \"owned vector slab metadata mismatch\");");
+        Line(header, body_indent + "        }");
+        Line(header, body_indent +
+             "        for (std::uint64_t index = 0; index < metadata.length; ++index) {");
+        if (element.kind() == TypeDescriptor::Kind::kScalar &&
+            (element.scalar() == ScalarType::kString ||
+             element.scalar() == ScalarType::kBytes)) {
+            Line(header, body_indent +
+                 "            " + metadata_name + " element_metadata{};");
+            Line(header, body_indent +
+                 "            status = read_metadata(bytes, byte_size,");
+            Line(header, body_indent +
+                 "                static_cast<std::size_t>(index * " +
+                 std::to_string(element_size) + "u), element_metadata);");
+            Line(header, body_indent +
+                 "            if (!status.ok()) return status;");
+            Line(header, body_indent +
+                 "            status = collect_child(element_metadata);");
+            Line(header, body_indent +
+                 "            if (!status.ok()) return status;");
+        } else if (element.kind() == TypeDescriptor::Kind::kUserDefined) {
+            const auto desc_it = descriptors.find(element.name());
+            const bool is_struct =
+                desc_it != descriptors.end() &&
+                desc_it->second->aggregate().kind() == AggregateKind::kStruct;
+            if (is_struct) {
+                Line(header, body_indent + "            static_cast<void>(index);");
+            } else {
+                const std::string nested_q =
+                    QualifiedGeneratedName(element.name(), type_names);
+                const size_t nested_size = NestedObjectSize(element, plans);
+                Line(header, body_indent +
+                     "            " + metadata_name + " element_metadata{};");
+                Line(header, body_indent +
+                     "            status = read_metadata(bytes, byte_size,");
+                Line(header, body_indent +
+                     "                static_cast<std::size_t>(index * " +
+                     std::to_string(element_size) + "u), element_metadata);");
+                Line(header, body_indent +
+                     "            if (!status.ok()) return status;");
+                Line(header, body_indent +
+                     "            status = collect_child(element_metadata);");
+                Line(header, body_indent +
+                     "            if (!status.ok()) return status;");
+                if (NestedTypePayloadNeedsWalk(element, plans, descriptors)) {
+                    Line(header, body_indent +
+                         "            if (element_metadata.offset != 0u) {");
+                    Line(header, body_indent +
+                         "                if (depth + 1u >= 32u) {");
+                    Line(header, body_indent +
+                         "                    return Status::Error(StatusCode::kResourceExhausted,");
+                    Line(header, body_indent +
+                         "                                         \"owned graph depth limit exceeded\");");
+                    Line(header, body_indent + "                }");
+                    Line(header, body_indent +
+                         "                auto nested_slab = allocator->Inspect(");
+                    Line(header, body_indent +
+                         "                    ShmHandle{element_metadata.offset,");
+                    Line(header, body_indent +
+                         "                              element_metadata.generation,");
+                    Line(header, body_indent +
+                         "                              element_metadata.region_id});");
+                    Line(header, body_indent +
+                         "                if (!nested_slab.ok()) return nested_slab.status();");
+                    Line(header, body_indent +
+                         "                if (nested_slab->data == nullptr ||");
+                    Line(header, body_indent +
+                         "                    nested_slab->object_size != " +
+                         std::to_string(nested_size) + "u) {");
+                    Line(header, body_indent +
+                         "                    return Status::Error(StatusCode::kCorruption,");
+                    Line(header, body_indent +
+                         "                                         \"nested vector message slab size mismatch\");");
+                    Line(header, body_indent + "                }");
+                    Line(header, body_indent + "                const " + nested_q +
+                         "Accessor nested(");
+                    Line(header, body_indent +
+                         "                    static_cast<const std::byte*>(nested_slab->data),");
+                    Line(header, body_indent +
+                         "                    static_cast<std::size_t>(nested_slab->object_size));");
+                    Line(header, body_indent +
+                         "                if (!nested.valid()) {");
+                    Line(header, body_indent +
+                         "                    return Status::Error(StatusCode::kSchemaMismatch,");
+                    Line(header, body_indent +
+                         "                                         \"nested vector message metadata is invalid\");");
+                    Line(header, body_indent + "                }");
+                    Line(header, body_indent +
+                         "                status = StaticMessageTraits<" + nested_q +
+                         ">::AppendOwnedChildren(");
+                    Line(header, body_indent +
+                         "                    nested, collector, allocator, depth + 2u);");
+                    Line(header, body_indent +
+                         "                if (!status.ok()) return status;");
+                    Line(header, body_indent + "            }");
+                }
+            }
+        } else if (element.kind() == TypeDescriptor::Kind::kVector &&
+                   element.element_type() != nullptr) {
+            // vector<vector<T>>: collect inner vector handles; walk string/bytes
+            // or message elements one level further. Deeper nests fail closed at
+            // the Unsupported gate before codegen reaches here for local types.
+            const TypeDescriptor& inner = *element.element_type();
+            const size_t inner_element_size =
+                ElementSize(inner, plans, descriptors);
+            Line(header, body_indent +
+                 "            " + metadata_name + " inner_metadata{};");
+            Line(header, body_indent +
+                 "            status = read_metadata(bytes, byte_size,");
+            Line(header, body_indent +
+                 "                static_cast<std::size_t>(index * " +
+                 std::to_string(element_size) + "u), inner_metadata);");
+            Line(header, body_indent +
+                 "            if (!status.ok()) return status;");
+            Line(header, body_indent +
+                 "            status = collect_child(inner_metadata);");
+            Line(header, body_indent +
+                 "            if (!status.ok()) return status;");
+            if (NestedTypePayloadNeedsWalk(element, plans, descriptors)) {
+                Line(header, body_indent +
+                     "            if (inner_metadata.offset != 0u) {");
+                Line(header, body_indent +
+                     "                auto inner_slab = allocator->Inspect(");
+                Line(header, body_indent +
+                     "                    ShmHandle{inner_metadata.offset,");
+                Line(header, body_indent +
+                     "                              inner_metadata.generation,");
+                Line(header, body_indent +
+                     "                              inner_metadata.region_id});");
+                Line(header, body_indent +
+                     "                if (!inner_slab.ok()) return inner_slab.status();");
+                Line(header, body_indent +
+                     "                const auto* inner_bytes =");
+                Line(header, body_indent +
+                     "                    static_cast<const std::byte*>(inner_slab->data);");
+                Line(header, body_indent +
+                     "                const std::size_t inner_size =");
+                Line(header, body_indent +
+                     "                    static_cast<std::size_t>(inner_slab->object_size);");
+                if (inner.kind() == TypeDescriptor::Kind::kScalar &&
+                    (inner.scalar() == ScalarType::kString ||
+                     inner.scalar() == ScalarType::kBytes)) {
+                    Line(header, body_indent +
+                         "                for (std::uint64_t j = 0; j < inner_metadata.length; ++j) {");
+                    Line(header, body_indent +
+                         "                    " + metadata_name + " leaf{};");
+                    Line(header, body_indent +
+                         "                    status = read_metadata(inner_bytes, inner_size,");
+                    Line(header, body_indent +
+                         "                        static_cast<std::size_t>(j * " +
+                         std::to_string(inner_element_size) + "u), leaf);");
+                    Line(header, body_indent +
+                         "                    if (!status.ok()) return status;");
+                    Line(header, body_indent +
+                         "                    status = collect_child(leaf);");
+                    Line(header, body_indent +
+                         "                    if (!status.ok()) return status;");
+                    Line(header, body_indent + "                }");
+                } else {
+                    Line(header, body_indent +
+                         "                static_cast<void>(inner_bytes);");
+                    Line(header, body_indent +
+                         "                static_cast<void>(inner_size);");
+                    Line(header, body_indent +
+                         "                return Status::Error(StatusCode::kUnsupported,");
+                    Line(header, body_indent +
+                         "                                     \"owned graph nested vector element walk is unsupported\");");
+                }
+                Line(header, body_indent + "            }");
+            }
+        } else {
+            Line(header, body_indent +
+                 "            return Status::Error(StatusCode::kUnsupported,");
+            Line(header, body_indent +
+                 "                                 \"owned graph vector element walk is unsupported\");");
+        }
+        Line(header, body_indent + "        }");
+    } else {
+        Line(header, body_indent +
+             "        return Status::Error(StatusCode::kUnsupported,");
+        Line(header, body_indent +
+             "                             \"owned graph nested field walk is unsupported\");");
+    }
+    Line(header, body_indent + "    }");
+    Line(header, body_indent + "}");
+    if (optional) Line(header, indent + "}");
+}
+
+Status EmitOwnedGraphTraits(
+    const SchemaDescriptor& descriptor, const LayoutPlan& layout,
+    const std::map<std::string, const LayoutPlan*, std::less<>>& plans,
+    const std::map<std::string, const SchemaDescriptor*, std::less<>>&
+        descriptors,
+    const std::map<std::string, std::string, std::less<>>& type_names,
+    const std::map<uint32_t, std::string>& field_names,
+    const std::string& qualified_name, const std::string& metadata_name,
+    std::string& header) {
+    bool owned_graph_supported = true;
+    bool needs_nested_walk = false;
+    bool needs_vector_metadata_reader = false;
+    bool has_owned_fields = layout.unknown_fields_offset().has_value();
+    for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+        const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+        const FieldLayout& field_layout = layout.fields()[i];
+        if (RequiresUnsupportedOwnedGraphTraversal(field, field_layout, plans,
+                                                     descriptors, type_names)) {
+            owned_graph_supported = false;
+        }
+        if (field_layout.storage_kind() == FieldStorageKind::kVariable) {
+            has_owned_fields = true;
+            if (!IsDirectOwnedLeaf(field, field_layout, descriptors) &&
+                NestedTypePayloadNeedsWalk(field.type(), plans, descriptors)) {
+                needs_nested_walk = true;
+                if (field.type().kind() == TypeDescriptor::Kind::kVector) {
+                    needs_vector_metadata_reader = true;
+                }
+            }
+        }
+    }
+
+    const std::size_t max_handles =
+        static_cast<std::size_t>(layout.max_dynamic_children()) + 1u;
+
+    Line(header, "namespace mino {");
+    Line(header, "template <> struct StaticMessageTraits<" + qualified_name + "> {");
+    Line(header, "    static constexpr bool kIsSpecialized = true;");
+    Line(header, "    static constexpr TypeId type_id{static_cast<std::uint32_t>(" +
+                     qualified_name + "::kSchemaShortId)};");
+    Line(header, "    static constexpr std::uint32_t message_type = type_id.value;");
+    Line(header, "    static constexpr std::uint32_t schema_version = " +
+                     qualified_name + "::kSchemaVersion;");
+    Line(header, "    static constexpr std::uint64_t schema_short_id = " +
+                     qualified_name + "::kSchemaShortId;");
+    Line(header, "    static constexpr std::uint32_t layout_version = " +
+                     qualified_name + "::kLayoutVersion;");
+    Line(header, "    static constexpr std::uint32_t index_flags = " +
+                     std::string(layout.max_dynamic_children() == 0
+                                     ? "0"
+                                     : "::mino::kIndexSlotFlagHasChildSlabs") +
+                     ";");
+    Line(header, "    static constexpr bool kOwnedGraphCollectionSupported = " +
+                     std::string(owned_graph_supported ? "true" : "false") + ";");
+    Line(header, "    static constexpr std::size_t kMaxOwnedGraphHandles = " +
+                     std::to_string(max_handles) + "u;");
+    Line(header, "    static Status Validate(const " + qualified_name +
+                     "& value) noexcept {");
+    Line(header, "        return " + qualified_name +
+                     "Accessor(value).valid() ? Status::Ok() :");
+    Line(header, "            Status::Error(StatusCode::kSchemaMismatch, \"invalid generated SHM object\");");
+    Line(header, "    }");
+    Line(header, "    static Status AppendOwnedChildren(");
+    Line(header, "        const " + qualified_name + "Accessor& accessor,");
+    Line(header, "        OwnedGraphCollector& collector,");
+    Line(header, "        const CentralSlabAllocator* allocator,");
+    Line(header, "        std::size_t depth) noexcept {");
+    if (!owned_graph_supported) {
+        Line(header, "        static_cast<void>(accessor);");
+        Line(header, "        static_cast<void>(collector);");
+        Line(header, "        static_cast<void>(allocator);");
+        Line(header, "        static_cast<void>(depth);");
+        Line(header, "        return Status::Error(StatusCode::kUnsupported,");
+        Line(header, "                             \"generated owned graph requires nested traversal\");");
+    } else {
+        Line(header, "        if (depth > 32u) {");
+        Line(header, "            return Status::Error(StatusCode::kResourceExhausted,");
+        Line(header, "                                 \"owned graph depth limit exceeded\");");
+        Line(header, "        }");
+        Line(header, "        Status status = Status::Ok();");
+        if (!has_owned_fields) {
+            Line(header, "        static_cast<void>(accessor);");
+            Line(header, "        static_cast<void>(collector);");
+            Line(header, "        static_cast<void>(allocator);");
+            Line(header, "        static_cast<void>(status);");
+        } else {
+        Line(header, "        const auto collect_child = [&collector](const auto& metadata) {");
+        Line(header, "            if (metadata.offset == 0) return Status::Ok();");
+        Line(header, "            return collector.AddOwnedChild(");
+        Line(header, "                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});");
+        Line(header, "        };");
+        Line(header, "        const auto require_allocator = [allocator]() {");
+        Line(header, "            if (allocator == nullptr) {");
+        Line(header, "                return Status::Error(StatusCode::kUnsupported,");
+        Line(header, "                                     \"nested owned graph requires allocator\");");
+        Line(header, "            }");
+        Line(header, "            return Status::Ok();");
+        Line(header, "        };");
+        if (needs_vector_metadata_reader) {
+            Line(header, "        const auto load_u32_le = [](const std::byte* p) {");
+            Line(header, "            std::array<std::byte, 4> native{};");
+            Line(header, "            for (std::size_t i = 0; i < 4; ++i) {");
+            Line(header, "                const std::size_t index =");
+            Line(header, "                    std::endian::native == std::endian::little ? i : 3u - i;");
+            Line(header, "                native[index] = p[i];");
+            Line(header, "            }");
+            Line(header, "            return std::bit_cast<std::uint32_t>(native);");
+            Line(header, "        };");
+            Line(header, "        const auto load_u64_le = [](const std::byte* p) {");
+            Line(header, "            std::array<std::byte, 8> native{};");
+            Line(header, "            for (std::size_t i = 0; i < 8; ++i) {");
+            Line(header, "                const std::size_t index =");
+            Line(header, "                    std::endian::native == std::endian::little ? i : 7u - i;");
+            Line(header, "                native[index] = p[i];");
+            Line(header, "            }");
+            Line(header, "            return std::bit_cast<std::uint64_t>(native);");
+            Line(header, "        };");
+            Line(header, "        const auto read_metadata =");
+            Line(header, "            [&](const std::byte* data, std::size_t size, std::size_t offset,");
+            Line(header, "                " + metadata_name + "& out) -> Status {");
+            Line(header, "            if (data == nullptr || offset > size || 40u > size - offset) {");
+            Line(header, "                return Status::Error(StatusCode::kCorruption,");
+            Line(header, "                                     \"owned graph metadata is out of bounds\");");
+            Line(header, "            }");
+            Line(header, "            const std::byte* p = data + offset;");
+            Line(header, "            out.offset = load_u64_le(p);");
+            Line(header, "            out.generation = load_u32_le(p + 8);");
+            Line(header, "            out.region_id = load_u32_le(p + 12);");
+            Line(header, "            out.length = load_u64_le(p + 16);");
+            Line(header, "            out.capacity = load_u64_le(p + 24);");
+            Line(header, "            out.element_size = load_u64_le(p + 32);");
+            Line(header, "            return Status::Ok();");
+            Line(header, "        };");
+        } else if (!needs_nested_walk) {
+            Line(header, "        static_cast<void>(allocator);");
+            Line(header, "        static_cast<void>(require_allocator);");
+        }
+        for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
+            const FieldDescriptor& field = descriptor.aggregate().fields()[i];
+            const FieldLayout& field_layout = layout.fields()[i];
+            if (field_layout.storage_kind() != FieldStorageKind::kVariable) {
+                continue;
+            }
+            const std::string& name = field_names.at(field.id());
+            EmitOwnedFieldWalk(header, field, field_layout, name, metadata_name,
+                               "        ",
+                               field_layout.presence_bit().has_value(), plans,
+                               descriptors, type_names);
+        }
+        if (layout.unknown_fields_offset().has_value()) {
+            Line(header, "        status = collect_child(accessor.unknown_fields());");
+            Line(header, "        if (!status.ok()) return status;");
+        }
+        }
+        Line(header, "        return Status::Ok();");
+    }
+    Line(header, "    }");
+    Line(header, "    static Status CollectOwnedGraph(");
+    Line(header, "        ShmHandle root, const " + qualified_name + "& value,");
+    Line(header, "        std::span<ShmHandle> output, std::size_t& handle_count,");
+    Line(header, "        const CentralSlabAllocator* allocator = nullptr) noexcept {");
+    Line(header, "        handle_count = 0;");
+    if (!owned_graph_supported) {
+        Line(header, "        static_cast<void>(root);");
+        Line(header, "        static_cast<void>(value);");
+        Line(header, "        static_cast<void>(output);");
+        Line(header, "        static_cast<void>(allocator);");
+        Line(header, "        return Status::Error(StatusCode::kUnsupported,");
+        Line(header, "                             \"generated owned graph requires nested traversal\");");
+    } else {
+        Line(header, "        const " + qualified_name + "Accessor accessor(value);");
+        Line(header, "        if (!accessor.valid()) {");
+        Line(header, "            return Status::Error(StatusCode::kSchemaMismatch,");
+        Line(header, "                                 \"invalid generated SHM object metadata\");");
+        Line(header, "        }");
+        Line(header, "        OwnedGraphCollector collector(output);");
+        Line(header, "        Status status = collector.AddRoot(root);");
+        Line(header, "        if (!status.ok()) return status;");
+        Line(header, "        status = AppendOwnedChildren(accessor, collector, allocator, 0u);");
+        Line(header, "        if (!status.ok()) return status;");
+        Line(header, "        handle_count = collector.size();");
+        Line(header, "        return Status::Ok();");
+    }
+    Line(header, "    }");
+    Line(header, "};");
+    Line(header, "}  // namespace mino");
+    Line(header);
+    return Status::Ok();
 }
 
 Status EmitType(
@@ -1204,97 +1749,15 @@ Status EmitType(
     if (!cpp_namespace.empty()) Line(header, "}  // namespace " + cpp_namespace);
     Line(header);
 
-    bool owned_graph_supported = true;
-    size_t direct_owned_children = 0;
-    for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
-        const FieldDescriptor& field = descriptor.aggregate().fields()[i];
-        const FieldLayout& field_layout = layout.fields()[i];
-        if (RequiresUnsupportedOwnedGraphTraversal(field, field_layout)) {
-            owned_graph_supported = false;
-        }
-        if (IsDirectOwnedLeaf(field, field_layout)) ++direct_owned_children;
+    {
+        const std::string qualified_metadata =
+            cpp_namespace.empty() ? "::" + metadata_name
+                                  : "::" + cpp_namespace + "::" + metadata_name;
+        const Status owned_status = EmitOwnedGraphTraits(
+            descriptor, layout, plans, descriptors, type_names, field_names,
+            qualified_name, qualified_metadata, header);
+        if (!owned_status.ok()) return owned_status;
     }
-    if (layout.unknown_fields_offset().has_value()) ++direct_owned_children;
-
-    Line(header, "namespace mino {");
-    Line(header, "template <> struct StaticMessageTraits<" + qualified_name + "> {");
-    Line(header, "    static constexpr bool kIsSpecialized = true;");
-    Line(header, "    static constexpr TypeId type_id{static_cast<std::uint32_t>(" +
-                     qualified_name + "::kSchemaShortId)};");
-    Line(header, "    static constexpr std::uint32_t message_type = type_id.value;");
-    Line(header, "    static constexpr std::uint32_t schema_version = " +
-                     qualified_name + "::kSchemaVersion;");
-    Line(header, "    static constexpr std::uint64_t schema_short_id = " +
-                     qualified_name + "::kSchemaShortId;");
-    Line(header, "    static constexpr std::uint32_t layout_version = " +
-                     qualified_name + "::kLayoutVersion;");
-    Line(header, "    static constexpr std::uint32_t index_flags = " +
-                     std::string(layout.max_dynamic_children() == 0
-                                     ? "0"
-                                     : "::mino::kIndexSlotFlagHasChildSlabs") +
-                     ";");
-    Line(header, "    static constexpr bool kOwnedGraphCollectionSupported = " +
-                     std::string(owned_graph_supported ? "true" : "false") + ";");
-    Line(header, "    static constexpr std::size_t kMaxOwnedGraphHandles = " +
-                     std::to_string(direct_owned_children + 1) + "u;");
-    Line(header, "    static Status Validate(const " + qualified_name +
-                     "& value) noexcept {");
-    Line(header, "        return " + qualified_name +
-                     "Accessor(value).valid() ? Status::Ok() :");
-    Line(header, "            Status::Error(StatusCode::kSchemaMismatch, \"invalid generated SHM object\");");
-    Line(header, "    }");
-    Line(header, "    static Status CollectOwnedGraph(");
-    Line(header, "        ShmHandle root, const " + qualified_name + "& value,");
-    Line(header, "        std::span<ShmHandle> output, std::size_t& handle_count) noexcept {");
-    Line(header, "        handle_count = 0;");
-    if (!owned_graph_supported) {
-        Line(header, "        static_cast<void>(root);");
-        Line(header, "        static_cast<void>(value);");
-        Line(header, "        static_cast<void>(output);");
-        Line(header, "        return Status::Error(StatusCode::kUnsupported,");
-        Line(header, "                             \"generated owned graph requires nested traversal\");");
-    } else {
-        Line(header, "        const " + qualified_name + "Accessor accessor(value);");
-        Line(header, "        if (!accessor.valid()) {");
-        Line(header, "            return Status::Error(StatusCode::kSchemaMismatch,");
-        Line(header, "                                 \"invalid generated SHM object metadata\");");
-        Line(header, "        }");
-        Line(header, "        OwnedGraphCollector collector(output);");
-        Line(header, "        Status status = collector.AddRoot(root);");
-        Line(header, "        if (!status.ok()) return status;");
-        if (direct_owned_children != 0) {
-            Line(header, "        const auto collect_child = [&collector](const auto& metadata) {");
-            Line(header, "            if (metadata.offset == 0) return Status::Ok();");
-            Line(header, "            return collector.AddOwnedChild(");
-            Line(header, "                ShmHandle{metadata.offset, metadata.generation, metadata.region_id});");
-            Line(header, "        };");
-        }
-        for (size_t i = 0; i < descriptor.aggregate().fields().size(); ++i) {
-            const FieldDescriptor& field = descriptor.aggregate().fields()[i];
-            const FieldLayout& field_layout = layout.fields()[i];
-            if (!IsDirectOwnedLeaf(field, field_layout)) continue;
-            const std::string& name = field_names.at(field.id());
-            if (field_layout.presence_bit().has_value()) {
-                Line(header, "        if (accessor.has_" + name + "()) {");
-                Line(header, "            status = collect_child(accessor." + name + "());");
-                Line(header, "            if (!status.ok()) return status;");
-                Line(header, "        }");
-            } else {
-                Line(header, "        status = collect_child(accessor." + name + "());");
-                Line(header, "        if (!status.ok()) return status;");
-            }
-        }
-        if (layout.unknown_fields_offset().has_value()) {
-            Line(header, "        status = collect_child(accessor.unknown_fields());");
-            Line(header, "        if (!status.ok()) return status;");
-        }
-        Line(header, "        handle_count = collector.size();");
-        Line(header, "        return Status::Ok();");
-    }
-    Line(header, "    }");
-    Line(header, "};");
-    Line(header, "}  // namespace mino");
-    Line(header);
 
     Line(source, "static_assert(sizeof(" + qualified_name + ") == " +
                      qualified_name + "::kObjectSize);");
@@ -1388,6 +1851,44 @@ Status EmitType(
             Line(source, indent + "if (!field_status_" +
                              std::to_string(field.id()) + ".ok()) return field_status_" +
                              std::to_string(field.id()) + ";");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kInlineStruct) {
+            const std::string nested_q =
+                QualifiedGeneratedName(field.type().name(), type_names);
+            if (nested_q.empty()) {
+                Line(source, indent + "return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+                Line(source, indent + "                             \"static wire adapter requires nested SHM resolution\");");
+            } else {
+                const size_t nested_size = NestedObjectSize(field.type(), plans);
+                Line(source, indent + "{");
+                Line(source, indent + "    const auto nested_bytes = accessor." + name +
+                                 "_bytes();");
+                Line(source, indent + "    if (nested_bytes.size() != " +
+                                 std::to_string(nested_size) + "u) {");
+                Line(source, indent + "        return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch,");
+                Line(source, indent + "                                     \"inline struct field size mismatch\");");
+                Line(source, indent + "    }");
+                Line(source, indent + "    " + nested_q + " nested_value{};");
+                Line(source, indent + "    std::memcpy(nested_value.storage.data(), nested_bytes.data(),");
+                Line(source, indent + "                nested_value.storage.size());");
+                Line(source, indent + "    auto nested_message = " + nested_q +
+                                 "WireAdapter::ToDynamicMessage(nested_value);");
+                Line(source, indent + "    if (!nested_message.ok()) return nested_message.status();");
+                Line(source, indent + "    auto nested_ptr = std::make_shared<::mino::schema::DynamicMessage>(");
+                Line(source, indent + "        std::move(*nested_message));");
+                Line(source, indent + "    auto dynamic_" + std::to_string(field.id()) +
+                                 " = ::mino::schema::DynamicValue::Message(std::move(nested_ptr));");
+                Line(source, indent + "    if (!dynamic_" + std::to_string(field.id()) +
+                                 ".ok()) return dynamic_" + std::to_string(field.id()) +
+                                 ".status();");
+                Line(source, indent + "    const ::mino::Status field_status_" +
+                                 std::to_string(field.id()) + " = message.SetField(" +
+                                 std::to_string(field.id()) + "u, std::move(*dynamic_" +
+                                 std::to_string(field.id()) + "));");
+                Line(source, indent + "    if (!field_status_" +
+                                 std::to_string(field.id()) + ".ok()) return field_status_" +
+                                 std::to_string(field.id()) + ";");
+                Line(source, indent + "}");
+            }
         } else {
             Line(source, indent + "return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
             Line(source, indent + "                             \"static wire adapter requires nested SHM resolution\");");
@@ -1525,6 +2026,45 @@ Status EmitType(
                              std::to_string(element_size) + "u})) {");
             Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch);");
             Line(source, "        }");
+        } else if (field_layout.storage_kind() == FieldStorageKind::kInlineStruct) {
+            const std::string nested_q =
+                QualifiedGeneratedName(field.type().name(), type_names);
+            if (nested_q.empty()) {
+                Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
+                Line(source, "                                     \"static wire decode requires nested SHM allocation\");");
+            } else {
+                Line(source, "        if (field_" + std::to_string(field.id()) +
+                                 "->message() == nullptr ||");
+                Line(source, "            field_" + std::to_string(field.id()) +
+                                 "->message()->value == nullptr) {");
+                Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch,");
+                Line(source, "                                         \"decoded inline struct has wrong type\");");
+                Line(source, "        }");
+                Line(source, "        const auto nested_descriptor_" +
+                                 std::to_string(field.id()) + " = std::find_if(");
+                Line(source, "            descriptors->begin(), descriptors->end(),");
+                Line(source, "            [](const auto& candidate) {");
+                Line(source, "                return candidate->aggregate().full_name() == " +
+                                 CppStringLiteral(std::string(field.type().name())) + ";");
+                Line(source, "            });");
+                Line(source, "        if (nested_descriptor_" + std::to_string(field.id()) +
+                                 " == descriptors->end()) {");
+                Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kNotFound,");
+                Line(source, "                                         \"inline struct descriptor is unavailable\");");
+                Line(source, "        }");
+                Line(source, "        auto nested_bytes = ::mino::schema::CanonicalWireCodec::Encode(");
+                Line(source, "            **nested_descriptor_" + std::to_string(field.id()) + ",");
+                Line(source, "            *field_" + std::to_string(field.id()) +
+                                 "->message()->value, *descriptors, limits);");
+                Line(source, "        if (!nested_bytes.ok()) return nested_bytes.status();");
+                Line(source, "        auto nested_value = " + nested_q +
+                                 "WireAdapter::Decode(*nested_bytes, limits);");
+                Line(source, "        if (!nested_value.ok()) return nested_value.status();");
+                Line(source, "        if (!builder.set_" + name +
+                                 "_bytes(nested_value->storage)) {");
+                Line(source, "            return ::mino::Status::Error(::mino::StatusCode::kSchemaMismatch);");
+                Line(source, "        }");
+            }
         } else {
             Line(source, "        return ::mino::Status::Error(::mino::StatusCode::kUnsupported,");
             Line(source, "                                     \"static wire decode requires nested SHM allocation\");");
@@ -1651,6 +2191,7 @@ Result<GeneratedArtifacts> CodeGenerator::Generate(
         }
         Line(artifacts.header);
         Line(artifacts.header, "#include \"mino/runtime/message_traits.h\"");
+        Line(artifacts.header, "#include \"mino/shm/allocator/central_slab.h\"");
         Line(artifacts.header, "#include \"mino/shm/channel/index_slot.h\"");
         if (options.emit_wire_adapter) {
             Line(artifacts.header, "#include \"mino/schema/dynamic_object.h\"");

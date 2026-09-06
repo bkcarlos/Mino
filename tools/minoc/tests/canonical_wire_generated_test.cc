@@ -3,6 +3,7 @@
 #include "tools/minoc/tests/generated/canonical_wire.generated.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "mino/schema/compiler.h"
 #include "mino/schema/dynamic_value.h"
 #include "mino/schema/layout.h"
+#include "mino/runtime/message_traits.h"
 #include "mino/schema/object_graph_walker.h"
 #include "mino/schema/wire.h"
 #include "mino/runtime/allocation_journal.h"
@@ -414,6 +416,28 @@ TEST(CanonicalWireGeneratedTest,
         *root, *layout, root_handle, *allocator, closure);
     ASSERT_TRUE(graph.ok()) << graph.status().ToString();
     ASSERT_GT(graph->size(), 1u);
+
+    static_assert(
+        mino::StaticMessageTraits<minoc_wire_test::GraphValues>::
+            kOwnedGraphCollectionSupported);
+    auto root_slab = allocator->Inspect(root_handle);
+    ASSERT_TRUE(root_slab.ok()) << root_slab.status().ToString();
+    ASSERT_EQ(root_slab->object_size, minoc_wire_test::GraphValues::kObjectSize);
+    minoc_wire_test::GraphValues root_value{};
+    std::memcpy(root_value.storage.data(), root_slab->data,
+                root_value.storage.size());
+    std::array<mino::ShmHandle,
+               mino::StaticMessageTraits<minoc_wire_test::GraphValues>::
+                   kMaxOwnedGraphHandles>
+        typed_graph{};
+    std::size_t typed_count = 0;
+    ASSERT_TRUE(mino::CollectOwnedGraph(root_handle, root_value, typed_graph,
+                                        typed_count, &*allocator)
+                    .ok());
+    ASSERT_EQ(typed_count, graph->size());
+    for (std::size_t i = 0; i < typed_count; ++i) {
+        EXPECT_EQ(typed_graph[i], (*graph)[i]) << "handle index " << i;
+    }
 
     auto dynamic_pin = object->Pin();
     ASSERT_TRUE(dynamic_pin.ok()) << dynamic_pin.status().ToString();

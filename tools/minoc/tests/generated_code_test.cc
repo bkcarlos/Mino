@@ -17,6 +17,10 @@ TEST(GeneratedCodeTest, BuilderAccessorAndTraitsUsePlannedLayout) {
     static_assert(
         mino::StaticMessageTraits<minoc_test::Sample>::index_flags ==
         mino::kIndexSlotFlagHasChildSlabs);
+    static_assert(
+        mino::StaticMessageTraits<minoc_test::Sample>::kOwnedGraphCollectionSupported);
+    static_assert(
+        mino::StaticMessageTraits<minoc_test::Child>::kOwnedGraphCollectionSupported);
 
     minoc_test::Sample object;
     minoc_test::SampleBuilder builder(object);

@@ -429,11 +429,12 @@ risk.
 
 ### P3: O(children) normal graph reclaim
 
-Status: implemented for generated graphs whose owned allocations are direct leaf
-fields. Generated traits emit a deterministic root-first manifest; normal ACK
-reclaim validates every exact handle and reclaims children before the root.
-Nested owned-graph traversal remains explicitly unsupported, and Linux stress,
-TSAN, and fault-injection qualification remains pending.
+Status: implemented for generated graphs, including nested messages and
+recursively variable containers. Generated traits emit a deterministic
+root-first manifest via allocator-backed `AppendOwnedChildren` (depth limit 32,
+cycles/duplicates fail closed); normal ACK reclaim validates every exact handle
+and reclaims children before the root. Linux stress, TSAN, and fault-injection
+qualification remains pending.
 
 Expected benefit: potentially high if allocator scans remain visible; high risk.
 

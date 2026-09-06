@@ -358,7 +358,8 @@ private:
         Status graph_collection = Status::Ok();
         if constexpr (SupportsOwnedGraphCollection()) {
             graph_collection = CollectOwnedGraph(
-                metadata_.payload, *value_, manifest, manifest_count);
+                metadata_.payload, *value_, manifest, manifest_count,
+                allocator_);
             if (graph_collection.ok() &&
                 (manifest_count == 0 || manifest_count > manifest.size())) {
                 graph_collection = Status::Error(
@@ -856,7 +857,8 @@ private:
                 reachable{};
             size_t handle_count = 0;
             MINO_RETURN_IF_ERROR(CollectOwnedGraph(
-                exclusive.handle(), *exclusive.value_, reachable, handle_count));
+                exclusive.handle(), *exclusive.value_, reachable, handle_count,
+                allocator_));
             if (handle_count == 0 || handle_count > reachable.size()) {
                 return Status::Error(
                     StatusCode::kCorruption,
@@ -962,7 +964,8 @@ private:
                 reachable{};
             size_t handle_count = 0;
             MINO_RETURN_IF_ERROR(CollectOwnedGraph(
-                builder.handle_, *builder.value_, reachable, handle_count));
+                builder.handle_, *builder.value_, reachable, handle_count,
+                builder.allocator_));
             if (handle_count == 0 || handle_count > reachable.size()) {
                 return Status::Error(StatusCode::kCorruption,
                                      "owned graph collector returned an invalid size");

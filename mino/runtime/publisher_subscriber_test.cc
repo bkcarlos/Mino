@@ -87,7 +87,9 @@ struct StaticMessageTraits<RuntimeGraphMessage> {
 
     static Status CollectOwnedGraph(
         ShmHandle root, const RuntimeGraphMessage& message,
-        std::span<ShmHandle> output, size_t& handle_count) noexcept {
+        std::span<ShmHandle> output, size_t& handle_count,
+        const CentralSlabAllocator* allocator = nullptr) noexcept {
+        static_cast<void>(allocator);
         handle_count = 0;
         OwnedGraphCollector collector(output);
         MINO_RETURN_IF_ERROR(collector.AddRoot(root));

@@ -189,7 +189,8 @@ public:
         if constexpr (SupportsOwnedGraphCollection()) {
             if (typed_reclaim_eligible) {
                 graph_collection = CollectOwnedGraph(
-                    metadata_.payload, *value_, manifest, manifest_count);
+                    metadata_.payload, *value_, manifest, manifest_count,
+                    allocator_);
                 if (graph_collection.ok() &&
                     (manifest_count == 0 || manifest_count > manifest.size())) {
                     graph_collection = Status::Error(

@@ -26,9 +26,11 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 `//mino/transport:fabric_driver` 实现了窗口/doorbell/Canonical Wire 协议。生产必须 `CreateDynamicFabricDeviceProvider` 加载 `kDevice` 插件；`docs/fabric-driver.md`：「normal repository build contains no selectable mock provider; mocks are defined only in test source」。树内无 IPCF/NTB/CXL 设备插件源码。
 
-### A4. 嵌套 owned-graph 遍历未实现
+### A4. 嵌套 owned-graph 遍历 — 已实现（codegen）
 
-`mino/schema/codegen/code_generator.cc`：「User-defined and recursively variable containers are intentionally unsupported until codegen can safely walk their nested shape。」非直接叶子字段会把 `kOwnedGraphCollectionSupported=false`，生成的 `CollectOwnedGraph` 返回 `"generated owned graph requires nested traversal"`。`PERFORMANCE_FOLLOWUP.md` 也写：O(children) reclaim 只覆盖 generated 图的直接叶子字段。
+生成的 `StaticMessageTraits::CollectOwnedGraph` / `AppendOwnedChildren` 支持嵌套 message 与递归可变容器（vector of string/bytes/message 等）：根优先、确定性顺序；嵌套层通过 `CentralSlabAllocator::Inspect` 解析子 slab；深度上限 32、环/共享句柄 fail-closed（`OwnedGraphCollector`）。`kMaxOwnedGraphHandles = layout.max_dynamic_children() + 1`。叶子图仍可传 `allocator=nullptr`；嵌套非空子图缺 allocator 时返回 `kUnsupported`（`"nested owned graph requires allocator"`）。
+
+静态 value-only Wire 适配器：inline struct 已可编解码；仍需 SHM 的嵌套 message / 非空 variable 继续走 graph-aware 重载（`ToDynamicMessage/Encode/Decode(root, allocator, …)`）。未实现项见 A5（hybrid 跨机零拷贝转发）。
 
 ### A5. Hybrid 跨机「图所有权转发 / 零拷贝」未实现
 
@@ -180,6 +182,6 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 在 `mino/ tools/ tests/ examples/` 内检索 `TODO|FIXME|NYI|待实现|未实现|not implemented`：
 
 - 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD 见 A1；会话密钥交换仍外置）
-- 另外两处明确 unsupported：嵌套 owned-graph、writable non-supervisor / ID-only Attach
+- 另外一处明确 unsupported：writable non-supervisor / ID-only Attach（嵌套 owned-graph 已落地）
 
 没有大面积 TODO stub。缺功能主要来自 **外部设备插件缺失、明确延期项、以及资格未关**，而不是空函数。

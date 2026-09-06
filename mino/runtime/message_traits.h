@@ -15,6 +15,8 @@
 
 namespace mino {
 
+class CentralSlabAllocator;
+
 // Bounded structural collector for one allocation graph. It guarantees root-
 // first insertion and rejects cycles, duplicate children, and shared metadata
 // by requiring every handle to be unique. It deliberately does not inspect the
@@ -97,12 +99,16 @@ inline constexpr bool kHasStaticMessageTraits =
 // Successful output is deterministic and starts with root. This operation only
 // validates serialized metadata shape and graph topology; allocator ownership
 // and liveness checks remain the caller's responsibility.
+//
+// Nested / recursively variable containers require `allocator` so child slabs
+// can be resolved. Leaf-only graphs may pass nullptr. Depth/cycles fail closed.
 template <typename T>
 Status CollectOwnedGraph(ShmHandle root, const T& value,
                          std::span<ShmHandle> output,
-                         size_t& handle_count) noexcept {
+                         size_t& handle_count,
+                         const CentralSlabAllocator* allocator = nullptr) noexcept {
     return StaticMessageTraits<T>::CollectOwnedGraph(root, value, output,
-                                                     handle_count);
+                                                     handle_count, allocator);
 }
 
 }  // namespace mino
