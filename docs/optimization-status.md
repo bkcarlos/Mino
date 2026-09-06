@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/ipsec-region-subset` tip（基于 master **`778eb09`**）
+- HEAD 对照：`feature/ipsec-region-subset` tip **`bed125f`**（基于 master **`778eb09`**）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
