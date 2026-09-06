@@ -27,6 +27,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -346,6 +347,13 @@ public:
         };
     }
 
+    Result<std::vector<std::byte>> ExportKeyingMaterial(
+        std::string_view, std::span<const std::byte>,
+        size_t) const noexcept override {
+        return Status::Error(StatusCode::kUnsupported,
+                             "fake TLS has no exporter");
+    }
+
 private:
     Result<security::TlsIoResult> Crossed() noexcept {
         state_->crossed_operations.store(true, std::memory_order_release);
@@ -492,6 +500,13 @@ public:
             .security_domain = SecurityDomainId{1},
             .credential_generation = 1,
         };
+    }
+
+    Result<std::vector<std::byte>> ExportKeyingMaterial(
+        std::string_view, std::span<const std::byte>,
+        size_t) const noexcept override {
+        return Status::Error(StatusCode::kUnsupported,
+                             "fake TLS has no exporter");
     }
 
 private:

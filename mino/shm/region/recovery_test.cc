@@ -4,6 +4,9 @@
 #include "mino/shm/region/recovery.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -31,9 +34,22 @@ namespace {
 class RecoveryOwnerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    static uint32_t sequence = 0;
-    name_ = "/ro_" + std::to_string(::getpid()) + "_" +
-            std::to_string(++sequence);
+    // linux-sandbox remaps PIDs; parallel //... actions share /dev/shm.
+    static std::atomic<uint32_t> sequence{0};
+    static const uint32_t kSalt = [] {
+      std::random_device rd;
+      uint32_t salt = rd() ^ (rd() << 1) ^ static_cast<uint32_t>(::getpid());
+      if (const char* tmp = std::getenv("TEST_TMPDIR"); tmp != nullptr) {
+        for (const char* p = tmp; *p != '\0'; ++p) {
+          salt = salt * 16777619u ^ static_cast<unsigned char>(*p);
+        }
+      }
+      return salt ? salt : 0x726f00u;  // "ro"
+    }();
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "/ro%06x_%u", kSalt & 0xffffffu,
+                  sequence.fetch_add(1) + 1);
+    name_ = buf;
     ASSERT_LE(name_.size(), 31u);
     RegionCreateOptions options;
     options.name = name_;

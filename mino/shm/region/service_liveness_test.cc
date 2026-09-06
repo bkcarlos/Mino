@@ -5,6 +5,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <atomic>
 #include <string>
 #include <thread>
 #include <utility>
@@ -96,9 +100,23 @@ pid_t SpawnLiveOwner(const std::string& name, int ready_fd) {
 class ServiceLivenessTest : public ::testing::Test {
  protected:
   std::string Name(const char* tag) {
-    static uint32_t sequence = 0;
-    return "/sl_" + std::to_string(::getpid()) + "_" +
-           std::to_string(++sequence) + tag;
+    // linux-sandbox remaps PIDs; parallel //... actions share /dev/shm.
+    static std::atomic<uint32_t> sequence{0};
+    static const uint32_t kSalt = [] {
+      std::random_device rd;
+      uint32_t salt = rd() ^ (rd() << 1) ^ static_cast<uint32_t>(::getpid());
+      if (const char* tmp = std::getenv("TEST_TMPDIR"); tmp != nullptr) {
+        for (const char* p = tmp; *p != '\0'; ++p) {
+          salt = salt * 16777619u ^ static_cast<unsigned char>(*p);
+        }
+      }
+      return salt ? salt : 0x736c00u;  // "sl"
+    }();
+    char buf[32];
+    const char* t = (tag == nullptr || tag[0] == '\0') ? "t" : tag;
+    std::snprintf(buf, sizeof(buf), "/sl%06x_%u%.4s", kSalt & 0xffffffu,
+                  sequence.fetch_add(1) + 1, t);
+    return buf;
   }
 
   void TearDown() override {
