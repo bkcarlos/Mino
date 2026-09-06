@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "mino/bridge/dedup_store.h"
 #include "mino/bridge/dedup_window.h"
 #include "mino/bridge/retransmit_window.h"
 #include "mino/bridge/schema_negotiator.h"
@@ -71,7 +72,13 @@ struct BridgePipelineOptions {
     uint64_t remote_session_epoch = 0;
     // Set only when this endpoint cannot restore its receiver-side dedup state.
     // The peer then exposes a degraded, potentially duplicate-delivery session.
+    // When dedup_store is non-null and restore succeeds, Create/Rebind clear
+    // this flag (durable upgrade path out of kDegraded).
     bool local_dedup_state_lost = false;
+    // Optional durable HWM store. Ownership remains with the caller for the
+    // pipeline lifetime. When set, Create/Rebind seed DedupWindow from it and
+    // HandleData persists accepted HWMs before emitting ACK.
+    DedupStore* dedup_store = nullptr;
     size_t max_control_frames = 1024;
     size_t max_control_bytes = 256u * 1024u;
     size_t max_pending_inbound_frames = 1024;
@@ -117,8 +124,9 @@ public:
     Result<BridgePumpResult> Pump(const BridgePumpBudget& budget) noexcept;
 
     // Rebinds the connection without discarding owned reliable frames. A normal
-    // reconnect preserves dedup state; receiver restart explicitly clears it
-    // and advertises the degraded path in SessionHello.
+    // reconnect preserves dedup state; receiver restart clears memory state.
+    // When a DedupStore is attached, restart reseeds from durable HWMs and does
+    // not advertise the degraded path.
     Status RebindConnection(transport::ConnectionId connection_id,
                             uint64_t local_session_epoch,
                             uint64_t remote_session_epoch,
@@ -226,6 +234,10 @@ private:
                    SchemaNegotiator* schema_negotiator,
                    std::unique_ptr<DedupWindow> dedup,
                    std::unique_ptr<RetransmitWindow> retransmit) noexcept;
+
+    Status RestoreDedupFromStore(uint64_t now_ns) noexcept;
+    Status PersistDedupAccepted(const SourceIdentity& source,
+                                uint64_t highest_contiguous_sequence) noexcept;
 
     Status QueueControl(const WireFrame& frame) noexcept;
     Status QueueNegotiatedControls(

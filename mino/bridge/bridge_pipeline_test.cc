@@ -1,6 +1,7 @@
 // Copyright 2026 The Mino Authors
 
 #include "mino/bridge/bridge_pipeline.h"
+#include "mino/bridge/dedup_store.h"
 
 #include <gtest/gtest.h>
 
@@ -12,7 +13,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -163,7 +166,8 @@ ConnectedPipelines MakePipelines(
     uint16_t lane_count = 1,
     size_t max_control_frames = BridgePipelineOptions{}.max_control_frames,
     const BridgeTopicAuthorizer* b_authorizer = nullptr,
-    NodeId b_authenticated_peer = {}) {
+    NodeId b_authenticated_peer = {},
+    DedupStore* b_dedup_store = nullptr) {
     ConnectedPipelines result;
     transport::TcpDriverOptions tcp_options;
     tcp_options.max_frame_body_bytes = 4096;
@@ -226,6 +230,7 @@ ConnectedPipelines MakePipelines(
     b_options.local_session_epoch = 202;
     b_options.remote_session_epoch = 101;
     b_options.topic_authorizer = b_authorizer;
+    b_options.dedup_store = b_dedup_store;
     if (b_authenticated_peer.value != 0) {
         b_options.authenticated_peer = security::AuthenticatedPeer{
             .node_id = b_authenticated_peer,
@@ -1106,6 +1111,74 @@ TEST(BridgePipelineTest, ReceiverRestartAcceptsHighSequenceAsDegradedBaseline) {
     EXPECT_EQ(pair.b_ingress.frames[0].header.sequence_num, 5000u);
     EXPECT_EQ(pair.a->reliability_status().code(), StatusCode::kDegraded);
 }
+
+TEST(BridgePipelineTest, PersistentDedupStoreAvoidsDegradedOnReceiverRestart) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path =
+        std::filesystem::path(tmp) /
+        ("bridge_dedup_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open(DedupStoreOptions{
+        .path = path.string(),
+        .max_sources = 64,
+    });
+    ASSERT_TRUE(store.ok()) << store.status().ToString();
+
+    ConnectedPipelines pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{},
+        store->get());
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = DataFrame(1),
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    for (size_t i = 0; i < 200 && pair.b_ingress.frames.empty(); ++i) {
+        BridgePumpBudget budget;
+        budget.now_ns = 1'000'000'000ull + i * 1'000'000;
+        ASSERT_TRUE(pair.a->Pump(budget).ok());
+        ASSERT_TRUE(pair.b->Pump(budget).ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
+    EXPECT_GE((*store)->size(), 1u);
+
+    // Simulate receiver process restart: clear memory but restore from store.
+    ASSERT_TRUE(Reconnect(&pair, 505, 606, true, 2'000'000'000ull).ok());
+    const Status resumed = PumpUntil(&pair, [&] {
+        return pair.a->session_ready() && pair.b->session_ready() &&
+               !pair.a->peer_dedup_state_lost() &&
+               !pair.b->reliability_degraded();
+    });
+    ASSERT_TRUE(resumed.ok()) << resumed.ToString();
+    EXPECT_EQ(pair.b->reliability_status().code(), StatusCode::kOk);
+
+    // Retransmitted seq 1 must be suppressed; only the original publish remains.
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = DataFrame(1),
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    for (size_t i = 0; i < 100; ++i) {
+        BridgePumpBudget budget;
+        budget.now_ns = 3'000'000'000ull + i * 1'000'000;
+        ASSERT_TRUE(pair.a->Pump(budget).ok());
+        ASSERT_TRUE(pair.b->Pump(budget).ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(pair.b_ingress.frames.size(), 1u);
+}
+
 
 TEST(BridgePipelineTest, FailedTransportCompletionIsObservableAndRetained) {
     ConnectedPipelines pair = MakePipelines();

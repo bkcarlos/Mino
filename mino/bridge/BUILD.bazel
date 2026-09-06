@@ -35,16 +35,19 @@ cc_library(
     name = "reliability",
     srcs = [
         "control_payload.cc",
+        "dedup_store.cc",
         "dedup_window.cc",
         "retransmit_window.cc",
     ],
     hdrs = [
         "control_payload.h",
+        "dedup_store.h",
         "dedup_window.h",
         "retransmit_window.h",
         "source_identity.h",
     ],
     deps = [
+        ":crc32c",
         "//mino/common:ids",
         "//mino/common:result",
         "//mino/common:status",
@@ -196,6 +199,16 @@ cc_test(
 cc_test(
     name = "dedup_window_test",
     srcs = ["dedup_window_test.cc"],
+    deps = [
+        ":reliability",
+        "//mino/common:status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "dedup_store_test",
+    srcs = ["dedup_store_test.cc"],
     deps = [
         ":reliability",
         "//mino/common:status",

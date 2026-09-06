@@ -166,6 +166,12 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
         dedup->BeginSession(options.remote_session_epoch, 0);
         retransmit->BeginSession(options.local_session_epoch,
                                  options.remote_session_epoch, 0);
+        if (options.dedup_store != nullptr) {
+            MINO_RETURN_IF_ERROR(SeedDedupWindowFromStore(
+                dedup.get(), options.dedup_store,
+                options.remote_session_epoch, 0));
+            options.local_dedup_state_lost = false;
+        }
         auto pipeline = std::unique_ptr<BridgePipeline>(new BridgePipeline(
             options, std::move(driver), connection_id, egress, ingress,
             schema_negotiator, std::move(dedup), std::move(retransmit)));
@@ -213,6 +219,21 @@ Status BridgePipeline::reliability_status() const {
                ? Status::Error(StatusCode::kDegraded,
                                "Bridge receiver dedup state was lost")
                : Status::Ok();
+}
+
+Status BridgePipeline::RestoreDedupFromStore(uint64_t now_ns) noexcept {
+    if (options_.dedup_store == nullptr) return Status::Ok();
+    return SeedDedupWindowFromStore(dedup_.get(), options_.dedup_store,
+                                    options_.remote_session_epoch, now_ns);
+}
+
+Status BridgePipeline::PersistDedupAccepted(
+    const SourceIdentity& source,
+    uint64_t highest_contiguous_sequence) noexcept {
+    if (options_.dedup_store == nullptr) return Status::Ok();
+    if (highest_contiguous_sequence == 0) return Status::Ok();
+    return options_.dedup_store->RecordAccepted(source,
+                                                highest_contiguous_sequence);
 }
 
 Status BridgePipeline::QueueControl(const WireFrame& frame) noexcept {
@@ -360,8 +381,14 @@ Status BridgePipeline::RebindConnection(
         peer_dedup_state_lost_ = false;
         resend_pending_ = retransmit_->size() != 0;
 
+        // Receiver restart clears in-memory dedup. When a DedupStore is
+        // attached, reseed from durable HWMs and clear the degraded flag.
         dedup_->BeginSession(remote_session_epoch, now_ns,
                              !local_dedup_state_lost);
+        if (options_.dedup_store != nullptr && local_dedup_state_lost) {
+            MINO_RETURN_IF_ERROR(RestoreDedupFromStore(now_ns));
+            options_.local_dedup_state_lost = false;
+        }
         retransmit_->BeginSession(local_session_epoch, remote_session_epoch,
                                   now_ns);
         if (schema_negotiator_ != nullptr) schema_negotiator_->Reset();
@@ -986,6 +1013,10 @@ Status BridgePipeline::HandleData(const WireFrameHeader& header,
     auto committed = dedup_->Check(options_.remote_session_epoch, source,
                                    header.sequence_num, now_ns);
     if (!committed.ok()) return committed.status();
+    if (committed->highest_contiguous_sequence.has_value()) {
+        MINO_RETURN_IF_ERROR(PersistDedupAccepted(
+            source, *committed->highest_contiguous_sequence));
+    }
     return EmitAck(header, *committed, AckDisposition::kAccepted);
 }
 

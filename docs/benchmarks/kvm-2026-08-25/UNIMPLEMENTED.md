@@ -55,9 +55,9 @@ Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region I
 
 完整 A8（subordinate writable / multi-writer）仍未实现，需未来 layout 升级；不得以超时 lease 冒充。
 
-### A9. 持久 Dedup Store 明确延期
+### A9. 持久 Dedup Store — 已实现（本分支）
 
-开发计划风险管理：「首版接受 kDegraded 降级 + 指标；持久 Dedup Store 作为后续扩展」。Receiver 重启去重状态丢失走 `kDegraded`，不是漏写的 D4 主路径。
+`mino/bridge/dedup_store.*`：CRC 保护的主机本地 HWM 快照（write + fdatasync/fsync + rename + 目录 fsync），损坏/截断 fail-closed。`BridgePipeline` 在 Create/Rebind 时从 store 种子化 `DedupWindow`，并在接收路径 `CommitAccepted`/`SeedAccepted` 之后、发 ACK 之前持久化 HWM；成功恢复时清除 `local_dedup_state_lost`（degraded → durable）。未配置 store 时仍保留原 `kDegraded` 路径。
 
 ### A10. PTP / 跨机时钟同步栈没有实现
 
@@ -190,5 +190,6 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 - 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD 见 A1；会话密钥交换仍外置）
 - 另外一处明确 unsupported：writable non-supervisor Attach（A8 / ADR-0014 残留；ID-only Attach 已由 region name registry 落地）
+- 持久 Dedup Store 已由 `dedup_store` + pipeline 集成落地（A9）
 
-没有大面积 TODO stub。缺功能主要来自 **外部设备插件缺失、明确延期项、以及资格未关**，而不是空函数。
+没有大面积 TODO stub。缺功能主要来自 **外部设备插件缺失、以及资格未关**，而不是空函数。
