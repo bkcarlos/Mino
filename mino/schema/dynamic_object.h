@@ -244,7 +244,12 @@ public:
     Result<DynamicView> GetNested(const FieldHandle& field) const noexcept;
     Result<DynamicVectorView> GetVector(
         const FieldHandle& field) const noexcept;
-    Result<DynamicMessage> ToDynamicMessage() const noexcept;
+    // When borrow_bytes is true, bytes/string leaf payloads are exposed as
+    // BytesView into the pinned SHM graph. The returned message must not
+    // outlive this DynamicView (and its pin). EncodeInto then copies once
+    // into the canonical wire buffer.
+    Result<DynamicMessage> ToDynamicMessage(
+        bool borrow_bytes = false) const noexcept;
 
     const std::shared_ptr<const Context>& context_for_internal() const noexcept {
         return context_;
@@ -289,7 +294,8 @@ public:
     Result<std::span<const std::byte>> GetBytes(size_t index) const noexcept;
     Result<DynamicView> GetNested(size_t index) const noexcept;
     Result<DynamicVectorView> GetVector(size_t index) const noexcept;
-    Result<DynamicVector> ToDynamicVector() const noexcept;
+    Result<DynamicVector> ToDynamicVector(
+        bool borrow_bytes = false) const noexcept;
 
 private:
     struct ElementAccess {

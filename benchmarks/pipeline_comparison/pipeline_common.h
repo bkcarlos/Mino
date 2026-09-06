@@ -121,6 +121,15 @@ bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
                                 Profile expected_profile,
                                 Role destination_role, ClockMode clock_mode,
                                 std::string* error);
+// Same checks as above but uses an explicit payload size so callers can
+// validate without SemanticFrame.payload.assign (hybrid ownership-forward path).
+bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
+                                size_t payload_size,
+                                uint64_t expected_sequence,
+                                uint64_t warmup_messages,
+                                Profile expected_profile,
+                                Role destination_role, ClockMode clock_mode,
+                                std::string* error);
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,
                            std::string* error);
 bool ValidateFrameForStage(Role role, const SemanticFrame& frame,

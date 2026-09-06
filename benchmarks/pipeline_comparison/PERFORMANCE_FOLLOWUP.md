@@ -445,17 +445,27 @@ Expected benefit: potentially high if allocator scans remain visible; high risk.
 
 ### P3: safe generated graph ownership forwarding
 
-Status: not implemented. The hybrid bridge still performs
-graph-to-semantic-to-wire and wire-to-semantic-to-graph payload copies; this
-requires a reviewed lifetime and ownership-transfer design before coding.
+Status: implemented on branch `feature/hybrid-cross-host-zc` (P8). True
+cross-host SHM zero-copy remains impossible without RDMA/Fabric registration;
+this item removes the hybrid bridge's graph↔SemanticFrame↔wire *intermediate*
+payload copies.
 
-Expected benefit: high for medium/large hybrid; very high risk.
-
-- avoid graph-to-semantic-to-graph payload copies at a cross-host boundary;
-- define explicit immutable borrow and ownership-transfer capabilities;
-- prevent old-root ACK from reclaiming a child referenced by a new root;
-- avoid reintroducing synchronous `ShmPinTable::PinCount()` scans;
-- require a reviewed lifetime design before implementation.
+- `mino/bridge/graph_ownership_forward.*`: encode with SHM/wire `BytesView`,
+  reconstruct with `WireLimits::borrow_bytes_fields` so DynamicBuilder performs
+  the sole local SHM payload memcpy; `TryRegisterPayload` hooks optional
+  `MemoryRegistrationProvider` for P9 verbs plugins.
+- `RemoteObjectReconstructor` forces borrow decode on ingress.
+- `mino_shm_tcp_bridge`: source uses `GeneratedToSemanticView` +
+  `Encode(..., payload span)`; sink uses `DecodeBorrowing` +
+  `PopulateGeneratedFrame(..., span)` — no `SemanticFrame.payload.assign` on
+  the optimized path.
+- Unavoidable remaining copy: WireFrame body materialization / TCP (or RDMA)
+  transfer. Census fields document encode/reconstruct payload bytes.
+- Same-host exclusive hop / pin-table rules unchanged; cross-host still ACKs
+  the local graph after wire send and rebuilds a fresh graph on the far side
+  (no remote handle reclaim).
+- Tests: `graph_ownership_forward_test`, wire borrow decode, hybrid runner
+  unit tests. Formal two-host perf campaign still pending.
 
 ### P3: fuse CRC with final encode/copy
 

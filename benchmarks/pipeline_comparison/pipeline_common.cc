@@ -730,6 +730,19 @@ bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
                                 Profile expected_profile,
                                 Role destination_role, ClockMode clock_mode,
                                 std::string* error) {
+    return ValidateBridgeTransitFrame(frame, frame.payload.size(),
+                                      expected_sequence, warmup_messages,
+                                      expected_profile, destination_role,
+                                      clock_mode, error);
+}
+
+bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
+                                size_t payload_size,
+                                uint64_t expected_sequence,
+                                uint64_t warmup_messages,
+                                Profile expected_profile,
+                                Role destination_role, ClockMode clock_mode,
+                                std::string* error) {
     if (frame.sample_id != expected_sequence) {
         return Fail(frame.sample_id < expected_sequence
                         ? "duplicate sample_id: expected " +
@@ -752,10 +765,10 @@ bool ValidateBridgeTransitFrame(const SemanticFrame& frame,
     }
     const size_t expected_payload_bytes =
         ProfilePayloadBytes(expected_profile);
-    if (frame.payload.size() != expected_payload_bytes) {
+    if (payload_size != expected_payload_bytes) {
         return Fail("payload size mismatch: expected " +
                         std::to_string(expected_payload_bytes) + ", got " +
-                        std::to_string(frame.payload.size()),
+                        std::to_string(payload_size),
                     error);
     }
     if (frame.completed_stage_mask != ExpectedMask(destination_role)) {

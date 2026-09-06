@@ -30,11 +30,21 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 生成的 `StaticMessageTraits::CollectOwnedGraph` / `AppendOwnedChildren` 支持嵌套 message 与递归可变容器（vector of string/bytes/message 等）：根优先、确定性顺序；嵌套层通过 `CentralSlabAllocator::Inspect` 解析子 slab；深度上限 32、环/共享句柄 fail-closed（`OwnedGraphCollector`）。`kMaxOwnedGraphHandles = layout.max_dynamic_children() + 1`。叶子图仍可传 `allocator=nullptr`；嵌套非空子图缺 allocator 时返回 `kUnsupported`（`"nested owned graph requires allocator"`）。
 
-静态 value-only Wire 适配器：inline struct 已可编解码；仍需 SHM 的嵌套 message / 非空 variable 继续走 graph-aware 重载（`ToDynamicMessage/Encode/Decode(root, allocator, …)`）。未实现项见 A5（hybrid 跨机零拷贝转发）。
+静态 value-only Wire 适配器：inline struct 已可编解码；仍需 SHM 的嵌套 message / 非空 variable 继续走 graph-aware 重载（`ToDynamicMessage/Encode/Decode(root, allocator, …)`）。跨机所有权转发见 A5（已实现，非真跨机 SHM 零拷贝）。
 
-### A5. Hybrid 跨机「图所有权转发 / 零拷贝」未实现
+### A5. Hybrid 跨机「图所有权转发 / 零拷贝」— 已实现（本分支 / P8）
 
-`benchmarks/pipeline_comparison/PERFORMANCE_FOLLOWUP.md` P3：**Status: not implemented.** 「The hybrid bridge still performs graph-to-semantic-to-wire and wire-to-semantic-to-graph payload copies」。这是产品级零拷贝跨机路径，不是测试缺口。
+产品路径：`mino/bridge/graph_ownership_forward.*` + hybrid bridge
+`mino_shm_tcp_bridge.cc`。跨机**不能**做真 SHM 零拷贝（无 RDMA/Fabric 内存注册时）；本项消除的是
+graph→SemanticFrame→wire / wire→SemanticFrame→graph 的**中间** payload 拷贝：
+
+- encode：SHM child `BytesView` → `EncodeInto` → canonical wire（1 次物化）
+- reconstruct：wire `borrow_bytes_fields` → `DynamicBuilder`/`PopulateGeneratedFrame`（1 次 SHM memcpy）
+- 仍不可避免：WireFrame body / TCP（或未来 RDMA）传输拷贝；`TryRegisterPayload` 为 P9 verbs 插件预留注册钩子
+
+`RemoteObjectReconstructor` 默认 borrow decode。测试：
+`//mino/bridge:graph_ownership_forward_test`、`wire_test` borrow 用例。
+见 `docs/optimization-status.md` 与 `PERFORMANCE_FOLLOWUP.md` P3。
 
 ### A6. Coordinator / in-process Bus 不做跨进程发现（同机动态路径已补）
 

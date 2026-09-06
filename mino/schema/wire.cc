@@ -934,6 +934,9 @@ Result<DynamicValue> DecodeValue(const TypeDescriptor& type,
                 return Resource("bytes exceeds descriptor max_bytes");
             }
             reader.ConsumeAll();
+            if (context.limits.borrow_bytes_fields) {
+                return DynamicValue::BytesView(bytes);
+            }
             return DynamicValue::Bytes(bytes);
         }
     }

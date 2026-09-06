@@ -32,6 +32,11 @@ struct WireLimits {
     size_t max_container_elements = 1u << 20;
     size_t max_depth = 32;
     UnknownFieldLimits unknown_fields;
+    // When true, Decode/DecodeInto stores bytes fields as BytesView aliases
+    // into the input span instead of owning a heap copy. The DynamicMessage
+    // must not outlive that input. Encode paths are unaffected. Used by
+    // graph ownership forwarding to keep reconstruct at one SHM memcpy.
+    bool borrow_bytes_fields = false;
 };
 
 uint64_t ZigZagEncode(int64_t value) noexcept;

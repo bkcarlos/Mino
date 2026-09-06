@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include "mino/bridge/graph_ownership_forward.h"
 #include "mino/bridge/wire_frame.h"
 #include "mino/common/ids.h"
 #include "mino/common/result.h"
@@ -69,6 +70,7 @@ using bridge::FrameFlag;
 using bridge::FrameType;
 using bridge::WireFrame;
 using bridge::WireFrameCodec;
+using bridge::ValidatedWireFrameView;
 using bridge::WireFrameLimits;
 using schema::CanonicalWireScratch;
 using schema::DynamicMessage;
@@ -799,6 +801,15 @@ class PipelineSchema final {
             ThrowStatus("prepare canonical wire codec", prepared.status());
         }
         prepared_codec_.emplace(std::move(*prepared));
+        schema::WireLimits borrow_limits;
+        borrow_limits.borrow_bytes_fields = true;
+        auto borrow_prepared =
+            PreparedCanonicalWireCodec::Create(descriptor_, {}, borrow_limits);
+        if (!borrow_prepared.ok()) {
+            ThrowStatus("prepare borrow canonical wire codec",
+                        borrow_prepared.status());
+        }
+        borrow_codec_.emplace(std::move(*borrow_prepared));
         const Status encode_reserved = encode_message_.ReserveFields(18);
         if (!encode_reserved.ok()) {
             ThrowStatus("reserve canonical encode fields", encode_reserved);
@@ -811,7 +822,10 @@ class PipelineSchema final {
 
     const SchemaDescriptor& descriptor() const noexcept { return *descriptor_; }
 
-    void Encode(const SemanticFrame& frame, std::vector<std::byte>* output) {
+    // Ownership-forward encode: scalars + payload BytesView (no SemanticFrame
+    // payload assign). EncodeInto copies payload once into the canonical buffer.
+    void Encode(const SemanticFrame& frame, std::span<const uint8_t> payload,
+                std::vector<std::byte>* output) {
         if (output == nullptr) {
             throw std::invalid_argument("canonical encode destination is null");
         }
@@ -840,19 +854,39 @@ class PipelineSchema final {
                              std::bit_cast<uint64_t>(frame.brake_percentage)));
         Set(message, 16, DynamicValue::Boolean(frame.emergency_stop));
         Set(message, 17, DynamicValue::Unsigned(frame.payload_checksum));
-        const auto payload = std::as_bytes(
-            std::span(frame.payload.data(), frame.payload.size()));
-        Set(message, 18, DynamicValue::BytesView(payload));
+        const auto payload_bytes = std::as_bytes(payload);
+        Set(message, 18, DynamicValue::BytesView(payload_bytes));
         const Status encoded =
             prepared_codec_->EncodeInto(message, encode_scratch_, *output);
         if (!encoded.ok()) ThrowStatus("CanonicalWireCodec::EncodeInto", encoded);
+        ++ownership_census_.encode_calls;
+        ownership_census_.encode_payload_bytes_copied += payload.size();
+        ++ownership_census_.semantic_payload_assigns_avoided;
     }
 
-    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) {
+    void Encode(const SemanticFrame& frame, std::vector<std::byte>* output) {
+        Encode(frame, std::span<const uint8_t>(frame.payload), output);
+    }
+
+    const bridge::GraphOwnershipCopyCensus& ownership_census() const noexcept {
+        return ownership_census_;
+    }
+    bridge::GraphOwnershipCopyCensus* mutable_ownership_census() noexcept {
+        return &ownership_census_;
+    }
+
+    // Ownership-forward decode: borrow bytes from `bytes` into decode_message_.
+    // Fills scalar SemanticFrame fields; returns payload span that aliases the
+    // wire buffer / BytesView. Caller must keep `bytes` (and this schema) alive.
+    std::span<const uint8_t> DecodeBorrowing(std::span<const std::byte> bytes,
+                                             SemanticFrame* frame) {
         if (frame == nullptr) {
             throw std::invalid_argument("semantic decode destination is null");
         }
-        const Status decoded = prepared_codec_->DecodeInto(
+        if (!borrow_codec_.has_value()) {
+            throw std::runtime_error("borrow decode codec is not prepared");
+        }
+        const Status decoded = borrow_codec_->DecodeInto(
             bytes, decode_scratch_, decode_message_);
         if (!decoded.ok()) ThrowStatus("CanonicalWireCodec::DecodeInto", decoded);
         const DynamicMessage& message = decode_message_;
@@ -879,18 +913,33 @@ class PipelineSchema final {
         frame->brake_percentage = Float64(message, 15);
         frame->emergency_stop = Boolean(message, 16);
         frame->payload_checksum = Unsigned(message, 17);
+        frame->payload.clear();
         const DynamicValue& payload = Field(message, 18);
-        if (payload.bytes() == nullptr ||
-            payload.bytes()->value.size() > kLargePayloadBytes) {
+        std::span<const std::byte> payload_bytes;
+        if (payload.bytes_view() != nullptr) {
+            payload_bytes = payload.bytes_view()->value;
+        } else if (payload.bytes() != nullptr) {
+            payload_bytes = payload.bytes()->value;
+        } else {
             throw std::runtime_error(
                 "canonical payload has the wrong dynamic type or size");
         }
-        const auto& payload_bytes = payload.bytes()->value;
-        frame->payload.resize(payload_bytes.size());
-        if (!payload_bytes.empty()) {
-            std::memcpy(frame->payload.data(), payload_bytes.data(),
-                        payload_bytes.size());
+        if (payload_bytes.size() > kLargePayloadBytes) {
+            throw std::runtime_error(
+                "canonical payload has the wrong dynamic type or size");
         }
+        ++ownership_census_.reconstruct_calls;
+        ownership_census_.reconstruct_payload_bytes_copied +=
+            payload_bytes.size();
+        ++ownership_census_.semantic_payload_assigns_avoided;
+        return std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(payload_bytes.data()),
+            payload_bytes.size());
+    }
+
+    void Decode(std::span<const std::byte> bytes, SemanticFrame* frame) {
+        const auto payload = DecodeBorrowing(bytes, frame);
+        frame->payload.assign(payload.begin(), payload.end());
     }
 
   private:
@@ -944,10 +993,12 @@ class PipelineSchema final {
 
     std::shared_ptr<const SchemaDescriptor> descriptor_;
     std::optional<PreparedCanonicalWireCodec> prepared_codec_;
+    std::optional<PreparedCanonicalWireCodec> borrow_codec_;
     DynamicMessage encode_message_;
     DynamicMessage decode_message_;
     CanonicalWireScratch encode_scratch_;
     CanonicalWireScratch decode_scratch_;
+    bridge::GraphOwnershipCopyCensus ownership_census_{};
 };
 
 EndpointDescriptor MakeEndpoint(std::string_view address, uint16_t port) {
@@ -1088,7 +1139,8 @@ class BridgeTransport final {
     BridgeTransport& operator=(const BridgeTransport&) = delete;
     ~BridgeTransport() { CloseBestEffort(); }
 
-    void SendData(const SemanticFrame& semantic, uint64_t deadline_ns) {
+    void SendData(const SemanticFrame& semantic,
+                  std::span<const uint8_t> payload, uint64_t deadline_ns) {
         WireFrame& frame = data_frame_;
         frame.header = {};
         PopulateIdentityHeader(&frame);
@@ -1096,7 +1148,8 @@ class BridgeTransport final {
         frame.header.flags = FlagValue(FrameFlag::kPayloadCrcPresent);
         frame.header.sequence_num = semantic.sample_id + 1;
         frame.header.timestamp_ns = semantic.origin_timestamp_ns;
-        schema_.Encode(semantic, &frame.payload);
+        // Graph→wire without SemanticFrame.payload.assign; BytesView→EncodeInto.
+        schema_.Encode(semantic, payload, &frame.payload);
         std::vector<std::byte> body = TakeOrThrow(
             "WireFrameCodec::Encode", WireFrameCodec::Encode(frame, limits_));
         const size_t body_size = body.size();
@@ -1106,28 +1159,35 @@ class BridgeTransport final {
         counters_->data_frame_body_bytes_sent += body_size;
     }
 
-    void ReceiveData(uint64_t expected_id, uint64_t deadline_ns,
-                     SemanticFrame* semantic) {
+    // Payload span aliases borrowed canonical bytes held by schema_ / this
+    // frame view. Must finish SHM ingest before the next ReceiveData call.
+    std::span<const uint8_t> ReceiveData(uint64_t expected_id,
+                                         uint64_t deadline_ns,
+                                         SemanticFrame* semantic) {
         std::vector<std::byte> body = Receive(deadline_ns);
         const size_t body_size = body.size();
-        auto frame = TakeOrThrow(
+        last_data_frame_ = TakeOrThrow(
             "WireFrameCodec::DecodeView",
             WireFrameCodec::DecodeView(std::move(body), limits_));
-        ValidateIdentityHeader(frame.header);
-        if (frame.header.frame_type != FrameType::kData ||
-            frame.header.flags != FlagValue(FrameFlag::kPayloadCrcPresent) ||
-            frame.header.perf_trace.has_value() ||
-            frame.header.sequence_num != expected_id + 1) {
+        ValidateIdentityHeader(last_data_frame_->header);
+        if (last_data_frame_->header.frame_type != FrameType::kData ||
+            last_data_frame_->header.flags !=
+                FlagValue(FrameFlag::kPayloadCrcPresent) ||
+            last_data_frame_->header.perf_trace.has_value() ||
+            last_data_frame_->header.sequence_num != expected_id + 1) {
             throw std::runtime_error(
                 "bridge data WireFrame header does not match expected sample");
         }
-        schema_.Decode(frame.payload, semantic);
-        if (frame.header.timestamp_ns != semantic->origin_timestamp_ns) {
+        const auto payload =
+            schema_.DecodeBorrowing(last_data_frame_->payload, semantic);
+        if (last_data_frame_->header.timestamp_ns !=
+            semantic->origin_timestamp_ns) {
             throw std::runtime_error(
                 "WireFrame timestamp does not match canonical message origin");
         }
         ++counters_->data_frames_received;
         counters_->data_frame_body_bytes_received += body_size;
+        return payload;
     }
 
     void SendCompletion(uint64_t total_frames, uint64_t deadline_ns) {
@@ -1391,6 +1451,7 @@ class BridgeTransport final {
     std::optional<ConnectionId> listener_;
     std::optional<ConnectionId> connection_;
     std::deque<std::vector<std::byte>> receive_cache_;
+    std::optional<ValidatedWireFrameView> last_data_frame_;
 };
 
 Role RoleAfterEdge(size_t edge) {
@@ -1401,8 +1462,18 @@ Role RoleAfterEdge(size_t edge) {
     return kRoles[edge];
 }
 
-void ValidateSampleAndPhase(const Options& options,
-                            const SemanticFrame& frame,
+uint64_t ThreadCpuNowNs() {
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+    }
+    return static_cast<uint64_t>(value.tv_sec) * kNanosecondsPerSecond +
+           static_cast<uint64_t>(value.tv_nsec);
+}
+
+void ValidateSampleAndPhase(const Options& options, const SemanticFrame& frame,
+                            std::span<const uint8_t> payload,
                             uint64_t expected_id) {
     if (frame.sample_id != expected_id) {
         throw std::runtime_error(
@@ -1424,45 +1495,39 @@ void ValidateSampleAndPhase(const Options& options,
         throw std::runtime_error("frame profile does not match --profile");
     }
     std::string error;
-    if (!ValidateFrameForStage(RoleAfterEdge(options.edge), frame, &error)) {
-        throw std::runtime_error("frame sample/phase validation failed: " + error);
+    if (!ValidateFrameForStage(RoleAfterEdge(options.edge), frame, payload,
+                               &error)) {
+        throw std::runtime_error("frame sample/phase validation failed: " +
+                                 error);
     }
-}
-
-uint64_t ThreadCpuNowNs() {
-    timespec value{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
-    }
-    return static_cast<uint64_t>(value.tv_sec) * kNanosecondsPerSecond +
-           static_cast<uint64_t>(value.tv_nsec);
 }
 
 void ValidateTransit(const Options& options, const SemanticFrame& frame,
-                     uint64_t expected_id, BridgeCounters* counters) {
+                     std::span<const uint8_t> payload, uint64_t expected_id,
+                     BridgeCounters* counters) {
     if (options.validation == BridgeValidation::kStructural) {
         std::string error;
         if (!ValidateBridgeTransitFrame(
-                frame, expected_id, options.warmup_messages, options.profile,
-                RoleAfterEdge(options.edge), options.clock_mode, &error)) {
+                frame, payload.size(), expected_id, options.warmup_messages,
+                options.profile, RoleAfterEdge(options.edge), options.clock_mode,
+                &error)) {
             throw std::runtime_error(
                 "frame structural transit validation failed: " + error);
         }
         return;
     }
     if (options.validation == BridgeValidation::kFull) {
-        ValidateSampleAndPhase(options, frame, expected_id);
+        ValidateSampleAndPhase(options, frame, payload, expected_id);
         return;
     }
     if (counters == nullptr) {
         throw std::invalid_argument("instrumented validation counters are null");
     }
     ++counters->validation_calls;
-    counters->validation_payload_bytes += frame.payload.size();
+    counters->validation_payload_bytes += payload.size();
     const uint64_t started_ns = ThreadCpuNowNs();
     try {
-        ValidateSampleAndPhase(options, frame, expected_id);
+        ValidateSampleAndPhase(options, frame, payload, expected_id);
     } catch (...) {
         const uint64_t finished_ns = ThreadCpuNowNs();
         counters->validation_thread_cpu_ns += finished_ns - started_ns;
@@ -1472,9 +1537,12 @@ void ValidateTransit(const Options& options, const SemanticFrame& frame,
     counters->validation_thread_cpu_ns += finished_ns - started_ns;
 }
 
-void GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
-                         const CentralSlabAllocator& allocator,
-                         Profile expected_profile, SemanticFrame* frame) {
+// Fills scalar semantic fields and returns a view of the SHM child payload.
+// Does NOT assign SemanticFrame.payload (ownership-forward / P8 path).
+std::span<const uint8_t> GeneratedToSemanticView(
+    const Frame& source, ShmHandle root_handle,
+    const CentralSlabAllocator& allocator, Profile expected_profile,
+    SemanticFrame* frame) {
     if (frame == nullptr) {
         throw std::invalid_argument("semantic destination is null");
     }
@@ -1532,20 +1600,22 @@ void GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
     frame->brake_percentage = accessor.brake_percentage();
     frame->emergency_stop = accessor.emergency_stop();
     frame->payload_checksum = accessor.payload_checksum();
-    frame->payload.resize(payload.length);
-    std::memcpy(frame->payload.data(), child->data, payload.length);
+    frame->payload.clear();
+    return std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(child->data), payload.length);
 }
 
 // Ingest into a fresh SHM graph always materializes payload in a child slab
-// (AllocateChild + memcpy). Semantic/network sources are not already in this
-// Region; the copy is required for first publish, not a residual bug.
+// (AllocateChild + memcpy). Cross-host wire bytes are not already in this
+// Region; this single memcpy is the unavoidable reconstruct copy (P8).
 void PopulateGeneratedFrame(const SemanticFrame& source,
+                            std::span<const uint8_t> payload,
                             MessageBuilder<Frame>* destination) {
     if (destination == nullptr || !destination->active()) {
         throw std::invalid_argument("generated SHM builder must be active");
     }
-    if (source.payload.empty() || source.payload.size() > kLargePayloadBytes ||
-        source.payload.size() > std::numeric_limits<uint32_t>::max()) {
+    if (payload.empty() || payload.size() > kLargePayloadBytes ||
+        payload.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error(
             "semantic payload does not fit generated Mino schema");
     }
@@ -1570,7 +1640,7 @@ void PopulateGeneratedFrame(const SemanticFrame& source,
     builder.set_payload_checksum(source.payload_checksum);
 
     AllocationRequest request;
-    request.object_size = static_cast<uint32_t>(source.payload.size());
+    request.object_size = static_cast<uint32_t>(payload.size());
     request.type_id = StaticMessageTraits<Frame>::type_id;
     request.schema = {
         .short_id = StaticMessageTraits<Frame>::schema_short_id,
@@ -1579,18 +1649,18 @@ void PopulateGeneratedFrame(const SemanticFrame& source,
     request.alignment = 1;
     Result<MutableBuildView> child = destination->AllocateChild(request);
     if (!child.ok()) ThrowStatus("allocate generated payload child", child.status());
-    if (child->data == nullptr || child->object_size != source.payload.size() ||
-        child->capacity < source.payload.size()) {
+    if (child->data == nullptr || child->object_size != payload.size() ||
+        child->capacity < payload.size()) {
         throw std::runtime_error(
             "allocator returned invalid generated payload child");
     }
-    std::memcpy(child->data, source.payload.data(), source.payload.size());
+    std::memcpy(child->data, payload.data(), payload.size());
     if (!builder.set_payload(VariableMetadata{
             .offset = child->handle.offset,
             .generation = child->handle.generation,
             .region_id = child->handle.region_id,
-            .length = source.payload.size(),
-            .capacity = source.payload.size(),
+            .length = payload.size(),
+            .capacity = payload.size(),
             .element_size = 1,
         })) {
         throw std::runtime_error(
@@ -1599,13 +1669,14 @@ void PopulateGeneratedFrame(const SemanticFrame& source,
 }
 
 void PublishBounded(Publisher<Frame>* publisher,
-                    const SemanticFrame& semantic, Deadline deadline) {
+                    const SemanticFrame& semantic,
+                    std::span<const uint8_t> payload, Deadline deadline) {
     if (deadline.expired()) {
         throw std::runtime_error("deadline expired before bridge SHM publish");
     }
     Result<MessageBuilder<Frame>> allocated = publisher->Allocate(deadline);
     if (!allocated.ok()) ThrowStatus("Publisher::Allocate", allocated.status());
-    PopulateGeneratedFrame(semantic, &*allocated);
+    PopulateGeneratedFrame(semantic, payload, &*allocated);
     const Status published =
         publisher->PublishLocal(std::move(*allocated), deadline);
     if (!published.ok()) {
@@ -1645,16 +1716,16 @@ void RunSourceBridge(const Options& options, BridgeTransport* transport,
     const Deadline runtime_deadline = RuntimeDeadline(deadline_ns);
     const uint64_t total = TotalFrames(options);
     SemanticFrame semantic;
-    semantic.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
         Result<BorrowedMessage<Frame>> polled =
             subscriber.Poll(runtime_deadline);
         if (!polled.ok()) ThrowStatus("Subscriber::Poll", polled.status());
         BorrowedMessage<Frame> borrowed = std::move(*polled);
-        GeneratedToSemantic(*borrowed, borrowed.metadata().payload, allocator,
-                            options.profile, &semantic);
-        ValidateTransit(options, semantic, expected_id, counters);
-        transport->SendData(semantic, deadline_ns);
+        const auto payload = GeneratedToSemanticView(
+            *borrowed, borrowed.metadata().payload, allocator, options.profile,
+            &semantic);
+        ValidateTransit(options, semantic, payload, expected_id, counters);
+        transport->SendData(semantic, payload, deadline_ns);
         const Status ack = std::move(borrowed).Ack();
         if (!ack.ok()) ThrowStatus("Subscriber source Ack", ack);
     }
@@ -1699,11 +1770,11 @@ void RunSinkBridge(const Options& options, BridgeTransport* transport,
     const Deadline runtime_deadline = RuntimeDeadline(deadline_ns);
     const uint64_t total = TotalFrames(options);
     SemanticFrame semantic;
-    semantic.payload.reserve(ProfilePayloadBytes(options.profile));
     for (uint64_t expected_id = 0; expected_id < total; ++expected_id) {
-        transport->ReceiveData(expected_id, deadline_ns, &semantic);
-        ValidateTransit(options, semantic, expected_id, counters);
-        PublishBounded(&publisher, semantic, runtime_deadline);
+        const auto payload =
+            transport->ReceiveData(expected_id, deadline_ns, &semantic);
+        ValidateTransit(options, semantic, payload, expected_id, counters);
+        PublishBounded(&publisher, semantic, payload, runtime_deadline);
     }
     transport->SendCompletion(total, deadline_ns);
 }

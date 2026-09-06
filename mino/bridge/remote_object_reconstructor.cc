@@ -124,9 +124,13 @@ Status RemoteObjectReconstructor::DecodeValidatePublish(
                 options_.max_descriptor_closure) {
             return Status::Error(StatusCode::kResourceExhausted);
         }
+        // Borrow bytes from the wire span so DynamicBuilder performs the only
+        // payload memcpy into local SHM (graph ownership forwarding path).
+        schema::WireLimits limits = options_.wire_limits;
+        limits.borrow_bytes_fields = true;
         auto message = schema::CanonicalWireCodec::Decode(
             *binding.schema_handle, payload,
-            binding.descriptor_closure, options_.wire_limits);
+            binding.descriptor_closure, limits);
         if (!message.ok()) return message.status();
 
         auto builder = schema::DynamicBuilder::FromDynamicMessage(

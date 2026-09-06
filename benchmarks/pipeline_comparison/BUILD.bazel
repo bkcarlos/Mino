@@ -156,6 +156,7 @@ cc_binary(
     deps = [
         ":autonomy_pipeline_mino_generated",
         ":pipeline_common",
+        "//mino/bridge:graph_ownership_forward",
         "//mino/bridge:wire_frame",
         "//mino/common:ids",
         "//mino/common:result",

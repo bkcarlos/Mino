@@ -83,6 +83,9 @@ struct RemoteObjectReconstructorOptions {
 
 // Bridge ingress implementation for canonical wire objects. The BridgePipeline
 // only acknowledges a frame after this port has completed local publication.
+// Decode uses WireLimits::borrow_bytes_fields so payload bytes are viewed from
+// the wire span and copied once into SHM by DynamicBuilder (see
+// graph_ownership_forward.h). SemanticFrame is not used on this path.
 class RemoteObjectReconstructor final : public BridgeIngressPort {
 public:
     RemoteObjectReconstructor(

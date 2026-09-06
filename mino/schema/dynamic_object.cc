@@ -1850,7 +1850,8 @@ Result<DynamicVectorView> DynamicVectorView::GetVector(size_t index) const noexc
                              value.element_size);
 }
 
-Result<DynamicVector> DynamicVectorView::ToDynamicVector() const noexcept {
+Result<DynamicVector> DynamicVectorView::ToDynamicVector(
+    bool borrow_bytes) const noexcept {
     try {
         DynamicVector result;
         for (size_t i = 0; i < size_; ++i) {
@@ -1858,7 +1859,7 @@ Result<DynamicVector> DynamicVectorView::ToDynamicVector() const noexcept {
             if (element_type_->kind() == TypeDescriptor::Kind::kUserDefined) {
                 auto nested = GetNested(i);
                 if (!nested.ok()) return nested.status();
-                auto message = nested->ToDynamicMessage();
+                auto message = nested->ToDynamicMessage(borrow_bytes);
                 if (!message.ok()) return message.status();
                 auto dynamic = DynamicValue::Message(
                     std::make_shared<DynamicMessage>(std::move(*message)));
@@ -1867,7 +1868,7 @@ Result<DynamicVector> DynamicVectorView::ToDynamicVector() const noexcept {
             } else if (element_type_->kind() == TypeDescriptor::Kind::kVector) {
                 auto nested = GetVector(i);
                 if (!nested.ok()) return nested.status();
-                auto vector = nested->ToDynamicVector();
+                auto vector = nested->ToDynamicVector(borrow_bytes);
                 if (!vector.ok()) return vector.status();
                 auto dynamic = DynamicValue::Vector(
                     std::make_shared<DynamicVector>(std::move(*vector)));
@@ -1907,9 +1908,14 @@ Result<DynamicVector> DynamicVectorView::ToDynamicVector() const noexcept {
                     }
                     case ScalarType::kBytes: {
                         auto v = GetBytes(i); if (!v.ok()) return v.status();
-                        auto dynamic = DynamicValue::Bytes(*v);
-                        if (!dynamic.ok()) return dynamic.status();
-                        value = std::move(*dynamic); break;
+                        if (borrow_bytes) {
+                            value = DynamicValue::BytesView(*v);
+                        } else {
+                            auto dynamic = DynamicValue::Bytes(*v);
+                            if (!dynamic.ok()) return dynamic.status();
+                            value = std::move(*dynamic);
+                        }
+                        break;
                     }
                 }
             }
@@ -1923,7 +1929,8 @@ Result<DynamicVector> DynamicVectorView::ToDynamicVector() const noexcept {
     }
 }
 
-Result<DynamicMessage> DynamicView::ToDynamicMessage() const noexcept {
+Result<DynamicMessage> DynamicView::ToDynamicMessage(
+    bool borrow_bytes) const noexcept {
     try {
         DynamicMessage result(context_->options.unknown_fields);
         const auto fields = descriptor_->aggregate().fields();
@@ -1938,7 +1945,7 @@ Result<DynamicMessage> DynamicView::ToDynamicMessage() const noexcept {
             if (type.kind() == TypeDescriptor::Kind::kUserDefined) {
                 auto nested = GetNested(*handle);
                 if (!nested.ok()) return nested.status();
-                auto message = nested->ToDynamicMessage();
+                auto message = nested->ToDynamicMessage(borrow_bytes);
                 if (!message.ok()) return message.status();
                 auto dynamic = DynamicValue::Message(
                     std::make_shared<DynamicMessage>(std::move(*message)));
@@ -1947,7 +1954,7 @@ Result<DynamicMessage> DynamicView::ToDynamicMessage() const noexcept {
             } else if (type.kind() == TypeDescriptor::Kind::kVector) {
                 auto vector = GetVector(*handle);
                 if (!vector.ok()) return vector.status();
-                auto converted = vector->ToDynamicVector();
+                auto converted = vector->ToDynamicVector(borrow_bytes);
                 if (!converted.ok()) return converted.status();
                 auto dynamic = DynamicValue::Vector(
                     std::make_shared<DynamicVector>(std::move(*converted)));
@@ -1987,9 +1994,14 @@ Result<DynamicMessage> DynamicView::ToDynamicMessage() const noexcept {
                     }
                     case ScalarType::kBytes: {
                         auto v = GetBytes(*handle); if (!v.ok()) return v.status();
-                        auto dynamic = DynamicValue::Bytes(*v);
-                        if (!dynamic.ok()) return dynamic.status();
-                        value = std::move(*dynamic); break;
+                        if (borrow_bytes) {
+                            value = DynamicValue::BytesView(*v);
+                        } else {
+                            auto dynamic = DynamicValue::Bytes(*v);
+                            if (!dynamic.ok()) return dynamic.status();
+                            value = std::move(*dynamic);
+                        }
+                        break;
                     }
                 }
             }

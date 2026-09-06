@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/opt-residual-copies`（基于 `505d0bf` exclusive-hop-recovery）
+- HEAD 对照：`feature/hybrid-cross-host-zc`（基于 `606671b` SharedHostDomain）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -39,12 +39,22 @@
 
 **不存在** `Bus::CreatePublisher<T>`。`Bus` 只有非模板 `CreatePublisher(topic, SchemaIdentity)` → `BusPublisher`；类型化零拷贝请用 `Publisher<T>` / `Subscriber<T>` 或 `SimpleNode`。
 
+### Hybrid 跨机所有权转发（P8 / A5）
+
+- API：`mino/bridge/graph_ownership_forward.h`（`EncodeFromGraph` /
+  `EncodeMessage` / `ReconstructToPrepared` / `TryRegisterPayload`）
+- 桥：`benchmarks/pipeline_comparison/mino_shm_tcp_bridge.cc` 优化路径不再
+  `SemanticFrame.payload.assign`
+- 诚实拷贝计数：SHM→wire 1；wire→SHM 1；WireFrame/TCP（或未来 RDMA）传输仍在；
+  无注册内存时**不存在**跨主机真零拷贝
+- 资格：单元测试已覆盖完整性；双机 hybrid 性能战役仍待跑
+
 ## 仍残留的拷贝 / 成本
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
 | 1 | 源端首发 `PopulateGeneratedFrame` | **KEEP** | `AllocateChild` + `memcpy` 仍在；语义/网络源不在本 Region，首发进 SHM **必须**物化。benchmark 已注明。 |
-| 2 | Hybrid 桥 graph↔semantic↔wire | **DEFER P8** | 跨机零拷贝产品路径，本轮不做。 |
+| 2 | Hybrid 桥 graph↔semantic↔wire | **DONE（P8）** | `graph_ownership_forward` + bridge：无 SemanticFrame.payload.assign；encode/reconstruct 各 1 次 payload 物化；TCP/WireFrame 拷贝仍不可避免；RDMA 注册钩子预留。 |
 | 3 | 控制面 `WireFrameCodec::Decode` | **DONE（拥有路径）** | Bridge inbound 控制+数据统一 `DecodeView`；`Decode(vector&&)` + `IntoWireFrame` 就地 compact，无二次 payload 堆拷。`Decode(span)` 仍 `assign`（调用方不拥有 body 时必要）。 |
 | 4 | `TcpDriver::Send` / 收帧 | **DONE（可控路径）** | `Send`/`SendUntracked` 改为锁外 body 拷 + segmented `PendingWrite`（不再 `PrefixFrame` 整帧）；收包 **头帧/尾帧** steal，仅「非零 offset 且仍有 trailing」的中段仍 `assign`。 |
 | 5 | 三把 mutex | **PARTIAL** | 锁布局保留（worker / ingress / ready-receive 分离，全量 lock-free 风险高）。`Send*` body 拷已移出 `send_ingress_mutex_`；注释标明职责。 |

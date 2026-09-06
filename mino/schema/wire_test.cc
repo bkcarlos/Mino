@@ -7,10 +7,12 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -752,6 +754,40 @@ message C { optional uint32 value = 1; }
                                             compiled->types(), limits);
     ASSERT_FALSE(depth.ok());
     EXPECT_EQ(depth.status().code(), StatusCode::kResourceExhausted);
+}
+
+
+TEST(CanonicalWireTest, BorrowBytesFieldsAliasesInputWithoutOwningCopy) {
+    auto root = CompileOne(R"idl(
+option schema_version = "1.0";
+package borrow_bytes;
+message Blob {
+  bytes payload = 1 [max_bytes = 64];
+}
+)idl");
+    ASSERT_NE(root, nullptr);
+    const std::string blob(32, 'Q');
+    DynamicMessage message;
+    ASSERT_TRUE(message.SetField(
+                           1, DynamicValue::BytesView(std::as_bytes(
+                                  std::span(blob.data(), blob.size()))))
+                    .ok());
+    auto encoded = CanonicalWireCodec::Encode(*root, message);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+    WireLimits limits;
+    limits.borrow_bytes_fields = true;
+    auto decoded = CanonicalWireCodec::Decode(*root, *encoded, {}, limits);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    const DynamicValue* field = decoded->FindField(1);
+    ASSERT_NE(field, nullptr);
+    ASSERT_NE(field->bytes_view(), nullptr);
+    EXPECT_EQ(field->bytes(), nullptr);
+    const auto* begin = encoded->data();
+    const auto* end = begin + encoded->size();
+    const auto* view = field->bytes_view()->value.data();
+    EXPECT_TRUE(view >= begin && view + blob.size() <= end);
+    EXPECT_EQ(std::memcmp(view, blob.data(), blob.size()), 0);
 }
 
 }  // namespace
