@@ -4,6 +4,8 @@
 
 #include "mino/runtime/deployment/shared_host_domain.h"
 
+#include "mino/runtime/message_traits.h"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -17,6 +19,36 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace mino::deployment {
+
+struct SharedHostTypedFrame {
+    uint32_t sequence = 0;
+    uint32_t value = 0;
+    uint32_t reserved = 0;
+};
+
+}  // namespace mino::deployment
+
+namespace mino {
+template <>
+struct StaticMessageTraits<deployment::SharedHostTypedFrame> {
+    static constexpr bool kIsSpecialized = true;
+    static constexpr TypeId type_id{0x53484454u};
+    static constexpr uint32_t message_type = 0x53484454u;
+    static constexpr uint32_t schema_version = 0x00010000u;
+    static constexpr uint64_t schema_short_id = 0x5348445459504544ull;
+    static constexpr uint32_t layout_version = 1;
+    static constexpr uint32_t index_flags = 0;
+    static Status Validate(
+        const deployment::SharedHostTypedFrame& value) noexcept {
+        return value.reserved == 0
+                   ? Status::Ok()
+                   : Status::Error(StatusCode::kInvalidArgument,
+                                   "reserved field must be zero");
+    }
+};
+}  // namespace mino
 
 namespace mino::deployment {
 namespace {
@@ -376,6 +408,167 @@ TEST_F(SharedHostDomainTest, DualSubscriberBroadcast) {
     EXPECT_EQ(std::memcmp(msg_b->data(), payload, msg_b->size()), 0);
 }
 
+
+TEST_F(SharedHostDomainTest, MpscAllowsMultiplePublishers) {
+    SharedHostDomainOptions options;
+    options.peer_slots = 4;
+    options.topic_slots = 2;
+    options.queue_depth = 64;
+    options.max_publishers_per_topic = 4;
+    options.max_payload_bytes = 64;
+    auto created = SharedHostDomain::Create(name_, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    SharedHostDomain domain = std::move(*created);
+    ASSERT_TRUE(domain.Join(NodeId{1}).ok());
+    const auto schema = MakeSchema(21);
+
+    SharedHostTopicOptions topic_options;
+    topic_options.mode = SharedHostTopicMode::kMpsc;
+    topic_options.queue_full_policy = QueueFullPolicy::kFail;
+    auto first = domain.Advertise("jobs", schema, topic_options);
+    auto second = domain.Advertise("jobs", schema, topic_options);
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_TRUE(second.ok()) << second.status().ToString();
+    EXPECT_EQ(first->mode(), SharedHostTopicMode::kMpsc);
+    EXPECT_EQ(second->mode(), SharedHostTopicMode::kMpsc);
+
+    auto topics = domain.ListTopics();
+    ASSERT_TRUE(topics.ok());
+    ASSERT_EQ(topics->size(), 1u);
+    EXPECT_EQ(topics->front().mode, SharedHostTopicMode::kMpsc);
+    EXPECT_EQ(topics->front().active_publishers, 2u);
+    EXPECT_TRUE(topics->front().publisher_active);
+
+    auto sub = domain.Subscribe("jobs", schema);
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+    ASSERT_TRUE(first->Publish(std::as_bytes(std::span("one", 3))).ok());
+    ASSERT_TRUE(second->Publish(std::as_bytes(std::span("two", 3))).ok());
+
+    auto msg1 = sub->Poll(Deadline::FromNow(std::chrono::seconds(2)));
+    ASSERT_TRUE(msg1.ok()) << msg1.status().ToString();
+    ASSERT_EQ(msg1->size(), 3u);
+    EXPECT_EQ(std::memcmp(msg1->data(), "one", 3), 0);
+    auto msg2 = sub->Poll(Deadline::FromNow(std::chrono::seconds(2)));
+    ASSERT_TRUE(msg2.ok()) << msg2.status().ToString();
+    ASSERT_EQ(msg2->size(), 3u);
+    EXPECT_EQ(std::memcmp(msg2->data(), "two", 3), 0);
+
+    // Mode/QoS mismatch fails closed.
+    SharedHostTopicOptions broadcast = topic_options;
+    broadcast.mode = SharedHostTopicMode::kBroadcast;
+    auto mismatch = domain.Advertise("jobs", schema, broadcast);
+    ASSERT_FALSE(mismatch.ok());
+    EXPECT_EQ(mismatch.status().code(), StatusCode::kSchemaMismatch);
+}
+
+TEST_F(SharedHostDomainTest, DeadMpscPublisherLeaseRecovered) {
+    SharedHostDomainOptions options;
+    options.peer_slots = 4;
+    options.topic_slots = 2;
+    options.queue_depth = 64;
+    options.max_publishers_per_topic = 2;
+    options.max_payload_bytes = 32;
+    auto created = SharedHostDomain::Create(name_, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    SharedHostDomain survivor = std::move(*created);
+    ASSERT_TRUE(survivor.Join(NodeId{1}).ok());
+    const auto schema = MakeSchema(88);
+    SharedHostTopicOptions topic_options;
+    topic_options.mode = SharedHostTopicMode::kMpsc;
+
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto opened = SharedHostDomain::Open(name_);
+        if (!opened.ok()) _exit(31);
+        SharedHostDomain peer = std::move(*opened);
+        if (!peer.Join(NodeId{2}).ok()) _exit(32);
+        auto pub = peer.Advertise("mpsc-recover", schema, topic_options);
+        if (!pub.ok()) _exit(33);
+        for (;;) {
+            (void)peer.Heartbeat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    bool saw = false;
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(survivor.Recover().ok());
+        auto topics = survivor.ListTopics();
+        ASSERT_TRUE(topics.ok());
+        for (const auto& topic : *topics) {
+            if (topic.name == "mpsc-recover" && topic.active_publishers >= 1) {
+                saw = true;
+                break;
+            }
+        }
+        if (saw) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(saw);
+
+    ASSERT_EQ(::kill(child, SIGKILL), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+    bool reclaimed = false;
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(survivor.Recover().ok());
+        auto topics = survivor.ListTopics();
+        ASSERT_TRUE(topics.ok());
+        for (const auto& topic : *topics) {
+            if (topic.name == "mpsc-recover" && topic.active_publishers == 0) {
+                reclaimed = true;
+                break;
+            }
+        }
+        if (reclaimed) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(reclaimed);
+
+    auto pub = survivor.Advertise("mpsc-recover", schema, topic_options);
+    ASSERT_TRUE(pub.ok()) << pub.status().ToString();
+    auto sub = survivor.Subscribe("mpsc-recover", schema);
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+    ASSERT_TRUE(pub->Publish(std::as_bytes(std::span("ok", 2))).ok());
+    auto message = sub->Poll(Deadline::FromNow(std::chrono::seconds(2)));
+    ASSERT_TRUE(message.ok()) << message.status().ToString();
+    ASSERT_EQ(message->size(), 2u);
+}
+
+TEST_F(SharedHostDomainTest, BorrowPathIsZeroCopy) {
+    SharedHostDomainOptions options;
+    options.queue_depth = 8;
+    options.max_payload_bytes = 64;
+    auto created = SharedHostDomain::Create(name_, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    SharedHostDomain domain = std::move(*created);
+    ASSERT_TRUE(domain.Join(NodeId{1}).ok());
+    const auto schema = MakeSchema(33);
+    auto pub = domain.Advertise("borrow", schema);
+    ASSERT_TRUE(pub.ok()) << pub.status().ToString();
+    auto sub = domain.Subscribe("borrow", schema);
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+
+    const char* payload = "zero-copy";
+    ASSERT_TRUE(
+        pub->Publish(std::as_bytes(std::span(payload, std::strlen(payload))))
+            .ok());
+    auto borrowed = sub->TryPollBorrow();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    ASSERT_TRUE(borrowed->active());
+    ASSERT_EQ(borrowed->bytes().size(), std::strlen(payload));
+    EXPECT_EQ(std::memcmp(borrowed->bytes().data(), payload,
+                          borrowed->bytes().size()),
+              0);
+    // Second borrow while first is live fails closed.
+    auto duplicate = sub->TryPollBorrow();
+    ASSERT_FALSE(duplicate.ok());
+    EXPECT_EQ(duplicate.status().code(), StatusCode::kWouldBlock);
+    ASSERT_TRUE(std::move(*borrowed).Release().ok());
+}
+
 TEST_F(SharedHostDomainTest, FailClosedSuite) {
     // RequiredBytes is sensible for default and scaled options.
     auto default_bytes = SharedHostDomain::RequiredBytes({});
@@ -448,5 +641,29 @@ TEST_F(SharedHostDomainTest, FailClosedSuite) {
     (void)SharedHostDomain::Unlink(name2);
 }
 
+TEST_F(SharedHostDomainTest, TypedAdvertiseSubscribePublish) {
+    SharedHostDomainOptions options;
+    options.queue_depth = 8;
+    options.max_payload_bytes = 64;
+    auto created = SharedHostDomain::Create(name_, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    SharedHostDomain domain = std::move(*created);
+    ASSERT_TRUE(domain.Join(NodeId{1}).ok());
+
+    auto pub = domain.Advertise<SharedHostTypedFrame>("typed");
+    ASSERT_TRUE(pub.ok()) << pub.status().ToString();
+    auto sub = domain.Subscribe<SharedHostTypedFrame>("typed");
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+
+    SharedHostTypedFrame frame{.sequence = 7, .value = 42, .reserved = 0};
+    ASSERT_TRUE(pub->Publish(frame).ok());
+    auto received = sub->TryPoll<SharedHostTypedFrame>();
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->get()->sequence, 7u);
+    EXPECT_EQ(received->get()->value, 42u);
+    ASSERT_TRUE(std::move(*received).Release().ok());
+}
+
 }  // namespace
 }  // namespace mino::deployment
+

@@ -4,6 +4,7 @@
 
 #include "mino/runtime/deployment/shared_host_domain.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -25,13 +27,14 @@
 #include "mino/platform/shared_memory.h"
 #include "mino/shm/channel/broadcast_channel.h"
 #include "mino/shm/channel/index_slot.h"
+#include "mino/shm/channel/mpsc_channel.h"
 
 namespace mino::deployment {
 namespace {
 
 constexpr uint64_t kCacheLine = 64;
-constexpr uint64_t kMagic = 0x4D494E4F53484431ull;  // "MINOSHD1"
-constexpr uint32_t kVersion = 1;
+constexpr uint64_t kMagic = 0x4D494E4F53484432ull;  // "MINOSHD2"
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kMaxTopicName = 63;
 constexpr uint64_t kMinLeaseNs = 1'000'000ull;
 constexpr uint64_t kMarkerSlackBytes = 256ull << 10;
@@ -82,6 +85,10 @@ struct alignas(kCacheLine) TopicSlot {
     uint32_t max_payload_bytes = 0;
     uint32_t capacity = 0;
     uint32_t max_subscribers = 0;
+    uint32_t max_publishers = 0;
+    uint32_t mode = 0;
+    uint32_t queue_full_policy = 0;
+    uint32_t sample_rate = 0;
     char name[64]{};
     SchemaPod schema{};
     uint64_t channel_offset = 0;
@@ -89,8 +96,8 @@ struct alignas(kCacheLine) TopicSlot {
     uint64_t payload_offset = 0;
     uint64_t payload_stride = 0;
     uint64_t channel_id = 0;
-    EndpointLease publisher;
-    unsigned char pad[32]{};
+    EndpointLease publishers[kSharedHostMaxPublishersPerTopic];
+    EndpointLease subscriber;
 };
 static_assert(alignof(TopicSlot) == kCacheLine);
 static_assert(std::is_standard_layout_v<TopicSlot>);
@@ -104,8 +111,8 @@ struct alignas(kCacheLine) DomainHeader {
     uint32_t topic_slots = 0;
     uint32_t queue_depth = 0;
     uint32_t max_subscribers = 0;
+    uint32_t max_publishers_per_topic = 0;
     uint32_t max_payload_bytes = 0;
-    uint32_t reserved0 = 0;
     uint64_t peer_lease_ns = 0;
     uint64_t channels_offset = 0;
     uint64_t channels_extent = 0;
@@ -114,6 +121,8 @@ struct alignas(kCacheLine) DomainHeader {
     uint64_t channel_extent = 0;
     uint64_t payload_extent = 0;
     uint64_t payload_stride = 0;
+    std::atomic<uint64_t> publisher_sequence{0};
+    uint64_t reserved1 = 0;
     EndpointLease directory_lock;
     PeerSlot peers[kSharedHostMaxPeerSlots];
     TopicSlot topics[kSharedHostMaxTopicSlots];
@@ -140,6 +149,8 @@ struct DomainState {
     std::optional<uint32_t> peer_index;
     uint64_t peer_token = 0;
 };
+
+using ChannelVariant = std::variant<BroadcastChannel, MpscChannel>;
 
 uint64_t MonotonicNowNs() noexcept {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -196,6 +207,35 @@ Status ValidateTopic(std::string_view topic) {
     return Status::Ok();
 }
 
+Status ValidateTopicOptions(const SharedHostTopicOptions& options,
+                            uint32_t queue_depth) {
+    if (options.mode != SharedHostTopicMode::kBroadcast &&
+        options.mode != SharedHostTopicMode::kMpsc) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "unsupported SharedHostTopicMode");
+    }
+    if (options.mode == SharedHostTopicMode::kMpsc && queue_depth < 64) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "MPSC topics require queue_depth >= 64");
+    }
+    if (options.sample_rate == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "sample_rate must be non-zero");
+    }
+    switch (options.queue_full_policy) {
+        case QueueFullPolicy::kBlock:
+        case QueueFullPolicy::kFail:
+        case QueueFullPolicy::kDropNewest:
+        case QueueFullPolicy::kDropOldest:
+        case QueueFullPolicy::kSample:
+            break;
+        default:
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "unsupported QueueFullPolicy");
+    }
+    return Status::Ok();
+}
+
 Result<SharedHostDomainOptions> NormalizeOptions(
     SharedHostDomainOptions options) {
     if (options.peer_slots == 0 ||
@@ -220,6 +260,12 @@ Result<SharedHostDomainOptions> NormalizeOptions(
         return Status::Error(StatusCode::kInvalidArgument,
                              "max_subscribers is out of range");
     }
+    if (options.max_publishers_per_topic == 0 ||
+        options.max_publishers_per_topic > kSharedHostMaxPublishersPerTopic) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "max_publishers_per_topic must be in [1, 16]");
+    }
     if (options.max_payload_bytes == 0 ||
         options.max_payload_bytes > kSharedHostMaxPayloadBytes) {
         return Status::Error(StatusCode::kInvalidArgument,
@@ -235,6 +281,11 @@ Result<SharedHostDomainOptions> NormalizeOptions(
 Result<SegmentLayout> ComputeLayout(const SharedHostDomainOptions& options) {
     SegmentLayout layout;
     layout.channel_extent = BroadcastChannel::RequiredSize(options.queue_depth);
+    if (options.queue_depth >= 64) {
+        layout.channel_extent =
+            std::max(layout.channel_extent,
+                     MpscChannel::RequiredSize(options.queue_depth));
+    }
     if (!CheckedAlignUpU64(layout.channel_extent, kCacheLine,
                            &layout.channel_extent)) {
         return Status::Error(StatusCode::kInvalidArgument,
@@ -332,6 +383,21 @@ void WriteTopicName(TopicSlot* slot, std::string_view topic) {
     std::memcpy(slot->name, topic.data(), topic.size());
 }
 
+bool SameTopicConfiguration(const TopicSlot& slot,
+                            const SharedHostTopicOptions& options,
+                            const SchemaPod& schema,
+                            const DomainHeader& header) noexcept {
+    return SameSchema(slot.schema, schema) &&
+           slot.mode == static_cast<uint32_t>(options.mode) &&
+           slot.queue_full_policy ==
+               static_cast<uint32_t>(options.queue_full_policy) &&
+           slot.sample_rate == options.sample_rate &&
+           slot.capacity == header.queue_depth &&
+           slot.max_subscribers == header.max_subscribers &&
+           slot.max_publishers == header.max_publishers_per_topic &&
+           slot.max_payload_bytes == header.max_payload_bytes;
+}
+
 ProcessIdentity LoadOwner(const EndpointLease& lease) noexcept {
     return ProcessIdentity{
         .node_id = lease.owner_node_id.load(std::memory_order_acquire),
@@ -356,6 +422,11 @@ uint64_t LeaseToken(uint32_t pid, uint64_t generation,
                     uint64_t state) noexcept {
     return (static_cast<uint64_t>(pid) << 32) |
            ((generation & kLeaseGenerationMask) << 2) | state;
+}
+
+bool LeaseIsActive(const EndpointLease& lease) noexcept {
+    const uint64_t control = lease.control.load(std::memory_order_acquire);
+    return (control & kLeaseStateMask) == kLeaseActive;
 }
 
 bool RecoverLease(EndpointLease& lease) noexcept {
@@ -473,7 +544,9 @@ Status ValidateHeader(const SharedMemorySegment& segment,
         header.topic_slots > kSharedHostMaxTopicSlots ||
         header.queue_depth < 2 ||
         (header.queue_depth & (header.queue_depth - 1)) != 0 ||
-        header.max_subscribers == 0 || header.max_payload_bytes == 0) {
+        header.max_subscribers == 0 || header.max_payload_bytes == 0 ||
+        header.max_publishers_per_topic == 0 ||
+        header.max_publishers_per_topic > kSharedHostMaxPublishersPerTopic) {
         return Status::Error(StatusCode::kCorruption,
                              "SharedHostDomain header fields are invalid");
     }
@@ -485,6 +558,39 @@ void ClearPeer(PeerSlot& peer) noexcept {
     peer.node_id = 0;
     peer.identity = {};
     peer.last_heartbeat_ns.store(0, std::memory_order_release);
+}
+
+uint32_t CountActivePublishers(const TopicSlot& topic) noexcept {
+    uint32_t count = 0;
+    const uint32_t limit =
+        std::min(topic.max_publishers, kSharedHostMaxPublishersPerTopic);
+    for (uint32_t i = 0; i < limit; ++i) {
+        if (LeaseIsActive(topic.publishers[i])) ++count;
+    }
+    return count;
+}
+
+Result<ChannelVariant> AttachTopicChannel(DomainState& state,
+                                          const TopicSlot& slot) {
+    std::byte* base = BytesOf(state);
+    void* channel_base = base + slot.channel_offset;
+    const auto mode = static_cast<SharedHostTopicMode>(slot.mode);
+    if (mode == SharedHostTopicMode::kMpsc) {
+        MINO_ASSIGN_OR_RETURN(MpscChannel channel,
+                              MpscChannel::Attach(channel_base));
+        if (channel.capacity() != slot.capacity) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "MPSC capacity mismatch");
+        }
+        return ChannelVariant(std::move(channel));
+    }
+    MINO_ASSIGN_OR_RETURN(BroadcastChannel channel,
+                          BroadcastChannel::Attach(channel_base));
+    if (channel.capacity() != slot.capacity) {
+        return Status::Error(StatusCode::kCorruption,
+                             "Broadcast capacity mismatch");
+    }
+    return ChannelVariant(std::move(channel));
 }
 
 Status RecoverState(const std::shared_ptr<DomainState>& state) {
@@ -517,7 +623,20 @@ Status RecoverState(const std::shared_ptr<DomainState>& state) {
     for (uint32_t i = 0; i < header->topic_slots; ++i) {
         TopicSlot& topic = header->topics[i];
         if (topic.state.load(std::memory_order_acquire) != kTopicReady) continue;
-        (void)RecoverLease(topic.publisher);
+        const uint32_t pub_limit =
+            std::min(topic.max_publishers, kSharedHostMaxPublishersPerTopic);
+        for (uint32_t p = 0; p < pub_limit; ++p) {
+            (void)RecoverLease(topic.publishers[p]);
+        }
+        (void)RecoverLease(topic.subscriber);
+        if (static_cast<SharedHostTopicMode>(topic.mode) ==
+            SharedHostTopicMode::kMpsc) {
+            Result<ChannelVariant> channel = AttachTopicChannel(*state, topic);
+            if (channel.ok()) {
+                auto& mpsc = std::get<MpscChannel>(*channel);
+                (void)mpsc.AbortOrphanedReservations(now);
+            }
+        }
     }
     return Status::Ok();
 }
@@ -532,23 +651,70 @@ Status EnsureJoined(const std::shared_ptr<DomainState>& state) {
 
 Status InitializeTopic(const std::shared_ptr<DomainState>& state,
                        TopicSlot& slot, std::string_view topic,
-                       const SchemaPod& schema) {
+                       const SchemaPod& schema,
+                       const SharedHostTopicOptions& options) {
     DomainHeader* header = state->header;
     std::byte* base = BytesOf(*state);
     std::memset(base + slot.channel_offset, 0,
                 static_cast<size_t>(slot.channel_extent));
     std::memset(base + slot.payload_offset, 0,
                 static_cast<size_t>(header->payload_extent));
-    MINO_RETURN_IF_ERROR(
-        BroadcastChannel::Init(base + slot.channel_offset, header->queue_depth)
-            .status());
+    if (options.mode == SharedHostTopicMode::kMpsc) {
+        MINO_RETURN_IF_ERROR(
+            MpscChannel::Init(base + slot.channel_offset, header->queue_depth)
+                .status());
+    } else {
+        MINO_RETURN_IF_ERROR(
+            BroadcastChannel::Init(base + slot.channel_offset,
+                                   header->queue_depth)
+                .status());
+    }
     WriteTopicName(&slot, topic);
     slot.schema = schema;
+    slot.mode = static_cast<uint32_t>(options.mode);
+    slot.queue_full_policy =
+        static_cast<uint32_t>(options.queue_full_policy);
+    slot.sample_rate = options.sample_rate;
     slot.max_payload_bytes = header->max_payload_bytes;
     slot.capacity = header->queue_depth;
     slot.max_subscribers = header->max_subscribers;
+    slot.max_publishers = header->max_publishers_per_topic;
     slot.payload_stride = header->payload_stride;
     slot.state.store(kTopicReady, std::memory_order_release);
+    return Status::Ok();
+}
+
+void FillIndexSlot(IndexSlot* slot, const TopicSlot& topic, uint64_t offset,
+                   uint32_t generation, uint32_t payload_len) {
+    slot->msg_type = static_cast<uint32_t>(topic.schema.short_id);
+    slot->schema_version = topic.schema.schema_version;
+    slot->schema_short_id = topic.schema.short_id;
+    slot->schema_layout_version = topic.schema.layout_version;
+    slot->reserved0 = 0;
+    slot->timestamp_ns = MonotonicNowNs();
+    slot->payload = ShmHandle{
+        .offset = offset,
+        .generation = generation,
+        .region_id = 1,
+    };
+    slot->payload_len = payload_len;
+    slot->flags = 0;
+}
+
+Status WritePayloadRing(DomainState& state, TopicSlot& topic, uint64_t sequence,
+                        std::span<const std::byte> payload, IndexSlot* slot) {
+    const uint64_t physical = sequence & (topic.capacity - 1u);
+    const uint64_t generation64 = sequence / topic.capacity + 1u;
+    if (generation64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(StatusCode::kResourceExhausted,
+                             "payload generation space is exhausted");
+    }
+    std::byte* base = BytesOf(state);
+    const uint64_t offset =
+        topic.payload_offset + physical * topic.payload_stride;
+    std::memcpy(base + offset, payload.data(), payload.size());
+    FillIndexSlot(slot, topic, offset, static_cast<uint32_t>(generation64),
+                  static_cast<uint32_t>(payload.size()));
     return Status::Ok();
 }
 
@@ -557,32 +723,82 @@ Status InitializeTopic(const std::shared_ptr<DomainState>& state,
 struct SharedHostPublisher::Impl {
     std::shared_ptr<DomainState> state;
     TopicSlot* slot = nullptr;
+    EndpointLease* lease = nullptr;
     uint64_t token = 0;
-    std::optional<BroadcastChannel> channel;
+    std::optional<ChannelVariant> channel;
+    SharedHostTopicOptions options{};
+    MpscChannel::ProducerIdentity mpsc_identity{};
 
-    ~Impl() {
-        if (slot != nullptr && token != 0) {
-            ReleaseLease(&slot->publisher, token);
-        }
-    }
+    ~Impl() { ReleaseLease(lease, token); }
 };
 
 struct SharedHostSubscriber::Impl {
     std::shared_ptr<DomainState> state;
     TopicSlot* slot = nullptr;
-    std::optional<BroadcastChannel> channel;
-    BroadcastChannel::SubscriberHandle handle{};
+    std::optional<ChannelVariant> channel;
+    SharedHostTopicMode mode = SharedHostTopicMode::kBroadcast;
+    BroadcastChannel::SubscriberHandle broadcast_handle{};
+    EndpointLease* subscriber_lease = nullptr;
+    uint64_t subscriber_token = 0;
+    std::atomic<bool> borrow_active{false};
 
     ~Impl() {
-        if (channel.has_value() && handle.generation != 0) {
-            (void)channel->UnregisterSubscriber(handle.id, handle.generation);
+        if (!channel.has_value()) return;
+        if (mode == SharedHostTopicMode::kBroadcast) {
+            if (auto* broadcast = std::get_if<BroadcastChannel>(&*channel)) {
+                if (broadcast_handle.generation != 0) {
+                    (void)broadcast->UnregisterSubscriber(
+                        broadcast_handle.id, broadcast_handle.generation);
+                }
+            }
+        } else {
+            ReleaseLease(subscriber_lease, subscriber_token);
         }
     }
+};
+
+struct SharedHostBorrowedBytes::Impl {
+    std::atomic<bool>* borrow_active = nullptr;
+    std::variant<BroadcastChannel::Borrow, MpscChannel::Borrow> borrow;
+    std::span<const std::byte> bytes{};
 };
 
 struct SharedHostDomain::Impl {
     std::shared_ptr<DomainState> state;
 };
+
+SharedHostBorrowedBytes::SharedHostBorrowedBytes() noexcept = default;
+SharedHostBorrowedBytes::SharedHostBorrowedBytes(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+SharedHostBorrowedBytes::SharedHostBorrowedBytes(
+    SharedHostBorrowedBytes&& other) noexcept = default;
+SharedHostBorrowedBytes& SharedHostBorrowedBytes::operator=(
+    SharedHostBorrowedBytes&& other) noexcept = default;
+SharedHostBorrowedBytes::~SharedHostBorrowedBytes() {
+    if (active()) {
+        (void)std::move(*this).Release();
+    }
+}
+
+bool SharedHostBorrowedBytes::active() const noexcept {
+    return impl_ != nullptr && impl_->borrow_active != nullptr;
+}
+
+std::span<const std::byte> SharedHostBorrowedBytes::bytes() const noexcept {
+    return active() ? impl_->bytes : std::span<const std::byte>{};
+}
+
+Status SharedHostBorrowedBytes::Release() && noexcept {
+    if (!active()) return Status::Ok();
+    Status ack = Status::Ok();
+    std::visit([&](auto& borrow) { ack = std::move(borrow).Ack(); },
+               impl_->borrow);
+    impl_->borrow_active->store(false, std::memory_order_release);
+    impl_->borrow_active = nullptr;
+    impl_.reset();
+    return ack;
+}
 
 SharedHostPublisher::SharedHostPublisher(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -593,10 +809,25 @@ SharedHostPublisher& SharedHostPublisher::operator=(
 SharedHostPublisher::~SharedHostPublisher() = default;
 
 bool SharedHostPublisher::active() const noexcept {
-    return impl_ != nullptr && impl_->channel.has_value() && impl_->token != 0;
+    return impl_ != nullptr && impl_->slot != nullptr && impl_->token != 0;
+}
+
+SharedHostTopicMode SharedHostPublisher::mode() const noexcept {
+    return impl_ == nullptr ? SharedHostTopicMode::kBroadcast
+                            : impl_->options.mode;
 }
 
 Status SharedHostPublisher::Publish(std::span<const std::byte> payload) {
+    return Publish(payload, Deadline::FromNow(std::chrono::seconds(5)));
+}
+
+Status SharedHostPublisher::PublishTyped(std::span<const std::byte> payload,
+                                         Deadline deadline) {
+    return Publish(payload, deadline);
+}
+
+Status SharedHostPublisher::Publish(std::span<const std::byte> payload,
+                                    Deadline deadline) {
     if (!active()) {
         return Status::Error(StatusCode::kUnavailable, "publisher is closed");
     }
@@ -609,34 +840,77 @@ Status SharedHostPublisher::Publish(std::span<const std::byte> payload) {
                              "payload exceeds topic max_payload_bytes");
     }
     MINO_RETURN_IF_ERROR(RecoverState(impl_->state));
-    MINO_ASSIGN_OR_RETURN(BroadcastChannel::Reservation reserved,
-                          impl_->channel->TryReserve());
-    const uint64_t sequence = reserved.sequence();
-    const uint64_t physical = sequence & (impl_->slot->capacity - 1u);
-    const uint64_t generation64 = sequence / impl_->slot->capacity + 1u;
-    if (generation64 > std::numeric_limits<uint32_t>::max()) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "payload generation space is exhausted");
+    const auto policy = impl_->options.queue_full_policy;
+    const uint32_t sample_rate = impl_->options.sample_rate;
+
+    if (impl_->options.mode == SharedHostTopicMode::kMpsc) {
+        auto& channel = std::get<MpscChannel>(*impl_->channel);
+        Result<MpscChannel::Reservation> reservation =
+            Status::Error(StatusCode::kWouldBlock, "not reserved");
+        if (policy != QueueFullPolicy::kBlock &&
+            policy != QueueFullPolicy::kSample) {
+            reservation =
+                channel.Reserve(impl_->mpsc_identity, policy, sample_rate);
+        } else {
+            for (;;) {
+                reservation = channel.TryReserve(impl_->mpsc_identity);
+                if (reservation.ok()) break;
+                const StatusCode code = reservation.status().code();
+                if (code != StatusCode::kWouldBlock &&
+                    code != StatusCode::kResourceExhausted) {
+                    break;
+                }
+                if (policy == QueueFullPolicy::kSample &&
+                    channel.next_sequence() % sample_rate != 0) {
+                    return Status::Error(
+                        StatusCode::kDegraded,
+                        "MPSC queue full: message sampled out");
+                }
+                (void)channel.AbortOrphanedReservations(MonotonicNowNs());
+                if (deadline.expired()) {
+                    return Status::Error(StatusCode::kTimeout,
+                                         "publish blocked until deadline");
+                }
+                std::this_thread::yield();
+            }
+        }
+        if (!reservation.ok()) return reservation.status();
+        MINO_RETURN_IF_ERROR(WritePayloadRing(
+            *impl_->state, *impl_->slot, reservation->sequence(), payload,
+            reservation->slot()));
+        return std::move(*reservation).Commit();
     }
-    std::byte* base = BytesOf(*impl_->state);
-    const uint64_t offset =
-        impl_->slot->payload_offset + physical * impl_->slot->payload_stride;
-    std::memcpy(base + offset, payload.data(), payload.size());
-    IndexSlot* slot = reserved.slot();
-    slot->msg_type = static_cast<uint32_t>(impl_->slot->schema.short_id);
-    slot->schema_version = impl_->slot->schema.schema_version;
-    slot->schema_short_id = impl_->slot->schema.short_id;
-    slot->schema_layout_version = impl_->slot->schema.layout_version;
-    slot->reserved0 = 0;
-    slot->timestamp_ns = MonotonicNowNs();
-    slot->payload = ShmHandle{
-        .offset = offset,
-        .generation = static_cast<uint32_t>(generation64),
-        .region_id = 1,
-    };
-    slot->payload_len = static_cast<uint32_t>(payload.size());
-    slot->flags = 0;
-    return std::move(reserved).Commit();
+
+    auto& channel = std::get<BroadcastChannel>(*impl_->channel);
+    Result<BroadcastChannel::Reservation> reservation =
+        Status::Error(StatusCode::kWouldBlock, "not reserved");
+    if (policy != QueueFullPolicy::kBlock &&
+        policy != QueueFullPolicy::kSample) {
+        reservation = channel.Reserve(policy, sample_rate);
+    } else {
+        for (;;) {
+            reservation = channel.TryReserve();
+            if (reservation.ok() ||
+                reservation.status().code() != StatusCode::kWouldBlock) {
+                break;
+            }
+            if (policy == QueueFullPolicy::kSample &&
+                channel.next_sequence() % sample_rate != 0) {
+                return Status::Error(StatusCode::kDegraded,
+                                     "Broadcast queue full: message sampled out");
+            }
+            if (deadline.expired()) {
+                return Status::Error(StatusCode::kTimeout,
+                                     "publish blocked until deadline");
+            }
+            std::this_thread::yield();
+        }
+    }
+    if (!reservation.ok()) return reservation.status();
+    MINO_RETURN_IF_ERROR(WritePayloadRing(*impl_->state, *impl_->slot,
+                                          reservation->sequence(), payload,
+                                          reservation->slot()));
+    return std::move(*reservation).Commit();
 }
 
 SharedHostSubscriber::SharedHostSubscriber(std::unique_ptr<Impl> impl) noexcept
@@ -648,29 +922,91 @@ SharedHostSubscriber& SharedHostSubscriber::operator=(
 SharedHostSubscriber::~SharedHostSubscriber() = default;
 
 bool SharedHostSubscriber::active() const noexcept {
-    return impl_ != nullptr && impl_->channel.has_value();
+    return impl_ != nullptr && impl_->slot != nullptr;
 }
 
-Result<std::vector<std::byte>> SharedHostSubscriber::TryPoll() {
+SharedHostTopicMode SharedHostSubscriber::mode() const noexcept {
+    return impl_ == nullptr ? SharedHostTopicMode::kBroadcast : impl_->mode;
+}
+
+Result<SharedHostBorrowedBytes> SharedHostSubscriber::TryPollBorrow() {
     if (!active()) {
         return Status::Error(StatusCode::kUnavailable, "subscriber is closed");
     }
     MINO_RETURN_IF_ERROR(RecoverState(impl_->state));
-    MINO_RETURN_IF_ERROR(
-        impl_->channel->Heartbeat(impl_->handle, MonotonicNowNs()));
-    MINO_ASSIGN_OR_RETURN(BroadcastChannel::Borrow borrowed,
-                          impl_->channel->Poll(impl_->handle));
-    const IndexSlotSnapshot& snapshot = *borrowed;
+    bool expected = false;
+    if (!impl_->borrow_active.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kWouldBlock,
+                             "subscriber already has an active borrow");
+    }
+
+    auto fail = [&](Status status) -> Result<SharedHostBorrowedBytes> {
+        impl_->borrow_active.store(false, std::memory_order_release);
+        return status;
+    };
+
+    IndexSlotSnapshot snapshot{};
+    auto borrowed = std::make_unique<SharedHostBorrowedBytes::Impl>();
+    borrowed->borrow_active = &impl_->borrow_active;
+
+    if (impl_->mode == SharedHostTopicMode::kMpsc) {
+        auto& channel = std::get<MpscChannel>(*impl_->channel);
+        (void)channel.AbortOrphanedReservations(MonotonicNowNs());
+        Result<MpscChannel::Borrow> polled = channel.Poll();
+        if (!polled.ok()) return fail(polled.status());
+        snapshot = **polled;
+        borrowed->borrow = std::move(*polled);
+    } else {
+        auto& channel = std::get<BroadcastChannel>(*impl_->channel);
+        const Status heartbeat =
+            channel.Heartbeat(impl_->broadcast_handle, MonotonicNowNs());
+        if (!heartbeat.ok()) return fail(heartbeat);
+        Result<BroadcastChannel::Borrow> polled =
+            channel.Poll(impl_->broadcast_handle);
+        if (!polled.ok()) return fail(polled.status());
+        snapshot = **polled;
+        borrowed->borrow = std::move(*polled);
+    }
+
     if (snapshot.payload_len == 0 ||
         snapshot.payload_len > impl_->slot->max_payload_bytes) {
-        return Status::Error(StatusCode::kCorruption,
-                             "shared topic payload length is invalid");
+        Status ack = Status::Ok();
+        std::visit([&](auto& borrow) { ack = std::move(borrow).Ack(); },
+                   borrowed->borrow);
+        (void)ack;
+        return fail(Status::Error(StatusCode::kCorruption,
+                                  "shared topic payload length is invalid"));
     }
     std::byte* base = BytesOf(*impl_->state);
-    const std::byte* src = base + snapshot.payload.offset;
-    std::vector<std::byte> out(snapshot.payload_len);
-    std::memcpy(out.data(), src, snapshot.payload_len);
-    MINO_RETURN_IF_ERROR(std::move(borrowed).Ack());
+    borrowed->bytes = std::span<const std::byte>(
+        base + snapshot.payload.offset, snapshot.payload_len);
+    return SharedHostBorrowedBytes(std::move(borrowed));
+}
+
+Result<SharedHostBorrowedBytes> SharedHostSubscriber::PollBorrow(
+    Deadline deadline) {
+    for (;;) {
+        Result<SharedHostBorrowedBytes> polled = TryPollBorrow();
+        if (polled.ok()) return polled;
+        if (polled.status().code() != StatusCode::kWouldBlock) {
+            return polled.status();
+        }
+        if (deadline.expired()) {
+            return Status::Error(StatusCode::kTimeout,
+                                 "timed out polling SharedHostSubscriber");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+Result<std::vector<std::byte>> SharedHostSubscriber::TryPoll() {
+    Result<SharedHostBorrowedBytes> borrowed = TryPollBorrow();
+    if (!borrowed.ok()) return borrowed.status();
+    const std::span<const std::byte> view = borrowed->bytes();
+    std::vector<std::byte> out(view.begin(), view.end());
+    MINO_RETURN_IF_ERROR(std::move(*borrowed).Release());
     return out;
 }
 
@@ -740,6 +1076,7 @@ Result<SharedHostDomain> SharedHostDomain::Create(
     header->topic_slots = normalized.topic_slots;
     header->queue_depth = normalized.queue_depth;
     header->max_subscribers = normalized.max_subscribers;
+    header->max_publishers_per_topic = normalized.max_publishers_per_topic;
     header->max_payload_bytes = normalized.max_payload_bytes;
     header->peer_lease_ns = normalized.peer_lease_ns;
     header->channels_offset = layout.channels_offset;
@@ -758,6 +1095,7 @@ Result<SharedHostDomain> SharedHostDomain::Create(
             layout.payloads_offset + layout.payload_extent * i;
         slot.payload_stride = layout.payload_stride;
         slot.channel_id = i + 1;
+        slot.max_publishers = normalized.max_publishers_per_topic;
     }
     header->magic.store(kMagic, std::memory_order_release);
 
@@ -900,26 +1238,31 @@ Result<std::vector<SharedTopicInfo>> SharedHostDomain::ListTopics() {
     for (uint32_t i = 0; i < header->topic_slots; ++i) {
         TopicSlot& slot = header->topics[i];
         if (slot.state.load(std::memory_order_acquire) != kTopicReady) continue;
-        const uint64_t pub =
-            slot.publisher.control.load(std::memory_order_acquire);
+        const uint32_t active = CountActivePublishers(slot);
         out.push_back(SharedTopicInfo{
             .name = std::string(slot.name),
             .schema = FromPod(slot.schema),
+            .mode = static_cast<SharedHostTopicMode>(slot.mode),
             .capacity = slot.capacity,
             .max_subscribers = slot.max_subscribers,
+            .max_publishers = slot.max_publishers,
             .max_payload_bytes = slot.max_payload_bytes,
-            .publisher_active = (pub & kLeaseStateMask) == kLeaseActive,
+            .active_publishers = active,
+            .publisher_active = active > 0,
+            .subscriber_active = LeaseIsActive(slot.subscriber),
         });
     }
     return out;
 }
 
 Result<SharedHostPublisher> SharedHostDomain::Advertise(
-    std::string_view topic, const schema::SchemaIdentity& schema) {
+    std::string_view topic, const schema::SchemaIdentity& schema,
+    SharedHostTopicOptions options) {
     MINO_RETURN_IF_ERROR(ValidateTopic(topic));
     MINO_RETURN_IF_ERROR(EnsureJoined(impl_->state));
     auto state = impl_->state;
     DomainHeader* header = state->header;
+    MINO_RETURN_IF_ERROR(ValidateTopicOptions(options, header->queue_depth));
     const SchemaPod wanted = ToPod(schema);
     if (wanted.short_id == 0) {
         return Status::Error(StatusCode::kInvalidArgument,
@@ -948,30 +1291,58 @@ Result<SharedHostPublisher> SharedHostDomain::Advertise(
             return Status::Error(StatusCode::kResourceExhausted,
                                  "topic directory is full");
         }
-        MINO_RETURN_IF_ERROR(InitializeTopic(state, *empty, topic, wanted));
+        MINO_RETURN_IF_ERROR(
+            InitializeTopic(state, *empty, topic, wanted, options));
         found = empty;
-    } else if (!SameSchema(found->schema, wanted) ||
-               found->capacity != header->queue_depth ||
-               found->max_subscribers != header->max_subscribers ||
-               found->max_payload_bytes != header->max_payload_bytes) {
-        return Status::Error(StatusCode::kSchemaMismatch,
-                             "topic already exists with different schema/QoS");
+    } else if (!SameTopicConfiguration(*found, options, wanted, *header)) {
+        return Status::Error(
+            StatusCode::kSchemaMismatch,
+            "topic already exists with different schema/QoS/mode");
     }
     directory_guard.Disarm();
     ReleaseLease(&header->directory_lock, directory_token);
 
-    MINO_ASSIGN_OR_RETURN(
-        uint64_t pub_token,
-        ClaimLeaseUntil(found->publisher,
-                        Deadline::FromNow(std::chrono::seconds(2))));
-    std::byte* base = BytesOf(*state);
-    MINO_ASSIGN_OR_RETURN(BroadcastChannel channel,
-                          BroadcastChannel::Attach(base + found->channel_offset));
+    EndpointLease* claimed_lease = nullptr;
+    uint64_t pub_token = 0;
+    if (options.mode == SharedHostTopicMode::kBroadcast) {
+        MINO_ASSIGN_OR_RETURN(
+            pub_token,
+            ClaimLeaseUntil(found->publishers[0],
+                            Deadline::FromNow(std::chrono::seconds(2))));
+        claimed_lease = &found->publishers[0];
+    } else {
+        const uint32_t limit =
+            std::min(found->max_publishers, kSharedHostMaxPublishersPerTopic);
+        Status last = Status::Error(StatusCode::kResourceExhausted,
+                                    "publisher lease table is full");
+        for (uint32_t i = 0; i < limit; ++i) {
+            Result<uint64_t> token = TryClaimLease(found->publishers[i]);
+            if (token.ok()) {
+                pub_token = *token;
+                claimed_lease = &found->publishers[i];
+                break;
+            }
+            last = token.status();
+        }
+        if (claimed_lease == nullptr) return last;
+    }
+
+    MINO_ASSIGN_OR_RETURN(ChannelVariant channel,
+                          AttachTopicChannel(*state, *found));
     auto impl = std::make_unique<SharedHostPublisher::Impl>();
     impl->state = state;
     impl->slot = found;
+    impl->lease = claimed_lease;
     impl->token = pub_token;
-    impl->channel = std::move(channel);
+    impl->channel.emplace(std::move(channel));
+    impl->options = options;
+    const ProcessIdentity owner = ProcessIdentity::Current();
+    impl->mpsc_identity = MpscChannel::ProducerIdentity{
+        .owner = owner,
+        .publisher_id =
+            header->publisher_sequence.fetch_add(1, std::memory_order_relaxed) +
+            1,
+    };
     return SharedHostPublisher(std::move(impl));
 }
 
@@ -1005,34 +1376,45 @@ Result<SharedHostSubscriber> SharedHostDomain::Subscribe(
         return Status::Error(StatusCode::kSchemaMismatch,
                              "subscribed schema does not match advertised topic");
     }
-    std::byte* base = BytesOf(*state);
-    MINO_ASSIGN_OR_RETURN(BroadcastChannel channel,
-                          BroadcastChannel::Attach(base + found->channel_offset));
-    BroadcastChannel::SubscriberHandle handle{};
-    bool registered = false;
-    for (uint32_t id = 0; id < found->max_subscribers; ++id) {
-        Result<BroadcastChannel::SubscriberHandle> claimed =
-            channel.RegisterSubscriber(SubscriberId{id},
-                                       ProcessIdentity::Current(),
-                                       MonotonicNowNs());
-        if (claimed.ok()) {
-            handle = *claimed;
-            registered = true;
-            break;
-        }
-        if (claimed.status().code() != StatusCode::kAlreadyExists) {
-            return claimed.status();
-        }
-    }
-    if (!registered) {
-        return Status::Error(StatusCode::kResourceExhausted,
-                             "topic subscriber capacity is exhausted");
-    }
+    MINO_ASSIGN_OR_RETURN(ChannelVariant channel,
+                          AttachTopicChannel(*state, *found));
     auto impl = std::make_unique<SharedHostSubscriber::Impl>();
     impl->state = state;
     impl->slot = found;
-    impl->channel = std::move(channel);
-    impl->handle = handle;
+    impl->channel.emplace(std::move(channel));
+    impl->mode = static_cast<SharedHostTopicMode>(found->mode);
+
+    if (impl->mode == SharedHostTopicMode::kMpsc) {
+        MINO_ASSIGN_OR_RETURN(
+            uint64_t token,
+            ClaimLeaseUntil(found->subscriber,
+                            Deadline::FromNow(std::chrono::seconds(2))));
+        impl->subscriber_lease = &found->subscriber;
+        impl->subscriber_token = token;
+    } else {
+        auto& broadcast = std::get<BroadcastChannel>(*impl->channel);
+        BroadcastChannel::SubscriberHandle handle{};
+        bool registered = false;
+        for (uint32_t id = 0; id < found->max_subscribers; ++id) {
+            Result<BroadcastChannel::SubscriberHandle> claimed =
+                broadcast.RegisterSubscriber(SubscriberId{id},
+                                             ProcessIdentity::Current(),
+                                             MonotonicNowNs());
+            if (claimed.ok()) {
+                handle = *claimed;
+                registered = true;
+                break;
+            }
+            if (claimed.status().code() != StatusCode::kAlreadyExists) {
+                return claimed.status();
+            }
+        }
+        if (!registered) {
+            return Status::Error(StatusCode::kResourceExhausted,
+                                 "topic subscriber capacity is exhausted");
+        }
+        impl->broadcast_handle = handle;
+    }
     return SharedHostSubscriber(std::move(impl));
 }
 

@@ -191,7 +191,12 @@ writable.
 `mino-node` assembles a real `LocalBusDeployment` with a bounded built-in
 `mino/control` Topic and a real `MonitoringDeployment`. Same-host multi-process dynamic peer/topic discovery without a static
 peer manifest uses `SharedHostDomain`
-(`//mino/runtime/deployment:shared_host_domain`); `LocalBusDeployment`
+(`//mino/runtime/deployment:shared_host_domain`, layout ABI v2 / magic
+`MINOSHD2`). SharedHostDomain supports Broadcast (1:N) and MPSC (N:1)
+topics with fail-closed schema/QoS/mode matching, multi-publisher lease
+recovery via `Recover()`, and a zero-copy borrow poll path over fixed
+per-topic payload rings. CentralSlab-backed payloads remain deferred;
+`SimpleNode` is the CentralSlab reference path. `LocalBusDeployment`
 remains the in-process Bus assembly, and its optional topic list stays a
 static pre-install for single-process compositions. For the `recorder` role,
 it also creates or opens a Recorder session at
