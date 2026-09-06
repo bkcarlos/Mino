@@ -9,6 +9,7 @@
 | 部署 / preflight | [Deployment and preflight](runbook.md#deployment-and-preflight) | [deployment.md](deployment.md) |
 | 启动停止 | [Start and stop](runbook.md#start-and-stop) | [deployment.md](deployment.md#preflight-and-startup) |
 | 证书轮换 | [Certificate rotation](runbook.md#certificate-rotation) | [deployment.md](deployment.md#preflight-and-startup) |
+| IPsec 传输（内核 XFRM） | [IPsec transport](ipsec.md) | 架构 §14.2；`IpsecTransportDriver` |
 | Region / ACL 拒绝 | [Region and ACL denial](runbook.md#region-and-acl-denial) | [monitoring.md](monitoring.md#tls-and-acl) |
 | Bridge 断链 | [Bridge disconnection](runbook.md#bridge-disconnection) | [monitoring.md](monitoring.md#bridge-disconnected) |
 | Subscriber lease 过期 | [Subscriber lease expiration](runbook.md#subscriber-lease-expiration) | [monitoring.md](monitoring.md#lease-expiration) |

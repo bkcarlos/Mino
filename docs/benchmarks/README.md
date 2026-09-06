@@ -10,8 +10,9 @@ Benchmark methodology and result reports.
   multi-round NVMe/ext4 qualification, artifact contract, and fail-closed SLA
   policy.
 - `kvm-2026-08-25/`: 2026-08-25 same-machine KVM campaign (pipeline comparison, remaining tests, unimplemented inventory, 72h soak start).
-- `../optimization-status.md`: master tip（`d36603e`）同机 hop / BytesView / DecodeView / owned-send / opt-closeout / P8–P9 关闭状态与 intentional KEEP（无新测量数字）。
-- `kvm-2026-08-25/UNIMPLEMENTED.md`: A1–A12 / 资格门 / KEEP 仍 incomplete 清单（对照 tip，非仅 2026-08-25 战役快照）。
+- `../optimization-status.md`: 同机 hop / BytesView / DecodeView / owned-send / opt-closeout / P8–P9 关闭状态与 intentional KEEP（无新测量数字；对照当前 tip）。
+- `kvm-2026-08-25/UNIMPLEMENTED.md`: A1–A12 / 资格门 / KEEP 仍 incomplete 清单（对照 tip；含 A12 IPsec 软件子集与 A8 fail-closed 再评估，非仅 2026-08-25 战役快照）。
+- `../operations/ipsec.md`: IPsec 内核 XFRM 运维与 `IpsecTransportDriver` 组合说明。
 - `NUMA_Allocator_Qualification.md`: D6-02 local/interleave/remote method,
   provenance contract, and fail-closed physical-host qualification.
 - `../large-object-pool.md`: D6-08 ordinary/HugePage/device-registration

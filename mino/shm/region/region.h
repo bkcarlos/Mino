@@ -83,11 +83,11 @@ struct RegionCreateOptions {
 //   * read_only=false requests the unique supervisor role and requires the
 //     current v6 layout. It fails with kWouldBlock while another supervisor
 //     process is live.
-//   * Independent writable non-supervisor Attach (A8) is intentionally
-//     unsupported under ADR-0014: SuperBlock cannot host a crash-safe
-//     multi-writer attachment registry. request_subordinate_writable is a
-//     fail-closed probe that returns kUnsupported rather than admitting a
-//     second writer. A future layout bump is required for subordinate writers.
+//   * Independent writable non-supervisor Attach (A8) remains intentionally
+//     unsupported under ADR-0014 on layout v6: SuperBlock (256B) cannot host a
+//     crash-safe multi-writer attachment registry. request_subordinate_writable
+//     is a fail-closed probe that returns kUnsupported rather than admitting a
+//     second writer. A future layout v7 attachment directory is required.
 struct RegionV4UpgradeOptions {
     std::string name;
     std::span<const ChannelRingDescriptor> rings;

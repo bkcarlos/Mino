@@ -40,3 +40,30 @@ cc_test(
         "@openssl//:ssl",
     ],
 )
+
+cc_library(
+    name = "ipsec",
+    srcs = ["ipsec.cc"],
+    hdrs = ["ipsec.h"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
+)
+
+cc_test(
+    name = "ipsec_test",
+    srcs = ["ipsec_test.cc"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":ipsec",
+        "@googletest//:gtest_main",
+    ],
+)

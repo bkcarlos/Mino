@@ -394,6 +394,10 @@ enum class HealthState : uint8_t {
 // - peer/transport failure: kUnavailable; damaged received metadata: kCorruption.
 // Shutdown() and Close() of an already closed object should be idempotent OK.
 class TransportDriver {
+    // Composing wrappers (IPsec guard) forward to Do* without double
+    // lifecycle/outstanding-send accounting on the inner driver.
+    friend class IpsecTransportDriver;
+
 public:
     virtual ~TransportDriver() = default;
 

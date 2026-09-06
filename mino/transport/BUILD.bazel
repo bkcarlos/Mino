@@ -137,3 +137,27 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "ipsec_transport",
+    srcs = ["ipsec_transport.cc"],
+    hdrs = ["ipsec_transport.h"],
+    deps = [
+        ":transport_driver",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/security:ipsec",
+    ],
+)
+
+cc_test(
+    name = "ipsec_transport_test",
+    srcs = ["ipsec_transport_test.cc"],
+    deps = [
+        ":ipsec_transport",
+        ":tcp_driver",
+        "//mino/bridge:wire_frame",
+        "//mino/security:ipsec",
+        "@googletest//:gtest_main",
+    ],
+)

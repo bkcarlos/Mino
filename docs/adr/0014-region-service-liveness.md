@@ -62,3 +62,14 @@ Supervisor attachment 不得跨 `fork()` 作为两个进程共同使用。子进
 | 日期 | 评审人 | 结论 | 说明 |
 |---|---|---|---|
 | 2026-08-01 | Mino D1 Recovery Review | ACCEPTED | 采用 supervisor-owner 契约关闭 v2 ACTIVE liveness 缺口；跨进程测试覆盖 live owner、SIGKILL takeover、PID reuse 与 recovery lease/epoch fencing。 |
+
+
+## 2026-09-06 评估附注（A8 / feature/ipsec-region-subset）
+
+再次评估「subordinate writable / multi-writer」是否可在不削弱单 supervisor 安全的前提下合入：
+
+- SuperBlock 仍为 256B，v3 service owner/fence 已占满原 compat pad；**不能**在 v6 头内塞 registry。
+- 安全路径需要：有界 attachment directory（建议放入 Region directory 区）+ **layout version bump（v7）** + 注册/注销世代协议 + 新 supervisor 在 `ACTIVE→DIRTY` destructive recovery 前对每个已注册 subordinate `ProbeProcessIdentity`（仅 `Dead` 可回收槽；`Alive`/`Unknown` 拒绝）。
+- 超时 lease、未注册第二 writer、或「先开放再补 registry」都会违反本 ADR 已否决项。
+
+因此本变更**保持** v6 fail-closed（`request_subordinate_writable → kUnsupported`），不实现半套 multi-writer。

@@ -3,9 +3,8 @@
 调查日期（首次）：2026-08-25 23:45 CST（UTC+8）  
 **文档同步日期：2026-09-06（Asia/Shanghai）**  
 仓库：`/workspace/Mino`  
-**HEAD（文档对照 tip）：`9cd50f9f33203533f4b6ea9287c4ec2291cd3195`**
-（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；
-相对 `abb282f`/`d36603e` 超前；A1 会话 KEX 已关闭）  
+**HEAD（文档对照 tip）：`feature/ipsec-region-subset`（见本分支 tip；提交后钉 SHA）**
+（相对 master `778eb09`：A12 IPsec 软件子集；A8 再评估仍 fail-closed）  
 范围：对照 D0–D6 计划、ADR、运维手册、pipeline follow-up、代码 TODO/stub，以及
 transport / discovery / 镜像路径；并与 tip 上已合入的 AEAD / nested owned-graph /
 exclusive-hop recovery / residual copies / Region ID Attach / DedupStore /
@@ -13,23 +12,23 @@ SharedHostDomain v3 CentralSlab / hybrid graph forward / PTP+RDMA/Fabric 插件 
 对齐。  
 不包含：新功能开发；不发明性能数字。
 
-**总判断（tip `9cd50f9`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
+**总判断（tip `feature/ipsec-region-subset`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
 关闭或降为明确外置/延期。真正仍缺的是少数协议外置能力（A8 多
-writer layout；A1 会话 KEX 已在 tip 关闭）、架构非目标（A11/A12），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
+writer 需 layout v7 attachment registry；A1 会话 KEX 已关闭；A12 IPsec **软件子集**已落地）、架构非目标（A11），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
 clean-ref 资格门**（驱动与软件参考插件已在树内，不算资格通过）。同机优化残留拷贝以
 intentional KEEP 为主，见 `docs/optimization-status.md`。
 
 ---
 
-## 仍 incomplete 速览（对照 tip `9cd50f9`）
+## 仍 incomplete 速览（对照 tip `feature/ipsec-region-subset`）
 
 ### 代码缺口 / 明确外置或延期（非 stub 大面积）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| A8 subordinate writable / multi-writer Attach | **未实现（ADR-0014）** | 需 attachment registry + layout bump；tip 仅 fail-closed 探测 |
+| A8 subordinate writable / multi-writer Attach | **仍未实现（ADR-0014）** | tip 评估：layout v7 attachment directory 未合入；保持 fail-closed，不削弱单 supervisor |
 | A10 双机 PTP 硬件资格 | **硬件资格残留** | pmc/ptp4l 侧车 + pipeline 门控已落地；无合格同步仍 fail-closed；物理双机 PTP qual 仍缺 |
-| A12 IPsec 传输 | **未做（架构选项）** | D6 落地 TLS；树内无 IPsec 驱动 |
+| A12 IPsec 传输 | **软件子集已落地** | `IpsecTransportDriver` + `NetlinkXfrmSaProbe`；内核 XFRM/ESP，非 userspace；缺 CAP 时 fail-closed |
 | SharedHostDomain → CentralSlab | **DONE（v3）** | ABI `MINOSHD3`；Publish 分配 / PollBorrow pin / Recover journal+pins；复用 SimpleNode 模式 |
 
 ### 硬件 / clean-ref 资格（代码在，门未关）
@@ -55,7 +54,7 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 | RDMA 通用 span `Send` staging | owned/`pre_registered` 路径已改进；通用 Send 仍 KEEP |
 | A11 128-bit 原子 | ADR-0001 生产 ABI 非目标 |
 
-**已关闭（勿再写成缺功能）**：帧 AEAD + 会话 KEX/pipeline 自动 keyring；嵌套 owned-graph；exclusive-hop journal 恢复与 ACK→Adopt 微窗口；Region ID Attach；DedupStore；SharedHostDomain 动态发现（非 static-only）；hybrid graph forward（P8）；PTP 客户端 + RDMA/Fabric **软件参考**插件；SimpleNode `Recover()`（存在且公开）。
+**已关闭（勿再写成缺功能）**：帧 AEAD + 会话 KEX/pipeline 自动 keyring；嵌套 owned-graph；exclusive-hop journal 恢复与 ACK→Adopt 微窗口；Region ID Attach；DedupStore；SharedHostDomain 动态发现（非 static-only）；hybrid graph forward（P8）；PTP 客户端 + RDMA/Fabric **软件参考**插件；SimpleNode `Recover()`（存在且公开）；IPsec **软件子集**（`IpsecTransportDriver` + netlink SA 探针；非硬件资格）。
 
 ---
 
@@ -120,16 +119,21 @@ graph→SemanticFrame→wire / wire→SemanticFrame→graph 的**中间** payloa
 
 Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region ID HWM 同身份域的持久 `region_names/` 目录；`Attach` 允许 `name` 为空且 `region_id != 0`，经 registry 解析后再走既有校验。`name` + `region_id` 仍表示按名打开并以 ID 做身份断言。见 `mino/shm/region/region_name_registry.*` 与 `RegionTest.AttachResolvesNameFromRegistry*`。
 
-### A8. 可写非 supervisor Attach — 架构残留（ADR-0014）
+### A8. 可写非 supervisor Attach — 架构残留（ADR-0014；本 tip 再评估）
 
-调查结论：在 Region layout v6 / SuperBlock 256B 约束下，**无法**安全实现独立进程的非 supervisor 可写 Attach。ADR-0014 已否决「单 supervisor + 任意未注册 writable clients」（supervisor 死亡后无法证明 clients 已退出，destructive recovery 不安全），并明确多 writer 需要**有界、崩溃安全的 attachment registry + layout version bump**。
+**评估结论（feature/ipsec-region-subset）**：在 Region layout **v6** / SuperBlock **仍严格 256B 且已满**（`service_owner` + `service_fence_word` 占尽原 compat pad）的前提下，**无法**把崩溃安全的 multi-writer attachment registry 塞进 SuperBlock。ADR-0014 已否决：
+- 单 supervisor + 任意未注册 writable clients；
+- 用超时 service lease 冒充 writer 退出；
+- 在 40B 残留 ABI 内压缩多槽 registry。
 
-本 tip 实现的最大安全子集：
+把 registry 放进 directory 区并做 **layout v7**（有界槽位 + `ProcessIdentity` + generation/state + supervisor-gated recovery：新 supervisor 在 destructive scan 前必须将全部已注册 subordinate 探测为 `Dead`，`Unknown`/`Alive` fail-closed）在工程上可行，但是一次 **ABI / Create / Attach / Detach / recovery / 迁移** 全路径变更。本 tip **未合入**该 bump：半成品会削弱单 supervisor 安全边界。
+
+本 tip 保持的最大安全子集：
 - 可写 Attach（含 **仅按 Region ID**）仍只授予唯一 supervisor role；
 - `RegionAttachOptions::request_subordinate_writable=true` 在映射/加锁之前 **fail-closed** 返回 `kUnsupported`（显式探测 API，不提供多 writer 语义）；
-- 不引入静默的第二 writer 映射。
+- 不引入静默的第二 writer 映射；不以超时 lease 冒充。
 
-完整 A8（subordinate writable / multi-writer）仍未实现，需未来 layout 升级；不得以超时 lease 冒充。
+完整 A8（subordinate writable / multi-writer）= **未来 layout v7 attachment directory + 崩溃安全注册/注销协议**；见 ADR-0014「待验证 / 后续」。
 
 ### A9. 持久 Dedup Store — 已实现（tip）
 
@@ -149,15 +153,21 @@ Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region I
 
 ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使用。」不是漏实现，是冻结的非目标。
 
-### A12. IPsec 未作为传输实现
+### A12. IPsec 传输 — 软件子集已落地（内核 XFRM；非 userspace ESP）
 
-架构 14.2 把 TLS、IPsec、受控 RDMA Fabric 并列；D6 落地的是 TLS 1.3 mTLS。树内没有 IPsec 驱动。这是架构选项，不是 D6 勾选项。
+架构 14.2 把 TLS、IPsec、受控 RDMA Fabric 并列；D6 主路径仍是 TLS 1.3 mTLS。本 tip 落地 IPsec **软件子集**（仍是架构选项，不是 D6 勾选替代 TLS）：
+
+- `//mino/security:ipsec`：`NetlinkXfrmSaProbe`（`NETLINK_XFRM` dump / fail-closed）、`ScriptedIpsecSaProbe`、`TestLoopbackXfrmSession`（需 `CAP_NET_ADMIN`，无权限则测试 SKIP）
+- `//mino/transport:ipsec_transport`：`IpsecTransportDriver` 包装内层 `TcpDriver`/`UdpDriver`；默认 `kRequireKernelSa` 在 Connect/Accept 前探针覆盖 SA，缺失则 `kUnavailable`；`kAssumedProtected` 供运维声明「载荷已由内核 IPsec 保护」的桥接（文档见 `docs/operations/ipsec.md`）
+- 进程内**不**实现 ESP/IKE；明文套接字 + 内核 XFRM。无 CAP / 无法 dump 时探针 **fail-closed**。
+
+**仍外置 / 非目标**：IKE 守护进程与密钥生命周期 UX；载体/芯片 IPsec 资格；用 IPsec 取代 mTLS 身份/`AuthenticatedPeer`。
 
 ---
 
 ## B. 代码已实现，当前 tip 上尚未资格关闭
 
-下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip `9cd50f9`。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
+下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip（本分支）。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
 
 1. **D4 当前候选物理双机 mTLS/ACL 复验**  
    开发计划 D4 DoD 唯一未勾：`b02eabf` 的 v4 probe 已归档 `docs/validation/physical_two_host_31291274125_manifest.json`，「当前候选修改了 Bridge/TCP/mTLS/ACL/RemoteBridge，必须重新验证」。按现要求不排 hybrid 双机。
@@ -274,7 +284,8 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 在 `mino/ tools/ tests/ examples/` 内检索 `TODO|FIXME|NYI|待实现|未实现|not implemented`：
 
 - 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD + 会话 KEX 见 A1）
-- 另外一处明确 unsupported：writable non-supervisor Attach（A8 / ADR-0014 残留；ID-only Attach 已由 region name registry 落地）
+- 另外一处明确 unsupported：writable non-supervisor Attach（A8 / ADR-0014；本 tip 再确认保持 fail-closed；ID-only Attach 已由 region name registry 落地）
+- IPsec 不再是「树内无驱动」：见 A12 软件子集；仍非 D6 TLS 替代
 - 持久 Dedup Store 已由 `dedup_store` + pipeline 集成落地（A9）
 - Exclusive hop journal 恢复与 ACK→Adopt 微窗口已落地（见 `docs/optimization-status.md`）
 

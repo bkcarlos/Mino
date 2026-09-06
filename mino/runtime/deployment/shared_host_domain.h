@@ -53,7 +53,8 @@ namespace mino::deployment {
 // - LocalBus/Coordinator stay in-process; no hybrid cross-host ZC / PTP / RDMA.
 // - Optional static LocalBusConfig::topics manifests remain valid for the
 //   in-process LocalBusDeployment path.
-// - Out of scope here: PTP sidecar, IPsec, Region multi-writer.
+// - Out of scope here: PTP sidecar, Region multi-writer.
+//   (IPsec network path lives under mino/transport:ipsec_transport.)
 
 inline constexpr uint32_t kSharedHostMaxPeerSlots = 64;
 inline constexpr uint32_t kSharedHostMaxTopicSlots = 64;
