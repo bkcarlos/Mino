@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <string>
@@ -662,6 +663,39 @@ TEST_F(SharedHostDomainTest, TypedAdvertiseSubscribePublish) {
     EXPECT_EQ(received->get()->sequence, 7u);
     EXPECT_EQ(received->get()->value, 42u);
     ASSERT_TRUE(std::move(*received).Release().ok());
+}
+
+
+TEST_F(SharedHostDomainTest, CentralSlabBorrowAndReclaim) {
+    SharedHostDomainOptions options;
+    options.peer_slots = 2;
+    options.topic_slots = 2;
+    options.queue_depth = 8;
+    options.max_payload_bytes = 128;
+    auto created = SharedHostDomain::Create(name_, options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    SharedHostDomain domain = std::move(*created);
+    ASSERT_TRUE(domain.Join(NodeId{1}).ok());
+    const auto schema = MakeSchema(77);
+    auto pub = domain.Advertise("slab", schema);
+    ASSERT_TRUE(pub.ok()) << pub.status().ToString();
+    auto sub = domain.Subscribe("slab", schema);
+    ASSERT_TRUE(sub.ok()) << sub.status().ToString();
+
+    // Fill beyond queue depth with release between polls so slab slots reclaim.
+    for (uint32_t i = 0; i < 32; ++i) {
+        char payload[64];
+        const int n = std::snprintf(payload, sizeof(payload), "msg-%u", i);
+        ASSERT_GT(n, 0);
+        ASSERT_TRUE(pub->Publish(std::as_bytes(std::span(payload, n))).ok())
+            << "publish " << i;
+        auto borrowed = sub->PollBorrow(Deadline::FromNow(std::chrono::seconds(2)));
+        ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+        ASSERT_EQ(borrowed->bytes().size(), static_cast<size_t>(n));
+        EXPECT_EQ(std::memcmp(borrowed->bytes().data(), payload, n), 0);
+        ASSERT_TRUE(std::move(*borrowed).Release().ok());
+    }
+    ASSERT_TRUE(domain.Recover().ok());
 }
 
 }  // namespace

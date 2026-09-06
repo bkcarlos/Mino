@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/aead-session-kex` tip **`9cd50f9`**（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；基于 `abb282f`/`d36603e`）
+- HEAD 对照：`feature/shared-host-domain-slab` tip（本提交；基于 master **`9d1c26e`**）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -25,7 +25,7 @@
 | Hybrid 跨机图所有权转发（P8） | **DONE** | `graph_ownership_forward.*`；中间 SemanticFrame.assign 已消；真跨机 SHM 零拷贝仍需 RDMA/Fabric MR |
 | Region ID Attach | **DONE** | `region_name_registry.*`：空 name + region_id 经持久 registry 解析 |
 | 持久 Dedup Store | **DONE** | `dedup_store.*` + BridgePipeline 种子化 / HWM 持久化 |
-| SharedHostDomain v2 | **DONE（拓扑）** | MPSC/Broadcast、borrow、typed、`Recover()`；**不**接 CentralSlab（KEEP deferred） |
+| SharedHostDomain v3 | **DONE** | MPSC/Broadcast、borrow、typed、`Recover()`；**CentralSlab + AllocationJournal + ShmPinTable**（ABI `MINOSHD3`，与 v1/v2 不兼容） |
 | P9 PTP + RDMA/Fabric 参考插件 | **DONE（软件路径）** | `PtpClockClient`；`libmino_rdma_{software_loopback,verbs}.so`；`libmino_fabric_software_loopback.so`；**不算** V-25 硬件资格 |
 
 ### Exclusive hop 契约（勿写错）
@@ -81,7 +81,7 @@
 | 5 | 三把 mutex | **KEEP（CLOSED）** | 锁布局保留（worker / ingress / ready-receive）。body 拷已在锁外；ingress CS 仅 admission+move。全量 lock-free/分片队列有丢唤醒与 tear-down 正确性风险，**有意停在此设计**（见 `tcp_driver.cc` 注释）。 |
 | 6 | `RetransmitWindow` owned 拷贝 | **KEEP** | 可靠重传故意自持；`Add`/`ResendPending` 不能挪走唯一副本。 |
 | 7 | Bus memcpy；RDMA staging | **KEEP / 部分改进** | **Bus/LocalBusDeployment**：Broadcast 槽位私有区 `memcpy` + `CanonicalMessage` 拥有向量是 API/布局物理必要（非 CentralSlab 图）；**KEEP**。**RDMA**：owned `TrySendOwned` 已 `move` 免 `assign`；span `Send` 仍 staging；真 NIC 零拷贝需调用方持 MR 并走 `pre_registered`（钩子已留，通用 Send 零拷贝仍 KEEP）。 |
-| Extra | SharedHostDomain fixed rings | **KEEP（deferred）** | 固定 per-topic ring，**不**接 CentralSlab。接上需要 ABI v3 + journal/pin，且会与 SimpleNode 布局重复；SharedHostDomain 定位可发现 POD/bytes 拓扑，CentralSlab 参考路径仍是 SimpleNode。见 `shared_host_domain.h`。 |
+| Extra | SharedHostDomain CentralSlab | **DONE（v3）** | 固定 per-topic ring 已替换为 CentralSlab 路径（journal/pins，复用 SimpleNode 模式）；ABI `MINOSHD3`。残留：Publish 仍需一次用户字节→slab `memcpy`（源不在本 Region 时物理必要）；Broadcast 多订户仍走 channel 语义。见 `shared_host_domain.h`。 |
 
 ## 历史测量
 

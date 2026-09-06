@@ -38,24 +38,22 @@ namespace mino::deployment {
 // mismatches fail closed. Dead peers and endpoint leases are reclaimable via
 // Recover(). MPSC topics also abort orphaned reservations on Recover().
 //
-// Layout ABI version 2 (magic MINOSHD2) is incompatible with v1 domains.
+// Layout ABI version 3 (magic MINOSHD3) is incompatible with v1/v2 domains.
 //
 // Capabilities in this revision:
 // - Topic modes: kBroadcast (1 publisher, N subscribers) and kMpsc (N
 //   publishers, 1 subscriber). MPSC requires queue_depth >= 64.
 // - Multi-publisher leases per topic with proven-dead Recover() reclamation.
-// - Zero-copy borrow poll path over the fixed per-topic payload ring.
+// - CentralSlab + AllocationJournal + ShmPinTable payload path (SimpleNode
+//   patterns): Publish allocates in the slab; PollBorrow pins and returns a
+//   zero-copy span; Recover reclaims orphan journal txns and dead-owner pins.
 // - Optional typed Advertise/Subscribe/Publish via StaticMessageTraits<T>.
 //
 // Remaining limits (intentional / deferred):
-// - Canonical payloads stay in fixed per-topic rings. CentralSlab +
-//   AllocationJournal + ShmPinTable are **deferred**: wiring them needs an ABI
-//   bump (MINOSHD2→v3), journal/pin recovery, and essentially duplicates
-//   SimpleNode's segment layout. SharedHostDomain's role is discoverable
-//   POD/bytes topology; SimpleNode remains the CentralSlab reference path.
 // - LocalBus/Coordinator stay in-process; no hybrid cross-host ZC / PTP / RDMA.
 // - Optional static LocalBusConfig::topics manifests remain valid for the
 //   in-process LocalBusDeployment path.
+// - Out of scope here: PTP sidecar, IPsec, Region multi-writer.
 
 inline constexpr uint32_t kSharedHostMaxPeerSlots = 64;
 inline constexpr uint32_t kSharedHostMaxTopicSlots = 64;

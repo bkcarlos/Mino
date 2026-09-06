@@ -9,7 +9,7 @@
 范围：对照 D0–D6 计划、ADR、运维手册、pipeline follow-up、代码 TODO/stub，以及
 transport / discovery / 镜像路径；并与 tip 上已合入的 AEAD / nested owned-graph /
 exclusive-hop recovery / residual copies / Region ID Attach / DedupStore /
-SharedHostDomain v2 / hybrid graph forward / PTP+RDMA/Fabric 插件 / opt-closeout
+SharedHostDomain v3 CentralSlab / hybrid graph forward / PTP+RDMA/Fabric 插件 / opt-closeout
 对齐。  
 不包含：新功能开发；不发明性能数字。
 
@@ -30,7 +30,7 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 | A8 subordinate writable / multi-writer Attach | **未实现（ADR-0014）** | 需 attachment registry + layout bump；tip 仅 fail-closed 探测 |
 | A10 ptp4l/pmc 侧车、双机 PTP 资格、pipeline 单向延迟字段 | **残留集成/资格** | `PtpClockClient` 已落地；无合格同步仍 fail-closed |
 | A12 IPsec 传输 | **未做（架构选项）** | D6 落地 TLS；树内无 IPsec 驱动 |
-| SharedHostDomain → CentralSlab | **KEEP deferred** | 固定 ring 拓扑已完成；接 slab 需 ABI v3，与 SimpleNode 重复 |
+| SharedHostDomain → CentralSlab | **DONE（v3）** | ABI `MINOSHD3`；Publish 分配 / PollBorrow pin / Recover journal+pins；复用 SimpleNode 模式 |
 
 ### 硬件 / clean-ref 资格（代码在，门未关）
 
@@ -114,7 +114,7 @@ graph→SemanticFrame→wire / wire→SemanticFrame→graph 的**中间** payloa
 
 ### A6. Coordinator / in-process Bus 不做跨进程发现（同机动态路径已补）
 
-`LocalBusDeployment` / `Coordinator` 仍是进程内组装（heap BroadcastChannel + 进程内 registry），没有把 Coordinator 做成跨进程服务。同机多进程动态加入改走 `SharedHostDomain`（POSIX SHM peer 表 + topic 目录，Advertise/Subscribe/Recover，无预置 peer list；ABI v2 / `MINOSHD2`，含 MPSC/Broadcast/borrow/typed）。pipeline 6 进程 SHM 基准仍可选静态 manifest 以排除发现抖动；这不再是「没有动态发现 API」或「SimpleNode/同机仅 static-only」。跨机发现仍属 Bridge / topology JSON，不在此列。
+`LocalBusDeployment` / `Coordinator` 仍是进程内组装（heap BroadcastChannel + 进程内 registry），没有把 Coordinator 做成跨进程服务。同机多进程动态加入改走 `SharedHostDomain`（POSIX SHM peer 表 + topic 目录，Advertise/Subscribe/Recover，无预置 peer list；ABI v3 / `MINOSHD3`，含 MPSC/Broadcast/borrow/typed + CentralSlab journal/pins）。pipeline 6 进程 SHM 基准仍可选静态 manifest 以排除发现抖动；这不再是「没有动态发现 API」或「SimpleNode/同机仅 static-only」。跨机发现仍属 Bridge / topology JSON，不在此列。
 
 ### A7. Region 按 ID / Registry 查找 Attach — 已实现（tip）
 
