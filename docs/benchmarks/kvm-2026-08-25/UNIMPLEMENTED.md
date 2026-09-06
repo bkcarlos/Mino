@@ -3,7 +3,7 @@
 调查日期（首次）：2026-08-25 23:45 CST（UTC+8）  
 **文档同步日期：2026-09-06（Asia/Shanghai）**  
 仓库：`/workspace/Mino`  
-**HEAD（文档对照 tip）：`afafa2c06473f475713ede6f6f0c89e4c83ed1d2`**
+**HEAD（文档对照 tip）：`9cd50f9f33203533f4b6ea9287c4ec2291cd3195`**
 （`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；
 相对 `abb282f`/`d36603e` 超前；A1 会话 KEX 已关闭）  
 范围：对照 D0–D6 计划、ADR、运维手册、pipeline follow-up、代码 TODO/stub，以及
@@ -13,7 +13,7 @@ SharedHostDomain v2 / hybrid graph forward / PTP+RDMA/Fabric 插件 / opt-closeo
 对齐。  
 不包含：新功能开发；不发明性能数字。
 
-**总判断（tip `afafa2c`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
+**总判断（tip `9cd50f9`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
 关闭或降为明确外置/延期。真正仍缺的是少数协议外置能力（A8 多
 writer layout；A1 会话 KEX 已在 tip 关闭）、架构非目标（A11/A12），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
 clean-ref 资格门**（驱动与软件参考插件已在树内，不算资格通过）。同机优化残留拷贝以
@@ -21,13 +21,12 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 
 ---
 
-## 仍 incomplete 速览（对照 tip `afafa2c`）
+## 仍 incomplete 速览（对照 tip `9cd50f9`）
 
 ### 代码缺口 / 明确外置或延期（非 stub 大面积）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| A1 会话密钥交换 / PKI / pipeline 自动挂 keyring | **已关闭（会话 KEX）** | TLS exporter + PSK KeyShare；pipeline 自动挂 keyring |
 | A8 subordinate writable / multi-writer Attach | **未实现（ADR-0014）** | 需 attachment registry + layout bump；tip 仅 fail-closed 探测 |
 | A10 ptp4l/pmc 侧车、双机 PTP 资格、pipeline 单向延迟字段 | **残留集成/资格** | `PtpClockClient` 已落地；无合格同步仍 fail-closed |
 | A12 IPsec 传输 | **未做（架构选项）** | D6 落地 TLS；树内无 IPsec 驱动 |
@@ -158,7 +157,7 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 ## B. 代码已实现，当前 tip 上尚未资格关闭
 
-下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip `d36603e`。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
+下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip `9cd50f9`。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
 
 1. **D4 当前候选物理双机 mTLS/ACL 复验**  
    开发计划 D4 DoD 唯一未勾：`b02eabf` 的 v4 probe 已归档 `docs/validation/physical_two_host_31291274125_manifest.json`，「当前候选修改了 Bridge/TCP/mTLS/ACL/RemoteBridge，必须重新验证」。按现要求不排 hybrid 双机。

@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/aead-session-kex` tip **`afafa2c`**（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；基于 `abb282f`/`d36603e`）
+- HEAD 对照：`feature/aead-session-kex` tip **`9cd50f9`**（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；基于 `abb282f`/`d36603e`）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
