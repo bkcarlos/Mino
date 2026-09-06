@@ -73,10 +73,15 @@ struct LocalBusConfig {
     std::vector<LocalTopicConfig> topics;
 };
 
-// Production, local-only Bus assembly. Each configured topic owns a real
+// Production, in-process Bus assembly. Each configured topic owns a real
 // BroadcastChannel and a fixed, bounded canonical-payload region retained by
-// LocalPublicationBinding. The deployment intentionally supports one publisher
-// per topic, matching BroadcastChannel's single-publisher contract.
+// LocalPublicationBinding. Discovery is process-local: Coordinator lives in
+// this address space and topics are heap-backed. For same-host multi-process
+// dynamic join/advertise/subscribe without a static peer manifest, use
+// SharedHostDomain. The optional LocalBusConfig::topics list remains a static
+// pre-install for single-process compositions. The deployment intentionally
+// supports one publisher per topic, matching BroadcastChannel's single-publisher
+// contract.
 class LocalBusDeployment final {
 public:
     static Result<std::unique_ptr<LocalBusDeployment>> Create(

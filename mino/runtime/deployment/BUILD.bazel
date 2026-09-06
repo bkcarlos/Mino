@@ -121,3 +121,41 @@ cc_library(
         "//mino/upgrade",
     ],
 )
+
+cc_library(
+    name = "shared_host_domain",
+    srcs = ["shared_host_domain.cc"],
+    hdrs = ["shared_host_domain.h"],
+    deps = [
+        "//mino/common:ids",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "//mino/platform:shared_memory",
+        "//mino/runtime:runtime_types",
+        "//mino/schema:descriptor",
+        "//mino/shm/channel:broadcast",
+        "//mino/shm/channel:index_slot",
+    ],
+)
+
+cc_test(
+    name = "shared_host_domain_test",
+    srcs = ["shared_host_domain_test.cc"],
+    deps = [
+        ":shared_host_domain",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "shared_host_domain_mp_stress_test",
+    timeout = "moderate",
+    srcs = ["shared_host_domain_mp_stress_test.cc"],
+    data = ["//examples:shared_host_domain_stress"],
+    deps = [
+        ":shared_host_domain",
+        "//mino/runtime:mp_stress_harness",
+        "@googletest//:gtest_main",
+    ],
+)

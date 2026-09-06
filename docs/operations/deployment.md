@@ -189,7 +189,11 @@ writable.
 ## Controlled node supervisor and monitoring
 
 `mino-node` assembles a real `LocalBusDeployment` with a bounded built-in
-`mino/control` Topic and a real `MonitoringDeployment`. For the `recorder` role,
+`mino/control` Topic and a real `MonitoringDeployment`. Same-host multi-process dynamic peer/topic discovery without a static
+peer manifest uses `SharedHostDomain`
+(`//mino/runtime/deployment:shared_host_domain`); `LocalBusDeployment`
+remains the in-process Bus assembly, and its optional topic list stays a
+static pre-install for single-process compositions. For the `recorder` role,
 it also creates or opens a Recorder session at
 `storage.data_dir/recorder`, installs the same control schema, starts Recorder,
 pumps it in the supervisor loop, and stops it durably during shutdown. Core/edge

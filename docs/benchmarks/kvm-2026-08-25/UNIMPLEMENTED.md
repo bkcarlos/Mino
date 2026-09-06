@@ -32,9 +32,9 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 `benchmarks/pipeline_comparison/PERFORMANCE_FOLLOWUP.md` P3：**Status: not implemented.** 「The hybrid bridge still performs graph-to-semantic-to-wire and wire-to-semantic-to-graph payload copies」。这是产品级零拷贝跨机路径，不是测试缺口。
 
-### A6. Coordinator / Bus 不做跨进程发现
+### A6. Coordinator / in-process Bus 不做跨进程发现（同机动态路径已补）
 
-`LocalBusDeployment` 注释（`mino/runtime/deployment/local_bus.h`）：「Production, local-only Bus assembly… intentionally supports one publisher per topic」。`Coordinator` 是进程内 C++ 对象（`Create` / `CreateForTesting`），没有独立网络发现服务。pipeline README：「current Coordinator and local Bus deployment do not provide cross-process discovery for this six-process topology」，所以 6 进程 SHM 用静态 manifest，不测 Bus 发现。
+`LocalBusDeployment` / `Coordinator` 仍是进程内组装（heap BroadcastChannel + 进程内 registry），没有把 Coordinator 做成跨进程服务。同机多进程动态加入改走 `SharedHostDomain`（POSIX SHM peer 表 + topic 目录，Advertise/Subscribe/Recover，无预置 peer list）。pipeline 6 进程 SHM 基准仍可选静态 manifest 以排除发现抖动；这不再是“没有动态发现 API”。跨机发现仍属 Bridge / topology JSON，不在此列。
 
 ### A7. Region 按 ID / Registry 查找 Attach 未实现
 

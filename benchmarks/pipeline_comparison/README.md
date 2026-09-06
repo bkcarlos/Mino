@@ -128,13 +128,18 @@ artifact records the effective backend-specific value.
 
 The Mino SHM backend uses production `SharedMemorySegment`,
 `CentralSlabAllocator`, `SpscChannel`, `Publisher<T>`, and `Subscriber<T>` hot
-paths. Its five channels are described by a benchmark-static shared manifest.
-It does **not** claim to measure `Bus` discovery or `SharedMemoryRegion`
-supervisor lifecycle because the current Coordinator and local Bus deployment
-do not provide cross-process discovery for this six-process topology. The hybrid
-runner therefore creates one benchmark-static SHM manifest per Linux boot ID and
-uses the production TCP/canonical schema path only for edges whose endpoints have
-different boot IDs.
+paths. Its five channels are still described by a benchmark-static shared
+manifest so the campaign measures hop latency rather than discovery churn.
+That static layout is a **benchmark choice**, not the only same-host path:
+`SharedHostDomain` (`//mino/runtime/deployment:shared_host_domain`) provides
+dynamic same-host peer Join plus Advertise/Subscribe over one POSIX SHM
+segment without a pre-baked peer list, and `SimpleNode` remains the compact
+multi-process topic façade. In-process `LocalBusDeployment` / `Coordinator`
+discovery is still address-space local; cross-host discovery continues to use
+the network topology JSON / Bridge path. The hybrid runner therefore creates
+one benchmark-static SHM manifest per Linux boot ID and uses the production
+TCP/canonical schema path only for edges whose endpoints have different boot
+IDs.
 
 Fast DDS transport/QoS and ZeroMQ socket options are written into every result.
 Initialization, DDS discovery, endpoint connection, warmup, control barriers,
