@@ -82,7 +82,12 @@ struct RegionCreateOptions {
 //     explicitly requests diagnostic legacy access.
 //   * read_only=false requests the unique supervisor role and requires the
 //     current v6 layout. It fails with kWouldBlock while another supervisor
-//     process is live. Writable non-supervisor Attach remains unsupported.
+//     process is live.
+//   * Independent writable non-supervisor Attach (A8) is intentionally
+//     unsupported under ADR-0014: SuperBlock cannot host a crash-safe
+//     multi-writer attachment registry. request_subordinate_writable is a
+//     fail-closed probe that returns kUnsupported rather than admitting a
+//     second writer. A future layout bump is required for subordinate writers.
 struct RegionV4UpgradeOptions {
     std::string name;
     std::span<const ChannelRingDescriptor> rings;
@@ -103,12 +108,19 @@ struct RegionV4CopyUpgradeOptions {
 };
 
 struct RegionAttachOptions {
-    // Required POSIX shm object name. Registry lookup and ID-only Attach are not
-    // implemented. A non-zero region_id is an optional identity assertion and
-    // must match the SuperBlock reached by name; zero means no ID assertion.
+    // POSIX shm object name (e.g. "/my_region"). Empty is allowed only when
+    // region_id is nonzero: Attach then resolves the name from the durable
+    // host-local Region name registry published by Create. When both are set,
+    // name opens the object and region_id is an identity assertion that must
+    // match the SuperBlock (zero means no ID assertion).
     std::string name;
     uint32_t region_id = 0;
     bool read_only = false;
+
+    // Fail-closed residual for A8 / ADR-0014. When true with read_only=false,
+    // Attach returns kUnsupported without mapping or taking the supervisor
+    // lock. Do not use this to request multi-writer semantics on v6.
+    bool request_subordinate_writable = false;
 
     // Zero selects CurrentSecurityDomainId(). Attach rejects a mismatched domain
     // with kPermissionDenied before taking the supervisor lock or changing any

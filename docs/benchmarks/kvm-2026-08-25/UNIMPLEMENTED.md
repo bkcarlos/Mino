@@ -40,13 +40,20 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 `LocalBusDeployment` / `Coordinator` 仍是进程内组装（heap BroadcastChannel + 进程内 registry），没有把 Coordinator 做成跨进程服务。同机多进程动态加入改走 `SharedHostDomain`（POSIX SHM peer 表 + topic 目录，Advertise/Subscribe/Recover，无预置 peer list）。pipeline 6 进程 SHM 基准仍可选静态 manifest 以排除发现抖动；这不再是“没有动态发现 API”。跨机发现仍属 Bridge / topology JSON，不在此列。
 
-### A7. Region 按 ID / Registry 查找 Attach 未实现
+### A7. Region 按 ID / Registry 查找 Attach — 已实现（本分支）
 
-`mino/shm/region/region.h`：「Registry lookup and ID-only Attach are not implemented。」Attach 必须带 POSIX shm name。
+Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region ID HWM 同身份域的持久 `region_names/` 目录；`Attach` 允许 `name` 为空且 `region_id != 0`，经 registry 解析后再走既有校验。`name` + `region_id` 仍表示按名打开并以 ID 做身份断言。见 `mino/shm/region/region_name_registry.*` 与 `RegionTest.AttachResolvesNameFromRegistry*`。
 
-### A8. 可写非 supervisor Attach 未实现
+### A8. 可写非 supervisor Attach — 架构残留（ADR-0014）
 
-同一头文件：「Writable non-supervisor Attach remains unsupported。」v6 可写 Attach 只能是唯一 supervisor。
+调查结论：在 Region layout v6 / SuperBlock 256B 约束下，**无法**安全实现独立进程的非 supervisor 可写 Attach。ADR-0014 已否决「单 supervisor + 任意未注册 writable clients」（supervisor 死亡后无法证明 clients 已退出，destructive recovery 不安全），并明确多 writer 需要**有界、崩溃安全的 attachment registry + layout version bump**。
+
+本分支实现的最大安全子集：
+- 可写 Attach（含 **仅按 Region ID**）仍只授予唯一 supervisor role；
+- `RegionAttachOptions::request_subordinate_writable=true` 在映射/加锁之前 **fail-closed** 返回 `kUnsupported`（显式探测 API，不提供多 writer 语义）；
+- 不引入静默的第二 writer 映射。
+
+完整 A8（subordinate writable / multi-writer）仍未实现，需未来 layout 升级；不得以超时 lease 冒充。
 
 ### A9. 持久 Dedup Store 明确延期
 
@@ -182,6 +189,6 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 在 `mino/ tools/ tests/ examples/` 内检索 `TODO|FIXME|NYI|待实现|未实现|not implemented`：
 
 - 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD 见 A1；会话密钥交换仍外置）
-- 另外一处明确 unsupported：writable non-supervisor / ID-only Attach（嵌套 owned-graph 已落地）
+- 另外一处明确 unsupported：writable non-supervisor Attach（A8 / ADR-0014 残留；ID-only Attach 已由 region name registry 落地）
 
 没有大面积 TODO stub。缺功能主要来自 **外部设备插件缺失、明确延期项、以及资格未关**，而不是空函数。

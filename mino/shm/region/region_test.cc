@@ -403,11 +403,12 @@ TEST_F(RegionTest, AttachRejectsPermissiveMarkerMode) {
   ASSERT_EQ(::close(restore_fd), 0);
 }
 
-TEST_F(RegionTest, AttachRequiresNameAndOptionallyMatchesRegionId) {
+TEST_F(RegionTest, AttachResolvesNameFromRegistryAndOptionallyMatchesRegionId) {
   const std::string name = Name("ao");
   auto region = Create(name);
   ASSERT_TRUE(region.ok()) << region.status().ToString();
   const uint32_t region_id = region->region_id();
+  ASSERT_TRUE(region->Detach().ok());
 
   RegionAttachOptions name_only;
   name_only.name = name;
@@ -435,14 +436,62 @@ TEST_F(RegionTest, AttachRequiresNameAndOptionallyMatchesRegionId) {
   RegionAttachOptions id_only;
   id_only.region_id = region_id;
   id_only.read_only = true;
-  auto without_name = SharedMemoryRegion::Attach(id_only);
-  ASSERT_FALSE(without_name.ok());
-  EXPECT_EQ(without_name.status().code(), StatusCode::kInvalidArgument);
-  EXPECT_NE(without_name.status().ToString().find("ID-only"),
-            std::string::npos);
+  auto by_id = SharedMemoryRegion::Attach(id_only);
+  ASSERT_TRUE(by_id.ok()) << by_id.status().ToString();
+  EXPECT_EQ(by_id->region_id(), region_id);
+  EXPECT_FALSE(by_id->is_supervisor());
 
+  RegionAttachOptions neither;
+  neither.read_only = true;
+  auto missing = SharedMemoryRegion::Attach(neither);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.status().code(), StatusCode::kInvalidArgument);
+
+  EXPECT_TRUE(by_id->Detach().ok());
   EXPECT_TRUE(matched->Detach().ok());
   EXPECT_TRUE(by_name->Detach().ok());
+}
+
+TEST_F(RegionTest, WritableAttachByRegionIdUsesSupervisorRole) {
+  const std::string name = Name("awi");
+  auto created = Create(name);
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+  const uint32_t region_id = created->region_id();
+  ASSERT_TRUE(created->Detach().ok());
+
+  RegionAttachOptions by_id;
+  by_id.region_id = region_id;
+  by_id.read_only = false;
+  auto attached = SharedMemoryRegion::Attach(by_id);
+  ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+  EXPECT_TRUE(attached->is_supervisor());
+  EXPECT_EQ(attached->region_id(), region_id);
+  EXPECT_TRUE(attached->ValidateSupervisorFence().ok());
+  EXPECT_TRUE(attached->Detach().ok());
+}
+
+TEST_F(RegionTest, SubordinateWritableAttachIsFailClosed) {
+  const std::string name = Name("asub");
+  auto created = Create(name);
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+  const uint32_t region_id = created->region_id();
+  ASSERT_TRUE(created->Detach().ok());
+
+  RegionAttachOptions subordinate;
+  subordinate.name = name;
+  subordinate.region_id = region_id;
+  subordinate.read_only = false;
+  subordinate.request_subordinate_writable = true;
+  auto denied = SharedMemoryRegion::Attach(subordinate);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.status().code(), StatusCode::kUnsupported);
+  EXPECT_NE(denied.status().ToString().find("ADR-0014"), std::string::npos);
+
+  RegionAttachOptions bad_combo = subordinate;
+  bad_combo.read_only = true;
+  auto invalid = SharedMemoryRegion::Attach(bad_combo);
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.status().code(), StatusCode::kInvalidArgument);
 }
 
 TEST_F(RegionTest, AttachRejectsBadMagic) {

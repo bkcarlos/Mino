@@ -35,6 +35,7 @@
 #include "mino/shm/channel/mpmc_ring.h"
 #include "mino/shm/region/recovery.h"
 #include "mino/shm/region/region_id_allocator.h"
+#include "mino/shm/region/region_name_registry.h"
 
 namespace mino {
 namespace {
@@ -382,6 +383,21 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
         directory_base + kChannelDirectoryRelativeOffset,
         directory_size - kChannelDirectoryRelativeOffset));
 
+    // Publish the durable ID->name mapping before ACTIVE so ID-only Attach
+    // cannot observe an ACTIVE SuperBlock that the registry cannot resolve.
+    // Failure rolls back the still-private object without leaking a mapping.
+    {
+        const Status registered = region_internal::RegisterRegionName(
+            region_id, options.name);
+        if (!registered.ok()) {
+            ReleaseSupervisorLock(supervisor_lock_fd);
+            (void)segment.Close();
+            (void)SharedMemorySegment::Unlink(options.name);
+            (void)region_internal::UnregisterRegionName(region_id);
+            return registered;
+        }
+    }
+
     // Initialization complete -> ACTIVE (6.1). clean_shutdown stays false
     // while the Region is in use; it becomes true only on clean Detach.
     StoreState(*sb, RegionState::kActive);
@@ -487,9 +503,29 @@ Status SharedMemoryRegion::ValidateSubRegionBounds(const SuperBlock& sb) {
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     const RegionAttachOptions& options) {
-    if (options.name.empty()) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "Attach requires a Region name; ID-only Attach is unsupported");
+    if (options.request_subordinate_writable) {
+        if (options.read_only) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "request_subordinate_writable is incompatible with read_only Attach");
+        }
+        return Status::Error(
+            StatusCode::kUnsupported,
+            "subordinate writable Attach is unsupported on Region layout v6; "
+            "ADR-0014 requires a crash-safe attachment registry and a layout "
+            "bump before multi-writer or non-supervisor writable Attach");
+    }
+
+    std::string resolved_name = options.name;
+    if (resolved_name.empty()) {
+        if (options.region_id == 0) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "Attach requires a Region name or a nonzero region_id");
+        }
+        MINO_ASSIGN_OR_RETURN(
+            resolved_name,
+            region_internal::LookupRegionName(options.region_id));
     }
 
     // Step 1 (permissions) is enforced by opening the object: a read-write
@@ -499,7 +535,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     // writes lifecycle fields) is possible. A read_only Attach maps read-only.
     MINO_ASSIGN_OR_RETURN(
         SharedMemorySegment segment,
-        SharedMemorySegment::Open(options.name, options.read_only));
+        SharedMemorySegment::Open(resolved_name, options.read_only));
     MINO_RETURN_IF_ERROR(ValidateSegmentSecurity(segment));
 
     const uint64_t object_size = segment.size();
@@ -610,7 +646,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     // distinguishes a dead incarnation from PID reuse and catches malformed or
     // unverifiable metadata before ACTIVE can become DIRTY.
     if (!options.read_only) {
-        auto lock = TryAcquireSupervisorLock(options.name);
+        auto lock = TryAcquireSupervisorLock(resolved_name);
         if (!lock.ok()) {
             region.CloseWithoutLifecycleUpdate();
             return lock.status();
