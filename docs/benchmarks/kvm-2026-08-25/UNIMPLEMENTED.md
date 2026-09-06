@@ -3,9 +3,9 @@
 调查日期（首次）：2026-08-25 23:45 CST（UTC+8）  
 **文档同步日期：2026-09-06（Asia/Shanghai）**  
 仓库：`/workspace/Mino`  
-**HEAD（文档对照 tip）：`f13d2b699624a28159caf6138c54c1c3b184ae0c`**
-（`feat(shm): Region layout v7 crash-safe attachment directory (A8)`；
-相对 master `5098097`：A8 subordinate writable 经 v7 registry 落地）  
+**HEAD（文档对照 tip）：`1db52b15ee27adcd66d8f9a6bb257bc184595deb`**
+（`1db52b1` fix: restore release-suite green for TLS mocks and SHM collisions；
+含 tip `f13d2b6` A8 layout v7 attachment directory 与其后 docs pin）  
 范围：对照 D0–D6 计划、ADR、运维手册、pipeline follow-up、代码 TODO/stub，以及
 transport / discovery / 镜像路径；并与 tip 上已合入的 AEAD / nested owned-graph /
 exclusive-hop recovery / residual copies / Region ID Attach / DedupStore /
@@ -13,7 +13,7 @@ SharedHostDomain v3 CentralSlab / hybrid graph forward / PTP+RDMA/Fabric 插件 
 对齐。  
 不包含：新功能开发；不发明性能数字。
 
-**总判断（tip `f13d2b6`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
+**总判断（tip `1db52b1`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
 关闭或降为明确外置/延期。真正仍缺的是少数协议外置能力（A8 layout v7
 attachment directory **已落地**；A1 会话 KEX 已关闭；A12 IPsec **软件子集**已落地）、架构非目标（A11），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
 clean-ref 资格门**（驱动与软件参考插件已在树内，不算资格通过）。同机优化残留拷贝以
@@ -21,7 +21,7 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 
 ---
 
-## 仍 incomplete 速览（对照 tip `f13d2b6`）
+## 仍 incomplete 速览（对照 tip `1db52b1`）
 
 ### 代码缺口 / 明确外置或延期（非 stub 大面积）
 
@@ -164,7 +164,7 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 ## B. 代码已实现，当前 tip 上尚未资格关闭
 
-下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip `f13d2b6`。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
+下列项都有对应源文件 / runner / workflow；缺的是 **clean exact-commit、真实硬件或评审产物**。开发计划把 D2/D5/72h soak 绑在候选 `e53e1711…` 等历史提交上，**不是** 当前 tip `1db52b1`。历史 KVM 战役目录 `kvm-2026-08-25/` 内 REPORT/summary 仍钉在当时 commit `c977bd1`，那是战役归档，**不要**当成 tip 资格。
 
 1. **D4 当前候选物理双机 mTLS/ACL 复验**  
    开发计划 D4 DoD 唯一未勾：`b02eabf` 的 v4 probe 已归档 `docs/validation/physical_two_host_31291274125_manifest.json`，「当前候选修改了 Bridge/TCP/mTLS/ACL/RemoteBridge，必须重新验证」。按现要求不排 hybrid 双机。

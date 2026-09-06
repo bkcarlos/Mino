@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/region-layout-v7` tip **`f13d2b6`**（基于 master **`5098097`**）
+- HEAD 对照：master tip **`1db52b1`**（release-suite green after TLS mock / SHM salt；含 A8 `f13d2b6`）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
