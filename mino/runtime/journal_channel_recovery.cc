@@ -155,6 +155,11 @@ JournalChannelRecoveryCoordinator::Resolve(
     if (binding.payload.IsNull()) {
         return AllocationJournal::CommittedOrphanAction::kDefer;
     }
+    // Exclusive-hop leases are not channel publications. Do not require a
+    // matching registered channel kind (source channel_id is diagnostic only).
+    if (binding.channel_kind == PublicationChannelKind::kExclusiveHop) {
+        return AllocationJournal::CommittedOrphanAction::kRollback;
+    }
     const Registration* registration = Find(binding.channel_id);
     if (registration == nullptr ||
         registration->channel_kind != binding.channel_kind) {
@@ -195,6 +200,8 @@ JournalChannelRecoveryCoordinator::Resolve(
                     return AllocationJournal::CommittedOrphanAction::kDefer;
             }
             break;
+        case PublicationChannelKind::kExclusiveHop:
+            return AllocationJournal::CommittedOrphanAction::kRollback;
         case PublicationChannelKind::kNone:
             break;
     }

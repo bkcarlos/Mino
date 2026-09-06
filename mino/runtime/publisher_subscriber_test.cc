@@ -1811,23 +1811,22 @@ TEST_F(RuntimeSpscTest, ExclusiveReleaseWithoutPublishReclaimsGraph) {
               before.published_graph_reclaims + 1);
 }
 
-// Documents the fail-closed hop crash window: after PublishLocal FinalizeCommit
-// the journal slot is free, and TakeExclusive ACKs the channel, so recovery
-// cannot reclaim a process-killed ExclusiveMessage. RAII Release must reclaim
-// exactly once; do not invent a second free path.
+// Exclusive hop lease keeps the detached graph visible to journal recovery.
+// Simulating owner death (DetachLocalOwnershipForRecoveryTest) lets
+// RecoverOrphans roll back the kExclusiveHop lease without Region recreate.
 TEST_F(RuntimeSpscTest,
-       ExclusiveDetachedGraphInvisibleToJournalRecoveryUntilRelease) {
-    const size_t journal_size = AllocationJournal::RequiredSize(1, 2);
+       ExclusiveDetachedGraphRecoverableViaJournalAfterOwnerDeath) {
+    const size_t journal_size = AllocationJournal::RequiredSize(2, 2);
     auto journal_memory = AllocateAligned(journal_size);
     auto journal = AllocationJournal::Init(
-        journal_memory.get(), journal_size, 1, 2, allocator_);
+        journal_memory.get(), journal_size, 2, 2, allocator_);
     ASSERT_TRUE(journal.ok()) << journal.status().ToString();
 
     JournalChannelRecoveryCoordinator recovery(*journal);
     ASSERT_TRUE(recovery.RegisterChannel(1, *channel_).ok());
 
     Publisher<RuntimeGraphMessage> publisher(allocator_, *channel_, *journal);
-    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_);
+    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_, *journal);
     auto builder = publisher.Allocate();
     ASSERT_TRUE(builder.ok());
     (*builder)->id = 0x911;
@@ -1848,24 +1847,108 @@ TEST_F(RuntimeSpscTest,
     ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
     auto exclusive = std::move(*borrowed).TakeExclusive();
     ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(exclusive->has_hop_lease());
     EXPECT_TRUE(channel_->IsEmpty());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 1u);
     EXPECT_EQ(allocator_.Inspect(root)->state, ObjectState::kPublished);
     EXPECT_EQ(allocator_.Inspect(child)->state, ObjectState::kPublished);
 
-    // Owner appears dead, but finalized journal + empty channel => no reclaim.
+    // Simulate process death while holding the exclusive hop.
+    exclusive->DetachLocalOwnershipForRecoveryTest();
+    EXPECT_FALSE(exclusive->active());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 1u);
+
     EXPECT_EQ(recovery.RecoverOrphans(
                   [](const ProcessIdentity&, void*) noexcept {
                       return ProcessLiveness::kDead;
                   }),
-              0u);
-    EXPECT_EQ(allocator_.Inspect(root)->state, ObjectState::kPublished);
-    EXPECT_EQ(allocator_.Inspect(child)->state, ObjectState::kPublished);
-
-    ASSERT_TRUE(std::move(*exclusive).Release().ok());
+              1u);
+    EXPECT_EQ(journal->ActiveTransactionCount(), 0u);
     EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
     EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
 }
 
+TEST_F(RuntimeSpscTest, ExclusiveHopLeaseClearedOnPublishLocal) {
+    auto hop_memory = AllocateAligned(SpscChannel::RequiredSize(kChannelCapacity));
+    auto hop = SpscChannel::Init(hop_memory.get(), kChannelCapacity);
+    ASSERT_TRUE(hop.ok()) << hop.status().ToString();
+    const size_t journal_size = AllocationJournal::RequiredSize(2, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 2, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> producer(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> hop_in(allocator_, *channel_, *journal);
+    Publisher<RuntimeGraphMessage> hop_out(allocator_, *hop, *journal);
+    Subscriber<RuntimeGraphMessage> sink(allocator_, *hop);
+
+    auto builder = producer.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x913;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    ASSERT_TRUE(producer.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = hop_in.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(exclusive->has_hop_lease());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 1u);
+    ASSERT_TRUE(hop_out.PublishLocal(std::move(*exclusive)).ok());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 0u);
+
+    auto received = sink.TryPoll();
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    EXPECT_EQ(received->metadata().payload, root);
+    ASSERT_TRUE(std::move(*received).Ack().ok());
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+}
+
+TEST_F(RuntimeSpscTest, ExclusiveReleaseWithHopLeaseReclaimsViaJournal) {
+    const size_t journal_size = AllocationJournal::RequiredSize(2, 2);
+    auto journal_memory = AllocateAligned(journal_size);
+    auto journal = AllocationJournal::Init(
+        journal_memory.get(), journal_size, 2, 2, allocator_);
+    ASSERT_TRUE(journal.ok()) << journal.status().ToString();
+
+    Publisher<RuntimeGraphMessage> publisher(allocator_, *channel_, *journal);
+    Subscriber<RuntimeGraphMessage> subscriber(allocator_, *channel_, *journal);
+    auto builder = publisher.Allocate();
+    ASSERT_TRUE(builder.ok());
+    (*builder)->id = 0x914;
+    AllocationRequest child_request;
+    child_request.object_size = 16;
+    child_request.type_id = TypeId{44};
+    child_request.schema = {.short_id = 3, .layout_version = 1};
+    child_request.alignment = 8;
+    auto child_build = builder->AllocateChild(child_request);
+    ASSERT_TRUE(child_build.ok()) << child_build.status().ToString();
+    SetGraphChild(**builder, child_build->handle);
+    const ShmHandle root = builder->handle();
+    const ShmHandle child = child_build->handle;
+    ASSERT_TRUE(publisher.PublishLocal(std::move(*builder)).ok());
+
+    auto borrowed = subscriber.TryPoll();
+    ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+    auto exclusive = std::move(*borrowed).TakeExclusive();
+    ASSERT_TRUE(exclusive.ok()) << exclusive.status().ToString();
+    EXPECT_TRUE(exclusive->has_hop_lease());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 1u);
+
+    ASSERT_TRUE(std::move(*exclusive).Release().ok());
+    EXPECT_EQ(journal->ActiveTransactionCount(), 0u);
+    EXPECT_EQ(allocator_.Inspect(root).status().code(), StatusCode::kNotFound);
+    EXPECT_EQ(allocator_.Inspect(child).status().code(), StatusCode::kNotFound);
+}
 // Codegen Builder may zero the root on hop. Restoring child-handle metadata
 // before Release/PublishLocal is required so typed reclaim always sees the child.
 TEST_F(RuntimeSpscTest, ExclusiveZeroRootRestoreChildThenReleaseReclaimsGraph) {

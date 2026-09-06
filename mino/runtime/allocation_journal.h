@@ -39,6 +39,9 @@ enum class PublicationChannelKind : uint32_t {
     kSpsc = 1,
     kMpsc = 2,
     kBroadcast = 3,
+    // Detached exclusive hop lease: graph is not in any channel; a live owner
+    // process holds ExclusiveMessage. Dead-owner recovery rolls the lease back.
+    kExclusiveHop = 4,
 };
 
 struct PublicationBinding {
@@ -166,6 +169,17 @@ public:
     Status RollbackCommitted(
         const AllocationTransaction& transaction) noexcept;
     Status Abort(const AllocationTransaction& transaction) noexcept;
+
+    // Adopts an already-published root-first graph into a durable exclusive-hop
+    // lease. Handles are not re-stamped; the lease only tracks them for dead-
+    // owner reclaim via RollbackCommitted / RecoverOrphans. source_channel_id
+    // must be non-zero (recovery registration identity); sequence is recorded
+    // for diagnostics and may be the pre-ACK publication sequence.
+    Result<AllocationTransaction> AdoptExclusiveHop(
+        const ProcessIdentity& owner,
+        std::span<const ShmHandle> root_first_manifest,
+        uint64_t source_channel_id,
+        uint64_t source_sequence) noexcept;
 
     uint32_t RecoverOrphans(
         IdentityProbe identity_probe = nullptr,

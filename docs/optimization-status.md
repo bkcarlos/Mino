@@ -1,7 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`91b92f829fa7182103e7ff1b90ca33f69f5badda`
-  （`fix: initialize NUMA placement in allocator test`；含 `e333069` SimpleNode 扩展与更早的 `a1b76c3` opt-complete）
+- HEAD 对照：`feature/exclusive-hop-recovery` tip（基于 `632f45c` nested owned-graph + AEAD `e37af80`）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -12,6 +11,7 @@
 |---|---|---|
 | 同机 SHM hop 拷 payload（A1） | **DONE** | `benchmarks/pipeline_comparison/mino_shm_pipeline.cc`：`RunForwarder` 用独占 hop；sink/CANBus 用 payload **span** 校验，不 `SemanticFrame.payload.assign` |
 | 独占转发 API（B1） | **DONE** | `BorrowedMessage::TakeExclusive() &&` → `ExclusiveMessage<T>`；`Publisher::PublishLocal(ExclusiveMessage&&)`（`mino/runtime/subscriber.h`、`publisher.h`） |
+| Exclusive hop crash recovery | **DONE** | journal `AdoptExclusiveHop` + `kExclusiveHop`；recovery Rollback；journal-backed `Subscriber`（`allocation_journal.*`、`journal_channel_recovery.cc`、`subscriber.h`） |
 | `BytesView`（A2） | **DONE** | `DynamicValue::BytesView` / `Kind::kBytesView`；`EncodeInto` 接受 view（`mino/schema/dynamic_value.*`、`wire.*`） |
 | 长度定界 payload `insert` memmove（A3） | **DONE** | `EncodeLengthDelimitedValue`：Leb128 前缀 + `Append`；嵌套走 scratch 再 Append |
 | 流式 DecodeView / owned send / 尾帧 steal（A4） | **DONE** | `LengthPrefixedFrameDecoder::Push`→`DecodeView`；Bridge `TrySendOwned` / `TrySendUntrackedOwned`；TcpDriver 收缓冲**尾部**完整帧 `move` steal |
@@ -20,8 +20,10 @@
 
 - **仅**完整 typed `Publisher<T>` / `Subscriber<T>` 路径上的 SPSC；`TakeExclusive` → `PublishLocal(ExclusiveMessage&&)`
 - pin table / Broadcast / MPSC → `kUnsupported`
-- 未 `PublishLocal` 的 `ExclusiveMessage` 析构 reclaim
-- `TakeExclusive` 与 `PublishLocal` 之间进程被杀：journal 已不跟踪、槽位已 ACK → **泄漏到 Region 重建**
+- 未 `PublishLocal` 的 `ExclusiveMessage` 析构 / `Release()` reclaim（有 hop lease 时走 journal `RollbackCommitted`）
+- **Crash-safe（journal-backed Subscriber）**：`TakeExclusive` 在 SPSC ACK 之后写入 durable `PublicationChannelKind::kExclusiveHop` lease；`PublishLocal(ExclusiveMessage&&)` `FinalizeCommit` 该 lease；死进程由 `JournalChannelRecoveryCoordinator::RecoverOrphans` **Rollback** 回收 graph，**不必**只靠 Region recreate
+- **无 journal 的 Subscriber**：仍仅 RAII reclaim；kill 窗口 fail-closed 泄漏到 Region 重建
+- **残留微窗口**：ACK 成功到 `AdoptExclusiveHop` 完成之间被杀仍可能泄漏（指令级）；长持有 `ExclusiveMessage` 窗口已覆盖
 - 与 `Transfer()`（Pin→`ShmSharedPtr`）不同：Transfer **不能**再发布
 - **不在** `SimpleNode` 上：SimpleNode 走 `Advertise` / `Subscribe` / `Publish` / `Poll`，无 `TakeExclusive`
 

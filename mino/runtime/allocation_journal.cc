@@ -656,6 +656,74 @@ Status AllocationJournal::Abort(
     return StartReclaim(transaction, AllocationJournalState::kBuilding);
 }
 
+Result<AllocationTransaction> AllocationJournal::AdoptExclusiveHop(
+    const ProcessIdentity& owner,
+    std::span<const ShmHandle> root_first_manifest,
+    uint64_t source_channel_id,
+    uint64_t source_sequence) noexcept {
+    if (owner.IsZero()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "exclusive hop lease requires an owner");
+    }
+    if (source_channel_id == 0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "exclusive hop lease requires a non-zero channel id");
+    }
+    if (root_first_manifest.empty() || root_first_manifest.front().IsNull()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "exclusive hop lease requires a root-first manifest");
+    }
+    if (root_first_manifest.size() > handles_per_transaction_) {
+        return Status::Error(
+            StatusCode::kResourceExhausted,
+            "exclusive hop manifest exceeds journal handle capacity");
+    }
+
+    for (size_t i = 0; i < root_first_manifest.size(); ++i) {
+        const ShmHandle handle = root_first_manifest[i];
+        if (handle.IsNull()) {
+            return Status::Error(StatusCode::kInvalidArgument,
+                                 "exclusive hop manifest contains a null handle");
+        }
+        for (size_t prior = 0; prior < i; ++prior) {
+            if (root_first_manifest[prior] == handle) {
+                return Status::Error(
+                    StatusCode::kInvalidArgument,
+                    "exclusive hop manifest contains a duplicate handle");
+            }
+        }
+        MINO_ASSIGN_OR_RETURN(SlabView slab, allocator_->Inspect(handle));
+        if (slab.state != ObjectState::kPublished) {
+            return Status::Error(
+                StatusCode::kInvalidArgument,
+                "exclusive hop lease accepts only published graph handles");
+        }
+    }
+
+    MINO_ASSIGN_OR_RETURN(AllocationTransaction transaction, Begin(owner));
+    for (size_t i = 0; i < root_first_manifest.size(); ++i) {
+        const Status appended =
+            AppendHandle(transaction, root_first_manifest[i], i == 0);
+        if (!appended.ok()) {
+            (void)Abort(transaction);
+            return appended;
+        }
+    }
+
+    PublicationBinding binding{
+        .channel_kind = PublicationChannelKind::kExclusiveHop,
+        .channel_id = source_channel_id,
+        .sequence = source_sequence,
+        .payload = root_first_manifest.front(),
+    };
+    const Status committed = Commit(transaction, binding);
+    if (!committed.ok()) {
+        (void)Abort(transaction);
+        return committed;
+    }
+    return transaction;
+}
+
 Status AllocationJournal::ContinueReclaim(uint32_t journal_index,
                                           uint64_t tag) noexcept {
     SharedRecord& record = records_[journal_index];

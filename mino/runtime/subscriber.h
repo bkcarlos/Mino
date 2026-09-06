@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -67,11 +68,17 @@ public:
           value_(other.value_),
           metadata_(other.metadata_),
           payload_cleanup_by_channel_(other.payload_cleanup_by_channel_),
+          journal_(other.journal_),
+          hop_owner_(other.hop_owner_),
+          channel_id_(other.channel_id_),
           active_(other.active_) {
         other.allocator_ = nullptr;
         other.pin_table_ = nullptr;
         other.pin_owner_ = {};
         other.value_ = nullptr;
+        other.journal_ = nullptr;
+        other.hop_owner_ = {};
+        other.channel_id_ = 0;
         other.active_ = false;
     }
 
@@ -86,11 +93,17 @@ public:
             value_ = other.value_;
             metadata_ = other.metadata_;
             payload_cleanup_by_channel_ = other.payload_cleanup_by_channel_;
+            journal_ = other.journal_;
+            hop_owner_ = other.hop_owner_;
+            channel_id_ = other.channel_id_;
             active_ = other.active_;
             other.allocator_ = nullptr;
             other.pin_table_ = nullptr;
             other.pin_owner_ = {};
             other.value_ = nullptr;
+            other.journal_ = nullptr;
+            other.hop_owner_ = {};
+            other.channel_id_ = 0;
             other.active_ = false;
         }
         return *this;
@@ -137,6 +150,9 @@ public:
     // published graph. The returned ExclusiveMessage owns the same root and
     // child handles so a hop can mutate root scalars and republish without a
     // payload memcpy. Pin-table and Broadcast/MPSC borrows are rejected.
+    // When this borrow was produced by a journal-backed Subscriber, a durable
+    // kExclusiveHop lease is recorded after the SPSC ACK so dead-owner recovery
+    // can reclaim the graph if PublishLocal/Release never runs.
     Result<ExclusiveMessage<T>> TakeExclusive() && noexcept {
         if (!active_) {
             return Status::Error(StatusCode::kInvalidArgument,
@@ -159,18 +175,62 @@ public:
                                  "borrowed message payload is incomplete");
         }
 
+        std::array<ShmHandle, OwnedGraphCapacity()> manifest{};
+        size_t manifest_count = 0;
+        if constexpr (SupportsOwnedGraphCollection()) {
+            const Status collected = CollectOwnedGraph(
+                metadata_.payload, *value_, manifest, manifest_count,
+                allocator_);
+            if (!collected.ok()) {
+                return collected;
+            }
+            if (manifest_count == 0 || manifest_count > manifest.size()) {
+                return Status::Error(
+                    StatusCode::kCorruption,
+                    "owned graph collector returned an invalid size");
+            }
+            if (manifest.front() != metadata_.payload) {
+                return Status::Error(StatusCode::kCorruption,
+                                     "owned graph collector is not root-first");
+            }
+        } else {
+            manifest[0] = metadata_.payload;
+            manifest_count = 1;
+        }
+
         ExclusiveMessage<T> exclusive(
             allocator_, const_cast<T*>(value_), metadata_);
         active_ = false;
         value_ = nullptr;
+        AllocationJournal* journal = journal_;
+        const ProcessIdentity hop_owner = hop_owner_;
+        const uint64_t channel_id = channel_id_;
+        const uint64_t sequence = metadata_.sequence_num;
         const Status channel_ack = std::visit(
             [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
         allocator_ = nullptr;
         pin_table_ = nullptr;
         pin_owner_ = {};
+        journal_ = nullptr;
+        hop_owner_ = {};
+        channel_id_ = 0;
         if (!channel_ack.ok()) {
             exclusive.Disarm();
             return channel_ack;
+        }
+        if (journal != nullptr) {
+            auto hop = journal->AdoptExclusiveHop(
+                hop_owner,
+                std::span<const ShmHandle>(manifest.data(), manifest_count),
+                channel_id, sequence);
+            if (!hop.ok()) {
+                const Status reclaimed = exclusive.ReclaimGraph();
+                if (!reclaimed.ok()) {
+                    return reclaimed;
+                }
+                return hop.status();
+            }
+            exclusive.AttachHopLease(journal, *hop);
         }
         return exclusive;
     }
@@ -230,6 +290,9 @@ public:
         allocator_ = nullptr;
         pin_table_ = nullptr;
         pin_owner_ = {};
+        journal_ = nullptr;
+        hop_owner_ = {};
+        channel_id_ = 0;
 
         if (!channel_ack.ok()) return channel_ack;
         if (!graph_collection.ok()) return graph_collection;
@@ -275,7 +338,10 @@ private:
                     const ProcessIdentity& pin_owner, ChannelBorrow&& borrow,
                     ShmSharedPtr<T>&& borrow_pin, const T* value,
                     MessageMetadata metadata,
-                    bool payload_cleanup_by_channel) noexcept
+                    bool payload_cleanup_by_channel,
+                    AllocationJournal* journal = nullptr,
+                    ProcessIdentity hop_owner = {},
+                    uint64_t channel_id = 0) noexcept
         : allocator_(allocator),
           pin_table_(pin_table),
           pin_owner_(pin_owner),
@@ -284,6 +350,9 @@ private:
           value_(value),
           metadata_(metadata),
           payload_cleanup_by_channel_(payload_cleanup_by_channel),
+          journal_(journal),
+          hop_owner_(hop_owner),
+          channel_id_(channel_id),
           active_(true) {}
 
     void AckIfActive() noexcept {
@@ -303,6 +372,9 @@ private:
     const T* value_ = nullptr;
     MessageMetadata metadata_;
     bool payload_cleanup_by_channel_ = false;
+    AllocationJournal* journal_ = nullptr;
+    ProcessIdentity hop_owner_;
+    uint64_t channel_id_ = 0;
     bool active_ = false;
 };
 
@@ -427,6 +499,23 @@ public:
           channel_(&channel),
           pin_table_(pin_table),
           pin_owner_(pin_owner) {
+        ValidateStaticContract();
+    }
+
+    // Journal-backed SPSC subscriber: TakeExclusive records a durable exclusive
+    // hop lease so dead-owner recovery can reclaim detached graphs.
+    Subscriber(CentralSlabAllocator& allocator, SpscChannel& channel,
+               AllocationJournal& journal,
+               const ProcessIdentity& hop_owner = ProcessIdentity::Current(),
+               uint64_t channel_id = Publisher<T>::kDefaultSingleChannelId,
+               ShmPinTable* pin_table = nullptr) noexcept
+        : allocator_(&allocator),
+          channel_(&channel),
+          pin_table_(pin_table),
+          pin_owner_(hop_owner),
+          journal_(&journal),
+          hop_owner_(hop_owner),
+          channel_id_(NormalizeChannelId(channel_id)) {
         ValidateStaticContract();
     }
 
@@ -714,7 +803,8 @@ private:
         return BorrowedMessage<T>(
             allocator_, pin_table_, pin_owner_,
             std::forward<ChannelBorrow>(borrow), std::move(borrow_pin), value,
-            MetadataFromSlot(slot), kChannelManagedCleanup);
+            MetadataFromSlot(slot), kChannelManagedCleanup, journal_,
+            hop_owner_, channel_id_);
     }
 
     static Status ValidateMetadata(const IndexSlotSnapshot& slot) noexcept {
@@ -734,11 +824,19 @@ private:
         return Status::Ok();
     }
 
+    static constexpr uint64_t NormalizeChannelId(uint64_t channel_id) noexcept {
+        return channel_id == 0 ? Publisher<T>::kDefaultSingleChannelId
+                               : channel_id;
+    }
+
     CentralSlabAllocator* allocator_;
     std::variant<SpscChannel*, MpscChannel*, BroadcastChannel*> channel_;
     ShmPinTable* pin_table_ = nullptr;
     ProcessIdentity pin_owner_;
     BroadcastChannel::SubscriberHandle broadcast_subscriber_;
+    AllocationJournal* journal_ = nullptr;
+    ProcessIdentity hop_owner_;
+    uint64_t channel_id_ = Publisher<T>::kDefaultSingleChannelId;
     std::atomic<uint64_t> batch_poll_calls_{0};
     std::atomic<uint64_t> batch_polled_messages_{0};
 };

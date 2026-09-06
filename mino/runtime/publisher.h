@@ -240,13 +240,13 @@ private:
 // header fields would be unsafe. Pin-based Transfer() retires the root and
 // cannot be republished.
 //
-// Fail-closed crash window: after the original PublishLocal FinalizeCommit,
-// the journal no longer tracks the graph. TakeExclusive ACKs the SPSC slot, so
-// JournalChannelRecoveryCoordinator also cannot see it. A process kill between
-// TakeExclusive and PublishLocal therefore leaks the published slabs until the
-// SHM region is recreated. Normal C++ unwind must reclaim via this RAII
-// destructor (or Release()) exactly once — never double-free, never rely on
-// journal epoch recovery to close the hop window.
+// Crash safety: when TakeExclusive runs with an AllocationJournal on the
+// Subscriber, it records a durable kExclusiveHop lease after the SPSC ACK.
+// Dead-owner JournalChannelRecoveryCoordinator recovery rolls that lease back
+// and reclaims the published graph without requiring Region recreate. Without a
+// journal, RAII Release remains the only reclaim path (fail-closed leak on
+// kill). There is a micro-window between ACK and AdoptExclusiveHop where a
+// kill can still leak; the long-lived ExclusiveMessage hold window is covered.
 template <typename T>
 class ExclusiveMessage {
 public:
@@ -274,6 +274,9 @@ public:
     const T& operator*() const noexcept { return *value_; }
 
     bool active() const noexcept { return active_; }
+    bool has_hop_lease() const noexcept {
+        return journal_ != nullptr && hop_lease_.valid();
+    }
     ShmHandle handle() const noexcept { return metadata_.payload; }
     const MessageMetadata& metadata() const noexcept { return metadata_; }
 
@@ -285,21 +288,43 @@ public:
         return ReclaimGraph();
     }
 
+    // Drops process-local ownership without reclaiming slabs or discharging a
+    // durable hop lease. Simulates process death for recovery tests.
+    void DetachLocalOwnershipForRecoveryTest() noexcept {
+        active_ = false;
+        allocator_ = nullptr;
+        value_ = nullptr;
+        journal_ = nullptr;
+        hop_lease_ = {};
+    }
+
 private:
     friend class Publisher<T>;
     friend class BorrowedMessage<T>;
 
     ExclusiveMessage(CentralSlabAllocator* allocator, T* value,
-                     MessageMetadata metadata) noexcept
+                     MessageMetadata metadata,
+                     AllocationJournal* journal = nullptr,
+                     AllocationTransaction hop_lease = {}) noexcept
         : allocator_(allocator),
           value_(value),
           metadata_(metadata),
+          journal_(journal),
+          hop_lease_(hop_lease),
           active_(true) {}
+
+    void AttachHopLease(AllocationJournal* journal,
+                        AllocationTransaction hop_lease) noexcept {
+        journal_ = journal;
+        hop_lease_ = hop_lease;
+    }
 
     void Disarm() noexcept {
         active_ = false;
         allocator_ = nullptr;
         value_ = nullptr;
+        journal_ = nullptr;
+        hop_lease_ = {};
     }
 
     void ReleaseIfActive() noexcept {
@@ -312,9 +337,13 @@ private:
         allocator_ = other.allocator_;
         value_ = other.value_;
         metadata_ = other.metadata_;
+        journal_ = other.journal_;
+        hop_lease_ = other.hop_lease_;
         active_ = other.active_;
         other.allocator_ = nullptr;
         other.value_ = nullptr;
+        other.journal_ = nullptr;
+        other.hop_lease_ = {};
         other.active_ = false;
     }
 
@@ -345,6 +374,18 @@ private:
 
     Status ReclaimGraph() noexcept {
         active_ = false;
+        AllocationJournal* journal = journal_;
+        const AllocationTransaction hop_lease = hop_lease_;
+        journal_ = nullptr;
+        hop_lease_ = {};
+
+        if (journal != nullptr && hop_lease.valid()) {
+            const Status rolled = journal->RollbackCommitted(hop_lease);
+            allocator_ = nullptr;
+            value_ = nullptr;
+            return rolled;
+        }
+
         if (allocator_ == nullptr || value_ == nullptr ||
             metadata_.payload.IsNull()) {
             allocator_ = nullptr;
@@ -394,6 +435,8 @@ private:
     CentralSlabAllocator* allocator_ = nullptr;
     T* value_ = nullptr;
     MessageMetadata metadata_;
+    AllocationJournal* journal_ = nullptr;
+    AllocationTransaction hop_lease_{};
     bool active_ = false;
 };
 
@@ -826,6 +869,17 @@ private:
         const Status committed = std::move(*reservation).Commit();
         if (!committed.ok()) {
             return committed;
+        }
+        if (exclusive.journal_ != nullptr && exclusive.hop_lease_.valid()) {
+            const Status finalized =
+                exclusive.journal_->FinalizeCommit(exclusive.hop_lease_);
+            if (!finalized.ok()) {
+                // Channel Commit already linearized republication. Leave the
+                // hop lease for dead-owner recovery rather than rolling it back
+                // (which would reclaim a live in-channel graph).
+                journal_cleanup_debt_count_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
         }
         exclusive.Disarm();
         published_count_.fetch_add(1, std::memory_order_relaxed);

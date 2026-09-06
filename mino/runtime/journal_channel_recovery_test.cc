@@ -394,6 +394,35 @@ TEST_F(JournalChannelRecoveryTest, IndeterminatePublicationIsDeferred) {
     EXPECT_TRUE(journal_->RollbackCommitted(orphan->transaction).ok());
 }
 
+TEST_F(JournalChannelRecoveryTest, ExclusiveHopLeaseRollsBackWithoutChannelMatch) {
+    auto orphan = BeginPublishedOrphan();
+    ASSERT_TRUE(orphan.ok()) << orphan.status().ToString();
+    ASSERT_TRUE(journal_->Commit(
+                    orphan->transaction,
+                    PublicationBinding{.channel_kind = PublicationChannelKind::kSpsc,
+                                       .channel_id = kSpscChannelId,
+                                       .sequence = 0,
+                                       .payload = orphan->root})
+                    .ok());
+    ASSERT_TRUE(journal_->FinalizeCommit(orphan->transaction).ok());
+    EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+
+    ShmHandle handles[] = {orphan->root};
+    auto hop = journal_->AdoptExclusiveHop(
+        ProcessIdentity::Current(), handles, kSpscChannelId, /*sequence=*/0);
+    ASSERT_TRUE(hop.ok()) << hop.status().ToString();
+    EXPECT_EQ(*journal_->State(*hop), AllocationJournalState::kCommitted);
+    EXPECT_EQ(journal_->Binding(*hop)->channel_kind,
+              PublicationChannelKind::kExclusiveHop);
+
+    // Registered channels are SPSC/MPSC/Broadcast — kind mismatch must not
+    // defer exclusive-hop rollback.
+    EXPECT_EQ(recovery_->RecoverOrphans(&AlwaysDead), 1u);
+    EXPECT_EQ(allocator_.Inspect(orphan->root).status().code(),
+              StatusCode::kNotFound);
+    EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+}
+
 TEST_F(JournalChannelRecoveryTest, UnknownOwnerLivenessPreventsRollback) {
     auto orphan = BeginPublishedOrphan();
     ASSERT_TRUE(orphan.ok()) << orphan.status().ToString();
