@@ -241,12 +241,12 @@ private:
 // cannot be republished.
 //
 // Crash safety: when TakeExclusive runs with an AllocationJournal on the
-// Subscriber, it records a durable kExclusiveHop lease after the SPSC ACK.
-// Dead-owner JournalChannelRecoveryCoordinator recovery rolls that lease back
-// and reclaims the published graph without requiring Region recreate. Without a
+// Subscriber, it records a durable kExclusiveHop lease *before* the SPSC ACK.
+// Dead-owner JournalChannelRecoveryCoordinator recovery: if the source
+// publication is still Visible (ACK never ran), Finalizes the lease only;
+// otherwise Rollbacks and reclaims the graph without Region recreate. Without a
 // journal, RAII Release remains the only reclaim path (fail-closed leak on
-// kill). There is a micro-window between ACK and AdoptExclusiveHop where a
-// kill can still leak; the long-lived ExclusiveMessage hold window is covered.
+// kill). The former ACK→Adopt micro-window is closed.
 template <typename T>
 class ExclusiveMessage {
 public:

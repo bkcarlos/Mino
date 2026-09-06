@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -151,8 +152,9 @@ public:
     // child handles so a hop can mutate root scalars and republish without a
     // payload memcpy. Pin-table and Broadcast/MPSC borrows are rejected.
     // When this borrow was produced by a journal-backed Subscriber, a durable
-    // kExclusiveHop lease is recorded after the SPSC ACK so dead-owner recovery
-    // can reclaim the graph if PublishLocal/Release never runs.
+    // kExclusiveHop lease is recorded *before* the SPSC ACK so the
+    // ACK→Adopt micro-window is closed. Recovery Finalizes (lease only) if the
+    // source publication is still Visible, otherwise Rollbacks the graph.
     Result<ExclusiveMessage<T>> TakeExclusive() && noexcept {
         if (!active_) {
             return Status::Error(StatusCode::kInvalidArgument,
@@ -198,14 +200,26 @@ public:
             manifest_count = 1;
         }
 
-        ExclusiveMessage<T> exclusive(
-            allocator_, const_cast<T*>(value_), metadata_);
-        active_ = false;
-        value_ = nullptr;
         AllocationJournal* journal = journal_;
         const ProcessIdentity hop_owner = hop_owner_;
         const uint64_t channel_id = channel_id_;
         const uint64_t sequence = metadata_.sequence_num;
+        std::optional<AllocationTransaction> hop_lease;
+        if (journal != nullptr) {
+            auto hop = journal->AdoptExclusiveHop(
+                hop_owner,
+                std::span<const ShmHandle>(manifest.data(), manifest_count),
+                channel_id, sequence);
+            if (!hop.ok()) {
+                return hop.status();
+            }
+            hop_lease = *hop;
+        }
+
+        ExclusiveMessage<T> exclusive(
+            allocator_, const_cast<T*>(value_), metadata_);
+        active_ = false;
+        value_ = nullptr;
         const Status channel_ack = std::visit(
             [](auto& borrow) { return std::move(borrow).Ack(); }, borrow_);
         allocator_ = nullptr;
@@ -215,22 +229,19 @@ public:
         hop_owner_ = {};
         channel_id_ = 0;
         if (!channel_ack.ok()) {
+            if (hop_lease.has_value() && journal != nullptr) {
+                // Channel still owns the graph; drop the lease without reclaim.
+                const Status finalized = journal->FinalizeCommit(*hop_lease);
+                if (!finalized.ok()) {
+                    exclusive.Disarm();
+                    return finalized;
+                }
+            }
             exclusive.Disarm();
             return channel_ack;
         }
-        if (journal != nullptr) {
-            auto hop = journal->AdoptExclusiveHop(
-                hop_owner,
-                std::span<const ShmHandle>(manifest.data(), manifest_count),
-                channel_id, sequence);
-            if (!hop.ok()) {
-                const Status reclaimed = exclusive.ReclaimGraph();
-                if (!reclaimed.ok()) {
-                    return reclaimed;
-                }
-                return hop.status();
-            }
-            exclusive.AttachHopLease(journal, *hop);
+        if (hop_lease.has_value()) {
+            exclusive.AttachHopLease(journal, *hop_lease);
         }
         return exclusive;
     }

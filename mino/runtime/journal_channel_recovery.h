@@ -68,7 +68,9 @@ public:
     // Uses AllocationJournal's tri-state liveness contract. kAlive and
     // kUnknown owners are never resolved; only kDead owners reach channel
     // inspection. Unknown channel IDs, type mismatches, and indeterminate
-    // publication state are conservatively deferred.
+    // publication state are conservatively deferred. Exclusive-hop leases are
+    // an exception: Visible source SPSC publication → Finalize (pre-ACK);
+    // otherwise Rollback reclaim (post-ACK / unregistered).
     uint32_t RecoverOrphans(
         IdentityProbe identity_probe = nullptr,
         void* identity_probe_context = nullptr) noexcept;

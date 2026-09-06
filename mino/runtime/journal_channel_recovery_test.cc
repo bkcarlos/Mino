@@ -415,12 +415,45 @@ TEST_F(JournalChannelRecoveryTest, ExclusiveHopLeaseRollsBackWithoutChannelMatch
     EXPECT_EQ(journal_->Binding(*hop)->channel_kind,
               PublicationChannelKind::kExclusiveHop);
 
-    // Registered channels are SPSC/MPSC/Broadcast — kind mismatch must not
-    // defer exclusive-hop rollback.
+    // Publication is not Visible in the SPSC channel (never committed there),
+    // so recovery Rollbacks the exclusive-hop lease and reclaims the graph.
     EXPECT_EQ(recovery_->RecoverOrphans(&AlwaysDead), 1u);
     EXPECT_EQ(allocator_.Inspect(orphan->root).status().code(),
               StatusCode::kNotFound);
     EXPECT_EQ(journal_->ActiveTransactionCount(), 0u);
+}
+
+TEST_F(JournalChannelRecoveryTest,
+       ExclusiveHopPreAckVisiblePublicationIsFinalized) {
+    auto orphan = BeginPublishedOrphan();
+    ASSERT_TRUE(orphan.ok()) << orphan.status().ToString();
+    auto reservation = spsc_->Reserve();
+    ASSERT_TRUE(reservation.ok()) << reservation.status().ToString();
+    reservation->slot()->payload = orphan->root;
+    const uint64_t sequence =
+        reservation->slot()->sequence_num.load(std::memory_order_relaxed);
+    ASSERT_TRUE(journal_->Commit(
+                    orphan->transaction,
+                    PublicationBinding{.channel_kind = PublicationChannelKind::kSpsc,
+                                       .channel_id = kSpscChannelId,
+                                       .sequence = sequence,
+                                       .payload = orphan->root})
+                    .ok());
+    ASSERT_TRUE(journal_->FinalizeCommit(orphan->transaction).ok());
+    ASSERT_TRUE(std::move(*reservation).Commit().ok());
+
+    // Adopt before ACK while the source publication remains Visible.
+    ShmHandle handles[] = {orphan->root};
+    auto hop = journal_->AdoptExclusiveHop(
+        ProcessIdentity::Current(), handles, kSpscChannelId, sequence);
+    ASSERT_TRUE(hop.ok()) << hop.status().ToString();
+    EXPECT_EQ(journal_->Binding(*hop)->channel_kind,
+              PublicationChannelKind::kExclusiveHop);
+
+    EXPECT_EQ(recovery_->RecoverOrphans(&AlwaysDead), 1u);
+    EXPECT_EQ(*journal_->State(*hop), AllocationJournalState::kFree);
+    EXPECT_TRUE(allocator_.Inspect(orphan->root).ok());
+    ReclaimFinalized(orphan->root);
 }
 
 TEST_F(JournalChannelRecoveryTest, UnknownOwnerLivenessPreventsRollback) {

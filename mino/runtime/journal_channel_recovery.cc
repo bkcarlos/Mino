@@ -155,9 +155,26 @@ JournalChannelRecoveryCoordinator::Resolve(
     if (binding.payload.IsNull()) {
         return AllocationJournal::CommittedOrphanAction::kDefer;
     }
-    // Exclusive-hop leases are not channel publications. Do not require a
-    // matching registered channel kind (source channel_id is diagnostic only).
+    // Exclusive-hop leases are adopted before SPSC ACK. If the source
+    // publication is still Visible, ACK never happened — Finalize the lease
+    // without reclaiming so the channel keeps owning the graph. After ACK,
+    // InspectPublication is Indeterminate/NotVisible → Rollback reclaim.
     if (binding.channel_kind == PublicationChannelKind::kExclusiveHop) {
+        const Registration* registration = Find(binding.channel_id);
+        if (registration != nullptr &&
+            registration->channel_kind == PublicationChannelKind::kSpsc &&
+            registration->spsc != nullptr) {
+            switch (registration->spsc->InspectPublication(binding.sequence,
+                                                           binding.payload)) {
+                case SpscChannel::PublicationVisibility::kVisible:
+                    return AllocationJournal::CommittedOrphanAction::kFinalize;
+                case SpscChannel::PublicationVisibility::kNotVisible:
+                case SpscChannel::PublicationVisibility::kIndeterminate:
+                    return AllocationJournal::CommittedOrphanAction::kRollback;
+            }
+        }
+        // No usable source channel view: fail-closed reclaim (typical post-ACK
+        // tear-down / unregistered channel).
         return AllocationJournal::CommittedOrphanAction::kRollback;
     }
     const Registration* registration = Find(binding.channel_id);

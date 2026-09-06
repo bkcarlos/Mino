@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include "mino/common/result.h"
 #include "mino/platform/rdma_provider.h"
@@ -98,8 +99,14 @@ protected:
     Result<ConnectionInfo> DoAccept(const AcceptRequest& request) override;
     Result<SendResult> DoSend(const SendRequest& request,
                               SendOperation operation) override;
+    Result<SendResult> DoTrySendOwned(
+        const SendRequest& request, std::vector<std::byte>&& payload,
+        SendOperation operation) override;
     Result<size_t> DoSendUntracked(
         const UntrackedSendRequest& request) override;
+    Result<size_t> DoTrySendUntrackedOwned(
+        const UntrackedSendRequest& request,
+        std::vector<std::byte>&& payload) override;
     Status DoConfirmRemoteAccepted(SendOperation operation) override;
     Result<ReceiveResult> DoPoll(const ReceiveRequest& request) override;
     Result<CompletionPollResult> DoPollCompletions(

@@ -172,9 +172,11 @@ public:
 
     // Adopts an already-published root-first graph into a durable exclusive-hop
     // lease. Handles are not re-stamped; the lease only tracks them for dead-
-    // owner reclaim via RollbackCommitted / RecoverOrphans. source_channel_id
-    // must be non-zero (recovery registration identity); sequence is recorded
-    // for diagnostics and may be the pre-ACK publication sequence.
+    // owner reclaim via RollbackCommitted / RecoverOrphans. Callers should
+    // Adopt *before* SPSC ACK so recovery can distinguish pre-ACK (Finalize)
+    // from post-ACK (Rollback) via InspectPublication. source_channel_id must
+    // be non-zero (recovery registration identity); sequence is the pre-ACK
+    // publication sequence used for that inspection.
     Result<AllocationTransaction> AdoptExclusiveHop(
         const ProcessIdentity& owner,
         std::span<const ShmHandle> root_first_manifest,

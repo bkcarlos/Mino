@@ -47,10 +47,12 @@ namespace mino::deployment {
 // - Zero-copy borrow poll path over the fixed per-topic payload ring.
 // - Optional typed Advertise/Subscribe/Publish via StaticMessageTraits<T>.
 //
-// Remaining limits:
-// - Canonical payloads still live in fixed per-topic rings (no CentralSlab /
-//   AllocationJournal / ShmPinTable wiring yet; SimpleNode remains the
-//   CentralSlab reference path).
+// Remaining limits (intentional / deferred):
+// - Canonical payloads stay in fixed per-topic rings. CentralSlab +
+//   AllocationJournal + ShmPinTable are **deferred**: wiring them needs an ABI
+//   bump (MINOSHD2→v3), journal/pin recovery, and essentially duplicates
+//   SimpleNode's segment layout. SharedHostDomain's role is discoverable
+//   POD/bytes topology; SimpleNode remains the CentralSlab reference path.
 // - LocalBus/Coordinator stay in-process; no hybrid cross-host ZC / PTP / RDMA.
 // - Optional static LocalBusConfig::topics manifests remain valid for the
 //   in-process LocalBusDeployment path.

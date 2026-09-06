@@ -3356,12 +3356,14 @@ private:
     std::vector<std::byte> heartbeat_wire_;
     DriverConfig config_{};
 
-    // Three mutexes intentionally remain (not lock-free):
+    // Three mutexes CLOSED at this design (intentional KEEP, not unfinished):
     // - mutex_: worker-owned connection/listener/epoll state.
     // - send_ingress_mutex_: Send*/admission queues so producers avoid mutex_.
     // - receive_mutex_: ready receive queue + capacity vs worker enqueue.
-    // Full MPSC/sharded replacement is deferred (deadlock/loss risk). Send
-    // and SendUntracked now keep body copies outside send_ingress_mutex_.
+    // Body copies for Send/SendUntracked already run outside send_ingress_mutex_;
+    // the ingress CS is admission accounting + move only. Replacing with
+    // lock-free/sharded MPSC risks lost wakes, double-free, and tear-down
+    // races; do not reopen without a dedicated concurrency campaign.
     mutable std::mutex mutex_;
     mutable std::mutex send_ingress_mutex_;
     mutable std::mutex receive_mutex_;

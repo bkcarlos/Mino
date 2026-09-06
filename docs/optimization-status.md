@@ -1,29 +1,31 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/hybrid-cross-host-zc`（基于 `606671b` SharedHostDomain）
+- HEAD 对照：`feature/opt-closeout`（基于 tip `b471a98` + 本分支收尾提交）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
 
-## 已关闭（opt-complete / a1b76c3）
+## 已关闭（opt-complete / a1b76c3 + opt-closeout）
 
 | 项 | 状态 | 代码入口 |
 |---|---|---|
 | 同机 SHM hop 拷 payload（A1） | **DONE** | `benchmarks/pipeline_comparison/mino_shm_pipeline.cc`：`RunForwarder` 用独占 hop；sink/CANBus 用 payload **span** 校验，不 `SemanticFrame.payload.assign` |
 | 独占转发 API（B1） | **DONE** | `BorrowedMessage::TakeExclusive() &&` → `ExclusiveMessage<T>`；`Publisher::PublishLocal(ExclusiveMessage&&)`（`mino/runtime/subscriber.h`、`publisher.h`） |
-| Exclusive hop crash recovery | **DONE** | journal `AdoptExclusiveHop` + `kExclusiveHop`；recovery Rollback；journal-backed `Subscriber`（`allocation_journal.*`、`journal_channel_recovery.cc`、`subscriber.h`） |
+| Exclusive hop crash recovery | **DONE** | journal `AdoptExclusiveHop` + `kExclusiveHop`；recovery Rollback/Finalize；journal-backed `Subscriber`（`allocation_journal.*`、`journal_channel_recovery.cc`、`subscriber.h`） |
+| Exclusive hop ACK→Adopt 微窗口 | **DONE（opt-closeout）** | `TakeExclusive` **先** `AdoptExclusiveHop` **再** SPSC ACK；源发布仍 Visible → Finalize（不回收）；否则 Rollback。见下契约 |
 | `BytesView`（A2） | **DONE** | `DynamicValue::BytesView` / `Kind::kBytesView`；`EncodeInto` 接受 view（`mino/schema/dynamic_value.*`、`wire.*`） |
 | 长度定界 payload `insert` memmove（A3） | **DONE** | `EncodeLengthDelimitedValue`：Leb128 前缀 + `Append`；嵌套走 scratch 再 Append |
 | 流式 DecodeView / owned send / 尾帧 steal（A4） | **DONE** | `LengthPrefixedFrameDecoder::Push`→`DecodeView`；Bridge `TrySendOwned` / `TrySendUntrackedOwned`；TcpDriver 收缓冲**尾部**完整帧 `move` steal |
+| RDMA owned Send 免 `assign` | **DONE（opt-closeout）** | `RdmaDriver::DoTrySendOwned` / `PostOwned`：`vector&&` 移入 pending；可选 `pre_registered` MR 跳过 Register/Deregister。span `Send` 仍需 staging 拷 |
 
 ### Exclusive hop 契约（勿写错）
 
 - **仅**完整 typed `Publisher<T>` / `Subscriber<T>` 路径上的 SPSC；`TakeExclusive` → `PublishLocal(ExclusiveMessage&&)`
 - pin table / Broadcast / MPSC → `kUnsupported`
 - 未 `PublishLocal` 的 `ExclusiveMessage` 析构 / `Release()` reclaim（有 hop lease 时走 journal `RollbackCommitted`）
-- **Crash-safe（journal-backed Subscriber）**：`TakeExclusive` 在 SPSC ACK 之后写入 durable `PublicationChannelKind::kExclusiveHop` lease；`PublishLocal(ExclusiveMessage&&)` `FinalizeCommit` 该 lease；死进程由 `JournalChannelRecoveryCoordinator::RecoverOrphans` **Rollback** 回收 graph，**不必**只靠 Region recreate
+- **Crash-safe（journal-backed Subscriber）**：`TakeExclusive` 在 SPSC ACK **之前**写入 durable `PublicationChannelKind::kExclusiveHop` lease；`PublishLocal(ExclusiveMessage&&)` `FinalizeCommit` 该 lease；死进程由 `JournalChannelRecoveryCoordinator::RecoverOrphans` 处理——源 SPSC 仍 **Visible**（未 ACK）→ **Finalize** 仅释 lease；否则 **Rollback** 回收 graph，**不必**只靠 Region recreate
 - **无 journal 的 Subscriber**：仍仅 RAII reclaim；kill 窗口 fail-closed 泄漏到 Region 重建
-- **残留微窗口**：ACK 成功到 `AdoptExclusiveHop` 完成之间被杀仍可能泄漏（指令级）；长持有 `ExclusiveMessage` 窗口已覆盖
+- **微窗口**：ACK→Adopt 指令级窗口已关闭；无 journal 路径与长持有后的 Region 级泄漏语义不变
 - 与 `Transfer()`（Pin→`ShmSharedPtr`）不同：Transfer **不能**再发布
 - **不在** `SimpleNode` 上：SimpleNode 走 `Advertise` / `Subscribe` / `Publish` / `Poll`，无 `TakeExclusive`
 
@@ -56,17 +58,18 @@
 - Fabric：`libmino_fabric_software_loopback.so`
 - **不**声称 V-25 硬件资格；软件 provenance 含 `NOT-QUALIFICATION-ELIGIBLE`
 
-## 仍残留的拷贝 / 成本
+## 仍残留的拷贝 / 成本（仅 physics KEEP / intentional KEEP）
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | 源端首发 `PopulateGeneratedFrame` | **KEEP** | `AllocateChild` + `memcpy` 仍在；语义/网络源不在本 Region，首发进 SHM **必须**物化。benchmark 已注明。 |
+| 1 | 源端首发 `PopulateGeneratedFrame` | **KEEP** | `AllocateChild` + `memcpy` 仍在；语义/网络源不在本 Region，首发进 SHM **必须**物化。benchmark 已注明。无法 Publish/BytesView 跳过：外部字节不是本 Region 图。 |
 | 2 | Hybrid 桥 graph↔semantic↔wire | **DONE（P8）** | `graph_ownership_forward` + bridge：无 SemanticFrame.payload.assign；encode/reconstruct 各 1 次 payload 物化；TCP/WireFrame 拷贝仍不可避免；RDMA 注册钩子预留。 |
 | 3 | 控制面 `WireFrameCodec::Decode` | **DONE（拥有路径）** | Bridge inbound 控制+数据统一 `DecodeView`；`Decode(vector&&)` + `IntoWireFrame` 就地 compact，无二次 payload 堆拷。`Decode(span)` 仍 `assign`（调用方不拥有 body 时必要）。 |
 | 4 | `TcpDriver::Send` / 收帧 | **DONE（可控路径）** | `Send`/`SendUntracked` 改为锁外 body 拷 + segmented `PendingWrite`（不再 `PrefixFrame` 整帧）；收包 **头帧/尾帧** steal，仅「非零 offset 且仍有 trailing」的中段仍 `assign`。 |
-| 5 | 三把 mutex | **PARTIAL** | 锁布局保留（worker / ingress / ready-receive 分离，全量 lock-free 风险高）。`Send*` body 拷已移出 `send_ingress_mutex_`；注释标明职责。 |
+| 5 | 三把 mutex | **KEEP（CLOSED）** | 锁布局保留（worker / ingress / ready-receive）。body 拷已在锁外；ingress CS 仅 admission+move。全量 lock-free/分片队列有丢唤醒与 tear-down 正确性风险，**有意停在此设计**（见 `tcp_driver.cc` 注释）。 |
 | 6 | `RetransmitWindow` owned 拷贝 | **KEEP** | 可靠重传故意自持；`Add`/`ResendPending` 不能挪走唯一副本。 |
-| 7 | Bus memcpy；RDMA `pending.payload.assign` | **PARTIAL（P9）** | 参考 RDMA/Fabric 插件与 MR 钩子已可 `dlopen`；真 NIC 资格与通用 Send 零拷贝仍 KEEP。 |
+| 7 | Bus memcpy；RDMA staging | **KEEP / 部分改进** | **Bus/LocalBusDeployment**：Broadcast 槽位私有区 `memcpy` + `CanonicalMessage` 拥有向量是 API/布局物理必要（非 CentralSlab 图）；**KEEP**。**RDMA**：owned `TrySendOwned` 已 `move` 免 `assign`；span `Send` 仍 staging；真 NIC 零拷贝需调用方持 MR 并走 `pre_registered`（钩子已留，通用 Send 零拷贝仍 KEEP）。 |
+| Extra | SharedHostDomain fixed rings | **KEEP（deferred）** | 固定 per-topic ring，**不**接 CentralSlab。接上需要 ABI v3 + journal/pin，且会与 SimpleNode 布局重复；SharedHostDomain 定位可发现 POD/bytes 拓扑，CentralSlab 参考路径仍是 SimpleNode。见 `shared_host_domain.h`。 |
 
 ## 历史测量
 

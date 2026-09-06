@@ -241,6 +241,21 @@ public:
                           .admitted_bytes = request.payload.size()};
     }
 
+    Result<SendResult> SendOwned(const SendRequest& request,
+                                 std::vector<std::byte>&& payload,
+                                 SendOperation operation) {
+        std::lock_guard lock(mutex_);
+        MINO_RETURN_IF_ERROR(Progress(0));
+        MINO_RETURN_IF_ERROR(ValidateConnected(request.connection_id));
+        const size_t admitted = payload.size();
+        MINO_ASSIGN_OR_RETURN(
+            platform::RdmaWorkRequestId wr,
+            PostOwned(request.connection_id, std::move(payload), operation,
+                      /*pre_registered=*/std::nullopt));
+        (void)wr;
+        return SendResult{.operation = operation, .admitted_bytes = admitted};
+    }
+
     Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
         std::lock_guard lock(mutex_);
         MINO_RETURN_IF_ERROR(Progress(0));
@@ -250,6 +265,20 @@ public:
                                    std::nullopt));
         (void)wr;
         return request.payload.size();
+    }
+
+    Result<size_t> SendUntrackedOwned(const UntrackedSendRequest& request,
+                                      std::vector<std::byte>&& payload) {
+        std::lock_guard lock(mutex_);
+        MINO_RETURN_IF_ERROR(Progress(0));
+        MINO_RETURN_IF_ERROR(ValidateConnected(request.connection_id));
+        const size_t admitted = payload.size();
+        MINO_ASSIGN_OR_RETURN(
+            platform::RdmaWorkRequestId wr,
+            PostOwned(request.connection_id, std::move(payload), std::nullopt,
+                      /*pre_registered=*/std::nullopt));
+        (void)wr;
+        return admitted;
     }
 
     Status ConfirmRemoteAccepted(SendOperation operation) {
@@ -418,6 +447,7 @@ private:
         bool remote_accepted = false;
         bool registration_released = false;
         bool completion_emitted = false;
+        bool owns_registration = true;
         Status status = Status::Ok();
     };
     struct Orphan {
@@ -497,9 +527,27 @@ private:
     Result<platform::RdmaWorkRequestId> Post(
         ConnectionId connection_id, std::span<const std::byte> payload,
         std::optional<SendOperation> operation) {
+        std::vector<std::byte> owned;
+        try {
+            owned.assign(payload.begin(), payload.end());
+        } catch (const std::bad_alloc&) {
+            return Exhausted("RDMA send buffer allocation failed");
+        }
+        return PostOwned(connection_id, std::move(owned), operation,
+                         /*pre_registered=*/std::nullopt);
+    }
+
+    // Moves owned staging into the pending WR. When pre_registered describes
+    // that exact buffer, skip provider Register (plugin already holds the MR)
+    // and do not Deregister on completion.
+    Result<platform::RdmaWorkRequestId> PostOwned(
+        ConnectionId connection_id, std::vector<std::byte>&& payload,
+        std::optional<SendOperation> operation,
+        std::optional<RegisteredMemory> pre_registered) {
         const auto connection = connections_.find(connection_id);
         if (pending_.size() >= options_.send_queue_depth ||
-            queued_send_bytes_ > options_.max_queued_send_bytes - payload.size()) {
+            queued_send_bytes_ >
+                options_.max_queued_send_bytes - payload.size()) {
             return WouldBlock("RDMA send queue is full");
         }
         if (registered_bytes_ >
@@ -511,44 +559,57 @@ private:
         pending.connection_id = connection_id;
         pending.provider_connection_id = connection->second.provider_id;
         pending.operation = operation;
-        try {
-            pending.payload.assign(payload.begin(), payload.end());
-        } catch (const std::bad_alloc&) {
-            return Exhausted("RDMA send buffer allocation failed");
-        }
+        pending.payload = std::move(payload);
+        pending.owns_registration = true;
         MemoryRegistrationOwner owner = options_.registration_owner;
         owner.lease_id = wr;
-        auto registration = options_.provider->Register({
-            .address = pending.payload.data(),
-            .bytes = pending.payload.size(),
-            .alignment = alignof(std::max_align_t),
-            .scope_id = options_.registration_scope_id,
-            .kind = MemoryRegistrationKind::kRdma,
-            .owner = owner,
-            .require_physical_contiguous = false,
-        });
-        if (!registration.ok()) {
-            ++stats_.registration_failures;
-            return registration.status();
-        }
-        if (registration->registration_id == 0 ||
-            registration->bytes != pending.payload.size() ||
-            registration->kind != MemoryRegistrationKind::kRdma ||
-            registration->owner != owner) {
-            const Status cleanup = options_.provider->Deregister(*registration);
-            if (!cleanup.ok()) {
-                orphans_.push_back(Orphan{.payload = std::move(pending.payload),
-                                          .registration = *registration});
-                registered_bytes_ += registration->bytes;
-                return cleanup;
+        if (pre_registered.has_value()) {
+            if (pre_registered->registration_id == 0 ||
+                pre_registered->bytes != pending.payload.size() ||
+                pre_registered->kind != MemoryRegistrationKind::kRdma) {
+                return Status::Error(
+                    StatusCode::kInvalidArgument,
+                    "RDMA pre-registered MR does not match payload");
             }
-            return Status::Error(StatusCode::kCorruption,
-                                 "RDMA provider returned invalid MR facts");
+            pending.registration = *pre_registered;
+            pending.owns_registration = false;
+        } else {
+            auto registration = options_.provider->Register({
+                .address = pending.payload.data(),
+                .bytes = pending.payload.size(),
+                .alignment = alignof(std::max_align_t),
+                .scope_id = options_.registration_scope_id,
+                .kind = MemoryRegistrationKind::kRdma,
+                .owner = owner,
+                .require_physical_contiguous = false,
+            });
+            if (!registration.ok()) {
+                ++stats_.registration_failures;
+                return registration.status();
+            }
+            if (registration->registration_id == 0 ||
+                registration->bytes != pending.payload.size() ||
+                registration->kind != MemoryRegistrationKind::kRdma ||
+                registration->owner != owner) {
+                const Status cleanup =
+                    options_.provider->Deregister(*registration);
+                if (!cleanup.ok()) {
+                    orphans_.push_back(
+                        Orphan{.payload = std::move(pending.payload),
+                               .registration = *registration});
+                    registered_bytes_ += registration->bytes;
+                    return cleanup;
+                }
+                return Status::Error(StatusCode::kCorruption,
+                                     "RDMA provider returned invalid MR facts");
+            }
+            pending.registration = *registration;
         }
-        pending.registration = *registration;
         const auto [inserted, ok] = pending_.emplace(wr, std::move(pending));
         (void)ok;
-        registered_bytes_ += inserted->second.registration.bytes;
+        if (inserted->second.owns_registration) {
+            registered_bytes_ += inserted->second.registration.bytes;
+        }
         queued_send_bytes_ += inserted->second.payload.size();
         order_[connection_id].push_back(wr);
         const Status posted = options_.provider->PostSend({
@@ -692,6 +753,10 @@ private:
 
     Status ReleaseRegistration(Pending& pending) {
         if (pending.registration_released) return Status::Ok();
+        if (!pending.owns_registration) {
+            pending.registration_released = true;
+            return Status::Ok();
+        }
         const Status status =
             options_.provider->Deregister(pending.registration);
         if (!status.ok()) {
@@ -859,9 +924,18 @@ Result<SendResult> RdmaDriver::DoSend(const SendRequest& request,
                                       SendOperation operation) {
     return impl_->Send(request, operation);
 }
+Result<SendResult> RdmaDriver::DoTrySendOwned(
+    const SendRequest& request, std::vector<std::byte>&& payload,
+    SendOperation operation) {
+    return impl_->SendOwned(request, std::move(payload), operation);
+}
 Result<size_t> RdmaDriver::DoSendUntracked(
     const UntrackedSendRequest& request) {
     return impl_->SendUntracked(request);
+}
+Result<size_t> RdmaDriver::DoTrySendUntrackedOwned(
+    const UntrackedSendRequest& request, std::vector<std::byte>&& payload) {
+    return impl_->SendUntrackedOwned(request, std::move(payload));
 }
 Status RdmaDriver::DoConfirmRemoteAccepted(SendOperation operation) {
     return impl_->ConfirmRemoteAccepted(operation);
