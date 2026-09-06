@@ -475,16 +475,17 @@ BridgeConnectionManager::PollDiscoveryHello() noexcept {
                              "epoch discovery returned an invalid batch");
     }
     MINO_ASSIGN_OR_RETURN(
-        auto frame,
-        WireFrameCodec::Decode(received->messages.front().payload,
-                               options_.pipeline.wire_limits));
-    if (frame.header.frame_type != FrameType::kSessionDiscovery) {
+        auto view,
+        WireFrameCodec::DecodeView(
+            std::move(received->messages.front().payload),
+            options_.pipeline.wire_limits));
+    if (view.header.frame_type != FrameType::kSessionDiscovery) {
         return Status::Error(StatusCode::kCorruption,
                              "non-discovery frame preceded identity fencing");
     }
     MINO_ASSIGN_OR_RETURN(
         auto discovery,
-        ControlPayloadCodec::DecodeSessionDiscovery(frame.payload));
+        ControlPayloadCodec::DecodeSessionDiscovery(view.payload));
     const BridgeNodeIdentityFence actual{
         .node_id = discovery.node_id,
         .process_identity = discovery.process_identity,
@@ -1577,15 +1578,16 @@ Result<BridgeListenerHubPumpResult> BridgeListenerHub::Pump(
                     Reject(index, false, &result);
                     continue;
                 }
-                auto frame = WireFrameCodec::Decode(
-                    received->messages.front().payload, options_.wire_limits);
-                if (!frame.ok() ||
-                    frame->header.frame_type != FrameType::kSessionDiscovery) {
+                auto view = WireFrameCodec::DecodeView(
+                    std::move(received->messages.front().payload),
+                    options_.wire_limits);
+                if (!view.ok() ||
+                    view->header.frame_type != FrameType::kSessionDiscovery) {
                     Reject(index, false, &result);
                     continue;
                 }
                 auto discovery =
-                    ControlPayloadCodec::DecodeSessionDiscovery(frame->payload);
+                    ControlPayloadCodec::DecodeSessionDiscovery(view->payload);
                 if (!discovery.ok()) {
                     Reject(index, false, &result);
                     continue;

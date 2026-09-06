@@ -1536,6 +1536,9 @@ void GeneratedToSemantic(const Frame& source, ShmHandle root_handle,
     std::memcpy(frame->payload.data(), child->data, payload.length);
 }
 
+// Ingest into a fresh SHM graph always materializes payload in a child slab
+// (AllocateChild + memcpy). Semantic/network sources are not already in this
+// Region; the copy is required for first publish, not a residual bug.
 void PopulateGeneratedFrame(const SemanticFrame& source,
                             MessageBuilder<Frame>* destination) {
     if (destination == nullptr || !destination->active()) {

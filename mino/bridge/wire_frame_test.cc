@@ -344,6 +344,40 @@ TEST(WireFrameCodecTest, DecodeViewOwnsGoldenBodyAndSurvivesMoves) {
     EXPECT_TRUE(moved.payload.empty());
 }
 
+TEST(WireFrameCodecTest, DecodeOwnedCompactsPayloadWithoutSecondHeapCopy) {
+    WireFrame frame = GoldenFrame();
+    frame.header.frame_type = FrameType::kSessionDiscovery;
+    frame.header.flags = FlagValue(FrameFlag::kControlFrame) |
+                         FlagValue(FrameFlag::kPayloadCrcPresent);
+    frame.payload = Bytes({0x10, 0x20, 0x30, 0x40, 0x50});
+    auto body = WireFrameCodec::Encode(frame);
+    ASSERT_TRUE(body.ok()) << body.status().ToString();
+    const std::byte* const original = body->data();
+    const size_t original_capacity = body->capacity();
+
+    auto decoded = WireFrameCodec::Decode(std::move(*body));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    EXPECT_EQ(decoded->header, frame.header);
+    EXPECT_EQ(decoded->payload, frame.payload);
+    // IntoWireFrame reuses the retained body allocation after compacting.
+    EXPECT_EQ(decoded->payload.data(), original);
+    EXPECT_GE(original_capacity, decoded->payload.size());
+}
+
+TEST(WireFrameCodecTest, IntoWireFrameMatchesDecodeSpanPayload) {
+    WireFrame frame = GoldenFrame();
+    frame.payload = Bytes({1, 2, 3, 4, 5, 6, 7});
+    auto body = WireFrameCodec::Encode(frame);
+    ASSERT_TRUE(body.ok()) << body.status().ToString();
+    std::vector<std::byte> owned = *body;
+
+    auto from_span = WireFrameCodec::Decode(owned);
+    ASSERT_TRUE(from_span.ok()) << from_span.status().ToString();
+    auto from_owned = WireFrameCodec::Decode(std::move(owned));
+    ASSERT_TRUE(from_owned.ok()) << from_owned.status().ToString();
+    EXPECT_EQ(*from_span, *from_owned);
+}
+
 TEST(WireFrameCodecTest,
      EncodeFormsAndDecodeViewAreDifferentialForEveryShapeAndTail) {
     const std::array<FrameType, 7> types = {

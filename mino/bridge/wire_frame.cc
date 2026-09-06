@@ -560,6 +560,29 @@ void ValidatedWireFrameView::RebindPayload() noexcept {
                                                          payload_size_);
 }
 
+WireFrame ValidatedWireFrameView::IntoWireFrame() && noexcept {
+    WireFrame frame;
+    frame.header = std::move(header);
+    if (payload_offset_ == 0 && payload_size_ == body_.size()) {
+        frame.payload = std::move(body_);
+    } else if (payload_size_ == 0) {
+        body_.clear();
+        frame.payload = std::move(body_);
+    } else {
+        if (payload_offset_ != 0) {
+            body_.erase(body_.begin(),
+                        body_.begin() +
+                            static_cast<ptrdiff_t>(payload_offset_));
+        }
+        body_.resize(payload_size_);
+        frame.payload = std::move(body_);
+    }
+    payload_offset_ = 0;
+    payload_size_ = 0;
+    RebindPayload();
+    return frame;
+}
+
 Result<size_t> WireFrameCodec::EncodedSize(
     const WireFrame& frame, const WireFrameLimits& limits,
     const WireAeadKeyring* aead) noexcept {
@@ -738,6 +761,7 @@ Result<WireFrame> WireFrameCodec::Decode(
 
         WireFrame frame;
         frame.header = std::move(decoded->header);
+        // Span callers do not own the body; payload must be copied.
         frame.payload.assign(decoded->payload.begin(), decoded->payload.end());
         return frame;
     } catch (const std::bad_alloc&) {
@@ -745,6 +769,14 @@ Result<WireFrame> WireFrameCodec::Decode(
     } catch (const std::length_error&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
+}
+
+Result<WireFrame> WireFrameCodec::Decode(
+    std::vector<std::byte>&& frame_body, const WireFrameLimits& limits,
+    const WireAeadKeyring* aead) noexcept {
+    auto decoded = DecodeView(std::move(frame_body), limits, aead);
+    if (!decoded.ok()) return decoded.status();
+    return std::move(*decoded).IntoWireFrame();
 }
 
 Result<ValidatedWireFrameView> WireFrameCodec::DecodeView(

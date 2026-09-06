@@ -120,6 +120,11 @@ public:
 
     std::span<const std::byte> body() const noexcept { return body_; }
 
+    // Consumes *this into an owning WireFrame. Compacts the retained body so
+    // payload storage is reused (erase/resize) instead of allocating a second
+    // heap copy of the decoded payload bytes.
+    WireFrame IntoWireFrame() && noexcept;
+
     WireFrameHeader header;
     std::span<const std::byte> payload;
 
@@ -193,6 +198,13 @@ public:
         const WireFrameLimits& limits = {}) noexcept;
     static Result<WireFrame> Decode(
         std::span<const std::byte> frame_body,
+        const WireFrameLimits& limits = {},
+        const WireAeadKeyring* aead = nullptr) noexcept;
+    // Owning overload for callers that already hold the frame body. Prefers
+    // DecodeView + IntoWireFrame so control-plane paths avoid payload.assign
+    // when the vector can be compacted in place.
+    static Result<WireFrame> Decode(
+        std::vector<std::byte>&& frame_body,
         const WireFrameLimits& limits = {},
         const WireAeadKeyring* aead = nullptr) noexcept;
 

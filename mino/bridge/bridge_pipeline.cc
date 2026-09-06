@@ -823,22 +823,13 @@ Status BridgePipeline::DrainInbound(const BridgePumpBudget& budget,
         if (!inspected.ok()) return inspected.status();
         MINO_RETURN_IF_ERROR(AuthorizeInboundData(*inspected));
         const size_t wire_bytes = message.payload.size();
-        const bool control =
-            HasFrameFlag(inspected->flags, FrameFlag::kControlFrame) ||
-            inspected->frame_type != FrameType::kData;
-        if (control) {
-            auto decoded = WireFrameCodec::Decode(message.payload,
+        // Control and data both own message.payload after Poll; DecodeView
+        // avoids the control-plane payload.assign that Decode(span) requires.
+        auto decoded = WireFrameCodec::DecodeView(std::move(message.payload),
                                                   options_.wire_limits);
-            if (!decoded.ok()) return decoded.status();
-            MINO_RETURN_IF_ERROR(
-                QueuePendingInbound(std::move(*decoded), wire_bytes));
-        } else {
-            auto decoded = WireFrameCodec::DecodeView(
-                std::move(message.payload), options_.wire_limits);
-            if (!decoded.ok()) return decoded.status();
-            MINO_RETURN_IF_ERROR(
-                QueuePendingInbound(std::move(*decoded), wire_bytes));
-        }
+        if (!decoded.ok()) return decoded.status();
+        MINO_RETURN_IF_ERROR(
+            QueuePendingInbound(std::move(*decoded), wire_bytes));
         result->bytes += wire_bytes;
         ++result->inbound_frames;
         result->made_progress = true;

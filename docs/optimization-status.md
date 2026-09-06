@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/exclusive-hop-recovery` tip（基于 `632f45c` nested owned-graph + AEAD `e37af80`）
+- HEAD 对照：`feature/opt-residual-copies`（基于 `505d0bf` exclusive-hop-recovery）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -41,13 +41,15 @@
 
 ## 仍残留的拷贝 / 成本
 
-1. 源端首发：`PopulateGeneratedFrame` 仍 `AllocateChild` + `memcpy`
-2. Hybrid 桥 graph↔semantic↔wire（跨机零拷贝未做）
-3. 控制面 `WireFrameCodec::Decode` 仍 `payload.assign`
-4. `TcpDriver::Send()` 非 owned 仍整帧 `PrefixFrame`；中段收帧仍 `assign`
-5. **三把 mutex 未改**（`mutex_` / `send_ingress_mutex_` / `receive_mutex_`）
-6. `RetransmitWindow` 为可靠重传故意自持 owned 拷贝
-7. Bus / LocalBusDeployment canonical memcpy；RDMA `pending.payload.assign`
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| 1 | 源端首发 `PopulateGeneratedFrame` | **KEEP** | `AllocateChild` + `memcpy` 仍在；语义/网络源不在本 Region，首发进 SHM **必须**物化。benchmark 已注明。 |
+| 2 | Hybrid 桥 graph↔semantic↔wire | **DEFER P8** | 跨机零拷贝产品路径，本轮不做。 |
+| 3 | 控制面 `WireFrameCodec::Decode` | **DONE（拥有路径）** | Bridge inbound 控制+数据统一 `DecodeView`；`Decode(vector&&)` + `IntoWireFrame` 就地 compact，无二次 payload 堆拷。`Decode(span)` 仍 `assign`（调用方不拥有 body 时必要）。 |
+| 4 | `TcpDriver::Send` / 收帧 | **DONE（可控路径）** | `Send`/`SendUntracked` 改为锁外 body 拷 + segmented `PendingWrite`（不再 `PrefixFrame` 整帧）；收包 **头帧/尾帧** steal，仅「非零 offset 且仍有 trailing」的中段仍 `assign`。 |
+| 5 | 三把 mutex | **PARTIAL** | 锁布局保留（worker / ingress / ready-receive 分离，全量 lock-free 风险高）。`Send*` body 拷已移出 `send_ingress_mutex_`；注释标明职责。 |
+| 6 | `RetransmitWindow` owned 拷贝 | **KEEP** | 可靠重传故意自持；`Add`/`ResendPending` 不能挪走唯一副本。 |
+| 7 | Bus memcpy；RDMA `pending.payload.assign` | **KEEP** | Bus 缝 / RDMA 插件路径低 ROI；RDMA device plugins 本轮 out of scope。 |
 
 ## 历史测量
 

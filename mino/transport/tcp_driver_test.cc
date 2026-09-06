@@ -1804,6 +1804,52 @@ TEST(TcpDriverTest, WakePathSendsSmallMessagesWithoutWritableInterest) {
 #endif
 }
 
+TEST(TcpDriverTest, CoalescedReceiveStealsLeadingFrameAndKeepsTrailing) {
+    // One TCP write with two length-prefixed frames exercises head-steal:
+    // first frame moves the buffer and only the trailing remnant is copied
+    // back; second frame then steals the remaining buffer as a trailing frame.
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 2000;
+    options.idle_timeout_ms = 5000;
+    options.partial_frame_timeout_ms = 5000;
+
+    auto driver_result = TcpDriver::Create(options);
+    ASSERT_TRUE(driver_result.ok()) << driver_result.status().ToString();
+    std::unique_ptr<TcpDriver> driver = std::move(*driver_result);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+
+    const EndpointDescriptor endpoint = Loopback(FindUnusedLoopbackPort());
+    auto listener = driver->Listen({.local_endpoint = endpoint, .backlog = 4});
+    ASSERT_TRUE(listener.ok()) << listener.status().ToString();
+
+    ScopedFd client = ConnectRaw(endpoint);
+    auto accepted = driver->Accept({
+        .listener_id = listener->id,
+        .timeout_ms = 1000,
+    });
+    ASSERT_TRUE(accepted.ok()) << accepted.status().ToString();
+
+    const std::vector<std::byte> first = FrameBody(96, 3101);
+    const std::vector<std::byte> second = FrameBody(64, 3102);
+    std::vector<std::byte> coalesced = Prefix(first);
+    const std::vector<std::byte> second_wire = Prefix(second);
+    coalesced.insert(coalesced.end(), second_wire.begin(), second_wire.end());
+    ASSERT_EQ(SendRawNoSignal(client.get(), coalesced),
+              static_cast<ssize_t>(coalesced.size()));
+
+    ASSERT_TRUE(WaitForReadyMessageCount(*driver, 2));
+    auto received = driver->Poll({
+        .max_messages = 2,
+        .max_bytes = 4096,
+        .timeout_ms = 1000,
+        .connection_id = accepted->id,
+    });
+    ASSERT_TRUE(received.ok()) << received.status().ToString();
+    ASSERT_EQ(received->messages.size(), 2u);
+    EXPECT_EQ(received->messages[0].payload, first);
+    EXPECT_EQ(received->messages[1].payload, second);
+}
+
 TEST(TcpDriverTest, ConcurrentSendIngressPreservesPerProducerOrder) {
     constexpr size_t kProducerCount = 8;
     constexpr size_t kMessagesPerProducer = 64;

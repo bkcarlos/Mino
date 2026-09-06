@@ -798,7 +798,13 @@ public:
 
     Result<SendResult> Send(const SendRequest& request,
                             SendOperation operation) {
-        const size_t wire_size = kTcpPrefixBytes + request.payload.size();
+        const size_t payload_size = request.payload.size();
+        const size_t wire_size = kTcpPrefixBytes + payload_size;
+        // Copy body outside send_ingress_mutex_ and use segmented PendingWrite
+        // (same as SendOwned) so the ingress critical section only does
+        // admission accounting + move, not PrefixFrame(prefix+body) alloc.
+        std::vector<std::byte> body(request.payload.begin(),
+                                    request.payload.end());
         {
             std::lock_guard lock(send_ingress_mutex_);
             if (stop_requested_.load(std::memory_order_acquire)) {
@@ -819,17 +825,15 @@ public:
                                 admission.queued_data_bytes) {
                 return WouldBlock("TCP data send byte queue is full");
             }
-            std::vector<std::byte> wire = PrefixFrame(request.payload);
             admission.data_writes.emplace_back();
-            admission.data_writes.back().InitializeContiguous(
-                std::move(wire), operation);
+            admission.data_writes.back().Initialize(std::move(body), operation);
             admission.queued_data_bytes += wire_size;
             total_data_send_bytes_ += wire_size;
         }
         Wake();
         return SendResult{
             .operation = operation,
-            .admitted_bytes = request.payload.size(),
+            .admitted_bytes = payload_size,
         };
     }
 
@@ -873,7 +877,10 @@ public:
     }
 
     Result<size_t> SendUntracked(const UntrackedSendRequest& request) {
-        const size_t wire_size = kTcpPrefixBytes + request.payload.size();
+        const size_t payload_size = request.payload.size();
+        const size_t wire_size = kTcpPrefixBytes + payload_size;
+        std::vector<std::byte> body(request.payload.begin(),
+                                    request.payload.end());
         {
             std::lock_guard lock(send_ingress_mutex_);
             if (stop_requested_.load(std::memory_order_acquire)) {
@@ -904,11 +911,10 @@ public:
                                        admission.queued_data_bytes) {
                 return WouldBlock("TCP data send byte queue is full");
             }
-            std::vector<std::byte> wire = PrefixFrame(request.payload);
             std::deque<PendingWrite>& writes =
                 is_control ? admission.control_writes : admission.data_writes;
             writes.emplace_back();
-            writes.back().InitializeContiguous(std::move(wire), {});
+            writes.back().Initialize(std::move(body), {});
             if (is_control) {
                 admission.queued_control_bytes += wire_size;
                 ++admission.queued_control_messages;
@@ -920,7 +926,7 @@ public:
             }
         }
         Wake();
-        return request.payload.size();
+        return payload_size;
     }
 
     Result<size_t> SendUntrackedOwned(
@@ -2837,12 +2843,16 @@ private:
                 connection.last_valid_receive = Clock::now();
             }
 
-            // Steal a complete trailing frame out of the receive buffer when
-            // possible so the ready queue owns the bytes without an extra
-            // assign/memcpy. Mid-buffer frames still copy; mutex layout is
-            // unchanged.
+            // Prefer steal over assign/memcpy when the complete frame is a
+            // prefix or suffix of the receive buffer:
+            // - trailing frame: move the whole buffer, erase any consumed
+            //   prefix in the stolen vector;
+            // - leading frame with trailing bytes: move the buffer, copy only
+            //   the (usually smaller) trailing remnant back.
+            // True mid-buffer frames (non-zero offset and trailing data) still
+            // assign; compacting receive_offset at buffer start makes that rare.
             std::vector<std::byte> payload;
-            bool stole_receive_tail = false;
+            bool stole_receive_bytes = false;
             if (!is_canonical_heartbeat) {
                 const size_t body_begin = connection.receive_offset;
                 const size_t body_end =
@@ -2857,12 +2867,25 @@ private:
                                 static_cast<ptrdiff_t>(body_begin));
                     }
                     connection.receive_offset = 0;
-                    stole_receive_tail = true;
+                    stole_receive_bytes = true;
+                } else if (body_begin == 0) {
+                    const size_t trailing =
+                        connection.receive_buffer.size() - body_end;
+                    payload = std::move(connection.receive_buffer);
+                    connection.receive_buffer.clear();
+                    connection.receive_offset = 0;
+                    if (trailing != 0) {
+                        connection.receive_buffer.assign(
+                            payload.end() - static_cast<ptrdiff_t>(trailing),
+                            payload.end());
+                        payload.resize(connection.expected_body_size);
+                    }
+                    stole_receive_bytes = true;
                 } else {
                     payload.assign(body.begin(), body.end());
                 }
             }
-            if (!stole_receive_tail) {
+            if (!stole_receive_bytes) {
                 connection.receive_offset += connection.expected_body_size;
             }
             const bool held_tls_write_turn =
@@ -3333,6 +3356,12 @@ private:
     std::vector<std::byte> heartbeat_wire_;
     DriverConfig config_{};
 
+    // Three mutexes intentionally remain (not lock-free):
+    // - mutex_: worker-owned connection/listener/epoll state.
+    // - send_ingress_mutex_: Send*/admission queues so producers avoid mutex_.
+    // - receive_mutex_: ready receive queue + capacity vs worker enqueue.
+    // Full MPSC/sharded replacement is deferred (deadlock/loss risk). Send
+    // and SendUntracked now keep body copies outside send_ingress_mutex_.
     mutable std::mutex mutex_;
     mutable std::mutex send_ingress_mutex_;
     mutable std::mutex receive_mutex_;
