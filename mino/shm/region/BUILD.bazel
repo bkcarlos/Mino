@@ -21,6 +21,31 @@ cc_library(
     ],
 )
 
+
+cc_library(
+    name = "attachment_directory",
+    srcs = ["attachment_directory.cc"],
+    hdrs = ["attachment_directory.h"],
+    deps = [
+        ":channel_directory",
+        ":superblock",
+        "//mino/common:result",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+    ],
+)
+
+cc_test(
+    name = "attachment_directory_test",
+    srcs = ["attachment_directory_test.cc"],
+    deps = [
+        ":attachment_directory",
+        "//mino/common:status",
+        "//mino/platform:process_identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "recovery_directory",
     srcs = ["recovery_directory.cc"],
@@ -123,6 +148,7 @@ cc_library(
         "region.h",
     ],
     deps = [
+        ":attachment_directory",
         ":channel_directory",
         ":recovery_directory",
         ":region_id_allocator",

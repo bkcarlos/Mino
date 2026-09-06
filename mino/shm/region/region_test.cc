@@ -470,28 +470,77 @@ TEST_F(RegionTest, WritableAttachByRegionIdUsesSupervisorRole) {
   EXPECT_TRUE(attached->Detach().ok());
 }
 
-TEST_F(RegionTest, SubordinateWritableAttachIsFailClosed) {
+TEST_F(RegionTest, SubordinateWritableAttachRegistersAndHeartbeats) {
   const std::string name = Name("asub");
   auto created = Create(name);
   ASSERT_TRUE(created.ok()) << created.status().ToString();
   const uint32_t region_id = created->region_id();
-  ASSERT_TRUE(created->Detach().ok());
+  EXPECT_EQ(created->superblock()->layout_version, kRegionLayoutVersion);
+  EXPECT_TRUE(created->is_supervisor());
 
   RegionAttachOptions subordinate;
   subordinate.name = name;
   subordinate.region_id = region_id;
   subordinate.read_only = false;
   subordinate.request_subordinate_writable = true;
-  auto denied = SharedMemoryRegion::Attach(subordinate);
+  auto attached = SharedMemoryRegion::Attach(subordinate);
+  ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+  EXPECT_TRUE(attached->is_subordinate_writable());
+  EXPECT_FALSE(attached->is_supervisor());
+  EXPECT_TRUE(attached->HeartbeatAttachment().ok());
+
+  // Unsupervised second writable Attach still takes the supervisor path and
+  // must fail while the creator holds the advisory lock.
+  RegionAttachOptions unsupervised;
+  unsupervised.name = name;
+  unsupervised.region_id = region_id;
+  unsupervised.read_only = false;
+  auto denied = SharedMemoryRegion::Attach(unsupervised);
   ASSERT_FALSE(denied.ok());
-  EXPECT_EQ(denied.status().code(), StatusCode::kUnsupported);
-  EXPECT_NE(denied.status().ToString().find("ADR-0014"), std::string::npos);
+  EXPECT_EQ(denied.status().code(), StatusCode::kWouldBlock);
+
+  // Supervisor cannot clean-detach while a live subordinate writer remains.
+  auto blocked = created->Detach();
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.code(), StatusCode::kWouldBlock);
+
+  ASSERT_TRUE(attached->Detach().ok());
+  ASSERT_TRUE(created->Detach().ok());
 
   RegionAttachOptions bad_combo = subordinate;
   bad_combo.read_only = true;
   auto invalid = SharedMemoryRegion::Attach(bad_combo);
   ASSERT_FALSE(invalid.ok());
   EXPECT_EQ(invalid.status().code(), StatusCode::kInvalidArgument);
+}
+
+TEST_F(RegionTest, SubordinateWritablePolicyExhaustionIsFailClosed) {
+  const std::string name = Name("apol");
+  auto created = Create(name);
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+
+  std::vector<SharedMemoryRegion> subordinates;
+  subordinates.reserve(kMaxSubordinateWritableAttachments);
+  for (uint32_t i = 0; i < kMaxSubordinateWritableAttachments; ++i) {
+    RegionAttachOptions options;
+    options.name = name;
+    options.request_subordinate_writable = true;
+    auto attached = SharedMemoryRegion::Attach(options);
+    ASSERT_TRUE(attached.ok()) << attached.status().ToString();
+    subordinates.push_back(std::move(*attached));
+  }
+
+  RegionAttachOptions overflow;
+  overflow.name = name;
+  overflow.request_subordinate_writable = true;
+  auto denied = SharedMemoryRegion::Attach(overflow);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
+
+  for (auto& subordinate : subordinates) {
+    EXPECT_TRUE(subordinate.Detach().ok());
+  }
+  EXPECT_TRUE(created->Detach().ok());
 }
 
 TEST_F(RegionTest, AttachRejectsBadMagic) {

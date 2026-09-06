@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/ipsec-region-subset` tip **`bed125f`**（基于 master **`778eb09`**）
+- HEAD 对照：`feature/region-layout-v7` tip **`TIP_PLACEHOLDER`**（基于 master **`5098097`**）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -27,7 +27,8 @@
 | 持久 Dedup Store | **DONE** | `dedup_store.*` + BridgePipeline 种子化 / HWM 持久化 |
 | SharedHostDomain v3 | **DONE** | MPSC/Broadcast、borrow、typed、`Recover()`；**CentralSlab + AllocationJournal + ShmPinTable**（ABI `MINOSHD3`，与 v1/v2 不兼容） |
 | P9 PTP + RDMA/Fabric 参考插件 | **DONE（软件路径）** | `PtpClockClient` + `PtpSyncSidecar` + pipeline 门控；RDMA/Fabric 参考插件；**不算** V-25 / 双机 PTP 硬件资格 |
-| A12 IPsec 传输软件子集 | **DONE（软件路径）** | `IpsecTransportDriver` + `NetlinkXfrmSaProbe`；内核 XFRM；**不算** IKE/硬件资格；A8 仍 ADR-0014 fail-closed |
+| A12 IPsec 传输软件子集 | **DONE（软件路径）** | `IpsecTransportDriver` + `NetlinkXfrmSaProbe`；内核 XFRM；**不算** IKE/硬件资格 |
+| A8 subordinate writable Attach | **DONE（layout v7）** | `attachment_directory.*` + `request_subordinate_writable`；Dead-only reclaim；见 ADR-0014 |
 
 ### Exclusive hop 契约（勿写错）
 

@@ -289,6 +289,179 @@ TEST_F(ServiceLivenessTest, RecoveryLeaseTakeoverFencesOldProcessEpoch) {
   EXPECT_TRUE(region->ValidateSupervisorFence().ok());
 }
 
+
+TEST_F(ServiceLivenessTest, LiveSubordinateBlocksSupervisorRecovery) {
+  const std::string name = Track("sublive");
+  int supervisor_ready[2];
+  int subordinate_ready[2];
+  ASSERT_EQ(::pipe(supervisor_ready), 0);
+  ASSERT_EQ(::pipe(subordinate_ready), 0);
+
+  const pid_t supervisor_pid = ::fork();
+  ASSERT_GE(supervisor_pid, 0);
+  if (supervisor_pid == 0) {
+    ::close(supervisor_ready[0]);
+    ::close(subordinate_ready[0]);
+    ::close(subordinate_ready[1]);
+    RegionCreateOptions create;
+    create.name = name;
+    create.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(create);
+    if (!region.ok()) {
+      ::_exit(40);
+    }
+    OwnerReady ready{
+        .region_id = region->region_id(),
+        .reserved = 0,
+        .service_epoch = region->service_epoch(),
+        .recovery_epoch = LoadRecoveryEpoch(*region->superblock()),
+        .identity = ProcessIdentity::Current(),
+    };
+    if (!WriteValue(supervisor_ready[1], ready)) {
+      ::_exit(41);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+  ::close(supervisor_ready[1]);
+  OwnerReady ready{};
+  ASSERT_TRUE(ReadValue(supervisor_ready[0], &ready));
+  ::close(supervisor_ready[0]);
+
+  const pid_t subordinate_pid = ::fork();
+  ASSERT_GE(subordinate_pid, 0);
+  if (subordinate_pid == 0) {
+    ::close(subordinate_ready[0]);
+    RegionAttachOptions options;
+    options.name = name;
+    options.region_id = ready.region_id;
+    options.request_subordinate_writable = true;
+    auto attached = SharedMemoryRegion::Attach(options);
+    if (!attached.ok()) {
+      ::_exit(42);
+    }
+    const uint8_t ok = 1;
+    if (!WriteValue(subordinate_ready[1], ok)) {
+      ::_exit(43);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+  ::close(subordinate_ready[1]);
+  uint8_t sub_ok = 0;
+  ASSERT_TRUE(ReadValue(subordinate_ready[0], &sub_ok));
+  ::close(subordinate_ready[0]);
+  ASSERT_EQ(sub_ok, 1);
+
+  ASSERT_EQ(::kill(supervisor_pid, SIGKILL), 0);
+  int supervisor_status = 0;
+  ASSERT_EQ(::waitpid(supervisor_pid, &supervisor_status, 0), supervisor_pid);
+
+  RegionAttachOptions takeover;
+  takeover.name = name;
+  takeover.region_id = ready.region_id;
+  auto blocked = SharedMemoryRegion::Attach(takeover);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.status().code(), StatusCode::kWouldBlock);
+
+  ASSERT_EQ(::kill(subordinate_pid, SIGKILL), 0);
+  int subordinate_status = 0;
+  ASSERT_EQ(::waitpid(subordinate_pid, &subordinate_status, 0),
+            subordinate_pid);
+
+  auto recovered = SharedMemoryRegion::Attach(takeover);
+  ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
+  EXPECT_TRUE(recovered->is_supervisor());
+  EXPECT_GT(recovered->service_epoch(), ready.service_epoch);
+  EXPECT_TRUE(recovered->Detach().ok());
+}
+
+TEST_F(ServiceLivenessTest, DeadSubordinateIsReclaimedOnSupervisorRecovery) {
+  const std::string name = Track("subdead");
+  int supervisor_ready[2];
+  int subordinate_ready[2];
+  ASSERT_EQ(::pipe(supervisor_ready), 0);
+  ASSERT_EQ(::pipe(subordinate_ready), 0);
+
+  const pid_t supervisor_pid = ::fork();
+  ASSERT_GE(supervisor_pid, 0);
+  if (supervisor_pid == 0) {
+    ::close(supervisor_ready[0]);
+    ::close(subordinate_ready[0]);
+    ::close(subordinate_ready[1]);
+    RegionCreateOptions create;
+    create.name = name;
+    create.size_bytes = 1024 * 1024;
+    auto region = SharedMemoryRegion::Create(create);
+    if (!region.ok()) {
+      ::_exit(50);
+    }
+    OwnerReady ready{
+        .region_id = region->region_id(),
+        .reserved = 0,
+        .service_epoch = region->service_epoch(),
+        .recovery_epoch = LoadRecoveryEpoch(*region->superblock()),
+        .identity = ProcessIdentity::Current(),
+    };
+    if (!WriteValue(supervisor_ready[1], ready)) {
+      ::_exit(51);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+  ::close(supervisor_ready[1]);
+  OwnerReady ready{};
+  ASSERT_TRUE(ReadValue(supervisor_ready[0], &ready));
+  ::close(supervisor_ready[0]);
+
+  const pid_t subordinate_pid = ::fork();
+  ASSERT_GE(subordinate_pid, 0);
+  if (subordinate_pid == 0) {
+    ::close(subordinate_ready[0]);
+    RegionAttachOptions options;
+    options.name = name;
+    options.region_id = ready.region_id;
+    options.request_subordinate_writable = true;
+    auto attached = SharedMemoryRegion::Attach(options);
+    if (!attached.ok()) {
+      ::_exit(52);
+    }
+    const uint8_t ok = 1;
+    if (!WriteValue(subordinate_ready[1], ok)) {
+      ::_exit(53);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+  ::close(subordinate_ready[1]);
+  uint8_t sub_ok = 0;
+  ASSERT_TRUE(ReadValue(subordinate_ready[0], &sub_ok));
+  ::close(subordinate_ready[0]);
+  ASSERT_EQ(sub_ok, 1);
+
+  ASSERT_EQ(::kill(subordinate_pid, SIGKILL), 0);
+  int subordinate_status = 0;
+  ASSERT_EQ(::waitpid(subordinate_pid, &subordinate_status, 0),
+            subordinate_pid);
+  ASSERT_EQ(::kill(supervisor_pid, SIGKILL), 0);
+  int supervisor_status = 0;
+  ASSERT_EQ(::waitpid(supervisor_pid, &supervisor_status, 0), supervisor_pid);
+
+  RegionAttachOptions takeover;
+  takeover.name = name;
+  takeover.region_id = ready.region_id;
+  auto recovered = SharedMemoryRegion::Attach(takeover);
+  ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
+  EXPECT_TRUE(recovered->is_supervisor());
+  EXPECT_TRUE(recovered->ValidateSupervisorFence().ok());
+  EXPECT_TRUE(recovered->Detach().ok());
+}
+
+
 #else
 
 TEST(ServiceLivenessTest, RequiresPosixProcesses) {

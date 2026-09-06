@@ -69,7 +69,9 @@ static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
 
 inline constexpr uint64_t kChannelDirectoryMinimumSize =
     sizeof(ChannelDirectoryImage);
-inline constexpr uint64_t kRegionDirectoryMinimumSize =
+// v5/v6 reserved directory floor (recovery + channel). Layout v7 appends the
+// attachment directory; see attachment_directory.h for the current Create min.
+inline constexpr uint64_t kRegionDirectoryMinimumSizeV5 =
     kChannelDirectoryRelativeOffset + kChannelDirectoryMinimumSize;
 
 Status InitializeChannelDirectory(void* channel_directory_base,

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <ctime>
 #include <limits>
 #include <new>
 #include <random>
@@ -33,6 +34,7 @@
 
 #include "mino/common/checked_arithmetic.h"
 #include "mino/shm/channel/mpmc_ring.h"
+#include "mino/shm/region/attachment_directory.h"
 #include "mino/shm/region/recovery.h"
 #include "mino/shm/region/region_id_allocator.h"
 #include "mino/shm/region/region_name_registry.h"
@@ -152,6 +154,25 @@ private:
     int fd_;
 };
 
+
+std::pair<std::byte*, uint64_t> AttachmentDirectoryView(std::byte* region_base,
+                                                       const SuperBlock& sb) {
+    const uint64_t directory_size = sb.allocator_offset - sb.directory_offset;
+    return {region_base + sb.directory_offset + kAttachmentDirectoryRelativeOffset,
+            directory_size - kAttachmentDirectoryRelativeOffset};
+}
+
+uint64_t MonotonicHeartbeatNs() {
+#if defined(__unix__) || defined(__APPLE__)
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+
 Status ValidateOfflineV4Source(const SuperBlock& sb) {
     if (sb.layout_version != kRecoveryDirectoryRegionLayoutVersion) {
         return Status::Error(StatusCode::kUnsupported,
@@ -195,6 +216,9 @@ void SharedMemoryRegion::MoveFrom(SharedMemoryRegion&& other) noexcept {
     service_fence_at_attach_ = other.service_fence_at_attach_;
     supervisor_lock_fd_ = other.supervisor_lock_fd_;
     is_supervisor_ = other.is_supervisor_;
+    is_subordinate_writable_ = other.is_subordinate_writable_;
+    attachment_slot_index_ = other.attachment_slot_index_;
+    attachment_generation_ = other.attachment_generation_;
     detached_ = other.detached_;
 
     other.segment_.reset();
@@ -203,6 +227,9 @@ void SharedMemoryRegion::MoveFrom(SharedMemoryRegion&& other) noexcept {
     other.service_fence_at_attach_ = 0;
     other.supervisor_lock_fd_ = -1;
     other.is_supervisor_ = false;
+    other.is_subordinate_writable_ = false;
+    other.attachment_slot_index_ = 0xffffffffu;
+    other.attachment_generation_ = 0;
     other.detached_ = true;
 }
 
@@ -219,6 +246,20 @@ void SharedMemoryRegion::CloseWithoutLifecycleUpdate() noexcept {
     // If this object already published a new service generation, relinquish
     // only that generation. Lifecycle state/clean_shutdown are deliberately
     // untouched so a failed recovery cannot masquerade as a clean detach.
+    if (segment_.has_value() && !segment_->read_only() &&
+        attachment_slot_index_ != 0xffffffffu &&
+        attachment_generation_ != 0) {
+        SuperBlock* sb = superblock();
+        if (sb != nullptr &&
+            sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion) {
+            auto [base, size] = AttachmentDirectoryView(this->base(), *sb);
+            (void)ReleaseAttachmentSlot(base, size, attachment_slot_index_,
+                                        attachment_generation_,
+                                        owner_identity_);
+        }
+        attachment_slot_index_ = 0xffffffffu;
+        attachment_generation_ = 0;
+    }
     if (is_supervisor_ && service_fence_at_attach_ != 0 &&
         segment_.has_value() && !segment_->read_only()) {
         SuperBlock* sb = superblock();
@@ -239,6 +280,7 @@ void SharedMemoryRegion::CloseWithoutLifecycleUpdate() noexcept {
     ReleaseSupervisorLock(supervisor_lock_fd_);
     supervisor_lock_fd_ = -1;
     is_supervisor_ = false;
+    is_subordinate_writable_ = false;
 }
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Create(
@@ -271,7 +313,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     }
     if (options.directory_size_bytes < kRegionDirectoryMinimumSize) {
         return Status::Error(StatusCode::kInvalidArgument,
-                             "directory sub-region is too small for Region v5 directories");
+                             "directory sub-region is too small for Region v7 directories");
     }
     uint64_t directory_end = 0;
     uint64_t alloc_off = 0;
@@ -348,7 +390,8 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     sb->access_mode = segment.backing_permissions();
     sb->feature_flags = options.feature_flags;
     sb->minimum_reader_version = std::max<uint32_t>(
-        options.minimum_reader_version, kSecurityDomainRegionLayoutVersion);
+        options.minimum_reader_version,
+        kAttachmentDirectoryRegionLayoutVersion);
 
     // Lifecycle: begin INITIALIZING, in-use (clean_shutdown=false), epoch 1.
     StoreRegionEpoch(*sb, 1);
@@ -372,8 +415,8 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
 
     // Initialize both fixed-capacity directory images before publishing ACTIVE.
     // The immutable SuperBlock directory_offset remains the start of the
-    // recovery directory; v5 locates the Channel Directory at its fixed relative
-    // offset inside the same reserved sub-region.
+    // recovery directory; v5+ locates the Channel Directory at its fixed relative
+    // offset inside the same reserved sub-region; v7 appends the Attachment Directory after it.
     auto* directory_base =
         static_cast<std::byte*>(segment.base()) + dir_off;
     const uint64_t directory_size = alloc_off - dir_off;
@@ -382,6 +425,9 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     MINO_RETURN_IF_ERROR(InitializeChannelDirectory(
         directory_base + kChannelDirectoryRelativeOffset,
         directory_size - kChannelDirectoryRelativeOffset));
+    MINO_RETURN_IF_ERROR(InitializeAttachmentDirectory(
+        directory_base + kAttachmentDirectoryRelativeOffset,
+        directory_size - kAttachmentDirectoryRelativeOffset));
 
     // Publish the durable ID->name mapping before ACTIVE so ID-only Attach
     // cannot observe an ACTIVE SuperBlock that the registry cannot resolve.
@@ -398,10 +444,6 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
         }
     }
 
-    // Initialization complete -> ACTIVE (6.1). clean_shutdown stays false
-    // while the Region is in use; it becomes true only on clean Detach.
-    StoreState(*sb, RegionState::kActive);
-
     SharedMemoryRegion region;
     region.segment_ = std::move(segment);
     region.region_id_ = region_id;
@@ -410,6 +452,29 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Create(
     region.supervisor_lock_fd_ = supervisor_lock_fd;
     region.is_supervisor_ = true;
     region.detached_ = false;
+    {
+        auto [att_base, att_size] =
+            AttachmentDirectoryView(region.base(), *sb);
+        auto claimed = ClaimAttachmentSlot(
+            att_base, att_size, AttachmentRole::kSupervisor,
+            region.owner_identity_, region.service_epoch());
+        if (!claimed.ok()) {
+            region.CloseWithoutLifecycleUpdate();
+            (void)SharedMemorySegment::Unlink(options.name);
+            (void)region_internal::UnregisterRegionName(region_id);
+            return claimed.status();
+        }
+        region.attachment_slot_index_ = claimed->slot_index;
+        region.attachment_generation_ = claimed->generation;
+        (void)HeartbeatAttachmentSlot(
+            att_base, att_size, region.attachment_slot_index_,
+            region.attachment_generation_, region.owner_identity_,
+            MonotonicHeartbeatNs());
+    }
+
+    // Initialization complete -> ACTIVE (6.1). clean_shutdown stays false
+    // while the Region is in use; it becomes true only on clean Detach.
+    StoreState(*sb, RegionState::kActive);
     return region;
 }
 
@@ -503,17 +568,10 @@ Status SharedMemoryRegion::ValidateSubRegionBounds(const SuperBlock& sb) {
 
 Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     const RegionAttachOptions& options) {
-    if (options.request_subordinate_writable) {
-        if (options.read_only) {
-            return Status::Error(
-                StatusCode::kInvalidArgument,
-                "request_subordinate_writable is incompatible with read_only Attach");
-        }
+    if (options.request_subordinate_writable && options.read_only) {
         return Status::Error(
-            StatusCode::kUnsupported,
-            "subordinate writable Attach is unsupported on Region layout v6; "
-            "ADR-0014 requires a crash-safe attachment registry and a layout "
-            "bump before multi-writer or non-supervisor writable Attach");
+            StatusCode::kInvalidArgument,
+            "request_subordinate_writable is incompatible with read_only Attach");
     }
 
     std::string resolved_name = options.name;
@@ -597,9 +655,13 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
         }
     }
     if (sb->layout_version >= kChannelDirectoryRegionLayoutVersion) {
-        if (directory_size < kRegionDirectoryMinimumSize) {
+        const uint64_t min_directory =
+            sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion
+                ? kRegionDirectoryMinimumSizeV7
+                : kRegionDirectoryMinimumSizeV5;
+        if (directory_size < min_directory) {
             return Status::Error(StatusCode::kCorruption,
-                                 "Region v5 directory sub-region is too small");
+                                 "Region directory sub-region is too small");
         }
         auto channels = ::mino::ReadChannelDirectory(
             directory_base + kChannelDirectoryRelativeOffset,
@@ -608,6 +670,11 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
         if (!channels.ok()) {
             return channels.status();
         }
+    }
+    if (sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion) {
+        MINO_RETURN_IF_ERROR(ValidateAttachmentDirectory(
+            directory_base + kAttachmentDirectoryRelativeOffset,
+            directory_size - kAttachmentDirectoryRelativeOffset));
     }
 
     // If the caller specified an explicit region_id, it must match the one
@@ -631,7 +698,7 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     if (!options.read_only && sb->layout_version < kRegionLayoutVersion) {
         return Status::Error(
             StatusCode::kUnsupported,
-            "older Region layout supports read-only compatibility only; recreate as v4 for writable supervisor Attach");
+            "older Region layout supports read-only compatibility only; recreate as v7 for writable Attach");
     }
 
     SharedMemoryRegion region;
@@ -640,12 +707,60 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
     region.owner_identity_ = ProcessIdentity::Current();
     region.detached_ = false;
 
-    // Steps 10-11: a writable Attach first acquires the unique host-local
-    // supervisor lock. Lock acquisition is the non-time-based proof that no
-    // live writable supervisor still owns this Region. ProcessIdentity then
-    // distinguishes a dead incarnation from PID reuse and catches malformed or
-    // unverifiable metadata before ACTIVE can become DIRTY.
+    // Steps 10-11: writable Attach is either unique supervisor (advisory lock +
+    // service fence) or a subordinate writable registry claim (layout v7).
     if (!options.read_only) {
+        if (options.request_subordinate_writable) {
+            if (sb->layout_version < kAttachmentDirectoryRegionLayoutVersion) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kUnsupported,
+                    "subordinate writable Attach requires Region layout v7 "
+                    "attachment directory (ADR-0014)");
+            }
+            const uint64_t service_fence = LoadServiceFence(*sb);
+            if (ServiceFencePhaseOf(service_fence) !=
+                ServiceFencePhase::kOwned) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "subordinate writable Attach requires a live OWNED supervisor");
+            }
+            const ProcessIdentity supervisor = LoadServiceOwner(*sb);
+            const ProcessIdentityLiveness liveness =
+                ProbeProcessIdentity(supervisor);
+            if (liveness != ProcessIdentityLiveness::kAlive) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "subordinate writable Attach requires an Alive supervisor");
+            }
+            if (LoadRegionState(*sb) != RegionState::kActive) {
+                region.CloseWithoutLifecycleUpdate();
+                return Status::Error(
+                    StatusCode::kUnavailable,
+                    "subordinate writable Attach requires an ACTIVE Region");
+            }
+            auto [att_base, att_size] =
+                AttachmentDirectoryView(region.base(), *sb);
+            auto claimed = ClaimAttachmentSlot(
+                att_base, att_size, AttachmentRole::kSubordinateWritable,
+                region.owner_identity_, ServiceFenceEpoch(service_fence));
+            if (!claimed.ok()) {
+                region.CloseWithoutLifecycleUpdate();
+                return claimed.status();
+            }
+            region.is_subordinate_writable_ = true;
+            region.attachment_slot_index_ = claimed->slot_index;
+            region.attachment_generation_ = claimed->generation;
+            region.service_fence_at_attach_ = service_fence;
+            (void)HeartbeatAttachmentSlot(
+                att_base, att_size, region.attachment_slot_index_,
+                region.attachment_generation_, region.owner_identity_,
+                MonotonicHeartbeatNs());
+            return region;
+        }
+
         auto lock = TryAcquireSupervisorLock(resolved_name);
         if (!lock.ok()) {
             region.CloseWithoutLifecycleUpdate();
@@ -683,6 +798,17 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
             }
         }
 
+        if (sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion) {
+            auto [att_base, att_size] =
+                AttachmentDirectoryView(region.base(), *sb);
+            Status prepared = PrepareAttachmentDirectoryForSupervisorRecovery(
+                att_base, att_size);
+            if (!prepared.ok()) {
+                region.CloseWithoutLifecycleUpdate();
+                return prepared;
+            }
+        }
+
         const uint64_t previous_service_epoch =
             ServiceFenceEpoch(previous_service_fence);
         if (previous_service_epoch >= kMaxServiceFenceEpoch) {
@@ -696,8 +822,27 @@ Result<SharedMemoryRegion> SharedMemoryRegion::Attach(
         StoreServiceFence(*sb, service_fence);
         region.service_fence_at_attach_ = service_fence;
 
+        if (sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion) {
+            auto [att_base, att_size] =
+                AttachmentDirectoryView(region.base(), *sb);
+            auto claimed = ClaimAttachmentSlot(
+                att_base, att_size, AttachmentRole::kSupervisor,
+                region.owner_identity_, region.service_epoch());
+            if (!claimed.ok()) {
+                region.CloseWithoutLifecycleUpdate();
+                return claimed.status();
+            }
+            region.attachment_slot_index_ = claimed->slot_index;
+            region.attachment_generation_ = claimed->generation;
+            (void)HeartbeatAttachmentSlot(
+                att_base, att_size, region.attachment_slot_index_,
+                region.attachment_generation_, region.owner_identity_,
+                MonotonicHeartbeatNs());
+        }
+
         // ACTIVE + !clean is recoverable only here: the old supervisor lock is
-        // gone and its exact ProcessIdentity was proven dead. Publish DIRTY
+        // gone, its ProcessIdentity was proven dead, and every registered
+        // subordinate writer was Dead-reclaimed (or absent). Publish DIRTY
         // before the allocator scanner can run.
         if (LoadRegionState(*sb) == RegionState::kActive) {
             if (LoadCleanShutdown(*sb)) {
@@ -752,10 +897,10 @@ Status SharedMemoryRegion::UpgradeV4ToV5Offline(
 
     const uint64_t directory_size =
         sb->allocator_offset - sb->directory_offset;
-    if (directory_size < kRegionDirectoryMinimumSize) {
+    if (directory_size < kRegionDirectoryMinimumSizeV7) {
         return Status::Error(
             StatusCode::kResourceExhausted,
-            "v4 reserved directory is too small for in-place v5 upgrade; use copy/recreate migration");
+            "v4 reserved directory is too small for in-place upgrade to v7; use copy/recreate migration");
     }
     auto* region_base = static_cast<std::byte*>(segment.base());
     auto recovery = ReadRecoveryDirectory(
@@ -770,6 +915,9 @@ Status SharedMemoryRegion::UpgradeV4ToV5Offline(
         directory_size - kChannelDirectoryRelativeOffset;
     MINO_RETURN_IF_ERROR(
         InitializeChannelDirectory(channel_base, channel_size));
+    MINO_RETURN_IF_ERROR(InitializeAttachmentDirectory(
+        region_base + sb->directory_offset + kAttachmentDirectoryRelativeOffset,
+        directory_size - kAttachmentDirectoryRelativeOffset));
 
     for (const ChannelRingDescriptor& descriptor : options.rings) {
         if (descriptor.channel_type !=
@@ -857,7 +1005,7 @@ Status SharedMemoryRegion::UpgradeV4ToV5Offline(
     sb->owner_user_id = static_cast<uint32_t>(segment.backing_owner_user_id());
     sb->owner_group_id = static_cast<uint32_t>(segment.backing_owner_group_id());
     sb->access_mode = segment.backing_permissions();
-    sb->minimum_reader_version = kSecurityDomainRegionLayoutVersion;
+    sb->minimum_reader_version = kAttachmentDirectoryRegionLayoutVersion;
     sb->immutable_crc32 = SuperBlockImmutableCrc(*sb);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     return segment.Close();
@@ -943,7 +1091,7 @@ SharedMemoryRegion::channel_directory() const {
     }
     const uint64_t directory_size =
         sb->allocator_offset - sb->directory_offset;
-    if (directory_size < kRegionDirectoryMinimumSize) {
+    if (directory_size < kRegionDirectoryMinimumSizeV5) {
         return Status::Error(StatusCode::kCorruption,
                              "Region channel directory storage is truncated");
     }
@@ -1093,6 +1241,25 @@ Status SharedMemoryRegion::PublishRecoveryReferences(
         sb->allocator_offset - sb->directory_offset, references, complete);
 }
 
+Status SharedMemoryRegion::HeartbeatAttachment() {
+    if (detached_ || !segment_.has_value() || read_only() ||
+        attachment_slot_index_ == 0xffffffffu ||
+        attachment_generation_ == 0) {
+        return Status::Error(StatusCode::kPermissionDenied,
+                             "Region has no registered writable attachment");
+    }
+    const SuperBlock* sb = superblock();
+    if (sb->layout_version < kAttachmentDirectoryRegionLayoutVersion) {
+        return Status::Error(StatusCode::kUnsupported,
+                             "Region layout has no attachment directory");
+    }
+    auto [att_base, att_size] = AttachmentDirectoryView(
+        const_cast<std::byte*>(base()), *sb);
+    return HeartbeatAttachmentSlot(att_base, att_size, attachment_slot_index_,
+                                   attachment_generation_, owner_identity_,
+                                   MonotonicHeartbeatNs());
+}
+
 Status SharedMemoryRegion::Detach() {
     if (detached_) {
         return Status::Ok();
@@ -1102,36 +1269,79 @@ Status SharedMemoryRegion::Detach() {
     SuperBlock* sb = superblock();
     if (sb != nullptr && !read_only() && is_supervisor_) {
         lifecycle_status = ValidateSupervisorFence();
-        if (lifecycle_status.ok()) {
-            uint64_t expected = service_fence_at_attach_;
-            const uint64_t closing = EncodeServiceFence(
-                ServiceFenceEpoch(expected), ServiceFencePhase::kClosing);
-            if (!CompareExchangeServiceFence(*sb, &expected, closing)) {
-                lifecycle_status = Status::Error(
-                    StatusCode::kUnavailable,
-                    "service fence changed before clean detach");
-            } else {
-                // The closing fence prevents a stale attachment from racing a
-                // lifecycle update. Only ACTIVE may be cleanly closed; never
-                // overwrite DIRTY/RECOVERING/QUARANTINED during teardown.
-                if (LoadRegionState(*sb) == RegionState::kActive) {
-                    StoreCleanShutdown(*sb, true);
-                    uint32_t active =
-                        static_cast<uint32_t>(RegionState::kActive);
-                    if (!std::atomic_ref(sb->state).compare_exchange_strong(
-                            active,
-                            static_cast<uint32_t>(RegionState::kClosed),
-                            std::memory_order_acq_rel,
-                            std::memory_order_acquire)) {
-                        StoreCleanShutdown(*sb, false);
-                    }
-                }
-                StoreServiceOwner(*sb, ProcessIdentity{});
-                StoreServiceFence(
-                    *sb, EncodeServiceFence(ServiceFenceEpoch(closing),
-                                            ServiceFencePhase::kUnowned));
+        if (lifecycle_status.ok() &&
+            sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion) {
+            auto [att_base, att_size] = AttachmentDirectoryView(base(), *sb);
+            if (CountLiveSubordinateWritableSlots(att_base, att_size) > 0) {
+                // Keep the mapping and supervisor lock; callers must drain
+                // subordinates first.
+                return Status::Error(
+                    StatusCode::kWouldBlock,
+                    "supervisor Detach refused while live subordinate writers exist");
             }
         }
+        if (!lifecycle_status.ok()) {
+            // Stale supervisor objects only unmap; they must not publish CLOSED.
+            detached_ = true;
+            Status close_status = segment_->Close();
+            ReleaseSupervisorLock(supervisor_lock_fd_);
+            supervisor_lock_fd_ = -1;
+            is_supervisor_ = false;
+            if (!close_status.ok()) {
+                return close_status;
+            }
+            return lifecycle_status;
+        }
+
+        uint64_t expected = service_fence_at_attach_;
+        const uint64_t closing = EncodeServiceFence(
+            ServiceFenceEpoch(expected), ServiceFencePhase::kClosing);
+        if (!CompareExchangeServiceFence(*sb, &expected, closing)) {
+            lifecycle_status = Status::Error(
+                StatusCode::kUnavailable,
+                "service fence changed before clean detach");
+        } else {
+            if (sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion &&
+                attachment_slot_index_ != 0xffffffffu) {
+                auto [att_base, att_size] =
+                    AttachmentDirectoryView(base(), *sb);
+                (void)ReleaseAttachmentSlot(
+                    att_base, att_size, attachment_slot_index_,
+                    attachment_generation_, owner_identity_);
+                attachment_slot_index_ = 0xffffffffu;
+                attachment_generation_ = 0;
+            }
+            // The closing fence prevents a stale attachment from racing a
+            // lifecycle update. Only ACTIVE may be cleanly closed; never
+            // overwrite DIRTY/RECOVERING/QUARANTINED during teardown.
+            if (LoadRegionState(*sb) == RegionState::kActive) {
+                StoreCleanShutdown(*sb, true);
+                uint32_t active =
+                    static_cast<uint32_t>(RegionState::kActive);
+                if (!std::atomic_ref(sb->state).compare_exchange_strong(
+                        active,
+                        static_cast<uint32_t>(RegionState::kClosed),
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    StoreCleanShutdown(*sb, false);
+                }
+            }
+            StoreServiceOwner(*sb, ProcessIdentity{});
+            StoreServiceFence(
+                *sb, EncodeServiceFence(ServiceFenceEpoch(closing),
+                                        ServiceFencePhase::kUnowned));
+        }
+    } else if (sb != nullptr && !read_only() && is_subordinate_writable_) {
+        if (sb->layout_version >= kAttachmentDirectoryRegionLayoutVersion &&
+            attachment_slot_index_ != 0xffffffffu) {
+            auto [att_base, att_size] = AttachmentDirectoryView(base(), *sb);
+            lifecycle_status = ReleaseAttachmentSlot(
+                att_base, att_size, attachment_slot_index_,
+                attachment_generation_, owner_identity_);
+        }
+        attachment_slot_index_ = 0xffffffffu;
+        attachment_generation_ = 0;
+        is_subordinate_writable_ = false;
     }
 
     detached_ = true;
@@ -1139,6 +1349,7 @@ Status SharedMemoryRegion::Detach() {
     ReleaseSupervisorLock(supervisor_lock_fd_);
     supervisor_lock_fd_ = -1;
     is_supervisor_ = false;
+    is_subordinate_writable_ = false;
     if (!lifecycle_status.ok()) {
         return lifecycle_status;
     }

@@ -27,6 +27,7 @@
 #include "mino/platform/process_identity.h"
 #include "mino/platform/shared_memory.h"
 #include "mino/security/security_domain.h"
+#include "mino/shm/region/attachment_directory.h"
 #include "mino/shm/region/channel_directory.h"
 #include "mino/shm/region/recovery_directory.h"
 #include "mino/shm/region/superblock.h"
@@ -63,8 +64,8 @@ struct RegionCreateOptions {
     bool use_huge_pages = false;
 
     // Reserved space between the SuperBlock and the data area for the fixed
-    // recovery and channel directories plus allocator metadata. Region layout
-    // v6 requires enough space for both directory images.
+    // recovery, channel, and attachment directories plus allocator metadata.
+    // Region layout v7 requires enough space for all three directory images.
     uint64_t directory_size_bytes = 64 * 1024;
     uint64_t allocator_size_bytes = 64 * 1024;
 
@@ -76,18 +77,22 @@ struct RegionCreateOptions {
 
 // Options for SharedMemoryRegion::Attach (design doc section 6.2).
 //
-// v6 attachment contract:
+// v7 attachment contract (ADR-0014):
 //   * read_only=true supports concurrent processes and never participates in
 //     lifecycle recovery. Unscoped v2-v5 layouts are rejected unless the caller
 //     explicitly requests diagnostic legacy access.
-//   * read_only=false requests the unique supervisor role and requires the
-//     current v6 layout. It fails with kWouldBlock while another supervisor
-//     process is live.
-//   * Independent writable non-supervisor Attach (A8) remains intentionally
-//     unsupported under ADR-0014 on layout v6: SuperBlock (256B) cannot host a
-//     crash-safe multi-writer attachment registry. request_subordinate_writable
-//     is a fail-closed probe that returns kUnsupported rather than admitting a
-//     second writer. A future layout v7 attachment directory is required.
+//   * read_only=false without request_subordinate_writable requests the unique
+//     supervisor role and requires the current v7 layout. It fails with
+//     kWouldBlock while another supervisor process is live. The supervisor holds
+//     the host-local advisory lock and registers in the attachment directory.
+//   * read_only=false with request_subordinate_writable=true claims a bounded
+//     subordinate writable slot in the v7 attachment directory (ProcessIdentity
+//     + generation + heartbeat). It does not take the supervisor lock. Attach
+//     requires a live OWNED supervisor; slots are reclaimed only when
+//     ProbeProcessIdentity reports Dead. Exceeding kMaxSubordinateWritableAttachments
+//     fails closed. v6 and older layouts remain unsupported for this path.
+//   * Writable Attach of layout < v7 is rejected (recreate/migrate). v2-v6 remain
+//     read-only compatible subject to Security Domain rules.
 struct RegionV4UpgradeOptions {
     std::string name;
     std::span<const ChannelRingDescriptor> rings;
@@ -117,9 +122,10 @@ struct RegionAttachOptions {
     uint32_t region_id = 0;
     bool read_only = false;
 
-    // Fail-closed residual for A8 / ADR-0014. When true with read_only=false,
-    // Attach returns kUnsupported without mapping or taking the supervisor
-    // lock. Do not use this to request multi-writer semantics on v6.
+    // When true with read_only=false on layout v7+, Attach registers a
+    // subordinate writable attachment (A8 / ADR-0014) instead of taking the
+    // unique supervisor role. Incompatible with read_only=true. Silent second
+    // writers without this flag remain rejected by the supervisor lock.
     bool request_subordinate_writable = false;
 
     // Zero selects CurrentSecurityDomainId(). Attach rejects a mismatched domain
@@ -198,19 +204,31 @@ public:
         return reinterpret_cast<const SuperBlock*>(segment_->base());
     }
 
-    // Cleanly detaches. A writable supervisor first validates its exact v3
-    // service fence, then marks clean_shutdown=true and ACTIVE->CLOSED. A stale
-    // Region object can only unmap; it cannot close a replacement supervisor's
-    // Region. Read-only attachments only unmap.
+    // Cleanly detaches. A writable supervisor first refuses Detach while live
+    // subordinate writers remain registered, validates its exact v3 service
+    // fence, releases its attachment slot, then marks clean_shutdown=true and
+    // ACTIVE->CLOSED. A subordinate writable releases its attachment slot only.
+    // A stale Region object can only unmap; it cannot close a replacement
+    // supervisor's Region. Read-only attachments only unmap.
     Status Detach();
 
-    // True for the unique writable supervisor attachment. Mutable Region data
-    // access is valid only while ValidateSupervisorFence() succeeds.
+    // True for the unique writable supervisor attachment. Mutable Region
+    // lifecycle/directory APIs are valid only while ValidateSupervisorFence()
+    // succeeds.
     bool is_supervisor() const noexcept { return is_supervisor_; }
+    // True for a registered subordinate writable attachment (layout v7+).
+    bool is_subordinate_writable() const noexcept {
+        return is_subordinate_writable_;
+    }
     uint64_t service_epoch() const noexcept {
         return ServiceFenceEpoch(service_fence_at_attach_);
     }
     Status ValidateSupervisorFence() const;
+
+    // Updates the attachment-directory heartbeat for this process's registered
+    // supervisor or subordinate writable slot. Heartbeat is diagnostic/liveness
+    // aid only; Dead reclaim always uses ProbeProcessIdentity.
+    Status HeartbeatAttachment();
 
     // The identity used for service and recovery ownership in this process.
     const ProcessIdentity& owner_identity() const { return owner_identity_; }
@@ -261,6 +279,9 @@ private:
     uint64_t service_fence_at_attach_ = 0;
     int supervisor_lock_fd_ = -1;
     bool is_supervisor_ = false;
+    bool is_subordinate_writable_ = false;
+    uint32_t attachment_slot_index_ = 0xffffffffu;
+    uint64_t attachment_generation_ = 0;
     bool detached_ = false;
     mutable std::mutex recovery_directory_mutex_;
     mutable std::mutex channel_directory_mutex_;

@@ -47,10 +47,11 @@ namespace mino {
 
 // Constants.
 inline constexpr uint32_t kSuperBlockMagic = 0x4D494E4F;  // "MINO"
-inline constexpr uint16_t kRegionLayoutVersion = 6;
+inline constexpr uint16_t kRegionLayoutVersion = 7;
 inline constexpr uint16_t kRecoveryDirectoryRegionLayoutVersion = 4;
 inline constexpr uint16_t kChannelDirectoryRegionLayoutVersion = 5;
 inline constexpr uint16_t kSecurityDomainRegionLayoutVersion = 6;
+inline constexpr uint16_t kAttachmentDirectoryRegionLayoutVersion = 7;
 inline constexpr uint16_t kOldestReadableRegionLayoutVersion = 2;
 // Byte-order detector: stored at Create; a reader on a different-endian host
 // observes a byte-swapped value and rejects the Region (first version only

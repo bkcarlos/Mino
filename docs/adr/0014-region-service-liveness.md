@@ -3,7 +3,7 @@
 - 状态：ACCEPTED
 - 决策：SuperBlock v3 在保持 256B 和 v2 既有字段偏移不变的前提下，增加完整 `ProcessIdentity service_owner` 与 64-bit `{service_epoch, phase}` fence。可写 `Create/Attach` 是唯一 supervisor attachment，并持有 host-local advisory lock；任意数量跨进程只读 Attach 继续支持。恢复租约只串行化 `DIRTY/RECOVERING` 扫描，不作为 ACTIVE service 判活依据。
 - 约束：v2 只允许只读兼容，禁止自动恢复；v3 不支持多个独立进程同时 writable Attach；`ACTIVE` 只有在旧 supervisor lock 已由内核释放且其 `ProcessIdentity` 明确为 `Dead` 后才能转 `DIRTY`；`Unknown` 一律拒绝 destructive recovery；SuperBlock 必须保持 256B。
-- 待验证：Linux x86-64 已由 `//mino/shm/region:service_liveness_test` 覆盖；macOS `KERN_PROC_PID` 路径需纳入平台 CI；若未来需要多进程 writer，必须新增有界、崩溃安全的 attachment registry 并提升 layout version。
+- 待验证：Linux x86-64 已由 `//mino/shm/region:service_liveness_test` 覆盖；macOS `KERN_PROC_PID` 路径需纳入平台 CI；多进程 subordinate writable 已由 Region layout v7 attachment directory 落地（有界槽位 + ProcessIdentity + generation + Dead reclaim）；超时 lease 仍否决。
 
 ## Context
 
@@ -51,7 +51,7 @@ Supervisor attachment 不得跨 `fork()` 作为两个进程共同使用。子进
 
 - 正面：正常 ACTIVE Region 不会被 destructive scanner；SIGKILL 后可自动 `ACTIVE→DIRTY→RECOVERING→ACTIVE`；PID reuse 不会阻塞或冒充 owner；stale Detach 与 stale recovery commit 都受 epoch fence 限制。
 - 正面：不依赖 service heartbeat，因此 `SIGSTOP`、长暂停和调度抖动不会导致 takeover。
-- 负面：v3 明确不支持多个独立进程 writable Attach。多进程业务拓扑必须由 supervisor 代理写入，或等待后续 attachment-registry ABI。
+- 负面：SuperBlock v3 本身仍只有唯一 supervisor fence；多进程 writable 必须走 layout v7 attachment directory 的 subordinate 注册路径，不能静默第二 writer。
 - 负面：advisory lock 是 host-local 机制；Region 本身也是 host-local POSIX SHM，此约束一致。fork 后必须遵守上面的 handle 规则。
 - 兼容：SuperBlock 仍为 256B；v3 reader 可只读 Attach v2；v2 writable Attach 被明确拒绝，必须 clean migrate/recreate 为 v3。
 
@@ -72,4 +72,15 @@ Supervisor attachment 不得跨 `fork()` 作为两个进程共同使用。子进
 - 安全路径需要：有界 attachment directory（建议放入 Region directory 区）+ **layout version bump（v7）** + 注册/注销世代协议 + 新 supervisor 在 `ACTIVE→DIRTY` destructive recovery 前对每个已注册 subordinate `ProbeProcessIdentity`（仅 `Dead` 可回收槽；`Alive`/`Unknown` 拒绝）。
 - 超时 lease、未注册第二 writer、或「先开放再补 registry」都会违反本 ADR 已否决项。
 
-因此本变更**保持** v6 fail-closed（`request_subordinate_writable → kUnsupported`），不实现半套 multi-writer。
+因此当时变更**保持** v6 fail-closed（`request_subordinate_writable → kUnsupported`），不实现半套 multi-writer。
+
+## 2026-09-06 落地附注（A8 / feature/region-layout-v7）
+
+已合入 Region **layout v7** attachment directory（directory 子区，固定相对偏移，在 Channel Directory 之后）：
+
+- 有界槽位（capacity 16）+ `ProcessIdentity` + `{generation,state}` + monotonic heartbeat（诊断/辅助；**回收仍只认** `ProbeProcessIdentity==Dead`）。
+- `request_subordinate_writable=true` 在 live OWNED supervisor 下注册 subordinate writable（最多 `kMaxSubordinateWritableAttachments=4`）；不取 supervisor advisory lock。
+- 无该标志的第二可写 Attach 仍走唯一 supervisor 路径 → live supervisor 时 `kWouldBlock`。
+- 新 supervisor 在 `ACTIVE→DIRTY` 前 `PrepareAttachmentDirectoryForSupervisorRecovery`：仅 Dead reclaim；live/unknown subordinate writer fail-closed。
+- Supervisor 在仍有 live subordinate writer 时拒绝 clean Detach。
+- v6 及更旧 layout：只读兼容保留；可写 Attach 需 recreate 为 v7。SuperBlock 仍严格 256B。
