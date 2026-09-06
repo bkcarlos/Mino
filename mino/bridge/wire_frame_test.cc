@@ -157,11 +157,11 @@ TEST(Crc32cTest, MatchesStandardCheckVector) {
 }
 
 TEST(WireFrameCodecTest, EncodedSizeEqualsEncodeForEveryCanonicalShape) {
-    const std::array<FrameType, 7> types = {
+    const std::array<FrameType, 8> types = {
         FrameType::kData,          FrameType::kSchemaAnnounce,
         FrameType::kSchemaRequest, FrameType::kAck,
         FrameType::kHeartbeat,     FrameType::kSessionHello,
-        FrameType::kSessionDiscovery,
+        FrameType::kSessionDiscovery, FrameType::kSessionKeyShare,
     };
     for (FrameType type : types) {
         for (uint32_t combination = 0; combination < 4; ++combination) {
@@ -380,11 +380,11 @@ TEST(WireFrameCodecTest, IntoWireFrameMatchesDecodeSpanPayload) {
 
 TEST(WireFrameCodecTest,
      EncodeFormsAndDecodeViewAreDifferentialForEveryShapeAndTail) {
-    const std::array<FrameType, 7> types = {
+    const std::array<FrameType, 8> types = {
         FrameType::kData,          FrameType::kSchemaAnnounce,
         FrameType::kSchemaRequest, FrameType::kAck,
         FrameType::kHeartbeat,     FrameType::kSessionHello,
-        FrameType::kSessionDiscovery,
+        FrameType::kSessionDiscovery, FrameType::kSessionKeyShare,
     };
     const std::array<size_t, 19> payload_lengths = {
         0,  1,  2,  3,  4,  5,  7,  8,  9,  15,

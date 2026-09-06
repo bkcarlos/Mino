@@ -1,6 +1,7 @@
 // Copyright 2026 The Mino Authors
 
 #include "mino/bridge/bridge_pipeline.h"
+#include "mino/bridge/wire_aead_session.h"
 #include "mino/bridge/dedup_store.h"
 
 #include <gtest/gtest.h>
@@ -1439,6 +1440,189 @@ TEST(BridgePipelineTest, TransientRemoteBackpressureRetainsAndRetriesFrame) {
     });
     ASSERT_TRUE(recovered.ok()) << recovered.ToString();
     EXPECT_EQ(pair.b_ingress.frames.size(), 1u);
+}
+
+
+ConnectedPipelines MakeAeadPipelines(bool enable_aead = true,
+                                     bool with_psk = true) {
+    ConnectedPipelines result;
+    transport::TcpDriverOptions tcp_options;
+    tcp_options.max_frame_body_bytes = 4096;
+    tcp_options.max_total_send_buffer_bytes = 32 * 1024;
+    tcp_options.max_connection_send_buffer_bytes = 16 * 1024;
+    tcp_options.max_ready_receive_bytes = 32 * 1024;
+    tcp_options.max_ready_receive_messages = 64;
+    tcp_options.max_pending_accepts = 4;
+    tcp_options.heartbeat_interval_ms = 50;
+    tcp_options.idle_timeout_ms = 2000;
+    tcp_options.partial_frame_timeout_ms = 1000;
+    tcp_options.io_poll_max_ms = 5;
+    auto a_created = transport::TcpDriver::Create(tcp_options);
+    auto b_created = transport::TcpDriver::Create(tcp_options);
+    EXPECT_TRUE(a_created.ok());
+    EXPECT_TRUE(b_created.ok());
+    if (!a_created.ok() || !b_created.ok()) return result;
+    result.a_driver = std::shared_ptr<transport::TcpDriver>(
+        std::move(*a_created));
+    result.b_driver = std::shared_ptr<transport::TcpDriver>(
+        std::move(*b_created));
+    const transport::DriverConfig config{
+        .max_connections = 8,
+        .max_listeners = 2,
+        .max_queued_sends = 64,
+    };
+    EXPECT_TRUE(result.a_driver->Start(config).ok());
+    EXPECT_TRUE(result.b_driver->Start(config).ok());
+    result.endpoint = Loopback(FreePort());
+    auto listener = result.b_driver->Listen(
+        {.local_endpoint = result.endpoint, .backlog = 2});
+    EXPECT_TRUE(listener.ok());
+    if (!listener.ok()) return result;
+    result.listener = *listener;
+    auto connected = result.a_driver->Connect({
+        .remote_endpoint = result.endpoint,
+        .local_bind = std::nullopt,
+        .timeout_ms = 1000,
+    });
+    EXPECT_TRUE(connected.ok());
+    if (!connected.ok()) return result;
+    result.a_connection = *connected;
+    auto accepted = result.b_driver->Accept(
+        {.listener_id = listener->id, .timeout_ms = 1000});
+    EXPECT_TRUE(accepted.ok());
+    if (!accepted.ok()) return result;
+    result.b_connection = *accepted;
+
+    std::vector<std::byte> psk(32, std::byte{0x42});
+    BridgePipelineOptions a_options;
+    a_options.local_session_epoch = 101;
+    a_options.remote_session_epoch = 202;
+    a_options.wire_limits.max_payload_length = 4096;
+    a_options.wire_limits.max_buffered_bytes = 8192;
+    a_options.enable_aead = enable_aead;
+    a_options.aead_local_is_client = true;
+    if (with_psk) a_options.aead_psk = psk;
+    BridgePipelineOptions b_options = a_options;
+    b_options.local_session_epoch = 202;
+    b_options.remote_session_epoch = 101;
+    b_options.aead_local_is_client = false;
+    if (with_psk) b_options.aead_psk = psk;
+
+    auto a_pipeline = BridgePipeline::Create(
+        a_options, result.a_driver, result.a_connection.id, &result.a_egress,
+        &result.a_ingress);
+    auto b_pipeline = BridgePipeline::Create(
+        b_options, result.b_driver, result.b_connection.id, nullptr,
+        &result.b_ingress);
+    EXPECT_TRUE(a_pipeline.ok()) << a_pipeline.status().ToString();
+    EXPECT_TRUE(b_pipeline.ok()) << b_pipeline.status().ToString();
+    if (a_pipeline.ok()) result.a = std::move(*a_pipeline);
+    if (b_pipeline.ok()) result.b = std::move(*b_pipeline);
+    return result;
+}
+
+TEST(BridgePipelineTest, AeadKeyShareAutoKeyringRoundTrip) {
+    ConnectedPipelines pair = MakeAeadPipelines();
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready() &&
+                           pair.a->aead_ready() && pair.b->aead_ready();
+                }).ok());
+    ASSERT_NE(pair.a->aead_keyring(), nullptr);
+    ASSERT_NE(pair.b->aead_keyring(), nullptr);
+
+    LengthPrefixedFrameDecoder decoder;
+    BindAeadKeyring(&decoder, pair.b->aead_keyring());
+
+    WireFrame frame = DataFrame(1, std::byte{0x77});
+    frame.header.flags = 0;
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = frame,
+        .reliability = registry::Reliability::kBestEffort,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.b_ingress.frames.size() == 1;
+                }).ok());
+    ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
+    EXPECT_EQ(pair.b_ingress.frames[0].payload, frame.payload);
+    EXPECT_TRUE(HasFrameFlag(pair.b_ingress.frames[0].header.flags,
+                             FrameFlag::kAeadPresent));
+}
+
+TEST(BridgePipelineTest, AeadFailClosedWithoutKeys) {
+    ConnectedPipelines pair =
+        MakeAeadPipelines(/*enable_aead=*/true, /*with_psk=*/false);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    for (size_t i = 0; i < 50; ++i) {
+        BridgePumpBudget budget;
+        budget.now_ns = i * 1'000'000;
+        ASSERT_TRUE(pair.a->Pump(budget).ok());
+        ASSERT_TRUE(pair.b->Pump(budget).ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_FALSE(pair.a->session_ready());
+    EXPECT_FALSE(pair.b->session_ready());
+    EXPECT_FALSE(pair.a->aead_ready());
+    EXPECT_TRUE(pair.b_ingress.frames.empty());
+}
+
+TEST(BridgePipelineTest, AeadSharedSecretInstallRoundTripAndTamper) {
+    ConnectedPipelines pair =
+        MakeAeadPipelines(/*enable_aead=*/true, /*with_psk=*/false);
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    std::array<std::byte, 32> secret{};
+    secret.fill(std::byte{0x99});
+    auto context = WireAeadEpochContext(101, 202);
+    ASSERT_TRUE(pair.a->InstallAeadFromSharedSecret(secret, context).ok());
+    ASSERT_TRUE(pair.b->InstallAeadFromSharedSecret(secret, context).ok());
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.a->session_ready() && pair.b->session_ready();
+                }).ok());
+
+    WireFrame frame = DataFrame(3, std::byte{0x12});
+    frame.header.flags = 0;
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = frame,
+        .reliability = registry::Reliability::kBestEffort,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+                    return pair.b_ingress.frames.size() == 1;
+                }).ok());
+    EXPECT_EQ(pair.b_ingress.frames[0].payload, frame.payload);
+
+    WireFrame tamper = DataFrame(4, std::byte{0x34});
+    ApplySessionAeadFlags(&tamper.header);
+    auto encoded =
+        WireFrameCodec::Encode(tamper, {}, pair.a->aead_keyring());
+    ASSERT_TRUE(encoded.ok());
+    (*encoded)[encoded->size() / 2] ^= std::byte{0xff};
+    auto sent = pair.a_driver->SendUntracked(transport::UntrackedSendRequest{
+        .connection_id = pair.a_connection.id,
+        .payload = *encoded,
+        .traffic_class = transport::UntrackedTrafficClass::kData,
+    });
+    ASSERT_TRUE(sent.ok()) << sent.status().ToString();
+    Status rejected = Status::Ok();
+    for (size_t i = 0; i < 200; ++i) {
+        BridgePumpBudget budget;
+        budget.now_ns = 20'000'000'000ull + i * 1'000'000;
+        auto pumped = pair.b->Pump(budget);
+        if (!pumped.ok()) {
+            rejected = pumped.status();
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(rejected.code(), StatusCode::kCorruption);
 }
 
 }  // namespace

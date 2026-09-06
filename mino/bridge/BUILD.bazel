@@ -19,6 +19,20 @@ cc_library(
     ],
 )
 
+
+cc_library(
+    name = "wire_aead_session",
+    srcs = ["wire_aead_session.cc"],
+    hdrs = ["wire_aead_session.h"],
+    deps = [
+        ":wire_aead",
+        ":wire_frame",
+        "//mino/common:result",
+        "//mino/common:status",
+        "@openssl//:crypto",
+    ],
+)
+
 cc_library(
     name = "wire_frame",
     srcs = ["wire_frame.cc"],
@@ -75,11 +89,13 @@ cc_library(
     deps = [
         ":reliability",
         ":schema_negotiator",
+        ":wire_aead_session",
         ":wire_frame",
         "//mino/common:result",
         "//mino/registry",
         "//mino/security:tls",
         "//mino/transport:transport_driver",
+        "@openssl//:crypto",
     ],
 )
 
@@ -280,6 +296,21 @@ cc_test(
     srcs = ["crc32c_test.cc"],
     deps = [
         ":crc32c",
+        "@googletest//:gtest_main",
+    ],
+)
+
+
+cc_test(
+    name = "wire_aead_session_test",
+    size = "small",
+    srcs = ["wire_aead_session_test.cc"],
+    deps = [
+        ":wire_aead_session",
+        ":wire_frame",
+        "//mino/common:status",
+        "//mino/security:test_tls_credentials",
+        "//mino/security:tls",
         "@googletest//:gtest_main",
     ],
 )

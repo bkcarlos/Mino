@@ -5,6 +5,7 @@
 #ifndef MINO_BRIDGE_BRIDGE_PIPELINE_H_
 #define MINO_BRIDGE_BRIDGE_PIPELINE_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -19,6 +20,7 @@
 #include "mino/bridge/dedup_window.h"
 #include "mino/bridge/retransmit_window.h"
 #include "mino/bridge/schema_negotiator.h"
+#include "mino/bridge/wire_aead_session.h"
 #include "mino/bridge/wire_frame.h"
 #include "mino/common/result.h"
 #include "mino/registry/metadata.h"
@@ -92,6 +94,15 @@ struct BridgePipelineOptions {
     // Production RemoteBridge supplies a complete transport-authenticated peer.
     security::AuthenticatedPeer authenticated_peer;
     const BridgeTopicAuthorizer* topic_authorizer = nullptr;
+    // When true, data frames use session AEAD automatically once a keyring is
+    // installed (TLS exporter, KeyShare+PSK, or InstallAeadKeyring). Control
+    // frames stay clear. Without keys, data encode/decode fail closed.
+    bool enable_aead = false;
+    // Role bit for directional key_ids (client→server vs server→client).
+    bool aead_local_is_client = true;
+    // Optional PSK (≥16 bytes) enabling authenticated SessionKeyShare when TLS
+    // exporter install is unavailable. Scrubbed when the pipeline is destroyed.
+    std::vector<std::byte> aead_psk;
 };
 
 struct BridgePumpBudget {
@@ -120,6 +131,8 @@ public:
         BridgeEgressPort* egress,
         BridgeIngressPort* ingress,
         SchemaNegotiator* schema_negotiator = nullptr) noexcept;
+
+    ~BridgePipeline();
 
     Result<BridgePumpResult> Pump(const BridgePumpBudget& budget) noexcept;
 
@@ -153,6 +166,25 @@ public:
     size_t pending_inbound_frames() const noexcept {
         return pending_inbound_.size();
     }
+
+    // Session AEAD keyring owned by the pipeline. Null until Install* / KeyShare
+    // completes. LengthPrefixedFrameDecoder callers may BindAeadKeyring(...,
+    // aead_keyring()) — no separate manual-only happy path.
+    const WireAeadKeyring* aead_keyring() const noexcept {
+        return aead_ready_ ? &aead_keyring_ : nullptr;
+    }
+    bool aead_ready() const noexcept { return aead_ready_; }
+
+    // Preferred after TLS 1.3 mTLS: pass SSL_export_keying_material output
+    // (kWireAeadExporterLength bytes) for label kWireAeadTlsExporterLabel.
+    Status InstallAeadFromTlsExporter(std::span<const std::byte> material)
+        noexcept;
+    // Non-TLS / test path: HKDF(shared_secret, context) → session keyring.
+    Status InstallAeadFromSharedSecret(std::span<const std::byte> secret,
+                                       std::span<const std::byte> context)
+        noexcept;
+    // Advanced injection; still auto-wired into encode/decode when enable_aead.
+    Status InstallAeadKeyring(WireAeadKeyring keyring) noexcept;
 
 private:
     struct Attempt {
@@ -244,6 +276,13 @@ private:
         const std::vector<WireFrame>& controls) noexcept;
     Status AdmitNegotiatedControls() noexcept;
     Status QueueSessionHello() noexcept;
+    Status QueueSessionKeyShare() noexcept;
+    Status HandleKeyShare(std::span<const std::byte> payload) noexcept;
+    void UpdateSessionReady() noexcept;
+    Status EnsureAeadForData(const WireFrameHeader& header) const noexcept;
+    void PrepareOutboundDataFlags(WireFrameHeader* header) const noexcept;
+    const WireAeadKeyring* EncodeAeadKeyring(
+        const WireFrameHeader& header) const noexcept;
     Status QueueAck(const AckPayload& ack) noexcept;
     bool CanQueueAck(const AckPayload& ack) const noexcept;
     void RemovePendingAck(PendingAckQueue::iterator pending) noexcept;
@@ -332,6 +371,12 @@ private:
     bool session_ready_ = false;
     bool peer_dedup_state_lost_ = false;
     bool resend_pending_ = false;
+    bool aead_ready_ = false;
+    bool key_share_sent_ = false;
+    bool key_share_received_ = false;
+    WireAeadKeyring aead_keyring_;
+    std::array<std::byte, kSessionKeyShareNonceLength> local_key_share_nonce_{};
+    bool has_local_key_share_nonce_ = false;
 };
 
 }  // namespace mino::bridge

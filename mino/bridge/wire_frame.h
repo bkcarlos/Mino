@@ -49,6 +49,9 @@ enum class FrameType : uint32_t {
     // Consumed only by the connection owner before BridgePipeline is bound.
     // Older codecs reject this unknown opcode, preserving fail-closed rollout.
     kSessionDiscovery = 6,
+    // Authenticated AEAD KeyShare (PSK-MAC'd nonce). Clear control; keys are
+    // installed into WireAeadKeyring before data-plane AEAD frames.
+    kSessionKeyShare = 7,
 };
 
 enum class FrameFlag : uint16_t {

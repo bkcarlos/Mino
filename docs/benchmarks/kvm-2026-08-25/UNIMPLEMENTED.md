@@ -3,9 +3,9 @@
 调查日期（首次）：2026-08-25 23:45 CST（UTC+8）  
 **文档同步日期：2026-09-06（Asia/Shanghai）**  
 仓库：`/workspace/Mino`  
-**HEAD（文档对照 tip）：`d36603ecd7ed29f684ad7187468974ffd7fb098a`**
-（`fix: restore release-suite green for SimpleNode and known GCC/py flakes`；
-相对 `origin/master` 超前；声称 release `//...` 154/154 green）  
+**HEAD（文档对照 tip）：`afafa2c06473f475713ede6f6f0c89e4c83ed1d2`**
+（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；
+相对 `abb282f`/`d36603e` 超前；A1 会话 KEX 已关闭）  
 范围：对照 D0–D6 计划、ADR、运维手册、pipeline follow-up、代码 TODO/stub，以及
 transport / discovery / 镜像路径；并与 tip 上已合入的 AEAD / nested owned-graph /
 exclusive-hop recovery / residual copies / Region ID Attach / DedupStore /
@@ -13,21 +13,21 @@ SharedHostDomain v2 / hybrid graph forward / PTP+RDMA/Fabric 插件 / opt-closeo
 对齐。  
 不包含：新功能开发；不发明性能数字。
 
-**总判断（tip `d36603e`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
-关闭或降为明确外置/延期。真正仍缺的是少数协议外置能力（AEAD 会话密钥交换、A8 多
-writer layout）、架构非目标（A11/A12），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
+**总判断（tip `afafa2c`）**：D0–D6 计划内源码几乎全部落地；A 段多数「缺代码」项已在 tip
+关闭或降为明确外置/延期。真正仍缺的是少数协议外置能力（A8 多
+writer layout；A1 会话 KEX 已在 tip 关闭）、架构非目标（A11/A12），以及 RDMA/Fabric/HugePage/NUMA 等**硬件或
 clean-ref 资格门**（驱动与软件参考插件已在树内，不算资格通过）。同机优化残留拷贝以
 intentional KEEP 为主，见 `docs/optimization-status.md`。
 
 ---
 
-## 仍 incomplete 速览（对照 tip `d36603e`）
+## 仍 incomplete 速览（对照 tip `afafa2c`）
 
 ### 代码缺口 / 明确外置或延期（非 stub 大面积）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| A1 会话密钥交换 / PKI / pipeline 自动挂 keyring | **残留外置** | 帧 AEAD（AES-256-GCM）已实现；无帧内 KEX |
+| A1 会话密钥交换 / PKI / pipeline 自动挂 keyring | **已关闭（会话 KEX）** | TLS exporter + PSK KeyShare；pipeline 自动挂 keyring |
 | A8 subordinate writable / multi-writer Attach | **未实现（ADR-0014）** | 需 attachment registry + layout bump；tip 仅 fail-closed 探测 |
 | A10 ptp4l/pmc 侧车、双机 PTP 资格、pipeline 单向延迟字段 | **残留集成/资格** | `PtpClockClient` 已落地；无合格同步仍 fail-closed |
 | A12 IPsec 传输 | **未做（架构选项）** | D6 落地 TLS；树内无 IPsec 驱动 |
@@ -56,17 +56,22 @@ intentional KEEP 为主，见 `docs/optimization-status.md`。
 | RDMA 通用 span `Send` staging | owned/`pre_registered` 路径已改进；通用 Send 仍 KEEP |
 | A11 128-bit 原子 | ADR-0001 生产 ABI 非目标 |
 
-**已关闭（勿再写成缺功能）**：帧 AEAD；嵌套 owned-graph；exclusive-hop journal 恢复与 ACK→Adopt 微窗口；Region ID Attach；DedupStore；SharedHostDomain 动态发现（非 static-only）；hybrid graph forward（P8）；PTP 客户端 + RDMA/Fabric **软件参考**插件；SimpleNode `Recover()`（存在且公开）。
+**已关闭（勿再写成缺功能）**：帧 AEAD + 会话 KEX/pipeline 自动 keyring；嵌套 owned-graph；exclusive-hop journal 恢复与 ACK→Adopt 微窗口；Region ID Attach；DedupStore；SharedHostDomain 动态发现（非 static-only）；hybrid graph forward（P8）；PTP 客户端 + RDMA/Fabric **软件参考**插件；SimpleNode `Recover()`（存在且公开）。
 
 ---
 
 ## A. 功能项（缺代码 / stub / 外置 / 明确延期）— 按 tip 标注
 
-### A1. Wire 帧 AEAD — 帧编解码已实现；会话密钥交换仍外置
+### A1. Wire 帧 AEAD — 帧编解码 + 会话密钥建立 / pipeline 自动 keyring 已实现
 
-**已实现**：`FrameFlag::kAeadPresent` 走 AES-256-GCM（OpenSSL EVP，`mino/bridge/wire_aead.*`）。可选 4 字节头字段存 `key_id`；wire payload 为 `[control opcode?][nonce 12][ciphertext][tag 16]`；AAD 覆盖 canonical header（header_crc 按零）与明文 control opcode。无密钥 fail-closed（`InvalidArgument`）。`WireAeadKeyring` 提供可注入的 encode/decode 密钥 API。
+**已实现（帧层）**：`FrameFlag::kAeadPresent` 走 AES-256-GCM（OpenSSL EVP，`mino/bridge/wire_aead.*`）。可选 4 字节头字段存 `key_id`；wire payload 为 `[control opcode?][nonce 12][ciphertext][tag 16]`；AAD 覆盖 canonical header（header_crc 按零）与明文 control opcode。无密钥 fail-closed（`InvalidArgument`）。
 
-**未实现 / 外置**：没有帧内密钥交换或 PKI。会话密钥需由握手/运维侧注入 keyring（pipeline 尚未自动挂载）。TLS 1.3 mTLS 仍是套接字层（`mino/security/tls.cc`），与帧内 AEAD 正交。
+**已实现（会话 KEX / 自动 keyring）**：
+- TLS 1.3 exporter：`TlsChannel::ExportKeyingMaterial` + label `EXPORTER-mino-wire-aead-v1` → 64 字节材料（C→S ‖ S→C），`InstallAeadFromTlsExporter` / `MakeWireAeadKeyringFromExporterMaterial`（`mino/bridge/wire_aead_session.*`）。
+- 无 TLS 时的认证 KeyShare：`FrameType::kSessionKeyShare` + PSK-HMAC nonce；双方 `DeriveWireAeadKeyringFromKeyShare` 后自动安装。
+- `BridgePipelineOptions::enable_aead` 时数据帧自动打 AEAD 标志并走 owned `WireAeadKeyring`；`BindAeadKeyring` 供 `LengthPrefixedFrameDecoder`。控制帧保持明文。未装密钥时 session 不 ready / 数据面 fail-closed。
+
+**仍外置 / 非目标**：完整证书 PKI 生命周期与轮换 UX（仍用现有 mTLS 凭证提供者）；IPsec（见 A12）。TLS 套接字层与帧内 AEAD 仍正交（可叠加）。
 
 ### A2. RDMA 硬件资格仍缺真实 NIC：树内已有可加载参考插件（P9）
 
@@ -269,7 +274,7 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 在 `mino/ tools/ tests/ examples/` 内检索 `TODO|FIXME|NYI|待实现|未实现|not implemented`：
 
-- 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD 见 A1；会话密钥交换仍外置）
+- 生产代码已无硬 `AEAD framing is not implemented` stub（帧 AEAD + 会话 KEX 见 A1）
 - 另外一处明确 unsupported：writable non-supervisor Attach（A8 / ADR-0014 残留；ID-only Attach 已由 region name registry 落地）
 - 持久 Dedup Store 已由 `dedup_store` + pipeline 集成落地（A9）
 - Exclusive hop journal 恢复与 ACK→Adopt 微窗口已落地（见 `docs/optimization-status.md`）

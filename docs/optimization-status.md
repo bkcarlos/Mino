@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`master` tip **`d36603e`**（`fix: restore release-suite green for SimpleNode and known GCC/py flakes`；声称 `//...` release 154/154 green；相对 `origin/master` 超前）
+- HEAD 对照：`feature/aead-session-kex` tip **`afafa2c`**（`feat(bridge): AEAD session KEX and BridgePipeline auto keyring`；基于 `abb282f`/`d36603e`）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
@@ -20,7 +20,7 @@
 | 长度定界 payload `insert` memmove（A3） | **DONE** | `EncodeLengthDelimitedValue`：Leb128 前缀 + `Append`；嵌套走 scratch 再 Append |
 | 流式 DecodeView / owned send / 尾帧 steal（A4） | **DONE** | `LengthPrefixedFrameDecoder::Push`→`DecodeView`；Bridge `TrySendOwned` / `TrySendUntrackedOwned`；TcpDriver 收缓冲**尾部**完整帧 `move` steal |
 | RDMA owned Send 免 `assign` | **DONE（opt-closeout）** | `RdmaDriver::DoTrySendOwned` / `PostOwned`：`vector&&` 移入 pending；可选 `pre_registered` MR 跳过 Register/Deregister。span `Send` 仍需 staging 拷 |
-| Wire 帧 AEAD | **DONE（帧层）** | `mino/bridge/wire_aead.*` AES-256-GCM + 可注入 `WireAeadKeyring`；会话密钥交换仍外置（见 UNIMPLEMENTED A1） |
+| Wire 帧 AEAD | **DONE（帧层+会话 KEX）** | `wire_aead.*` + `wire_aead_session.*`；TLS exporter / PSK KeyShare；`BridgePipeline` 自动挂 keyring |
 | 嵌套 owned-graph 遍历 | **DONE** | 生成 `CollectOwnedGraph` / `AppendOwnedChildren`（深度上限 32） |
 | Hybrid 跨机图所有权转发（P8） | **DONE** | `graph_ownership_forward.*`；中间 SemanticFrame.assign 已消；真跨机 SHM 零拷贝仍需 RDMA/Fabric MR |
 | Region ID Attach | **DONE** | `region_name_registry.*`：空 name + region_id 经持久 registry 解析 |

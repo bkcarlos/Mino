@@ -356,6 +356,41 @@ public:
         return peer_;
     }
 
+    Result<std::vector<std::byte>> ExportKeyingMaterial(
+        std::string_view label, std::span<const std::byte> context,
+        size_t length) const noexcept override {
+        try {
+            if (!handshake_complete_) {
+                return Unavailable("TLS handshake is incomplete");
+            }
+            if (label.empty()) {
+                return Invalid("TLS exporter label is empty");
+            }
+            if (length == 0 ||
+                length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                return Invalid("TLS exporter length is invalid");
+            }
+            if (context.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+                return Invalid("TLS exporter context is too large");
+            }
+            std::vector<std::byte> out(length);
+            const int use_context = context.empty() ? 0 : 1;
+            if (SSL_export_keying_material(
+                    ssl_.get(),
+                    reinterpret_cast<unsigned char*>(out.data()), length,
+                    label.data(), label.size(),
+                    reinterpret_cast<const unsigned char*>(context.data()),
+                    context.size(), use_context) != 1) {
+                ERR_clear_error();
+                return Internal("TLS export keying material failed");
+            }
+            return out;
+        } catch (const std::bad_alloc&) {
+            return AllocationFailure();
+        }
+    }
+
 private:
     enum class PendingOperation : uint8_t { kNone, kRead, kWrite };
 

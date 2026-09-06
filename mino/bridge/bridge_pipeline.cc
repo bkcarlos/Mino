@@ -2,6 +2,8 @@
 
 #include "mino/bridge/bridge_pipeline.h"
 
+#include <cstring>
+
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -159,6 +161,14 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
             !ValidLane(options.lane_index, options.lane_count)) {
             return Invalid("bridge pipeline dependencies or limits are invalid");
         }
+        if (options.enable_aead && !options.aead_psk.empty() &&
+            options.aead_psk.size() < 16) {
+            return Invalid("bridge AEAD PSK must be at least 16 bytes");
+        }
+        if (options.enable_aead && !options.aead_psk.empty() &&
+            options.max_control_bytes < kSessionKeyShareWireSize) {
+            return Invalid("bridge control byte limit cannot hold KeyShare");
+        }
         MINO_ASSIGN_OR_RETURN(auto dedup,
                               DedupWindow::Create(options.dedup));
         MINO_ASSIGN_OR_RETURN(auto retransmit,
@@ -192,6 +202,9 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
         pipeline->local_schema_bindings_.reserve(
             options.retransmit.max_entries);
         MINO_RETURN_IF_ERROR(pipeline->QueueSessionHello());
+        if (options.enable_aead && !options.aead_psk.empty()) {
+            MINO_RETURN_IF_ERROR(pipeline->QueueSessionKeyShare());
+        }
         return pipeline;
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -219,6 +232,16 @@ Status BridgePipeline::reliability_status() const {
                ? Status::Error(StatusCode::kDegraded,
                                "Bridge receiver dedup state was lost")
                : Status::Ok();
+}
+
+
+BridgePipeline::~BridgePipeline() {
+    volatile std::byte* psk = options_.aead_psk.data();
+    for (size_t i = 0; i < options_.aead_psk.size(); ++i) {
+        psk[i] = std::byte{0};
+    }
+    options_.aead_psk.clear();
+    aead_keyring_.Clear();
 }
 
 Status BridgePipeline::RestoreDedupFromStore(uint64_t now_ns) noexcept {
@@ -340,6 +363,118 @@ Status BridgePipeline::QueueSessionHello() noexcept {
     }
 }
 
+Status BridgePipeline::QueueSessionKeyShare() noexcept {
+    try {
+        if (!options_.enable_aead || options_.aead_psk.empty()) {
+            return Invalid("SessionKeyShare requires enable_aead and PSK");
+        }
+        MINO_ASSIGN_OR_RETURN(
+            auto share,
+            MakeSessionKeyShare(options_.aead_psk, options_.local_session_epoch,
+                                options_.remote_session_epoch));
+        local_key_share_nonce_ = share.nonce;
+        has_local_key_share_nonce_ = true;
+        MINO_ASSIGN_OR_RETURN(auto payload, EncodeSessionKeyShare(share));
+        const Status queued = QueueControl(
+            ControlFrame(FrameType::kSessionKeyShare, std::move(payload)));
+        if (queued.ok()) key_share_sent_ = true;
+        return queued;
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::length_error&) {
+        return AllocationFailure();
+    }
+}
+
+void BridgePipeline::UpdateSessionReady() noexcept {
+    const bool aead_ok = !options_.enable_aead || aead_ready_;
+    session_ready_ = hello_sent_ && hello_received_ && aead_ok;
+}
+
+Status BridgePipeline::InstallAeadKeyring(WireAeadKeyring keyring) noexcept {
+    if (!options_.enable_aead) {
+        return Invalid("InstallAeadKeyring requires enable_aead");
+    }
+    if (!keyring.has_encode_key()) {
+        return Invalid("AEAD keyring missing encode key");
+    }
+    aead_keyring_ = std::move(keyring);
+    aead_ready_ = true;
+    UpdateSessionReady();
+    return Status::Ok();
+}
+
+Status BridgePipeline::InstallAeadFromTlsExporter(
+    std::span<const std::byte> material) noexcept {
+    auto keyring = MakeWireAeadKeyringFromExporterMaterial(
+        material, options_.aead_local_is_client);
+    if (!keyring.ok()) return keyring.status();
+    return InstallAeadKeyring(std::move(*keyring));
+}
+
+Status BridgePipeline::InstallAeadFromSharedSecret(
+    std::span<const std::byte> secret,
+    std::span<const std::byte> context) noexcept {
+    auto keyring = DeriveWireAeadKeyringFromSharedSecret(
+        secret, context, options_.aead_local_is_client);
+    if (!keyring.ok()) return keyring.status();
+    return InstallAeadKeyring(std::move(*keyring));
+}
+
+Status BridgePipeline::EnsureAeadForData(
+    const WireFrameHeader& header) const noexcept {
+    if (!options_.enable_aead) return Status::Ok();
+    if (!HasFrameFlag(header.flags, FrameFlag::kAeadPresent)) {
+        return Corruption("AEAD-enabled bridge received clear data frame");
+    }
+    if (!aead_ready_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "AEAD session keyring is not installed");
+    }
+    return Status::Ok();
+}
+
+void BridgePipeline::PrepareOutboundDataFlags(
+    WireFrameHeader* header) const noexcept {
+    if (header == nullptr || !options_.enable_aead) return;
+    ApplySessionAeadFlags(header);
+}
+
+const WireAeadKeyring* BridgePipeline::EncodeAeadKeyring(
+    const WireFrameHeader& header) const noexcept {
+    if (!HasFrameFlag(header.flags, FrameFlag::kAeadPresent)) return nullptr;
+    return aead_ready_ ? &aead_keyring_ : nullptr;
+}
+
+Status BridgePipeline::HandleKeyShare(std::span<const std::byte> payload)
+    noexcept {
+    try {
+        if (!options_.enable_aead || options_.aead_psk.empty()) {
+            return Corruption("unexpected SessionKeyShare without AEAD PSK");
+        }
+        auto share = DecodeSessionKeyShare(payload);
+        if (!share.ok()) return share.status();
+        // Peer is the sender of this KeyShare.
+        MINO_RETURN_IF_ERROR(VerifySessionKeyShare(
+            *share, options_.aead_psk, options_.remote_session_epoch,
+            options_.local_session_epoch));
+        if (!has_local_key_share_nonce_) {
+            return Corruption("local SessionKeyShare nonce is missing");
+        }
+        auto keyring = DeriveWireAeadKeyringFromKeyShare(
+            options_.aead_psk, local_key_share_nonce_, share->nonce,
+            options_.local_session_epoch, options_.remote_session_epoch,
+            options_.aead_local_is_client);
+        if (!keyring.ok()) return keyring.status();
+        MINO_RETURN_IF_ERROR(InstallAeadKeyring(std::move(*keyring)));
+        key_share_received_ = true;
+        UpdateSessionReady();
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    }
+}
+
 Status BridgePipeline::RebindConnection(
     transport::ConnectionId connection_id, uint64_t local_session_epoch,
     uint64_t remote_session_epoch, bool local_dedup_state_lost,
@@ -380,6 +515,12 @@ Status BridgePipeline::RebindConnection(
         session_ready_ = false;
         peer_dedup_state_lost_ = false;
         resend_pending_ = retransmit_->size() != 0;
+        aead_ready_ = false;
+        key_share_sent_ = false;
+        key_share_received_ = false;
+        aead_keyring_.Clear();
+        has_local_key_share_nonce_ = false;
+        local_key_share_nonce_ = {};
 
         // Receiver restart clears in-memory dedup. When a DedupStore is
         // attached, reseed from durable HWMs and clear the degraded flag.
@@ -392,7 +533,11 @@ Status BridgePipeline::RebindConnection(
         retransmit_->BeginSession(local_session_epoch, remote_session_epoch,
                                   now_ns);
         if (schema_negotiator_ != nullptr) schema_negotiator_->Reset();
-        return QueueSessionHello();
+        MINO_RETURN_IF_ERROR(QueueSessionHello());
+        if (options_.enable_aead && !options_.aead_psk.empty()) {
+            return QueueSessionKeyShare();
+        }
+        return Status::Ok();
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
     }
@@ -590,8 +735,10 @@ Status BridgePipeline::FlushControls(BridgePumpBudget budget,
         result->made_progress = true;
         control_queue_.pop_front();
         hello_sent_ = true;
+        // First control flush marks hello_sent (existing seam). KeyShare may
+        // still be pending; UpdateSessionReady gates on aead_ready when needed.
     }
-    session_ready_ = hello_sent_ && hello_received_;
+    UpdateSessionReady();
     return Status::Ok();
 }
 
@@ -852,9 +999,14 @@ Status BridgePipeline::DrainInbound(const BridgePumpBudget& budget,
         const size_t wire_bytes = message.payload.size();
         // Control and data both own message.payload after Poll; DecodeView
         // avoids the control-plane payload.assign that Decode(span) requires.
-        auto decoded = WireFrameCodec::DecodeView(std::move(message.payload),
-                                                  options_.wire_limits);
+        const WireAeadKeyring* inbound_aead =
+            aead_ready_ ? &aead_keyring_ : nullptr;
+        auto decoded = WireFrameCodec::DecodeView(
+            std::move(message.payload), options_.wire_limits, inbound_aead);
         if (!decoded.ok()) return decoded.status();
+        if (decoded->header.frame_type == FrameType::kData) {
+            MINO_RETURN_IF_ERROR(EnsureAeadForData(decoded->header));
+        }
         MINO_RETURN_IF_ERROR(
             QueuePendingInbound(std::move(*decoded), wire_bytes));
         result->bytes += wire_bytes;
@@ -870,6 +1022,9 @@ Status BridgePipeline::HandleFrame(const WireFrameHeader& header,
                                    BridgePumpResult*) noexcept {
     if (header.frame_type == FrameType::kSessionHello) {
         return HandleHello(payload, now_ns);
+    }
+    if (header.frame_type == FrameType::kSessionKeyShare) {
+        return HandleKeyShare(payload);
     }
     if (!session_ready_) {
         return Corruption("bridge frame arrived before session handshake");
@@ -1218,7 +1373,7 @@ Status BridgePipeline::HandleHello(std::span<const std::byte> payload,
         RemoveRetiredReliable();
         resend_pending_ = retransmit_->size() != 0;
         hello_received_ = true;
-        session_ready_ = hello_sent_;
+        UpdateSessionReady();
         return Status::Ok();
     } catch (const std::bad_alloc&) {
         return AllocationFailure();
@@ -1423,10 +1578,16 @@ Status BridgePipeline::ResendPending(const BridgePumpBudget& budget,
             MINO_RETURN_IF_ERROR(
                 PrepareSchema(&pending->outbound, &control_pending));
             if (control_pending) return Status::Ok();
+            PrepareOutboundDataFlags(&pending->outbound.frame.header);
+            if (options_.enable_aead && !aead_ready_) {
+                return Status::Error(StatusCode::kInvalidArgument,
+                                     "AEAD session keyring is not installed");
+            }
             MINO_ASSIGN_OR_RETURN(
                 rebound_body,
-                WireFrameCodec::Encode(pending->outbound.frame,
-                                       options_.wire_limits));
+                WireFrameCodec::Encode(
+                    pending->outbound.frame, options_.wire_limits,
+                    EncodeAeadKeyring(pending->outbound.frame.header)));
             body = rebound_body;
         }
         if (result->outbound_frames >= budget.max_outbound_frames ||
@@ -1545,9 +1706,15 @@ Status BridgePipeline::SendData(EncodedOutboundFrame outbound,
         return Status::Error(StatusCode::kWouldBlock,
                              "schema announcement must be flushed first");
     }
+    PrepareOutboundDataFlags(&outbound.frame.header);
+    if (options_.enable_aead && !aead_ready_) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "AEAD session keyring is not installed");
+    }
     MINO_ASSIGN_OR_RETURN(
         auto body,
-        WireFrameCodec::Encode(outbound.frame, options_.wire_limits));
+        WireFrameCodec::Encode(outbound.frame, options_.wire_limits,
+                               EncodeAeadKeyring(outbound.frame.header)));
     if (body.size() > options_.wire_limits.max_buffered_bytes) {
         return Exhausted("encoded bridge frame exceeds wire limit");
     }

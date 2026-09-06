@@ -20,8 +20,8 @@ namespace mino::bridge {
 
 // In-frame AEAD for Canonical Wire frames (AES-256-GCM via OpenSSL EVP).
 // This is independent of socket-layer TLS (mino/security/tls.h). Session key
-// exchange is intentionally out of scope: callers inject keys through
-// WireAeadKeyring after an external handshake or test fixture supplies them.
+// establishment (TLS exporter / authenticated KeyShare) and BridgePipeline
+// auto-install live in wire_aead_session.*; this type only holds key material.
 inline constexpr size_t kWireAeadKeyLength = 32;
 inline constexpr size_t kWireAeadNonceLength = 12;
 inline constexpr size_t kWireAeadTagLength = 16;
@@ -67,8 +67,8 @@ struct WireAeadKey {
 };
 
 // Minimal keyring for the wire codec. One encode key plus zero or more decode
-// keys keyed by key_id. Pipeline/session code can install keys after an
-// external key-exchange; this type does not perform PKI or handshake.
+// keys keyed by key_id. Session helpers install keys after TLS exporter or
+// KeyShare; this type does not perform PKI or handshake itself.
 class WireAeadKeyring final {
 public:
     WireAeadKeyring() = default;

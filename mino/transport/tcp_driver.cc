@@ -305,6 +305,7 @@ bool IsKnownControlOpcode(uint32_t opcode) noexcept {
         case bridge::FrameType::kHeartbeat:
         case bridge::FrameType::kSessionHello:
         case bridge::FrameType::kSessionDiscovery:
+        case bridge::FrameType::kSessionKeyShare:
             return true;
         case bridge::FrameType::kData:
             return false;

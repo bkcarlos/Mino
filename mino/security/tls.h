@@ -139,6 +139,11 @@ public:
     // Read can progress without new socket readability.
     virtual bool has_buffered_read() const noexcept = 0;
     virtual Result<AuthenticatedPeer> peer() const noexcept = 0;
+    // RFC 8446 exporter. Available only after handshake_complete(). Output is
+    // secret keying material — callers must scrub and never log/SHM it.
+    virtual Result<std::vector<std::byte>> ExportKeyingMaterial(
+        std::string_view label, std::span<const std::byte> context,
+        size_t length) const noexcept = 0;
 };
 
 class TlsChannelFactory {
