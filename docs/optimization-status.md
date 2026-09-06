@@ -1,6 +1,6 @@
 # 优化状态（以 master 代码为准）
 
-- HEAD 对照：`feature/opt-closeout`（基于 tip `b471a98` + 本分支收尾提交）
+- HEAD 对照：`feature/opt-closeout`（代码 closeout `7f0b243`；基于 `b471a98`；文档 tip = 本分支 HEAD）
 - 更新日期：2026-09-06（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
