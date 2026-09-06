@@ -21,20 +21,44 @@ independent.
 
 ## Device provider
 
-`//mino/platform:rdma_provider` is the low-level QP/CQ/MR boundary. The repository
-does not link an ambient host `libibverbs` and contains no production software
-loopback. Normal builds therefore remain hermetic with respect to rdma-core. A
-real deployment must explicitly load an absolute-path plugin through
-`CreateDynamicRdmaDeviceProvider`.
+`//mino/platform:rdma_provider` is the low-level QP/CQ/MR boundary. The core
+library still does not link an ambient host `libibverbs`. Normal Mino targets
+therefore remain hermetic with respect to rdma-core. A real deployment must
+explicitly load an absolute-path plugin through `CreateDynamicRdmaDeviceProvider`.
 
-The plugin exports the four version-1 symbols documented in
-`mino/platform/rdma_provider.h`, reports `MemoryRegistrationProviderClass::kDevice`,
-supports `kRdma`, and returns non-empty provenance. Mino rejects a missing plugin,
-ABI mismatch, empty provenance, unavailable device, `kUnavailable`, or `kMock`
-provider. Because the version-1 plugin returns a C++ provider interface, plugin and
-Mino must use the same compiler/standard-library ABI. Qualification records SHA-256
-for both artifacts. This is an explicit deployment plugin model, not a claim that
-host-installed verbs are a hermetic Bazel dependency.
+### In-tree reference plugins (P9)
+
+| Bazel target | Shared library | Role |
+|---|---|---|
+| `//mino/platform:libmino_rdma_software_loopback.so` | `libmino_rdma_software_loopback.so` | Software loopback with full MR + loopback QP semantics for CI `dlopen` / `TryRegisterPayload` wiring |
+| `//mino/platform:libmino_rdma_verbs.so` | `libmino_rdma_verbs.so` | Verbs MR reference; compiles without headers as a stub that returns no device; with `libibverbs` opens the named device and `ibv_reg_mr` |
+
+Load example (absolute path required):
+
+```sh
+bazel build //mino/platform:libmino_rdma_software_loopback.so
+# then pass the realpath of bazel-bin/.../libmino_rdma_software_loopback.so
+```
+
+```cpp
+auto provider = mino::platform::CreateDynamicRdmaDeviceProvider({
+    .plugin_path = "/abs/path/libmino_rdma_software_loopback.so",
+    .device_name = "loopback0",
+});
+```
+
+Both plugins export the four version-1 symbols documented in
+`mino/platform/rdma_provider.h` and report `MemoryRegistrationProviderClass::kDevice`
+so the production loader accepts them. Software-loopback provenance contains
+`NOT-QUALIFICATION-ELIGIBLE`. **V-25 / physical RDMA qualification still requires
+a real ACTIVE/LINKUP NIC, an approved plugin SHA-256, and the protected workflow —
+these reference plugins do not close that gate.**
+
+Mino rejects a missing plugin, ABI mismatch, empty provenance, unavailable device,
+`kUnavailable`, or `kMock` provider. In-test loopbacks in `rdma_driver_test.cc`
+remain `kMock` and are not selectable by production assembly. Because the version-1
+plugin returns a C++ provider interface, plugin and Mino must use the same
+compiler/standard-library ABI. Qualification records SHA-256 for both artifacts.
 
 `RdmaDeviceProvider::Close` is a synchronous DMA fence for the connection. It must
 transition the QP to closed/error and guarantee no WR on that QP can still access
@@ -86,9 +110,10 @@ device reset fail affected operations at `kLocalPublished`; reset marks the driv
 unavailable. Close drops queued receives for that connection and fences/deregisters
 its retained sends.
 
-The test-only loopback provider is defined inside `rdma_driver_test.cc`; no mock
-provider target is available to production assembly. Fault injection covers MR
-failure, CQ error, device reset, and peer death.
+The test-only `kMock` loopback provider remains inside `rdma_driver_test.cc` for
+driver unit tests. The in-tree software reference plugin above is a separate
+loadable ABI artifact for CI and integration; it is not a qualification NIC.
+Fault injection covers MR failure, CQ error, device reset, and peer death.
 
 ## Authentication and ACL
 

@@ -38,11 +38,22 @@ Metric registration and policy changes are cold-path operations. Registration is
 
 Local stage durations use monotonic timestamps supplied by the caller. `CrossNodeLatencyRecorder` accepts cross-node wall-clock subtraction only when `ClockQuality` is synchronized, in the same domain, within uncertainty and freshness thresholds, and no local wall/monotonic divergence indicates a clock jump. Uncertain, jump, and negative samples are counted separately and never enter the normal histogram.
 
+### PTP / PHC client (`PtpClockClient`)
+
+`mino/observability/ptp_clock.h` provides a fail-closed client path:
+
+1. Configure either an absolute PHC device (`phc_device_path=/dev/ptp0`) or an explicit `clock_id` (`clock_id_explicit=true`, e.g. `CLOCK_REALTIME`).
+2. Feed sync quality with `PublishSync(offset_ns, uncertainty_ns, state)` (ptp4l/pmc sidecar) or lab-only `assume_synchronized`.
+3. Call `AllowsCrossNodeOneWayReporting()` / `TryRecord(...)` only after step 2 succeeds within thresholds.
+
+Without a configured source or while unsynchronized/degraded/stale, reporting stays disabled. Opening a PHC alone does **not** imply a qualified PTP contract.
+
 ## Validation
 
 - `//mino/observability:metrics_test`
 - `//mino/observability:tracing_test`
 - `//mino/observability:clock_test`
+- `//mino/observability:ptp_clock_test`
 - `//mino/observability:exporter_test`
 - `//mino/observability:prometheus_http_endpoint_test`
 - `//mino/observability:monitoring_drill_test`

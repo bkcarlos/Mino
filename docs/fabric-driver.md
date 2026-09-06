@@ -112,8 +112,8 @@ and rejection of non-Canonical bytes.
 ## Provider plugin ABI
 
 Production assembly loads an explicitly configured absolute path using
-`CreateDynamicFabricDeviceProvider`. No host search path or software fallback is
-used. ABI v1 exports:
+`CreateDynamicFabricDeviceProvider`. No host search path is consulted. ABI v1
+exports:
 
 ```text
 mino_fabric_provider_abi_version_v1
@@ -124,8 +124,26 @@ mino_fabric_provider_provenance_v1
 
 The provider must report `kDevice`, the configured IPCF/NTB/CXL kind, a non-empty
 device ID/provenance, power-of-two cache line/alignment, finite window limits,
-`device_present=true`, and `link_active=true`. A normal repository build contains
-no selectable mock provider; mocks are defined only in test source.
+`device_present=true`, and `link_active=true`.
+
+### In-tree reference plugin (P9)
+
+| Bazel target | Shared library | Role |
+|---|---|---|
+| `//mino/platform:libmino_fabric_software_loopback.so` | `libmino_fabric_software_loopback.so` | Software shared-window loopback; kind from device name (`ipcf*` / `ntb*` / `cxl*`) |
+
+```cpp
+auto provider = mino::platform::CreateDynamicFabricDeviceProvider({
+    .plugin_path = "/abs/path/libmino_fabric_software_loopback.so",
+    .device_name = "ntb0",
+    .expected_kind = mino::platform::FabricKind::kNtb,
+});
+```
+
+Provenance contains `NOT-QUALIFICATION-ELIGIBLE`. Unit-test mocks in
+`fabric_driver_test.cc` remain `kMock` and are not production-selectable.
+**Physical Fabric qualification (IPCF+NTB+CXL on two hosts) is unchanged and still
+requires real devices — this plugin does not satisfy V-25.**
 
 ## Benchmark and qualification
 

@@ -5,6 +5,7 @@ cc_library(
     name = "observability",
     srcs = [
         "clock.cc",
+        "ptp_clock.cc",
         "metrics.cc",
         "operational_metrics.cc",
         "otlp_exporter.cc",
@@ -16,6 +17,7 @@ cc_library(
     hdrs = [
         "bounded_queue.h",
         "clock.h",
+        "ptp_clock.h",
         "exporter.h",
         "metrics.h",
         "operational_metrics.h",
@@ -29,7 +31,10 @@ cc_library(
         "@platforms//os:linux": ["-pthread"],
         "//conditions:default": [],
     }),
-    deps = ["//mino/common:status"],
+    deps = [
+        "//mino/common:result",
+        "//mino/common:status",
+    ],
 )
 
 cc_test(
@@ -53,6 +58,15 @@ cc_test(
 cc_test(
     name = "clock_test",
     srcs = ["clock_test.cc"],
+    deps = [
+        ":observability",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ptp_clock_test",
+    srcs = ["ptp_clock_test.cc"],
     deps = [
         ":observability",
         "@googletest//:gtest_main",

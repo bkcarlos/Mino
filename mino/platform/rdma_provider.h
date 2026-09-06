@@ -1,7 +1,9 @@
 // Copyright 2026 The Mino Authors
 //
-// Low-level RDMA device boundary. The built-in tree intentionally contains no
-// software provider that can be selected by production assembly.
+// Low-level RDMA device boundary. Production assembly loads an absolute-path
+// plugin via CreateDynamicRdmaDeviceProvider. In-tree reference .so plugins live
+// under mino/platform/plugins/ (software loopback + verbs); they are not linked
+// into the core library and software provenance is not V-25 eligible.
 
 #ifndef MINO_PLATFORM_RDMA_PROVIDER_H_
 #define MINO_PLATFORM_RDMA_PROVIDER_H_

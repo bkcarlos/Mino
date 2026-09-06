@@ -18,13 +18,24 @@ HEAD：`c977bd18ab67b17aa98406674ba482817e812beb`（`perf: complete pipeline opt
 
 **未实现 / 外置**：没有帧内密钥交换或 PKI。会话密钥需由握手/运维侧注入 keyring（pipeline 尚未自动挂载）。TLS 1.3 mTLS 仍是套接字层（`mino/security/tls.cc`），与帧内 AEAD 正交。
 
-### A2. RDMA 硬件路径仅 mock：仓库没有 verbs 插件
+### A2. RDMA 硬件资格仍缺真实 NIC：树内已有可加载参考插件（P9）
 
-`//mino/transport:rdma_driver` 是完整 `TransportDriver` 生命周期，但设备边界是 `dlopen` 外部插件（`CreateDynamicRdmaDeviceProvider` 要求绝对路径，`docs/rdma-driver.md`：「仓库不链接 ambient `libibverbs`，不含生产 software loopback」）。树内没有任何 `mino_create_rdma_provider_v1` 实现，只有 loader 的 `dlsym`。测试用 loopback 写在 `rdma_driver_test.cc`；生产组装 `RemoteBridge::CreateRdma` 拒绝 `kMock`。默认 `MemoryRegistrationProvider` 是 `UnavailableProvider`，`Register()` 返回 `"no DMA/RDMA memory registration provider is installed"`（`mino/platform/memory_registration.cc`）。
+`//mino/transport:rdma_driver` 是完整 `TransportDriver` 生命周期；设备边界仍是 `dlopen` 绝对路径插件（`CreateDynamicRdmaDeviceProvider`）。
 
-### A3. Fabric（IPCF / NTB / CXL）同样只有协议层 + 测试 mock
+**已实现（P9）**：
+- `//mino/platform:libmino_rdma_software_loopback.so` — ABI v1 + MR + loopback 语义；provenance 含 `NOT-QUALIFICATION-ELIGIBLE`
+- `//mino/platform:libmino_rdma_verbs.so` — 有 `libibverbs` 头时走 `ibv_reg_mr`；无头/无设备时 create 返回 nullptr（loader → unavailable）
+- 插件负载测试：`//mino/platform:rdma_plugin_load_test`；`TryRegisterPayload` 在注入 `MemoryRegistrationProvider` 后可用
 
-`//mino/transport:fabric_driver` 实现了窗口/doorbell/Canonical Wire 协议。生产必须 `CreateDynamicFabricDeviceProvider` 加载 `kDevice` 插件；`docs/fabric-driver.md`：「normal repository build contains no selectable mock provider; mocks are defined only in test source」。树内无 IPCF/NTB/CXL 设备插件源码。
+**仍未关闭**：V-25 物理双机 ACTIVE/LINKUP、批准插件 SHA-256、`kDevice` 真 NIC。测试内 `kMock` loopback（`rdma_driver_test.cc`）与默认 `UnavailableProvider` 行为不变；生产组装仍拒绝 `kMock`。软件参考插件**不算**硬件资格。
+
+### A3. Fabric 硬件资格仍缺真实设备：树内已有可加载软件参考插件（P9）
+
+`//mino/transport:fabric_driver` 实现了窗口/doorbell/Canonical Wire 协议。生产必须 `CreateDynamicFabricDeviceProvider` 加载 `kDevice` 插件。
+
+**已实现（P9）**：`//mino/platform:libmino_fabric_software_loopback.so`（device_name 选 `ipcf*`/`ntb*`/`cxl*` kind）；`//mino/platform:fabric_plugin_load_test`。provenance 含 `NOT-QUALIFICATION-ELIGIBLE`。
+
+**仍未关闭**：V-25 要求 IPCF+NTB+CXL 三件套双机真实 sysfs/驱动/链路；缺一种 kind 不能替代。测试 mock 仍只在 `fabric_driver_test.cc`。软件参考插件**不算**物理资格。
 
 ### A4. 嵌套 owned-graph 遍历 — 已实现（codegen）
 
@@ -69,9 +80,15 @@ Create 在发布 ACTIVE 前将 `region_id → POSIX shm name` 写入与 Region I
 
 `mino/bridge/dedup_store.*`：CRC 保护的主机本地 HWM 快照（write + fdatasync/fsync + rename + 目录 fsync），损坏/截断 fail-closed。`BridgePipeline` 在 Create/Rebind 时从 store 种子化 `DedupWindow`，并在接收路径 `CommitAccepted`/`SeedAccepted` 之后、发 ACK 之前持久化 HWM；成功恢复时清除 `local_dedup_state_lost`（degraded → durable）。未配置 store 时仍保留原 `kDegraded` 路径。
 
-### A10. PTP / 跨机时钟同步栈没有实现
+### A10. PTP / 跨机时钟：客户端路径已落地；无合格同步仍 fail-closed（P9）
 
-`ClockQuality` / `CrossNodeLatencyRecorder` 有数据结构（`mino/observability/clock.h`），但仓库没有 `ptp4l`/PHC 客户端。架构 15.4 与 pipeline README 都规定：没有合格 PTP 就不报告跨机单向延迟。
+`ClockQuality` / `CrossNodeLatencyRecorder`（`mino/observability/clock.h`）之外，P9 增加 `PtpClockClient`（`mino/observability/ptp_clock.*`）：
+- 配置绝对 PHC 路径（`/dev/ptpN` + `clock_gettime(FD_TO_CLOCKID)`）或显式 `clock_id`
+- `PublishSync` / 可选 `assume_synchronized` 发布质量；`AllowsCrossNodeOneWayReporting()` 仅在 synchronized + 不确定度/新鲜度阈值内为真
+- 未配置或未同步：fail-closed，不报告跨机单向延迟（架构 15.4 / pipeline README 不变）
+- 测试：`//mino/observability:ptp_clock_test`（含 clock_gettime 路径；PHC 不可读时 SKIP）
+
+**仍未关闭**：与 `ptp4l`/pmc 的生产侧车集成、双机 PTP 资格契约、以及在 pipeline 结果中正式启用跨机单向延迟字段。
 
 ### A11. 128-bit 原子不进入 v1 ABI（明确非目标）
 
@@ -143,8 +160,8 @@ ADR-0001：「128-bit：仅作为工具链能力报告；当前生产 ABI 不使
 
 ## C. 文档写明的测量 / 产品边界（不是缺模块）
 
-1. **无 PTP ⇒ 不报告跨机单向延迟**  
-   pipeline README：「Multi-host mode … intentionally emits no cross-host one-way latency without a future PTP qualification contract。」`RESULTS_TWO_HOST_20260816.md`：「Cross-host one-way latency: **not reported**.」
+1. **无合格 PTP 同步 ⇒ 不报告跨机单向延迟**  
+   `PtpClockClient` 可打开 PHC/`clock_gettime` 并在 `PublishSync` 后放行；未配置或未同步仍 fail-closed。pipeline README / `RESULTS_TWO_HOST_*` 在未具备 PTP 资格契约前继续不写跨机单向延迟字段。
 
 2. **Bus 发现不覆盖 6 进程拓扑**  
    同 README Important scope boundary：SHM backend 测的是生产 allocator/SPSC/Publisher/Subscriber，**不声称**测到 `Bus` discovery 或 Region supervisor 生命周期。

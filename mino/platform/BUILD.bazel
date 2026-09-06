@@ -167,3 +167,66 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+
+# ---------------------------------------------------------------------------
+# Reference device plugins (shared libraries). Load via absolute dlopen path:
+#   CreateDynamicRdmaDeviceProvider({.plugin_path = "<abs>/libmino_rdma_software_loopback.so", ...})
+#   CreateDynamicFabricDeviceProvider({.plugin_path = "<abs>/libmino_fabric_software_loopback.so", ...})
+# Software loopbacks report kDevice for ABI acceptance but are NOT V-25
+# qualification-eligible (see provenance + docs/*-driver.md).
+# ---------------------------------------------------------------------------
+
+cc_binary(
+    name = "libmino_rdma_software_loopback.so",
+    srcs = ["plugins/rdma_software_loopback_plugin.cc"],
+    linkshared = True,
+    linkstatic = True,
+    deps = [
+        ":rdma_provider",
+    ],
+)
+
+cc_binary(
+    name = "libmino_rdma_verbs.so",
+    srcs = ["plugins/rdma_verbs_plugin.cc"],
+    linkshared = True,
+    linkstatic = True,
+    deps = [
+        ":rdma_provider",
+    ],
+)
+
+cc_binary(
+    name = "libmino_fabric_software_loopback.so",
+    srcs = ["plugins/fabric_software_loopback_plugin.cc"],
+    linkshared = True,
+    linkstatic = True,
+    deps = [
+        ":fabric_provider",
+    ],
+)
+
+cc_test(
+    name = "rdma_plugin_load_test",
+    srcs = ["rdma_plugin_load_test.cc"],
+    data = [
+        ":libmino_rdma_software_loopback.so",
+        ":libmino_rdma_verbs.so",
+    ],
+    deps = [
+        ":memory_registration",
+        ":rdma_provider",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "fabric_plugin_load_test",
+    srcs = ["fabric_plugin_load_test.cc"],
+    data = [":libmino_fabric_software_loopback.so"],
+    deps = [
+        ":fabric_provider",
+        "@googletest//:gtest_main",
+    ],
+)
