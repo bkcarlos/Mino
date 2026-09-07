@@ -38,7 +38,8 @@ TEST(SharedHostDomainMpStressTest, IndependentProcessesDiscoverAndExchange) {
     ASSERT_EQ(SpawnWorker(worker, {"sub", shm, "2", "16"},
                           TmpPath("shd_sub.err"), &subscriber),
               0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Brief head-start so Open/Join can begin before Create under slow ASAN.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(SpawnWorker(worker, {"pub", shm, "1", "16"},
                           TmpPath("shd_pub.err"), &publisher),
               0);

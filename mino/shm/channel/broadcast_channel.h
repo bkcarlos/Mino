@@ -867,11 +867,13 @@ public:
     //
     // A paused-but-alive subscriber (fresh heartbeat) is never evicted here.
     // Unlike MPSC crash recovery (design doc 9.5: never judge a crash by
-    // timeout alone), the broadcast channel deliberately decides on the
-    // heartbeat alone: process-liveness revalidation (12.2 step 1) is layered
-    // above in the lease coordinator, which chooses when (and whether) to
-    // call this scan. The channel only enforces the lease arithmetic.
-    uint64_t EvictStaleSubscribers(uint64_t now_ns, uint64_t lease_ns) noexcept {
+    // timeout alone), the default path decides on the heartbeat alone;
+    // process-liveness revalidation (12.2 step 1) is layered above. Cross-
+    // process coordinators (SharedHostDomain) pass require_dead_owner=true so
+    // a live slow subscriber (e.g. under ASAN) cannot be heartbeat-evicted.
+    // Unsigned wrap is guarded: now_ns < heartbeat is treated as not expired.
+    uint64_t EvictStaleSubscribers(uint64_t now_ns, uint64_t lease_ns,
+                                   bool require_dead_owner = false) noexcept {
         uint64_t evicted = 0;
         for (uint32_t id = 0; id < kMaxSubscribers; ++id) {
             SubscriberSlot& sub = subs_[id];
@@ -888,9 +890,19 @@ public:
             // A generation mismatch means a late stale-heartbeat write raced
             // ID reuse. Conservatively keep the subscriber: only a heartbeat
             // explicitly authored by this generation may drive its eviction.
-            if (heartbeat_generation != generation ||
+            if (heartbeat_generation != generation || now_ns < heartbeat ||
                 now_ns - heartbeat < lease_ns) {
                 continue;
+            }
+            if (require_dead_owner) {
+                // Registration seeds borrow_owner_* with the subscriber
+                // ProcessIdentity; TryClaimBorrow refreshes the same owner.
+                const ProcessIdentity owner = LoadBorrowOwner(sub);
+                if (owner.IsZero() ||
+                    ProbeProcessIdentity(owner) !=
+                        ProcessIdentityLiveness::kDead) {
+                    continue;
+                }
             }
             // (a) Claim the transition. acq_rel arbitrates with a concurrent
             // Unregister and makes Poll/Ack/Heartbeat reject new work.
@@ -911,10 +923,22 @@ public:
             const uint64_t claimed_heartbeat =
                 sub.heartbeat_ns.load(std::memory_order_acquire);
             if (claimed_heartbeat_generation != generation ||
+                now_ns < claimed_heartbeat ||
                 now_ns - claimed_heartbeat < lease_ns) {
                 sub.state.store(static_cast<uint32_t>(SubscriberState::kActive),
                                 std::memory_order_release);
                 continue;
+            }
+            if (require_dead_owner) {
+                const ProcessIdentity owner = LoadBorrowOwner(sub);
+                if (owner.IsZero() ||
+                    ProbeProcessIdentity(owner) !=
+                        ProcessIdentityLiveness::kDead) {
+                    sub.state.store(
+                        static_cast<uint32_t>(SubscriberState::kActive),
+                        std::memory_order_release);
+                    continue;
+                }
             }
             if (!ClearDeadBorrow(SubscriberHandle{SubscriberId{id}, generation})
                      .ok()) {

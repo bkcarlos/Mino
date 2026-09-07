@@ -91,8 +91,11 @@ int main(int argc, char** argv) {
             std::cerr << "advertise failed: " << pub.status().ToString() << "\n";
             return 1;
         }
-        // Give subscribers a moment to attach.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Give subscribers time to attach+register under slow ASAN builds.
+        for (int i = 0; i < 20; ++i) {
+            (void)domain->Heartbeat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         for (uint64_t i = 0; i < messages; ++i) {
             const std::string payload = "msg-" + std::to_string(i);
             const mino::Status st = pub->Publish(
@@ -113,8 +116,15 @@ int main(int argc, char** argv) {
             std::cerr << "subscribe failed: " << sub.status().ToString() << "\n";
             return 1;
         }
+        // Settle after Subscribe so the publisher's attach/Recover path observes
+        // a live registration+heartbeat before the first Publish.
+        for (int i = 0; i < 10; ++i) {
+            (void)domain->Heartbeat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         uint64_t got = 0;
         while (got < messages) {
+            (void)domain->Heartbeat();
             auto message =
                 sub->Poll(mino::Deadline::FromNow(std::chrono::seconds(5)));
             if (!message.ok()) {

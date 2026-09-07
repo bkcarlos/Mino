@@ -778,8 +778,10 @@ Status RecoverState(const std::shared_ptr<DomainState>& state) {
                 journal_recovery.RegisterChannel(topic.channel_id, *mpsc[i]));
         } else {
             auto& broadcast_channel = std::get<BroadcastChannel>(channel);
+            // Require proven-dead ProcessIdentity (SimpleNode pattern): do not
+            // heartbeat-evict a live slow subscriber under ASAN/clock quirks.
             (void)broadcast_channel.EvictStaleSubscribers(
-                now, header->peer_lease_ns);
+                now, header->peer_lease_ns, /*require_dead_owner=*/true);
             std::byte* base = BytesOf(*state);
             MINO_ASSIGN_OR_RETURN(
                 broadcast[i],
@@ -1170,6 +1172,15 @@ SharedHostTopicMode SharedHostSubscriber::mode() const noexcept {
 Result<SharedHostBorrowedBytes> SharedHostSubscriber::TryPollBorrow() {
     if (!active()) {
         return Status::Error(StatusCode::kUnavailable, "subscriber is closed");
+    }
+    // Renew the broadcast lease before Recover so a concurrent coordinator
+    // cannot treat this live subscriber as expired while we are polling.
+    if (impl_->mode == SharedHostTopicMode::kBroadcast &&
+        impl_->channel.has_value()) {
+        auto& channel = std::get<BroadcastChannel>(*impl_->channel);
+        const Status pre_hb =
+            channel.Heartbeat(impl_->broadcast_handle, MonotonicNowNs());
+        if (!pre_hb.ok()) return pre_hb;
     }
     MINO_RETURN_IF_ERROR(RecoverState(impl_->state));
     bool expected = false;

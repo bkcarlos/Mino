@@ -427,6 +427,11 @@ int RunPub(const std::filesystem::path& path, const Config& config) {
         }
         if (!WaitHandshake(session.monitor)) return 1;
         if (!WaitForFile(PeerPath(path), kHandshakeTimeout)) return 1;
+        // CONNECTED/ACCEPT does not guarantee subscription filters are live on
+        // the PUB socket yet (classic ZMQ slow-joiner). Settle briefly so the
+        // measured stream starts at seq 0 under tight HWM / medium payloads.
+        // Keep expectations honest: ZMQ PUB may still mute-drop under HWM.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         std::vector<std::byte> payload(config.payload_bytes);
         for (uint64_t seq = 0; seq < config.messages; ++seq) {
             FillPayload(payload, seq, MonotonicNs());
