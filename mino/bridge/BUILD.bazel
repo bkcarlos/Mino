@@ -19,7 +19,6 @@ cc_library(
     ],
 )
 
-
 cc_library(
     name = "wire_aead_session",
     srcs = ["wire_aead_session.cc"],
@@ -119,7 +118,6 @@ cc_library(
         "//mino/transport:transport_driver",
     ],
 )
-
 
 cc_library(
     name = "graph_ownership_forward",
@@ -299,7 +297,6 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
-
 
 cc_test(
     name = "wire_aead_session_test",

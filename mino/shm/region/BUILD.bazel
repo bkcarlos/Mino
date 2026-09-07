@@ -21,7 +21,6 @@ cc_library(
     ],
 )
 
-
 cc_library(
     name = "attachment_directory",
     srcs = ["attachment_directory.cc"],

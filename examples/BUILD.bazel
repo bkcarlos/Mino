@@ -54,7 +54,6 @@ cc_binary(
     ],
 )
 
-
 cc_binary(
     name = "shared_host_domain_stress",
     srcs = ["shared_host_domain_stress.cc"],

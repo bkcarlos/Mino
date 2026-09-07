@@ -168,7 +168,6 @@ cc_test(
     ],
 )
 
-
 # ---------------------------------------------------------------------------
 # Reference device plugins (shared libraries). Load via absolute dlopen path:
 #   CreateDynamicRdmaDeviceProvider({.plugin_path = "<abs>/libmino_rdma_software_loopback.so", ...})
