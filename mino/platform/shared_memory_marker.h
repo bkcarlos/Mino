@@ -28,15 +28,17 @@ enum class MarkerBackingKind : uint32_t {
     kNone = 0,
     kHugeFile = 1,
     kPosixData = 2,
+    kRegularFile = 3,
 };
 
 constexpr uint32_t kMarkerFlagHugeRequested = 1u << 0;
 constexpr uint32_t kMarkerFlagBackingSizeCommitted = 1u << 1;
 
 // CRC-protected payload. `backing_name` is an absolute hugetlbfs file path for
-// kHugeFile and a POSIX shm name for kPosixData. Device/inode identify the exact
-// object; a zero inode is allowed only while CREATING before recovery adopts a
-// uniquely generated candidate.
+// kHugeFile, a POSIX shm name for kPosixData, or an absolute regular-file path
+// for kRegularFile. Device/inode identify the exact object; a zero inode is
+// allowed only while CREATING before recovery adopts a uniquely generated
+// candidate.
 struct SharedMemoryMarkerPayload {
     uint64_t magic = kMarkerMagic;
     uint32_t version = kMarkerVersion;

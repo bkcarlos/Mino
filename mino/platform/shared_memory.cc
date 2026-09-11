@@ -203,7 +203,7 @@ bool IsKnownState(uint32_t state) {
 }
 
 bool IsKnownBacking(uint32_t kind) {
-    return kind <= static_cast<uint32_t>(MarkerBackingKind::kPosixData);
+    return kind <= static_cast<uint32_t>(MarkerBackingKind::kRegularFile);
 }
 
 Status ValidatePayload(const SharedMemoryMarkerPayload& payload) {
@@ -413,6 +413,29 @@ Status SetPrivatePermissions(int fd, std::string_view what) {
     return Status::Ok();
 }
 
+// Force the backing store to reserve `size` bytes. POSIX shm/tmpfs otherwise
+// accepts sparse ftruncate and then SIGBUS on first touch when the mount is
+// full — Create must fail closed before returning a mapped segment.
+Status CommitBackingSize(int fd, uint64_t size, std::string_view what) {
+#if defined(__linux__)
+    const int error_number =
+        ::posix_fallocate(fd, 0, static_cast<off_t>(size));
+    if (error_number == 0) return Status::Ok();
+    StatusCode code = StatusCode::kInternal;
+    if (error_number == ENOSPC || error_number == ENOMEM) {
+        code = StatusCode::kResourceExhausted;
+    }
+    return Status::Error(
+        code, std::string("posix_fallocate(") + std::string(what) +
+                  ") failed: " + std::strerror(error_number));
+#else
+    (void)fd;
+    (void)size;
+    (void)what;
+    return Status::Ok();
+#endif
+}
+
 uint64_t RandomToken() {
     static std::atomic<uint64_t> sequence{0};
     std::random_device random;
@@ -436,6 +459,77 @@ std::string UniqueHugeBasename() {
     return name;
 }
 #endif  // MINO_HAS_HUGETLB
+
+std::string UniqueRegularBasename() {
+    char name[32];
+    std::snprintf(name, sizeof(name), ".mino-f-%016llx",
+                  static_cast<unsigned long long>(RandomToken()));
+    return name;
+}
+
+Result<std::string> ResolveRegularBackingDirectory(
+    const std::string& configured) {
+    if (configured.empty()) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "file backing directory is empty");
+    }
+    char* resolved = ::realpath(configured.c_str(), nullptr);
+    if (resolved == nullptr) {
+        return ErrnoStatus("realpath(file backing directory) failed");
+    }
+    std::string path = resolved;
+    std::free(resolved);
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        return ErrnoStatus("stat(file backing directory) failed");
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "file backing path is not a directory");
+    }
+    return path;
+}
+
+Result<std::pair<int, std::string>> OpenRecordedRegularDirectory(
+    const SharedMemoryMarkerPayload& payload) {
+    MINO_ASSIGN_OR_RETURN(std::string mount,
+                          ReadMarkerString(payload.mount_path,
+                                           sizeof(payload.mount_path),
+                                           "mount_path"));
+    MINO_ASSIGN_OR_RETURN(std::string backing,
+                          ReadMarkerString(payload.backing_name,
+                                           sizeof(payload.backing_name),
+                                           "backing_name"));
+    const std::string prefix = mount + "/";
+    if (backing.rfind(prefix, 0) != 0) {
+        return Status::Error(StatusCode::kCorruption,
+                             "regular backing is outside recorded directory");
+    }
+    std::string basename = backing.substr(prefix.size());
+    if (basename.empty() || basename.find('/') != std::string::npos ||
+        basename.rfind(".mino-f-", 0) != 0) {
+        return Status::Error(StatusCode::kCorruption,
+                             "invalid regular backing basename");
+    }
+    int directory_fd =
+        ::open(mount.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        return ErrnoStatus("open(recorded file backing directory) failed");
+    }
+    struct stat st;
+    if (::fstat(directory_fd, &st) != 0) {
+        const int saved_errno = errno;
+        ::close(directory_fd);
+        return ErrnoStatus("fstat(recorded file backing directory) failed",
+                           saved_errno);
+    }
+    if (static_cast<uint64_t>(st.st_dev) != payload.mount_device) {
+        ::close(directory_fd);
+        return Status::Error(StatusCode::kCorruption,
+                             "recorded file backing directory identity mismatch");
+    }
+    return std::make_pair(directory_fd, std::move(basename));
+}
 
 Status VerifyDataIdentity(int fd, const SharedMemoryMarkerPayload& payload,
                           std::string_view kind, bool require_size = true) {
@@ -587,8 +681,39 @@ Status AdoptMissingBackingIdentity(SharedMemoryMarkerPayload* payload) {
         return Status::Ok();
     }
 #endif
+    if (kind == MarkerBackingKind::kRegularFile) {
+        MINO_ASSIGN_OR_RETURN(auto directory,
+                              OpenRecordedRegularDirectory(*payload));
+        int fd = ::openat(directory.first, directory.second.c_str(),
+                          O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            const int saved_errno = errno;
+            ::close(directory.first);
+            if (saved_errno == ENOENT) return Status::Ok();
+            return ErrnoStatus("open regular candidate failed", saved_errno);
+        }
+        struct stat st;
+        const int stat_result = ::fstat(fd, &st);
+        const int saved_errno = errno;
+        ::close(fd);
+        ::close(directory.first);
+        if (stat_result != 0) {
+            return ErrnoStatus("fstat regular candidate failed", saved_errno);
+        }
+        if (static_cast<uint64_t>(st.st_dev) != payload->mount_device) {
+            return Status::Error(StatusCode::kCorruption,
+                                 "regular candidate device mismatch");
+        }
+        payload->backing_device = static_cast<uint64_t>(st.st_dev);
+        payload->backing_inode = static_cast<uint64_t>(st.st_ino);
+        if (st.st_size == static_cast<off_t>(payload->data_size)) {
+            payload->flags |=
+                shared_memory_internal::kMarkerFlagBackingSizeCommitted;
+        }
+        return Status::Ok();
+    }
     return Status::Error(StatusCode::kUnsupported,
-                         "huge backing unsupported on this platform");
+                         "recorded backing kind is unsupported");
 }
 
 Status RemoveRecordedBacking(const SharedMemoryMarkerPayload& payload) {
@@ -648,8 +773,38 @@ Status RemoveRecordedBacking(const SharedMemoryMarkerPayload& payload) {
         return Status::Ok();
     }
 #endif
+    if (kind == MarkerBackingKind::kRegularFile) {
+        MINO_ASSIGN_OR_RETURN(auto directory,
+                              OpenRecordedRegularDirectory(payload));
+        int fd = ::openat(directory.first, directory.second.c_str(),
+                          O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            const int saved_errno = errno;
+            ::close(directory.first);
+            if (saved_errno == ENOENT) return Status::Ok();
+            return ErrnoStatus("open regular backing for unlink failed",
+                               saved_errno);
+        }
+        Status identity = VerifyDataIdentity(
+            fd, payload, "regular",
+            (payload.flags &
+             shared_memory_internal::kMarkerFlagBackingSizeCommitted) != 0);
+        ::close(fd);
+        if (!identity.ok()) {
+            ::close(directory.first);
+            return identity;
+        }
+        if (::unlinkat(directory.first, directory.second.c_str(), 0) != 0 &&
+            errno != ENOENT) {
+            const int saved_errno = errno;
+            ::close(directory.first);
+            return ErrnoStatus("unlinkat(regular backing) failed", saved_errno);
+        }
+        ::close(directory.first);
+        return Status::Ok();
+    }
     return Status::Error(StatusCode::kUnsupported,
-                         "recorded huge backing unsupported");
+                         "recorded backing kind unsupported");
 }
 
 Status PublishUnlinking(MarkerMapping& marker,
@@ -812,6 +967,14 @@ Result<CreatedFallbackMapping> CreateFallback(
         ::close(data_fd);
         return ErrnoStatus("ftruncate(fallback data) failed", saved_errno);
     }
+    {
+        Status committed =
+            CommitBackingSize(data_fd, payload.data_size, "fallback data");
+        if (!committed.ok()) {
+            ::close(data_fd);
+            return committed;
+        }
+    }
     struct stat st;
     if (::fstat(data_fd, &st) != 0) {
         const int saved_errno = errno;
@@ -837,6 +1000,118 @@ Result<CreatedFallbackMapping> CreateFallback(
     Status published = PublishMarker(marker.record, payload);
     if (!published.ok()) {
         (void)::munmap(mapping.value(), payload.data_size);
+        return published;
+    }
+
+    return CreatedFallbackMapping{
+        .base = mapping.value(),
+        .size = payload.data_size,
+        .page_size = payload.page_size,
+        .security = FileSecurity{
+            .owner_user_id = static_cast<uint64_t>(st.st_uid),
+            .owner_group_id = static_cast<uint64_t>(st.st_gid),
+            .permissions = static_cast<uint32_t>(st.st_mode & 0777),
+        },
+    };
+}
+
+Result<CreatedFallbackMapping> CreateRegularFile(
+    MarkerMapping& marker, SharedMemoryMarkerPayload payload,
+    const std::string& directory) {
+    MINO_ASSIGN_OR_RETURN(std::string mount,
+                          ResolveRegularBackingDirectory(directory));
+    struct stat mount_st;
+    if (::stat(mount.c_str(), &mount_st) != 0) {
+        return ErrnoStatus("stat(file backing directory) failed");
+    }
+
+    payload.backing_kind =
+        static_cast<uint32_t>(MarkerBackingKind::kRegularFile);
+    payload.page_size = HostPageSize();
+    payload.fallback_reason = 0;
+    payload.fallback_errno = 0;
+    payload.mount_device = static_cast<uint64_t>(mount_st.st_dev);
+    payload.backing_device = 0;
+    payload.backing_inode = 0;
+    payload.flags &=
+        ~shared_memory_internal::kMarkerFlagBackingSizeCommitted;
+    if (!CopyMarkerString(mount, payload.mount_path,
+                          sizeof(payload.mount_path))) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "file backing directory path is too long");
+    }
+
+    int data_fd = -1;
+    std::string backing_path;
+    std::string basename;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        basename = UniqueRegularBasename();
+        backing_path = mount + "/" + basename;
+        if (!CopyMarkerString(backing_path, payload.backing_name,
+                              sizeof(payload.backing_name))) {
+            return Status::Error(StatusCode::kInternal,
+                                 "regular backing path is too long");
+        }
+        MINO_RETURN_IF_ERROR(PublishMarker(marker.record, payload));
+        data_fd = ::open(backing_path.c_str(),
+                         O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                         0600);
+        if (data_fd >= 0 || errno != EEXIST) break;
+    }
+    if (data_fd < 0) return ErrnoStatus("open(regular backing) failed");
+    const Status private_data =
+        SetPrivatePermissions(data_fd, "regular data");
+    if (!private_data.ok()) {
+        ::close(data_fd);
+        (void)::unlink(backing_path.c_str());
+        return private_data;
+    }
+    if (::ftruncate(data_fd, static_cast<off_t>(payload.data_size)) != 0) {
+        const int saved_errno = errno;
+        ::close(data_fd);
+        (void)::unlink(backing_path.c_str());
+        return ErrnoStatus("ftruncate(regular data) failed", saved_errno);
+    }
+    {
+        Status committed =
+            CommitBackingSize(data_fd, payload.data_size, "regular data");
+        if (!committed.ok()) {
+            ::close(data_fd);
+            (void)::unlink(backing_path.c_str());
+            return committed;
+        }
+    }
+    struct stat st;
+    if (::fstat(data_fd, &st) != 0) {
+        const int saved_errno = errno;
+        ::close(data_fd);
+        (void)::unlink(backing_path.c_str());
+        return ErrnoStatus("fstat(regular data) failed", saved_errno);
+    }
+    payload.backing_device = static_cast<uint64_t>(st.st_dev);
+    payload.backing_inode = static_cast<uint64_t>(st.st_ino);
+    payload.flags |=
+        shared_memory_internal::kMarkerFlagBackingSizeCommitted;
+    const Status identity_published = PublishMarker(marker.record, payload);
+    if (!identity_published.ok()) {
+        ::close(data_fd);
+        (void)::unlink(backing_path.c_str());
+        return identity_published;
+    }
+    RunTestHook(SharedMemoryTestPoint::kAfterBackingIdentityRecorded);
+
+    auto mapping = MapDataFd(data_fd, payload.data_size,
+                             /*read_only=*/false, /*extra_flags=*/0);
+    ::close(data_fd);
+    if (!mapping.ok()) {
+        (void)::unlink(backing_path.c_str());
+        return mapping.status();
+    }
+    payload.state = static_cast<uint32_t>(MarkerState::kFallbackReady);
+    Status published = PublishMarker(marker.record, payload);
+    if (!published.ok()) {
+        (void)::munmap(mapping.value(), payload.data_size);
+        (void)::unlink(backing_path.c_str());
         return published;
     }
 
@@ -1020,6 +1295,38 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(
         MarkerMapping marker = std::move(mapped).value();
         CreationCleanupGuard cleanup(options.name, &marker);
         RunTestHook(SharedMemoryTestPoint::kAfterCreatingMarker);
+
+        if (!options.file_backing_directory.empty()) {
+            MINO_ASSIGN_OR_RETURN(
+                CreatedFallbackMapping regular,
+                CreateRegularFile(marker, payload,
+                                  options.file_backing_directory));
+            auto marker_security_result = ReadFileSecurity(marker.fd, "marker");
+            if (!marker_security_result.ok()) {
+                (void)::munmap(regular.base, regular.size);
+                return marker_security_result.status();
+            }
+            const FileSecurity marker_security = *marker_security_result;
+            cleanup.Commit();
+            SharedMemorySegment segment;
+            segment.base_ = regular.base;
+            segment.size_ = regular.size;
+            segment.read_only_ = false;
+            segment.huge_pages_requested_ = options.use_huge_pages;
+            segment.huge_pages_actual_ = false;
+            segment.actual_page_size_ = regular.page_size;
+            segment.huge_page_fallback_reason_ =
+                HugePageFallbackReason::kNone;
+            segment.huge_page_fallback_errno_ = 0;
+            segment.marker_owner_user_id_ = marker_security.owner_user_id;
+            segment.marker_owner_group_id_ = marker_security.owner_group_id;
+            segment.marker_permissions_ = marker_security.permissions;
+            segment.backing_owner_user_id_ = regular.security.owner_user_id;
+            segment.backing_owner_group_id_ = regular.security.owner_group_id;
+            segment.backing_permissions_ = regular.security.permissions;
+            segment.name_ = options.name;
+            return segment;
+        }
 
 #if MINO_HAS_HUGETLB
         if (options.use_huge_pages && huge_mount.ok()) {
@@ -1255,14 +1562,28 @@ Result<SharedMemorySegment> SharedMemorySegment::Open(
         return Status::Error(StatusCode::kUnsupported,
                              "recorded huge backing is unsupported");
 #endif
+    } else if (kind == MarkerBackingKind::kRegularFile) {
+        MINO_ASSIGN_OR_RETURN(auto directory,
+                              OpenRecordedRegularDirectory(payload));
+        data_fd = ::openat(directory.first, directory.second.c_str(),
+                           open_flags | O_CLOEXEC | O_NOFOLLOW);
+        const int saved_errno = errno;
+        ::close(directory.first);
+        if (data_fd < 0) {
+            return ErrnoStatus("open regular data failed", saved_errno);
+        }
     } else {
         return Status::Error(StatusCode::kCorruption,
                              "ready marker has no data backing");
     }
     (void)::fcntl(data_fd, F_SETFD, FD_CLOEXEC);
-    Status identity = VerifyDataIdentity(
-        data_fd, payload,
-        kind == MarkerBackingKind::kHugeFile ? "huge" : "fallback");
+    const char* identity_kind = "fallback";
+    if (kind == MarkerBackingKind::kHugeFile) {
+        identity_kind = "huge";
+    } else if (kind == MarkerBackingKind::kRegularFile) {
+        identity_kind = "regular";
+    }
+    Status identity = VerifyDataIdentity(data_fd, payload, identity_kind);
     if (!identity.ok()) {
         ::close(data_fd);
         return identity;

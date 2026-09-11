@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -22,11 +23,13 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "mino/common/ids.h"
@@ -600,6 +603,35 @@ void PopulateManifest(ManifestHeader* header, Profile profile,
     header->channels = layout.channels;
 }
 
+uint64_t FilesystemAvailableBytes(const std::filesystem::path& path,
+                                  std::string_view label) {
+    struct statvfs stats {};
+    if (::statvfs(path.c_str(), &stats) != 0) {
+        throw std::runtime_error(std::string("statvfs(") + std::string(label) +
+                                 ") failed: " + std::strerror(errno));
+    }
+    const uint64_t block = static_cast<uint64_t>(stats.f_frsize != 0
+                                                     ? stats.f_frsize
+                                                     : stats.f_bsize);
+    return MultiplyOrThrow(block, static_cast<uint64_t>(stats.f_bavail),
+                           std::string(label) + " available bytes");
+}
+
+// Marker + a small safety margin so other /dev/shm users do not race us into
+// ENOSPC after the preflight succeeds.
+constexpr uint64_t kPosixShmReservationOverhead = 1ull << 20;  // 1 MiB
+
+bool PosixShmCanHost(uint64_t segment_bytes) {
+    const uint64_t needed =
+        AddOrThrow(segment_bytes, kPosixShmReservationOverhead,
+                   "POSIX shm reservation");
+    try {
+        return FilesystemAvailableBytes("/dev/shm", "/dev/shm") >= needed;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 template <typename Frame>
 void Setup(const CommonOptions& common, const BackendOptions& backend) {
     const SegmentLayout layout =
@@ -609,9 +641,46 @@ void Setup(const CommonOptions& common, const BackendOptions& backend) {
         ThrowStatus("unlink stale shared-memory segment", stale);
     }
 
+    SharedMemoryCreateOptions create_options;
+    create_options.name = backend.shm_name;
+    create_options.size = layout.total_size;
+
+    const bool use_file_backing = !PosixShmCanHost(layout.total_size);
+    if (use_file_backing) {
+        if (common.runtime_dir.empty()) {
+            throw std::runtime_error(
+                "SHM segment (" + std::to_string(layout.total_size) +
+                " bytes) exceeds available /dev/shm and --runtime-dir is empty; "
+                "cannot place a file-backed alternate");
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(common.runtime_dir, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "create runtime directory for file-backed SHM failed: " +
+                ec.message());
+        }
+        const uint64_t disk_available = FilesystemAvailableBytes(
+            common.runtime_dir, common.runtime_dir.string());
+        if (disk_available < layout.total_size) {
+            throw std::runtime_error(
+                "SHM segment requires " + std::to_string(layout.total_size) +
+                " bytes but /dev/shm cannot host it and runtime-dir has only " +
+                std::to_string(disk_available) +
+                " bytes free (file-backed fallback refused)");
+        }
+        create_options.file_backing_directory = common.runtime_dir.string();
+        std::cerr << "mino_shm_pipeline setup: /dev/shm too small for "
+                  << layout.total_size
+                  << "-byte segment; using file-backed mmap under "
+                  << common.runtime_dir << '\n';
+    }
+
     SharedMemorySegment segment = TakeOrThrow(
         "create shared-memory segment",
-        SharedMemorySegment::Create(backend.shm_name, layout.total_size));
+        SharedMemorySegment::Create(create_options));
+    // Create commits backing pages (posix_fallocate). Touching an oversubscribed
+    // sparse POSIX shm mapping is a classic SIGBUS; Create now fails closed.
     std::memset(segment.base(), 0, static_cast<size_t>(segment.size()));
 
     auto* header = std::construct_at(

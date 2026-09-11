@@ -192,6 +192,34 @@ bazel build --registry=https://bcr.bazel.build \
   //benchmarks/pipeline_comparison/...
 ```
 
+## Mino SHM segment sizing and `/dev/shm`
+
+`mino_shm_pipeline` places one shared segment that holds the central slab
+allocator (root frame slots + payload slots), journal, pin table, and five
+SPSC channels. Slot counts scale with `--channel-capacity` (fairness default
+for this comparison is 64). The allocator uses a single stride of
+`sizeof(SlabHeader) + max(frame, profile payload)`, so the large profile
+(1 MiB payload) needs on the order of **~768 MiB** at capacity 64 — far above a
+typical container `/dev/shm` of 64 MiB.
+
+Linux POSIX shm accepts sparse `ftruncate` even when the tmpfs cannot hold the
+bytes; the first full touch (`memset` during setup) then raises **SIGBUS**.
+Mino now:
+
+1. commits POSIX and file backings with `posix_fallocate` so `Create` fails
+   closed with `ResourceExhausted` instead of returning a mapping that SIGBUS
+   on touch;
+2. has `mino_shm_pipeline` setup preflight `/dev/shm` free space, and when the
+   segment cannot fit, places a **file-backed** `MAP_SHARED` object under
+   `--runtime-dir` (the runner already uses a unique `/tmp/mino-pipeline-*`
+   directory). Workers `Open` the marker and follow the recorded path; cleanup
+   unlinks both marker and file.
+
+Remounting a larger `/dev/shm` also works when you have privileges
+(`mount -o remount,size=1G /dev/shm`), but the code path above does not require
+it. Medium (64 KiB payload) still fits a 64 MiB shm for capacity 64; large
+uses the file-backed alternate on such hosts.
+
 ## Run the comparison
 
 The runner executes backends serially and rotates their order between rounds.

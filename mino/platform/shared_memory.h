@@ -46,6 +46,12 @@ struct SharedMemoryCreateOptions {
     // Used only while Create chooses a huge backing. Open and Unlink never
     // consult configuration or guess a path; they use the validated marker.
     std::string hugetlbfs_path;
+
+    // When non-empty, Create places the data object as a regular file under this
+    // directory (MAP_SHARED) instead of POSIX shm. Open/Unlink follow the
+    // marker-recorded absolute path. Use this when the segment cannot fit on
+    // /dev/shm (classic SIGBUS risk after sparse ftruncate on a full tmpfs).
+    std::string file_backing_directory;
 };
 
 struct SharedMemoryOpenOptions {
