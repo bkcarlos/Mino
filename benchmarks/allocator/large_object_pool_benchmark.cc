@@ -707,6 +707,7 @@ int main(int argc, char** argv) {
             .size = kPoolBytes,
             .use_huge_pages = true,
             .hugetlbfs_path = config.hugetlbfs_path,
+            .file_backing_directory = {},
         };
         auto segment = SharedMemorySegment::Create(shm_options);
         if (!segment.ok()) throw std::runtime_error(segment.status().ToString());
