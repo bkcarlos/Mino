@@ -385,7 +385,9 @@ cc_test(
 
 cc_test(
     name = "simple_node_business_mp_stress_test",
-    size = "small",
+    # medium (300s): MediumPayload under TSan exceeds the 60s "small" budget
+    # even when correct; keep exclusive because workers share /dev/shm.
+    size = "medium",
     srcs = ["simple_node_business_mp_stress_test.cc"],
     data = [
         "//benchmarks/pipeline_comparison:autonomy_pipeline_descriptor",

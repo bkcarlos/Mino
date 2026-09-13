@@ -29,7 +29,7 @@ extern char** environ;
 
 namespace mino::mp_stress {
 
-inline constexpr auto kChildTimeout = std::chrono::seconds(90);
+inline constexpr auto kChildTimeout = std::chrono::seconds(180);
 
 inline std::filesystem::path Runfile(std::string_view relative) {
     const char* srcdir = std::getenv("TEST_SRCDIR");

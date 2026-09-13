@@ -240,7 +240,7 @@ int RunSub(std::string_view name, const Config& config) {
         std::min(config.messages, static_cast<uint64_t>(1 << 20))));
 
     const uint64_t loop_start_ns = NowNs();
-    const auto overall = mino::Deadline::FromNow(std::chrono::seconds(90));
+    const auto overall = mino::Deadline::FromNow(std::chrono::seconds(180));
     while (received + lost < config.messages) {
         if (overall.expired()) {
             lost += config.messages - received - lost;

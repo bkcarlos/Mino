@@ -4,6 +4,7 @@
 #include "mino/shm/region/attachment_directory.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -16,9 +17,9 @@ namespace {
 class AttachmentDirectoryTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    storage_.assign(kAttachmentDirectoryMinimumSize, std::byte{0});
+    std::memset(storage_, 0, sizeof(storage_));
     ASSERT_TRUE(
-        InitializeAttachmentDirectory(storage_.data(), storage_.size()).ok());
+        InitializeAttachmentDirectory(storage_, sizeof(storage_)).ok());
   }
 
   ProcessIdentity FakeIdentity(uint64_t pid) const {
@@ -29,27 +30,27 @@ class AttachmentDirectoryTest : public ::testing::Test {
     return id;
   }
 
-  std::vector<std::byte> storage_;
+  alignas(64) std::byte storage_[kAttachmentDirectoryMinimumSize];
 };
 
 TEST_F(AttachmentDirectoryTest, ClaimReleaseAndHeartbeat) {
   const ProcessIdentity id = ProcessIdentity::Current();
-  auto claimed = ClaimAttachmentSlot(storage_.data(), storage_.size(),
+  auto claimed = ClaimAttachmentSlot(storage_, sizeof(storage_),
                                      AttachmentRole::kSupervisor, id,
                                      /*attach_service_epoch=*/1);
   ASSERT_TRUE(claimed.ok()) << claimed.status().ToString();
-  EXPECT_TRUE(HeartbeatAttachmentSlot(storage_.data(), storage_.size(),
+  EXPECT_TRUE(HeartbeatAttachmentSlot(storage_, sizeof(storage_),
                                       claimed->slot_index, claimed->generation,
                                       id, /*heartbeat_ns=*/42)
                   .ok());
-  EXPECT_TRUE(ReleaseAttachmentSlot(storage_.data(), storage_.size(),
+  EXPECT_TRUE(ReleaseAttachmentSlot(storage_, sizeof(storage_),
                                     claimed->slot_index, claimed->generation, id)
                   .ok());
 }
 
 TEST_F(AttachmentDirectoryTest, SubordinatePolicyCapsWriters) {
   const ProcessIdentity supervisor = ProcessIdentity::Current();
-  ASSERT_TRUE(ClaimAttachmentSlot(storage_.data(), storage_.size(),
+  ASSERT_TRUE(ClaimAttachmentSlot(storage_, sizeof(storage_),
                                   AttachmentRole::kSupervisor, supervisor,
                                   /*attach_service_epoch=*/1)
                   .ok());
@@ -59,17 +60,17 @@ TEST_F(AttachmentDirectoryTest, SubordinatePolicyCapsWriters) {
     // Same process identity is fine for unit policy counting; production
     // attachments come from distinct processes.
     auto claimed = ClaimAttachmentSlot(
-        storage_.data(), storage_.size(), AttachmentRole::kSubordinateWritable,
+        storage_, sizeof(storage_), AttachmentRole::kSubordinateWritable,
         supervisor, /*attach_service_epoch=*/1);
     ASSERT_TRUE(claimed.ok()) << claimed.status().ToString();
     regs.push_back(*claimed);
   }
   auto denied = ClaimAttachmentSlot(
-      storage_.data(), storage_.size(), AttachmentRole::kSubordinateWritable,
+      storage_, sizeof(storage_), AttachmentRole::kSubordinateWritable,
       supervisor, /*attach_service_epoch=*/1);
   ASSERT_FALSE(denied.ok());
   EXPECT_EQ(denied.status().code(), StatusCode::kResourceExhausted);
-  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_.data(), storage_.size()),
+  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_, sizeof(storage_)),
             kMaxSubordinateWritableAttachments);
 }
 
@@ -78,29 +79,38 @@ TEST_F(AttachmentDirectoryTest, PrepareRecoveryReclaimsDeadIdentity) {
   ASSERT_EQ(ProbeProcessIdentity(dead), ProcessIdentityLiveness::kDead);
 
   auto claimed = ClaimAttachmentSlot(
-      storage_.data(), storage_.size(), AttachmentRole::kSubordinateWritable,
+      storage_, sizeof(storage_), AttachmentRole::kSubordinateWritable,
       dead, /*attach_service_epoch=*/3);
   ASSERT_TRUE(claimed.ok()) << claimed.status().ToString();
-  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_.data(), storage_.size()),
+  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_, sizeof(storage_)),
             1u);
 
-  ASSERT_TRUE(PrepareAttachmentDirectoryForSupervisorRecovery(storage_.data(),
-                                                              storage_.size())
+  ASSERT_TRUE(PrepareAttachmentDirectoryForSupervisorRecovery(storage_,
+                                                              sizeof(storage_))
                   .ok());
-  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_.data(), storage_.size()),
+  EXPECT_EQ(CountLiveSubordinateWritableSlots(storage_, sizeof(storage_)),
             0u);
 }
 
 TEST_F(AttachmentDirectoryTest, PrepareRecoveryRefusesLiveSubordinate) {
   const ProcessIdentity live = ProcessIdentity::Current();
-  ASSERT_TRUE(ClaimAttachmentSlot(storage_.data(), storage_.size(),
+  ASSERT_TRUE(ClaimAttachmentSlot(storage_, sizeof(storage_),
                                   AttachmentRole::kSubordinateWritable, live,
                                   /*attach_service_epoch=*/1)
                   .ok());
   auto prepared = PrepareAttachmentDirectoryForSupervisorRecovery(
-      storage_.data(), storage_.size());
+      storage_, sizeof(storage_));
   ASSERT_FALSE(prepared.ok());
   EXPECT_EQ(prepared.code(), StatusCode::kWouldBlock);
+}
+
+TEST(AttachmentDirectoryAlignmentTest, RejectsMisalignedBase) {
+  alignas(64) std::byte storage[kAttachmentDirectoryMinimumSize + 64];
+  void* misaligned = storage + 32;
+  EXPECT_EQ(InitializeAttachmentDirectory(misaligned,
+                                          kAttachmentDirectoryMinimumSize)
+                .code(),
+            StatusCode::kInvalidArgument);
 }
 
 }  // namespace

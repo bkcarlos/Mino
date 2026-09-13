@@ -236,40 +236,63 @@ Result<AllocationTransaction> AllocationJournal::Begin(
                              "allocation transaction tag space exhausted");
     }
 
-    for (uint32_t i = 0; i < transaction_capacity_; ++i) {
-        SharedRecord& record = records_[i];
-        uint64_t observed = record.control.load(std::memory_order_acquire);
-        if (TagState(observed) != AllocationJournalState::kFree) {
-            continue;
-        }
-        const uint64_t initializing =
-            MakeTag(epoch, AllocationJournalState::kInitializing);
-        if (!record.control.compare_exchange_strong(
-                observed, initializing, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        InvokePersistenceHook(PersistencePoint::kInitializingTagged, epoch);
+    // Two passes: first claim Free slots only. A second pass opportunistically
+    // reclaims abandoned kInitializing records that still have a zero owner
+    // (crash between the Initializing CAS and StoreOwner). Concurrent hot-path
+    // RecoverOrphans must not reclaim that window — it races live Begin.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (uint32_t i = 0; i < transaction_capacity_; ++i) {
+            SharedRecord& record = records_[i];
+            uint64_t observed = record.control.load(std::memory_order_acquire);
+            AllocationJournalState state = TagState(observed);
+            if (pass == 1 && state == AllocationJournalState::kInitializing &&
+                LoadOwner(record).IsZero()) {
+                const uint64_t finalizing = MakeTag(
+                    TagEpoch(observed), AllocationJournalState::kFinalizing);
+                if (record.control.compare_exchange_strong(
+                        observed, finalizing, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    (void)ContinueFinalize(i, finalizing);
+                }
+                observed = record.control.load(std::memory_order_acquire);
+                state = TagState(observed);
+            }
+            if (state != AllocationJournalState::kFree) {
+                continue;
+            }
+            const uint64_t initializing =
+                MakeTag(epoch, AllocationJournalState::kInitializing);
+            if (!record.control.compare_exchange_strong(
+                    observed, initializing, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                continue;
+            }
+            // Publish owner before the persistence hook / Building transition so
+            // concurrent RecoverOrphans can distinguish a live Begin from a
+            // crash mid-init (zero-owner Initializing is deferred; Dead owners
+            // are reclaimed).
+            record.handle_count.store(0, std::memory_order_relaxed);
+            record.reclaim_cursor.store(0, std::memory_order_relaxed);
+            StoreBinding(record, {});
+            StoreOwner(record, owner);
+            InvokePersistenceHook(PersistencePoint::kInitializingTagged, epoch);
 
-        record.handle_count.store(0, std::memory_order_relaxed);
-        record.reclaim_cursor.store(0, std::memory_order_relaxed);
-        StoreOwner(record, owner);
-        StoreBinding(record, {});
-        const uint64_t building =
-            MakeTag(epoch, AllocationJournalState::kBuilding);
-        uint64_t expected = initializing;
-        if (!record.control.compare_exchange_strong(
-                expected, building, std::memory_order_release,
-                std::memory_order_acquire)) {
-            return Status::Error(StatusCode::kUnavailable,
-                                 "transaction initialization was recovered");
+            const uint64_t building =
+                MakeTag(epoch, AllocationJournalState::kBuilding);
+            uint64_t expected = initializing;
+            if (!record.control.compare_exchange_strong(
+                    expected, building, std::memory_order_release,
+                    std::memory_order_acquire)) {
+                return Status::Error(StatusCode::kUnavailable,
+                                     "transaction initialization was recovered");
+            }
+            InvokePersistenceHook(PersistencePoint::kBuildingPublished, epoch);
+            return AllocationTransaction{
+                .journal_index = i,
+                .transaction_epoch = epoch,
+                .owner = owner,
+            };
         }
-        InvokePersistenceHook(PersistencePoint::kBuildingPublished, epoch);
-        return AllocationTransaction{
-            .journal_index = i,
-            .transaction_epoch = epoch,
-            .owner = owner,
-        };
     }
     return Status::Error(StatusCode::kResourceExhausted,
                          "allocation journal transaction capacity exhausted");
@@ -830,6 +853,13 @@ uint32_t AllocationJournal::RecoverOrphans(
         }
 
         const ProcessIdentity owner = LoadOwner(record);
+        // kInitializing with a zero owner is the live Begin window after the
+        // Free->Initializing CAS and before StoreOwner. Concurrent scanners
+        // must not treat that as crash debris — Begin reclaims abandoned
+        // zero-owner Initializing only when it needs capacity.
+        if (state == AllocationJournalState::kInitializing && owner.IsZero()) {
+            continue;
+        }
         ProcessLiveness liveness = ProcessLiveness::kDead;
         if (!owner.IsZero()) {
             liveness = identity_probe(owner, identity_probe_context);

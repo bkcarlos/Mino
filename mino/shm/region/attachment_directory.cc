@@ -78,6 +78,12 @@ Status ValidateImage(const void* base, uint64_t available_size,
         return Status::Error(StatusCode::kCorruption,
                              "attachment directory storage is truncated");
     }
+    if (reinterpret_cast<uintptr_t>(base) %
+            alignof(AttachmentDirectoryImage) !=
+        0) {
+        return Status::Error(StatusCode::kCorruption,
+                             "attachment directory is misaligned");
+    }
     const auto* image = static_cast<const AttachmentDirectoryImage*>(base);
     if (image->control.magic != kAttachmentDirectoryMagic) {
         return Status::Error(StatusCode::kCorruption,
@@ -175,6 +181,12 @@ Status InitializeAttachmentDirectory(void* attachment_directory_base,
     if (available_size < sizeof(AttachmentDirectoryImage)) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "attachment directory storage is too small");
+    }
+    if (reinterpret_cast<uintptr_t>(attachment_directory_base) %
+            alignof(AttachmentDirectoryImage) !=
+        0) {
+        return Status::Error(StatusCode::kInvalidArgument,
+                             "attachment directory base is misaligned");
     }
     auto* image = new (attachment_directory_base) AttachmentDirectoryImage();
     image->control.magic = kAttachmentDirectoryMagic;
