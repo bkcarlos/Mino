@@ -24,6 +24,22 @@ mino::schema::SchemaIdentity MakeSchema() {
     return mino::schema::SchemaIdentity(0x44594e01ull, digest, 1, 1);
 }
 
+bool WaitForPeerCount(mino::deployment::SharedHostDomain* domain,
+                      size_t minimum, std::chrono::seconds timeout) {
+    const auto deadline = mino::Deadline::FromNow(timeout);
+    for (;;) {
+        auto peers = domain->ListPeers();
+        if (peers.ok() && peers->size() >= minimum) {
+            return true;
+        }
+        if (deadline.expired()) {
+            return false;
+        }
+        (void)domain->Heartbeat();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -71,18 +87,20 @@ int main(int argc, char** argv) {
 
     const auto schema = MakeSchema();
     if (role == "join-wait") {
-        for (int i = 0; i < 500; ++i) {
-            auto peers = domain->ListPeers();
-            if (peers.ok() && peers->size() >= 2) {
-                std::cout << "{\"role\":\"join-wait\",\"peers\":"
-                          << peers->size() << "}\n";
-                return 0;
-            }
+        if (!WaitForPeerCount(&*domain, 2, std::chrono::seconds(20))) {
+            std::cerr << "join-wait timed out\n";
+            return 1;
+        }
+        auto peers = domain->ListPeers();
+        const size_t count = peers.ok() ? peers->size() : 0;
+        // Stay joined briefly so the existing peer's ListPeers can observe
+        // this slot before destructor Leave() clears it.
+        for (int i = 0; i < 50; ++i) {
             (void)domain->Heartbeat();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cerr << "join-wait timed out\n";
-        return 1;
+        std::cout << "{\"role\":\"join-wait\",\"peers\":" << count << "}\n";
+        return 0;
     }
 
     if (role == "pub") {
@@ -91,11 +109,10 @@ int main(int argc, char** argv) {
             std::cerr << "advertise failed: " << pub.status().ToString() << "\n";
             return 1;
         }
-        // Give subscribers time to attach+register under slow ASAN builds.
-        for (int i = 0; i < 20; ++i) {
-            (void)domain->Heartbeat();
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        // Stay joined until a late joiner (or the paired subscriber) is
+        // visible. A fixed 200ms settle races destructor Leave() under
+        // debug/O0, so LateJoiner only saw itself.
+        (void)WaitForPeerCount(&*domain, 2, std::chrono::seconds(20));
         for (uint64_t i = 0; i < messages; ++i) {
             const std::string payload = "msg-" + std::to_string(i);
             const mino::Status st = pub->Publish(

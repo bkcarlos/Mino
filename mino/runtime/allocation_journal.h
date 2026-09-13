@@ -84,6 +84,9 @@ public:
         kReclaimTagged = 5,
         kReclaimProgress = 6,
         kFinalizingTagged = 7,
+        // After Free->Initializing CAS, before owner publication. Concurrent
+        // RecoverOrphans must treat this unpublished window as live Begin.
+        kInitializingClaimed = 9,
     };
     using PersistenceHook = void (*)(PersistencePoint, uint64_t,
                                      void*) noexcept;

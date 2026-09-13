@@ -1552,22 +1552,26 @@ private:
         std::vector<std::pair<ConnectionId, Status>> failures;
         bool has_immediate_writes = false;
         for (auto& [id, connection] : connections_) {
-            if (connection.closing || connection.write_blocked ||
+            if (connection.closing ||
                 (connection.tls && !connection.tls->handshake_complete()) ||
                 TlsPendingRead(connection) ||
                 !HasPendingWriteLocked(connection)) {
                 continue;
             }
             if (connection.tls && connection.tls_write_frame_credits == 0) {
-                // Exactly one peer owns the TLS application-write turn. A peer
-                // with queued application traffic may request that turn using a
-                // canonical heartbeat without changing the wire protocol.
+                // Stage the credit request even if the socket is write_blocked
+                // so SyncEpollInterests can arm EPOLLOUT for the heartbeat.
                 if (!connection.tls_credit_request_outstanding &&
                     HasPendingOrIngressApplicationWriteLocked(connection)) {
                     connection.heartbeat_pending = true;
                     connection.tls_heartbeat_bypasses_credit = true;
                 }
                 if (!connection.tls_heartbeat_bypasses_credit) continue;
+            }
+            if (connection.write_blocked &&
+                !(connection.tls && connection.tls_heartbeat_bypasses_credit &&
+                  connection.heartbeat_pending)) {
+                continue;
             }
             const Status status = WriteConnectionLocked(connection);
             if (!status.ok()) {
@@ -3144,7 +3148,10 @@ private:
                     }
                 }
                 if (connection.tls) {
-                    connection.write_blocked = HasPendingWriteLocked(connection);
+                    // Stay software-ready after a successful TLS record.
+                    // Forcing write_blocked here skips the next Drain, so a
+                    // peer that just spent its write-turn credit cannot send
+                    // the credit-request heartbeat for remaining frames.
                     return Status::Ok();
                 }
                 continue;
@@ -3308,7 +3315,10 @@ private:
                                                released_messages);
                 }
                 if (connection.tls) {
-                    connection.write_blocked = HasPendingWriteLocked(connection);
+                    // Stay software-ready after a successful TLS record.
+                    // Forcing write_blocked here skips the next Drain, so a
+                    // peer that just spent its write-turn credit cannot send
+                    // the credit-request heartbeat for remaining frames.
                     return Status::Ok();
                 }
                 continue;
@@ -3342,7 +3352,6 @@ private:
                 }
             }
             if (connection.tls) {
-                connection.write_blocked = HasPendingWriteLocked(connection);
                 return Status::Ok();
             }
         }

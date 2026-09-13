@@ -45,7 +45,7 @@ struct alignas(64) AllocationJournal::SharedRecord {
     std::atomic<uint64_t> owner_start_time_ns{0};
 
     std::atomic<uint32_t> publication_kind{0};
-    uint32_t reserved0 = 0;
+    std::atomic<uint32_t> owner_published{0};
     std::atomic<uint64_t> publication_channel_id{0};
     std::atomic<uint64_t> publication_sequence{0};
     std::atomic<uint64_t> publication_payload_offset{0};
@@ -274,6 +274,10 @@ Result<AllocationTransaction> AllocationJournal::Begin(
             record.handle_count.store(0, std::memory_order_relaxed);
             record.reclaim_cursor.store(0, std::memory_order_relaxed);
             StoreBinding(record, {});
+            // Unpublished Initializing is the live Begin window. Persist the
+            // claim first so tests can prove RecoverOrphans will not steal it
+            // even under AlwaysDead, then publish a consistent owner.
+            InvokePersistenceHook(PersistencePoint::kInitializingClaimed, epoch);
             StoreOwner(record, owner);
             InvokePersistenceHook(PersistencePoint::kInitializingTagged, epoch);
 
@@ -853,10 +857,12 @@ uint32_t AllocationJournal::RecoverOrphans(
         }
 
         const ProcessIdentity owner = LoadOwner(record);
-        // kInitializing with a zero owner is the live Begin window after the
-        // Free->Initializing CAS and before StoreOwner. Concurrent scanners
-        // must not treat that as crash debris — Begin reclaims abandoned
-        // zero-owner Initializing only when it needs capacity.
+        // kInitializing with an unpublished / zero owner is the live Begin
+        // window after the Free->Initializing CAS and before StoreOwner
+        // publishes a consistent identity. Torn field writes must not look
+        // like a Dead reused PID. Concurrent scanners skip this window;
+        // Begin reclaims abandoned unpublished Initializing only when it
+        // needs capacity.
         if (state == AllocationJournalState::kInitializing && owner.IsZero()) {
             continue;
         }
@@ -994,7 +1000,15 @@ ProcessLiveness AllocationJournal::DefaultIdentityProbe(
 
 ProcessIdentity AllocationJournal::LoadOwner(
     const SharedRecord& record) noexcept {
-    return ProcessIdentity{
+    // owner_published is the sole publication signal. A torn StoreOwner that
+    // has written some identity fields but not the flag must look unpublished
+    // (zero). ProbeProcessIdentity treats a live PID with a stale start time
+    // as Dead PID-reuse, so returning a partial identity would let
+    // RecoverOrphans steal a live Begin.
+    if (record.owner_published.load(std::memory_order_acquire) == 0) {
+        return {};
+    }
+    ProcessIdentity owner{
         .node_id = record.owner_node_id.load(std::memory_order_acquire),
         .process_id = record.owner_process_id.load(std::memory_order_acquire),
         .process_epoch =
@@ -1002,16 +1016,31 @@ ProcessIdentity AllocationJournal::LoadOwner(
         .start_time_ns =
             record.owner_start_time_ns.load(std::memory_order_acquire),
     };
+    if (record.owner_published.load(std::memory_order_acquire) == 0 ||
+        owner.process_id == 0) {
+        return {};
+    }
+    return owner;
 }
 
 void AllocationJournal::StoreOwner(SharedRecord& record,
                                    const ProcessIdentity& owner) noexcept {
+    if (owner.IsZero()) {
+        record.owner_published.store(0, std::memory_order_release);
+        record.owner_node_id.store(0, std::memory_order_relaxed);
+        record.owner_process_id.store(0, std::memory_order_relaxed);
+        record.owner_process_epoch.store(0, std::memory_order_relaxed);
+        record.owner_start_time_ns.store(0, std::memory_order_relaxed);
+        return;
+    }
+    record.owner_published.store(0, std::memory_order_relaxed);
     record.owner_node_id.store(owner.node_id, std::memory_order_relaxed);
     record.owner_process_id.store(owner.process_id, std::memory_order_relaxed);
     record.owner_process_epoch.store(owner.process_epoch,
                                      std::memory_order_relaxed);
     record.owner_start_time_ns.store(owner.start_time_ns,
-                                     std::memory_order_release);
+                                     std::memory_order_relaxed);
+    record.owner_published.store(1, std::memory_order_release);
 }
 
 PublicationBinding AllocationJournal::LoadBinding(

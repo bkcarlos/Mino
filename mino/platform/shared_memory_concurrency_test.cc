@@ -298,7 +298,17 @@ TEST_F(SharedMemoryConcurrencyTest,
     ASSERT_GE(candidate_fd, 0);
     ::close(candidate_fd);
 
-    auto recovered = SharedMemorySegment::Create(name, 8192);
+    Result<SharedMemorySegment> recovered =
+        Status::Error(StatusCode::kWouldBlock, "recovery not attempted");
+    for (int attempt = 0; attempt < 100 && !recovered.ok(); ++attempt) {
+        recovered = SharedMemorySegment::Create(name, 8192);
+        if (!recovered.ok() &&
+            recovered.status().code() != StatusCode::kWouldBlock &&
+            recovered.status().code() != StatusCode::kAlreadyExists) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     ASSERT_TRUE(recovered.ok()) << recovered.status().ToString();
     errno = 0;
     EXPECT_EQ(::shm_open(candidate.c_str(), O_RDONLY, 0), -1);

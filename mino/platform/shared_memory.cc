@@ -861,6 +861,24 @@ Status RecoverExistingMarkerForCreate(const std::string& name) {
     int fd = ::shm_open(name.c_str(), O_RDWR, 0);
     if (fd < 0) return ErrnoStatus("open existing marker failed");
     Status lock = LockMarkerExclusive(fd, /*already_exists=*/true);
+    if (!lock.ok() &&
+        (lock.code() == StatusCode::kAlreadyExists ||
+         lock.code() == StatusCode::kWouldBlock)) {
+        // flock is released when the holder exits, but TSAN/_exit teardown
+        // can leave LOCK_NB failing for a brief window after waitpid. If the
+        // published creator is already Dead, retry instead of fail-closed
+        // forever on a lock the kernel is about to drop.
+        auto snapshot = ReadStableMarker(fd);
+        if (snapshot.ok() &&
+            static_cast<MarkerState>(snapshot->state) == MarkerState::kCreating &&
+            ProbeProcessIdentity(snapshot->creator) ==
+                ProcessIdentityLiveness::kDead) {
+            for (int attempt = 0; attempt < 50 && !lock.ok(); ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                lock = LockMarkerExclusive(fd, /*already_exists=*/true);
+            }
+        }
+    }
     if (!lock.ok()) {
         ::close(fd);
         return lock;

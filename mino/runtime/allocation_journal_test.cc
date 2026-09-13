@@ -345,6 +345,45 @@ TEST_F(AllocationJournalTest, UnknownLivenessNeverReclaims) {
 }
 
 TEST_F(AllocationJournalTest,
+       ConcurrentRecoverDoesNotStealUnpublishedInitializingBegin) {
+    struct PauseContext {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+    } pause;
+    auto hold_before_owner =
+        [](AllocationJournal::PersistencePoint point, uint64_t,
+           void* opaque) noexcept {
+            if (point !=
+                AllocationJournal::PersistencePoint::kInitializingClaimed) {
+                return;
+            }
+            auto* ctx = static_cast<PauseContext*>(opaque);
+            ctx->entered.store(true, std::memory_order_release);
+            while (!ctx->release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        };
+    journal_->SetPersistenceHook(hold_before_owner, &pause);
+
+    Result<AllocationTransaction> begun =
+        Status::Error(StatusCode::kUnavailable, "unset");
+    std::thread beginner([&]() { begun = journal_->Begin(ProcessIdentity::Current()); });
+    while (!pause.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // Owner is unpublished. Even AlwaysDead must not treat the zero-owner
+    // Initializing window as crash debris — that is a live Begin.
+    EXPECT_EQ(journal_->RecoverOrphans(&AlwaysDead), 0u);
+    pause.release.store(true, std::memory_order_release);
+    beginner.join();
+    journal_->SetPersistenceHook(nullptr, nullptr);
+
+    ASSERT_TRUE(begun.ok()) << begun.status().ToString();
+    EXPECT_EQ(*journal_->State(*begun), AllocationJournalState::kBuilding);
+    EXPECT_TRUE(journal_->Abort(*begun).ok());
+}
+
+TEST_F(AllocationJournalTest,
        ConcurrentRecoverDoesNotStealLiveInitializingBegin) {
     struct PauseContext {
         std::atomic<bool> entered{false};
