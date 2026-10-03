@@ -82,6 +82,20 @@
           "annotations": {"summary": "Mino storage writes are failing", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#storage-failure"}
         },
         {
+          "alert": "MinoDedupCapacityNearLimit",
+          "expr": "mino_dedup_max_utilization_permille >= 800",
+          "for": "5m",
+          "labels": {"severity": "warning", "component": "bridge"},
+          "annotations": {"summary": "A durable dedup store is near its source limit", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#durable-dedup"}
+        },
+        {
+          "alert": "MinoDedupPersistenceFailure",
+          "expr": "increase(mino_dedup_persistence_failures_total[5m]) + increase(mino_dedup_capacity_rejections_total[5m]) > 0",
+          "for": "1m",
+          "labels": {"severity": "critical", "component": "bridge"},
+          "annotations": {"summary": "Durable dedup cannot commit ACK state", "runbook_url": "https://github.com/bkcarlos/Mino/blob/main/docs/operations/monitoring.md#durable-dedup"}
+        },
+        {
           "alert": "MinoStorageBacklog",
           "expr": "mino_storage_pending_bytes > 1073741824",
           "for": "10m",

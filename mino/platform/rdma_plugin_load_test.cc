@@ -84,6 +84,12 @@ TEST(RdmaPluginLoadTest, VerbsPluginLoadsAbiEvenWithoutDevice) {
         EXPECT_EQ((*provider)->provider_class(),
                   MemoryRegistrationProviderClass::kDevice);
         EXPECT_NE((*provider)->provenance().find("verbs"), std::string::npos);
+        EXPECT_NE((*provider)->provenance().find("MR-ONLY"), std::string::npos);
+        RdmaProviderLimits limits;
+        limits.max_connections = 1;
+        EXPECT_EQ((*provider)->Start(limits).code(), StatusCode::kUnsupported);
+        EXPECT_TRUE((*provider)->Start({}).ok());
+        EXPECT_TRUE((*provider)->Shutdown().ok());
     } else {
         EXPECT_TRUE(provider.status().code() == StatusCode::kUnavailable ||
                     provider.status().code() == StatusCode::kUnsupported)

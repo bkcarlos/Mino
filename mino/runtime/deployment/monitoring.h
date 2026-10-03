@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 
+#include "mino/bridge/dedup_store.h"
 #include "mino/capacity/capacity.h"
 #include "mino/common/result.h"
 #include "mino/observability/metrics.h"
@@ -36,6 +37,8 @@ struct MonitoringSources {
     const security::TlsChannelFactory* tls = nullptr;
     std::vector<const CentralSlabAllocator*> slab_allocators;
     std::vector<const LargeObjectPool*> large_object_pools;
+    // Each shared store appears once even when multiple bridge lanes use it.
+    std::vector<const bridge::DedupStore*> dedup_stores;
 };
 
 struct MonitoringConfig {

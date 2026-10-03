@@ -10,6 +10,11 @@
 
 #include <array>
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <stdexcept>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -22,6 +27,20 @@ namespace mino::transport {
 namespace {
 
 using namespace std::chrono_literals;
+
+class PolicyCheckingProbe final : public security::IpsecSaProbe {
+public:
+    bool allowed = true;
+    size_t checks = 0;
+    Status RequireProtection(const security::IpsecSaSelector& selector) override {
+        ++checks;
+        EXPECT_TRUE(selector.require_out_policy);
+        if (!allowed || !selector.require_out_policy) {
+            return Status::Error(StatusCode::kUnavailable, "policy revoked");
+        }
+        return Status::Ok();
+    }
+};
 
 TcpDriverOptions TestTcpOptions() {
     return TcpDriverOptions{
@@ -102,6 +121,226 @@ std::vector<std::byte> FrameBody(size_t payload_size = 64) {
     return encoded.ok() ? std::move(*encoded) : std::vector<std::byte>{};
 }
 
+// This test double advertises a pinned socket policy without requiring kernel
+// privileges. Real policy installation/data flow is covered by SocketIpsecTest.
+class PinnedTestDriver final : public TransportDriver {
+public:
+    std::atomic<size_t> io_calls{0};
+    HealthState health() const noexcept override { return HealthState::kHealthy; }
+    TransportCapabilities capabilities() const noexcept override {
+        return {.kind = TransportKind::kNetwork,
+                .reliability = TransportReliability::kReliable,
+                .max_frame_size = 4096,
+                .features = Capability::kConnect};
+    }
+    std::optional<security::SocketIpsecPolicy>
+    MandatoryIpsecSocketPolicy() const noexcept override {
+        return security::SocketIpsecPolicy{.outbound_spi = 1, .inbound_spi = 2};
+    }
+protected:
+    Status DoStart(const DriverConfig&) override { return Status::Ok(); }
+    Status DoShutdown() override { return Status::Ok(); }
+    Result<ConnectionInfo> DoConnect(const ConnectRequest& request) override {
+        return ConnectionInfo{.id = 1, .local_endpoint = Loopback(8000),
+                              .peer_endpoint = request.remote_endpoint};
+    }
+    Result<ConnectionInfo> DoListen(const ListenRequest&) override {
+        return Status::Error(StatusCode::kUnsupported);
+    }
+    Result<SendResult> DoSend(const SendRequest& request, SendOperation operation) override {
+        ++io_calls;
+        return SendResult{.operation = operation, .admitted_bytes = request.payload.size()};
+    }
+    Result<size_t> DoSendUntracked(const UntrackedSendRequest& request) override {
+        ++io_calls;
+        return request.payload.size();
+    }
+    Result<ReceiveResult> DoPoll(const ReceiveRequest&) override {
+        ++io_calls;
+        return Status::Error(StatusCode::kWouldBlock);
+    }
+    Result<CompletionPollResult> DoPollCompletions(const CompletionPollRequest&) override {
+        return Status::Error(StatusCode::kWouldBlock);
+    }
+    Status DoClose(ConnectionId) override { return Status::Ok(); }
+};
+
+class ControlledProbe final : public security::IpsecSaProbe {
+public:
+    std::atomic<bool> allowed{true};
+    std::atomic<bool> throws{false};
+    std::atomic<size_t> checks{0};
+    void BlockNext(bool result) {
+        std::lock_guard lock(mutex_);
+        block_next_ = true;
+        blocked_ = released_ = returned_ = false;
+        blocked_result_ = result;
+    }
+    bool WaitBlocked() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, 2s, [this] { return blocked_; });
+    }
+    void Release() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+    bool WaitReturned() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, 2s, [this] { return returned_; });
+    }
+    Status RequireProtection(const security::IpsecSaSelector&) override {
+        ++checks;
+        {
+            std::unique_lock lock(mutex_);
+            if (block_next_) {
+                block_next_ = false;
+                blocked_ = true;
+                cv_.notify_all();
+                // Bound even a failed test so driver destruction cannot hang.
+                const bool released = cv_.wait_for(lock, 2s, [this] { return released_; });
+                returned_ = true;
+                cv_.notify_all();
+                return released && blocked_result_ ? Status::Ok() :
+                    Status::Error(StatusCode::kUnavailable);
+            }
+        }
+        if (throws.load()) throw std::runtime_error("injected probe failure");
+        return allowed.load() ? Status::Ok() : Status::Error(StatusCode::kUnavailable);
+    }
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool block_next_ = false;
+    bool blocked_ = false;
+    bool released_ = false;
+    bool returned_ = false;
+    bool blocked_result_ = false;
+};
+
+class BackgroundIpsecTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        auto inner = std::make_unique<PinnedTestDriver>();
+        inner_ = inner.get();
+        IpsecTransportOptions options;
+        options.inner = std::move(inner);
+        options.probe = probe_;
+        options.protected_socket_recheck_ms = 100;
+        auto result = IpsecTransportDriver::Create(std::move(options));
+        ASSERT_TRUE(result.ok());
+        driver_ = std::move(*result);
+        ASSERT_TRUE(driver_->Start(TestConfig()).ok());
+        ASSERT_TRUE(Connect().ok());
+    }
+    void TearDown() override {
+        probe_->Release();
+        if (driver_) {
+            EXPECT_TRUE(driver_->Shutdown().ok());
+        }
+    }
+    Result<ConnectionInfo> Connect() {
+        return driver_->Connect({.remote_endpoint = Loopback(9000), .local_bind = std::nullopt});
+    }
+    Status SendStatus() {
+        return driver_->SendUntracked({.connection_id = 1, .payload = body_}).status();
+    }
+    bool WaitStatus(StatusCode code) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (SendStatus().code() == code) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+    std::shared_ptr<ControlledProbe> probe_ = std::make_shared<ControlledProbe>();
+    std::unique_ptr<IpsecTransportDriver> driver_;
+    PinnedTestDriver* inner_ = nullptr;
+    std::vector<std::byte> body_ = FrameBody();
+};
+
+TEST_F(BackgroundIpsecTest, ExpiryNeverRunsProbeOnIoThreadAndRetainsOwnedPayload) {
+    probe_->BlockNext(true);
+    ASSERT_TRUE(probe_->WaitBlocked()); // Worker runs without any Send/Poll calls.
+    std::this_thread::sleep_for(110ms);
+    const auto started = std::chrono::steady_clock::now();
+    const auto checks = probe_->checks.load();
+    EXPECT_EQ(SendStatus().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(driver_->Send({.connection_id = 1, .payload = body_}).status().code(),
+              StatusCode::kWouldBlock);
+    auto owned = body_;
+    EXPECT_EQ(driver_->TrySendOwned(1, std::move(owned)).status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(owned, body_);
+    EXPECT_EQ(driver_->TrySendUntrackedOwned(1, std::move(owned),
+                  UntrackedTrafficClass::kData).status().code(), StatusCode::kWouldBlock);
+    EXPECT_EQ(owned, body_);
+    EXPECT_EQ(driver_->Poll({.connection_id = 1}).status().code(), StatusCode::kWouldBlock);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 250ms);
+    EXPECT_EQ(probe_->checks.load(), checks);
+    EXPECT_EQ(inner_->io_calls.load(), 0u);
+    probe_->Release();
+    // The slow check has already expired; a later fresh check resumes traffic.
+    EXPECT_TRUE(WaitStatus(StatusCode::kOk));
+}
+
+TEST_F(BackgroundIpsecTest, DeniedAndThrowingChecksFailClosedThenRecover) {
+    probe_->allowed = false;
+    ASSERT_TRUE(WaitStatus(StatusCode::kUnavailable));
+    probe_->throws = true;
+    probe_->allowed = true;
+    std::this_thread::sleep_for(120ms);
+    EXPECT_EQ(SendStatus().code(), StatusCode::kUnavailable);
+    probe_->throws = false;
+    EXPECT_TRUE(WaitStatus(StatusCode::kOk));
+}
+
+TEST_F(BackgroundIpsecTest, CloseAndReusedConnectionIdIgnoreOldFailedCheck) {
+    probe_->BlockNext(false);
+    ASSERT_TRUE(probe_->WaitBlocked());
+    ASSERT_TRUE(driver_->Close(1).ok());
+    ASSERT_TRUE(Connect().ok()); // Reuses ID 1 while its old check is still pending.
+    probe_->Release();
+    ASSERT_TRUE(probe_->WaitReturned());
+    // The worker must consume the old result before starting this next check.
+    // Hold the new check so it cannot hide an incorrectly applied old denial.
+    probe_->BlockNext(true);
+    ASSERT_TRUE(probe_->WaitBlocked());
+    EXPECT_NE(SendStatus().code(), StatusCode::kUnavailable);
+    probe_->Release();
+}
+
+TEST_F(BackgroundIpsecTest, ShutdownJoinsPendingVerifierAndRestartWorks) {
+    probe_->BlockNext(true);
+    ASSERT_TRUE(probe_->WaitBlocked());
+    auto shutdown = std::async(std::launch::async, [this] { return driver_->Shutdown(); });
+    EXPECT_EQ(shutdown.wait_for(20ms), std::future_status::timeout);
+    probe_->Release();
+    ASSERT_EQ(shutdown.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(shutdown.get().ok());
+    const auto checks = probe_->checks.load();
+    std::this_thread::sleep_for(120ms);
+    EXPECT_EQ(probe_->checks.load(), checks);
+    ASSERT_TRUE(driver_->Start(TestConfig()).ok());
+    ASSERT_TRUE(Connect().ok());
+    EXPECT_TRUE(SendStatus().ok());
+    probe_->allowed = false;
+    EXPECT_TRUE(WaitStatus(StatusCode::kUnavailable));
+}
+
+TEST_F(BackgroundIpsecTest, DestructionJoinsWorkerWithoutExplicitShutdown) {
+    probe_->BlockNext(true);
+    ASSERT_TRUE(probe_->WaitBlocked());
+    auto destroyed = std::async(std::launch::async,
+        [driver = std::move(driver_)]() mutable { driver.reset(); });
+    EXPECT_EQ(destroyed.wait_for(20ms), std::future_status::timeout);
+    probe_->Release();
+    ASSERT_EQ(destroyed.wait_for(2s), std::future_status::ready);
+    destroyed.get();
+    const auto checks = probe_->checks.load();
+    std::this_thread::sleep_for(120ms);
+    EXPECT_EQ(probe_->checks.load(), checks);
+}
+
 TEST(IpsecTransportTest, CreateRequiresInnerAndProbe) {
     IpsecTransportOptions options;
     auto missing = IpsecTransportDriver::Create(std::move(options));
@@ -144,8 +383,7 @@ TEST(IpsecTransportTest, ConnectAndExchangeWhenProbeAllows) {
     ASSERT_TRUE(server_tcp.ok()) << server_tcp.status().ToString();
     ASSERT_TRUE(client_tcp.ok()) << client_tcp.status().ToString();
 
-    auto allow = std::make_shared<security::ScriptedIpsecSaProbe>();
-    allow->AllowAll();
+    auto allow = std::make_shared<PolicyCheckingProbe>();
 
     IpsecTransportOptions server_opts;
     server_opts.inner = std::move(*server_tcp);
@@ -203,6 +441,26 @@ TEST(IpsecTransportTest, ConnectAndExchangeWhenProbeAllows) {
     ASSERT_TRUE(polled.ok()) << polled.status().ToString();
     ASSERT_EQ(polled->messages.size(), 1u);
     EXPECT_EQ(polled->messages[0].payload, body);
+
+    // Revocation after connect must gate every send entry point and receive.
+    allow->allowed = false;
+    EXPECT_EQ((*client)->Send(send).status().code(), StatusCode::kUnavailable);
+    UntrackedSendRequest untracked;
+    untracked.connection_id = connected->id;
+    untracked.payload = body;
+    EXPECT_EQ((*client)->SendUntracked(untracked).status().code(),
+              StatusCode::kUnavailable);
+    auto owned = body;
+    EXPECT_EQ((*client)->TrySendOwned(connected->id, std::move(owned)).status().code(),
+              StatusCode::kUnavailable);
+    EXPECT_EQ(owned, body);
+    owned = body;
+    EXPECT_EQ((*client)->TrySendUntrackedOwned(connected->id, std::move(owned),
+                  UntrackedTrafficClass::kData).status().code(),
+              StatusCode::kUnavailable);
+    EXPECT_EQ(owned, body);
+    EXPECT_EQ((*server)->Poll(receive).status().code(), StatusCode::kUnavailable);
+    EXPECT_GE(allow->checks, 9u);
 
     EXPECT_TRUE((*client)->Shutdown().ok());
     EXPECT_TRUE((*server)->Shutdown().ok());

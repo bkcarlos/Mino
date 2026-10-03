@@ -246,6 +246,45 @@ TEST(MonitoringDeploymentTest, OtlpSinkFailureIsCountedAndFailSafe) {
     monitoring->Stop();
 }
 
+TEST(MonitoringDeploymentTest, DurableDedupCapacityAndFailuresAreExported) {
+    const auto path = TestPath("dedup.snap");
+    auto store = bridge::DedupStore::Open({.path = path.string(), .max_sources = 1});
+    ASSERT_TRUE(store.ok());
+    MonitoringSources sources;
+    sources.dedup_stores = {store->get()};
+    auto created = MonitoringDeployment::Create(TestConfig(), sources);
+    ASSERT_TRUE(created.ok());
+    auto monitoring = std::move(*created);
+    ASSERT_TRUE(monitoring->Start().ok());
+    ASSERT_TRUE((*store)->RecordAccepted({1, 2, 3}, 1).ok());
+    EXPECT_FALSE((*store)->RecordAccepted({1, 2, 4}, 1).ok());
+    ASSERT_TRUE(std::filesystem::remove(path));
+    ASSERT_TRUE(std::filesystem::create_directory(path));
+    EXPECT_FALSE((*store)->RecordAccepted({1, 2, 3}, 2).ok());
+    std::string response;
+    ASSERT_TRUE(WaitForMetrics(monitoring->prometheus_port(),
+        {"mino_dedup_sources 1\n", "mino_dedup_capacity 1\n",
+         "mino_dedup_max_utilization_permille 1000\n",
+         "mino_dedup_persistence_total 1\n",
+         "mino_dedup_persistence_failures_total 1\n",
+         "mino_dedup_capacity_rejections_total 1\n"}, &response));
+    ASSERT_TRUE(std::filesystem::remove(path));
+    ASSERT_TRUE((*store)->RetireEpochsThrough({1, 2, 3}).ok());
+    ASSERT_TRUE(WaitForMetrics(monitoring->prometheus_port(),
+        {"mino_dedup_sources 1\n", "mino_dedup_retired_publishers 1\n",
+         "mino_dedup_capacity 1\n", "mino_dedup_max_utilization_permille 1000\n",
+         "mino_dedup_persistence_total 2\n"}, &response));
+    monitoring->Stop();
+    sources.dedup_stores.push_back(store->get());
+    EXPECT_FALSE(MonitoringDeployment::Create(TestConfig(), sources).ok());
+    sources.dedup_stores = {nullptr};
+    EXPECT_FALSE(MonitoringDeployment::Create(TestConfig(), sources).ok());
+    monitoring.reset();
+    store->reset();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + ".lock");
+}
+
 TEST(MonitoringDeploymentTest,
      RealModuleFailuresChangeLabelFreePrometheusMetrics) {
     const schema::SchemaIdentity schema = TestSchema();

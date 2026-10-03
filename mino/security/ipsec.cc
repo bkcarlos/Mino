@@ -4,6 +4,8 @@
 
 #include "mino/security/ipsec.h"
 
+#include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <string>
@@ -11,6 +13,7 @@
 #include <utility>
 
 #if defined(__linux__)
+#include "mino/security/ipsec_policy.h"
 #include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/xfrm.h>
@@ -91,12 +94,21 @@ Result<ScopedFd> OpenXfrmSocket() {
         0) {
         return NetlinkErrno("bind NETLINK_XFRM");
     }
+    timeval timeout{.tv_sec = 1, .tv_usec = 0};
+    if (::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                     sizeof(timeout)) != 0) {
+        return NetlinkErrno("NETLINK_XFRM timeout");
+    }
+    if (::setsockopt(fd.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                     sizeof(timeout)) != 0) {
+        return NetlinkErrno("NETLINK_XFRM send timeout");
+    }
     return fd;
 }
 
 uint32_t NextNlSeq() {
-    static uint32_t seq = 1;
-    return seq++;
+    static std::atomic<uint32_t> seq{1};
+    return seq.fetch_add(1, std::memory_order_relaxed);
 }
 
 Status SendNetlinkDump(int fd, uint16_t nlmsg_type) {
@@ -125,29 +137,48 @@ Result<std::vector<IpsecSaInfo>> DumpSecurityAssociations(int fd) {
     MINO_RETURN_IF_ERROR(SendNetlinkDump(fd, XFRM_MSG_GETSA));
 
     std::vector<IpsecSaInfo> out;
-    std::array<std::byte, 8192> buffer{};
+    alignas(xfrm_usersa_info) std::array<std::byte, 65536> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     for (;;) {
-        const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), 0);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::Error(StatusCode::kUnavailable, "XFRM dump deadline exceeded");
+        }
+        const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
         if (n < 0) {
             return NetlinkErrno("netlink dump recv");
         }
-        if (n == 0) break;
+        if (n == 0 || static_cast<size_t>(n) > buffer.size()) {
+            return Status::Error(StatusCode::kCorruption, "incomplete XFRM dump");
+        }
 
         const std::byte* p = buffer.data();
         const std::byte* end = buffer.data() + n;
         bool done = false;
-        while (p + sizeof(nlmsghdr) <= end) {
+        while (static_cast<size_t>(end - p) >= sizeof(nlmsghdr)) {
             const auto* nlh = reinterpret_cast<const nlmsghdr*>(p);
             if (nlh->nlmsg_len < sizeof(nlmsghdr) ||
-                p + nlh->nlmsg_len > end) {
+                nlh->nlmsg_len > static_cast<size_t>(end - p)) {
                 return Status::Error(StatusCode::kCorruption,
                                      "truncated XFRM netlink message");
             }
+            if (nlh->nlmsg_flags & NLM_F_DUMP_INTR) {
+                return Status::Error(StatusCode::kUnavailable, "interrupted XFRM dump");
+            }
             if (nlh->nlmsg_type == NLMSG_DONE) {
+                if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(int))) {
+                    int dump_error = 0;
+                    std::memcpy(&dump_error, NLMSG_DATA(nlh), sizeof(dump_error));
+                    if (dump_error != 0) {
+                        return Status::Error(StatusCode::kUnavailable, "failed XFRM dump");
+                    }
+                }
                 done = true;
                 break;
             }
             if (nlh->nlmsg_type == NLMSG_ERROR) {
+                if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(nlmsgerr))) {
+                    return Status::Error(StatusCode::kCorruption, "short XFRM error");
+                }
                 const auto* err =
                     reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(nlh));
                 if (err != nullptr && err->error != 0) {
@@ -161,8 +192,9 @@ Result<std::vector<IpsecSaInfo>> DumpSecurityAssociations(int fd) {
                     return Status::Error(StatusCode::kCorruption,
                                          "short XFRM_MSG_NEWSA");
                 }
-                const auto* sa =
-                    reinterpret_cast<const xfrm_usersa_info*>(NLMSG_DATA(nlh));
+                xfrm_usersa_info sa_value{};
+                std::memcpy(&sa_value, NLMSG_DATA(nlh), sizeof(sa_value));
+                const auto* sa = &sa_value;
                 IpsecSaInfo info;
                 if (sa->family == AF_INET) {
                     info.family = IpsecAddressFamily::kIpv4;
@@ -181,6 +213,51 @@ Result<std::vector<IpsecSaInfo>> DumpSecurityAssociations(int fd) {
                 info.spi = ntohl(sa->id.spi);
                 info.mode = sa->mode;
                 info.proto = sa->id.proto;
+                info.reqid = sa->reqid;
+                size_t offset = NLMSG_ALIGN(NLMSG_LENGTH(sizeof(*sa)));
+                bool scoped = false;
+                while (offset < nlh->nlmsg_len) {
+                    if (nlh->nlmsg_len - offset < sizeof(nlattr)) {
+                        return Status::Error(StatusCode::kCorruption, "short SA attribute");
+                    }
+                    nlattr attr{};
+                    std::memcpy(&attr, p + offset, sizeof(attr));
+                    if (attr.nla_len < sizeof(attr) ||
+                        attr.nla_len > nlh->nlmsg_len - offset) {
+                        return Status::Error(StatusCode::kCorruption, "invalid SA attribute");
+                    }
+                    if (attr.nla_type == XFRMA_ALG_AEAD ||
+                        attr.nla_type == XFRMA_ALG_CRYPT) {
+                        const size_t header_bytes = attr.nla_type == XFRMA_ALG_AEAD
+                            ? sizeof(xfrm_algo_aead) : sizeof(xfrm_algo);
+                        if (attr.nla_len < sizeof(attr) + header_bytes) {
+                            return Status::Error(StatusCode::kCorruption, "short SA algorithm");
+                        }
+                        // Common name/key-length prefix; do not retain keys.
+                        xfrm_algo algorithm{};
+                        std::memcpy(&algorithm, p + offset + sizeof(attr), sizeof(algorithm));
+                        const size_t key_bytes = algorithm.alg_key_len / 8 +
+                            (algorithm.alg_key_len % 8 != 0);
+                        if (key_bytes > attr.nla_len - sizeof(attr) - header_bytes) {
+                            return Status::Error(StatusCode::kCorruption, "short SA key");
+                        }
+                        info.encrypts = algorithm.alg_key_len != 0 &&
+                            std::strncmp(algorithm.alg_name, "ecb(cipher_null)",
+                                         sizeof(algorithm.alg_name)) != 0;
+                    }
+                    if (attr.nla_type == XFRMA_MARK) {
+                        if (attr.nla_len != sizeof(attr) + sizeof(xfrm_mark)) {
+                            return Status::Error(StatusCode::kCorruption, "invalid SA mark");
+                        }
+                        xfrm_mark mark{};
+                        std::memcpy(&mark, p + offset + sizeof(attr), sizeof(mark));
+                        scoped |= mark.m != 0;
+                    }
+                    if (attr.nla_type == XFRMA_IF_ID || attr.nla_type == XFRMA_SEC_CTX)
+                        scoped = true;
+                    offset += NLA_ALIGN(attr.nla_len);
+                }
+                if (scoped) info.encrypts = false;
                 out.push_back(info);
             }
             p += NLMSG_ALIGN(nlh->nlmsg_len);
@@ -190,31 +267,50 @@ Result<std::vector<IpsecSaInfo>> DumpSecurityAssociations(int fd) {
     return out;
 }
 
-Result<std::vector<xfrm_userpolicy_info>> DumpPolicies(int fd) {
+Result<std::vector<internal::XfrmPolicy>> DumpPolicies(int fd) {
     MINO_RETURN_IF_ERROR(SendNetlinkDump(fd, XFRM_MSG_GETPOLICY));
-    std::vector<xfrm_userpolicy_info> out;
-    std::array<std::byte, 8192> buffer{};
+    std::vector<internal::XfrmPolicy> out;
+    alignas(xfrm_usersa_info) std::array<std::byte, 65536> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     for (;;) {
-        const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), 0);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::Error(StatusCode::kUnavailable, "XFRM dump deadline exceeded");
+        }
+        const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
         if (n < 0) {
             return NetlinkErrno("netlink policy dump recv");
         }
-        if (n == 0) break;
+        if (n == 0 || static_cast<size_t>(n) > buffer.size()) {
+            return Status::Error(StatusCode::kCorruption, "incomplete XFRM dump");
+        }
         const std::byte* p = buffer.data();
         const std::byte* end = buffer.data() + n;
         bool done = false;
-        while (p + sizeof(nlmsghdr) <= end) {
+        while (static_cast<size_t>(end - p) >= sizeof(nlmsghdr)) {
             const auto* nlh = reinterpret_cast<const nlmsghdr*>(p);
             if (nlh->nlmsg_len < sizeof(nlmsghdr) ||
-                p + nlh->nlmsg_len > end) {
+                nlh->nlmsg_len > static_cast<size_t>(end - p)) {
                 return Status::Error(StatusCode::kCorruption,
                                      "truncated XFRM policy netlink message");
             }
+            if (nlh->nlmsg_flags & NLM_F_DUMP_INTR) {
+                return Status::Error(StatusCode::kUnavailable, "interrupted XFRM dump");
+            }
             if (nlh->nlmsg_type == NLMSG_DONE) {
+                if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(int))) {
+                    int dump_error = 0;
+                    std::memcpy(&dump_error, NLMSG_DATA(nlh), sizeof(dump_error));
+                    if (dump_error != 0) {
+                        return Status::Error(StatusCode::kUnavailable, "failed XFRM dump");
+                    }
+                }
                 done = true;
                 break;
             }
             if (nlh->nlmsg_type == NLMSG_ERROR) {
+                if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(nlmsgerr))) {
+                    return Status::Error(StatusCode::kCorruption, "short XFRM error");
+                }
                 const auto* err =
                     reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(nlh));
                 if (err != nullptr && err->error != 0) {
@@ -229,31 +325,16 @@ Result<std::vector<xfrm_userpolicy_info>> DumpPolicies(int fd) {
                     return Status::Error(StatusCode::kCorruption,
                                          "short XFRM_MSG_NEWPOLICY");
                 }
-                const auto* pol =
-                    reinterpret_cast<const xfrm_userpolicy_info*>(
-                        NLMSG_DATA(nlh));
-                out.push_back(*pol);
+                MINO_ASSIGN_OR_RETURN(auto policy, internal::ParseXfrmPolicy(
+                    std::span<const std::byte>(p + NLMSG_HDRLEN,
+                                               nlh->nlmsg_len - NLMSG_HDRLEN)));
+                out.push_back(std::move(policy));
             }
             p += NLMSG_ALIGN(nlh->nlmsg_len);
         }
         if (done) break;
     }
     return out;
-}
-
-bool PolicyCoversIpv4(const xfrm_userpolicy_info& pol,
-                      const IpsecSaSelector& selector) {
-    if (pol.sel.family != AF_INET) return false;
-    if (pol.dir != XFRM_POLICY_OUT) return false;
-    const auto* daddr =
-        reinterpret_cast<const std::byte*>(&pol.sel.daddr.a4);
-    if (!SameAddress(selector.peer, daddr, 4)) return false;
-    if (selector.peer.protocol != IpsecProtocol::kAny &&
-        pol.sel.proto != 0 &&
-        pol.sel.proto != static_cast<uint8_t>(selector.peer.protocol)) {
-        return false;
-    }
-    return true;
 }
 
 void FillRandomKey(std::span<std::byte> key) {
@@ -321,7 +402,7 @@ Status NetlinkAddSa(int fd, uint32_t spi, bool outbound, uint8_t proto,
     }
 
     std::array<std::byte, 1024> buffer{};
-    const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), 0);
+    const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
     if (n < 0) return NetlinkErrno("XFRM_MSG_NEWSA ack");
     const auto* nlh = reinterpret_cast<const nlmsghdr*>(buffer.data());
     if (n >= static_cast<ssize_t>(sizeof(nlmsghdr)) &&
@@ -356,7 +437,7 @@ Status NetlinkDelSa(int fd, uint32_t spi) {
         return NetlinkErrno("XFRM_MSG_DELSA");
     }
     std::array<std::byte, 512> buffer{};
-    (void)::recv(fd, buffer.data(), buffer.size(), 0);
+    (void)::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
     return Status::Ok();
 }
 
@@ -408,7 +489,7 @@ Status NetlinkAddPolicy(int fd, uint8_t dir, uint8_t proto, uint32_t spi) {
         return NetlinkErrno("XFRM_MSG_NEWPOLICY");
     }
     std::array<std::byte, 1024> buffer{};
-    const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), 0);
+    const ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
     if (n < 0) return NetlinkErrno("XFRM_MSG_NEWPOLICY ack");
     const auto* nlh = reinterpret_cast<const nlmsghdr*>(buffer.data());
     if (n >= static_cast<ssize_t>(sizeof(nlmsghdr)) &&
@@ -446,7 +527,7 @@ Status NetlinkDelPolicy(int fd, uint8_t dir, uint8_t proto) {
         return NetlinkErrno("XFRM_MSG_DELPOLICY");
     }
     std::array<std::byte, 512> buffer{};
-    (void)::recv(fd, buffer.data(), buffer.size(), 0);
+    (void)::recv(fd, buffer.data(), buffer.size(), MSG_TRUNC);
     return Status::Ok();
 }
 
@@ -466,6 +547,7 @@ Result<IpsecEndpoint> MakeIpv4Endpoint(std::span<const std::byte, 4> address,
 }
 
 Status ScriptedIpsecSaProbe::RequireProtection(const IpsecSaSelector& selector) {
+    std::lock_guard lock(mutex_);
     if (selector.peer.address_bytes != 4 && selector.peer.address_bytes != 16) {
         return Status::Error(StatusCode::kInvalidArgument,
                              "IPsec selector peer address length invalid");
@@ -554,19 +636,7 @@ Status NetlinkXfrmSaProbe::RequireProtection(const IpsecSaSelector& selector) {
     }
     if (selector.require_out_policy) {
         MINO_ASSIGN_OR_RETURN(auto policies, DumpPolicies(fd.get()));
-        bool found_policy = false;
-        for (const auto& pol : policies) {
-            if (selector.peer.family == IpsecAddressFamily::kIpv4 &&
-                PolicyCoversIpv4(pol, selector)) {
-                found_policy = true;
-                break;
-            }
-        }
-        if (!found_policy) {
-            return Status::Error(
-                StatusCode::kUnavailable,
-                "no covering outbound IPsec policy for peer (fail-closed)");
-        }
+        MINO_RETURN_IF_ERROR(internal::RequireXfrmPolicies(selector, policies, *sas));
     }
     return Status::Ok();
 #else
@@ -600,6 +670,18 @@ TestLoopbackXfrmSession& TestLoopbackXfrmSession::operator=(
 }
 
 TestLoopbackXfrmSession::~TestLoopbackXfrmSession() { TearDown(); }
+
+Status TestLoopbackXfrmSession::RemovePoliciesForTesting() {
+#if defined(__linux__)
+    if (!active_) return Status::Error(StatusCode::kUnavailable);
+    MINO_ASSIGN_OR_RETURN(ScopedFd fd, OpenXfrmSocket());
+    const auto proto = static_cast<uint8_t>(protocol_);
+    MINO_RETURN_IF_ERROR(NetlinkDelPolicy(fd.get(), XFRM_POLICY_OUT, proto));
+    return NetlinkDelPolicy(fd.get(), XFRM_POLICY_IN, proto);
+#else
+    return Status::Error(StatusCode::kUnsupported);
+#endif
+}
 
 void TestLoopbackXfrmSession::TearDown() noexcept {
 #if defined(__linux__)

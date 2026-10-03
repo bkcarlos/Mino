@@ -54,6 +54,14 @@ so the production loader accepts them. Software-loopback provenance contains
 a real ACTIVE/LINKUP NIC, an approved plugin SHA-256, and the protected workflow —
 these reference plugins do not close that gate.**
 
+The verbs reference is **MR-only**: QP/CM connection management, posting sends,
+CQ polling and receive delivery are not implemented. Its provenance includes
+`MR-ONLY;QP-CM-CQ-NOT-IMPLEMENTED;NOT-QUALIFICATION-ELIGIBLE`. `Start` with nonzero
+transport limits returns `kUnsupported` before `RdmaDriver` becomes active;
+registration-only users can call `Start({})`. A complete external device plugin
+is required for network transport. This is a software delivery boundary in
+addition to the hardware qualification gate, not merely a missing NIC test.
+
 Mino rejects a missing plugin, ABI mismatch, empty provenance, unavailable device,
 `kUnavailable`, or `kMock` provider. In-test loopbacks in `rdma_driver_test.cc`
 remain `kMock` and are not selectable by production assembly. Because the version-1

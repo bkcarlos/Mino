@@ -73,10 +73,13 @@ public:
     void BeginSession(uint64_t peer_session_epoch, uint64_t now_ns,
                       bool preserve_state = false) noexcept;
 
+    // A trusted durable prefix restores a source after age/capacity eviction;
+    // zero leaves the default memory-only behavior unchanged.
     Result<DedupCheckResult> Check(uint64_t peer_session_epoch,
                                   const SourceIdentity& source,
                                   uint64_t sequence,
-                                  uint64_t now_ns) noexcept;
+                                  uint64_t now_ns,
+                                  uint64_t durable_highest = 0) noexcept;
 
     // Preallocates a zero-HWM source state before the local publication
     // linearization point, so CommitAccepted cannot first allocate afterward.

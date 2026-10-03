@@ -340,6 +340,10 @@ public:
                              IPPROTO_UDP));
         if (fd.get() < 0) return Unavailable("failed to create UDP socket");
         MINO_RETURN_IF_ERROR(ConfigureSocket(fd.get()));
+        if (options_.ipsec_policy) {
+            MINO_RETURN_IF_ERROR(security::InstallSocketIpsecPolicy(
+                fd.get(), SocketFamily(request.remote_endpoint), *options_.ipsec_policy));
+        }
         if (request.local_bind.has_value()) {
             MINO_ASSIGN_OR_RETURN(const SocketAddress local,
                                   ToSocketAddress(*request.local_bind));
@@ -386,6 +390,10 @@ public:
                              IPPROTO_UDP));
         if (fd.get() < 0) return Unavailable("failed to create UDP listener");
         MINO_RETURN_IF_ERROR(ConfigureSocket(fd.get()));
+        if (options_.ipsec_policy) {
+            MINO_RETURN_IF_ERROR(security::InstallSocketIpsecPolicy(
+                fd.get(), SocketFamily(request.local_endpoint), *options_.ipsec_policy));
+        }
         const int enabled = 1;
         if (::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
                          sizeof(enabled)) != 0 ||

@@ -141,3 +141,18 @@ The payload is generated from the fixed seed recorded in JSON. Record metadata, 
 4. the ownership marker has the exact expected contents.
 
 If verification fails, cleanup is refused and a warning is printed.
+
+## 持久去重批量提交
+
+在目标磁盘目录运行相同更新量、source 数量的对照；工具只创建和清理自己的
+临时子目录，完成后重新打开快照检查全部 HWM。
+
+```sh
+bazel run --config=release //benchmarks/bridge:dedup_store_benchmark -- /path/to/disk 1 1024 64
+bazel run --config=release //benchmarks/bridge:dedup_store_benchmark -- /path/to/disk 32 1024 64
+```
+
+参数依次为目录、batch size、更新数、source 数。JSON 包含 `durable_commits`、
+`updates_per_second`、`commit_p99_us`、`reopen_verified`。提交 P99 不等于应用端
+消息 P99；后者还包括组批等待和网络处理。tmpfs、Docker 虚拟磁盘的结果只能
+作软件回归，不作为物理磁盘 SLA 或跨机资格证据。

@@ -531,6 +531,10 @@ public:
             return Unavailable("failed to create TCP socket");
         }
         MINO_RETURN_IF_ERROR(ConfigureTcpSocket(socket_fd.get()));
+        if (options_.ipsec_policy) {
+            MINO_RETURN_IF_ERROR(security::InstallSocketIpsecPolicy(
+                socket_fd.get(), family, *options_.ipsec_policy));
+        }
 
         if (request.local_bind.has_value()) {
             MINO_ASSIGN_OR_RETURN(const SocketAddress local,
@@ -718,6 +722,10 @@ public:
             return Unavailable("failed to create TCP listener");
         }
         MINO_RETURN_IF_ERROR(SetNonBlockingAndCloseOnExec(socket_fd.get()));
+        if (options_.ipsec_policy) {
+            MINO_RETURN_IF_ERROR(security::InstallSocketIpsecPolicy(
+                socket_fd.get(), family, *options_.ipsec_policy));
+        }
         const int enabled = 1;
         if (::setsockopt(socket_fd.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
                          sizeof(enabled)) != 0) {

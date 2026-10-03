@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -16,6 +17,7 @@
 
 #include "mino/common/result.h"
 #include "mino/common/status.h"
+#include "mino/security/socket_ipsec.h"
 
 namespace mino::security {
 
@@ -52,10 +54,13 @@ struct IpsecSaSelector {
     std::optional<IpsecEndpoint> local;
     // When true, require at least one inbound SA covering `local`←`peer`.
     bool require_inbound = false;
-    // When true, also require an OUT XFRM policy covering the selector
-    // (in addition to a matching SA). Default false keeps the probe usable
-    // with SA-only test installs.
-    bool require_out_policy = false;
+    // Require an effective mandatory ESP policy bound to an encrypting SA.
+    // Inbound policy is also required when require_inbound is set. False is
+    // reserved for SA diagnostics; the transport wrapper always requests true.
+    bool require_out_policy = true;
+    // When socket policies override the global SPD, verify their reqid/SPI
+    // bindings too. Never grant based on an unrelated global encrypting SA.
+    std::optional<SocketIpsecPolicy> socket_policy = std::nullopt;
 };
 
 // Observed kernel SA used for diagnostics (no key material).
@@ -67,6 +72,8 @@ struct IpsecSaInfo {
     uint32_t spi = 0;
     uint8_t mode = 0;  // XFRM_MODE_*
     uint8_t proto = 0; // IPPROTO_ESP / AH
+    uint32_t reqid = 0;
+    bool encrypts = false;
 };
 
 class IpsecSaProbe {
@@ -75,6 +82,9 @@ public:
     // Fail-closed: missing covering SA (or policy when required) returns
     // kFailedPrecondition-equivalent StatusCode::kUnavailable with a clear
     // message. Malformed selectors return kInvalidArgument.
+    // Calls may run concurrently on admission and background verifier threads.
+    // Implementations must be thread safe and finish within a bounded time;
+    // transport shutdown joins any in-flight background check.
     virtual Status RequireProtection(const IpsecSaSelector& selector) = 0;
 };
 
@@ -96,12 +106,19 @@ private:
 // In-memory probe for unit tests. Default deny (fail-closed).
 class ScriptedIpsecSaProbe final : public IpsecSaProbe {
 public:
-    void AllowAll() { allow_all_ = true; deny_message_.clear(); }
+    void AllowAll() {
+        std::lock_guard lock(mutex_);
+        allow_all_ = true;
+        deny_message_.clear();
+    }
     void DenyWith(std::string message) {
+        std::lock_guard lock(mutex_);
         allow_all_ = false;
+        allowed_peers_.clear();
         deny_message_ = std::move(message);
     }
     void AllowPeer(IpsecEndpoint peer) {
+        std::lock_guard lock(mutex_);
         allow_all_ = false;
         allowed_peers_.push_back(std::move(peer));
     }
@@ -109,6 +126,7 @@ public:
     Status RequireProtection(const IpsecSaSelector& selector) override;
 
 private:
+    std::mutex mutex_;
     bool allow_all_ = false;
     std::string deny_message_ = "IPsec SA missing (scripted deny)";
     std::vector<IpsecEndpoint> allowed_peers_;
@@ -132,6 +150,8 @@ public:
         IpsecProtocol protocol);
 
     bool active() const noexcept { return active_; }
+    // Fault injection: retain SAs while removing their selecting policies.
+    Status RemovePoliciesForTesting();
 
 private:
     TestLoopbackXfrmSession() = default;

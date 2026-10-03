@@ -168,7 +168,8 @@ ConnectedPipelines MakePipelines(
     size_t max_control_frames = BridgePipelineOptions{}.max_control_frames,
     const BridgeTopicAuthorizer* b_authorizer = nullptr,
     NodeId b_authenticated_peer = {},
-    DedupStore* b_dedup_store = nullptr) {
+    DedupStore* b_dedup_store = nullptr,
+    DedupWindowOptions b_dedup_options = {}) {
     ConnectedPipelines result;
     transport::TcpDriverOptions tcp_options;
     tcp_options.max_frame_body_bytes = 4096;
@@ -232,6 +233,7 @@ ConnectedPipelines MakePipelines(
     b_options.remote_session_epoch = 101;
     b_options.topic_authorizer = b_authorizer;
     b_options.dedup_store = b_dedup_store;
+    b_options.dedup = b_dedup_options;
     if (b_authenticated_peer.value != 0) {
         b_options.authenticated_peer = security::AuthenticatedPeer{
             .node_id = b_authenticated_peer,
@@ -1111,6 +1113,268 @@ TEST(BridgePipelineTest, ReceiverRestartAcceptsHighSequenceAsDegradedBaseline) {
     ASSERT_TRUE(recovered.ok()) << recovered.ToString();
     EXPECT_EQ(pair.b_ingress.frames[0].header.sequence_num, 5000u);
     EXPECT_EQ(pair.a->reliability_status().code(), StatusCode::kDegraded);
+}
+
+TEST(BridgePipelineTest, OfflineRetirementRejectsOldEpochsAfterRestartAcrossLanes) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_retirement_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    ASSERT_TRUE((*store)->RecordAcceptedBatch(std::vector<DedupResumeEntry>{
+        {{11, 22, 32}, 7}, {{11, 22, 33}, 8}}).ok());
+    {
+        auto pair = MakePipelines(
+            RetransmitWindowOptions{}.max_age_ns,
+            RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+            BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{}, store->get());
+        ASSERT_NE(pair.b, nullptr);
+        EXPECT_EQ((*store)->RetireEpochsThrough({11, 22, 33}).code(), StatusCode::kUnavailable);
+        EXPECT_EQ((*store)->ReplaceAll({}).code(), StatusCode::kUnavailable);
+        auto second_pair = MakePipelines(
+            RetransmitWindowOptions{}.max_age_ns,
+            RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+            BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{}, store->get());
+        ASSERT_NE(second_pair.b, nullptr);
+        pair.b.reset();
+        EXPECT_EQ((*store)->RetireEpochsThrough({11, 22, 33}).code(), StatusCode::kUnavailable);
+        second_pair.b.reset();
+        ASSERT_TRUE((*store)->RetireEpochsThrough({11, 22, 33}).ok());
+    }
+    store->reset();
+    store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    for (uint64_t epoch : {32, 33, 34}) {
+        auto pair = MakePipelines(
+            RetransmitWindowOptions{}.max_age_ns,
+            RetransmitWindowOptions{}.max_entries, nullptr, nullptr,
+            BridgeLaneFor({11, 22, epoch}, 2), 2,
+            BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{}, store->get());
+        ASSERT_NE(pair.a, nullptr);
+        ASSERT_NE(pair.b, nullptr);
+        ASSERT_TRUE(PumpUntil(&pair, [&] {
+            return pair.a->session_ready() && pair.b->session_ready();
+        }).ok());
+        auto frame = DataFrame(1);
+        frame.header.source_publisher_epoch = epoch;
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = frame,
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false, .schema_identity = std::nullopt, .descriptor_artifact = {}});
+        const Status pumped = PumpUntil(&pair, [&] {
+            return pair.b_ingress.frames.size() == 1 && pair.a->retransmit_entries() == 0;
+        });
+        if (epoch <= 33) {
+            EXPECT_EQ(pumped.code(), StatusCode::kPermissionDenied);
+            EXPECT_TRUE(pair.b_ingress.frames.empty());
+            EXPECT_EQ(pair.a->retransmit_entries(), 1u); // No fabricated Accepted ACK.
+            EXPECT_TRUE((*store)->Load()->empty());
+        } else {
+            ASSERT_TRUE(pumped.ok()) << pumped.ToString();
+            EXPECT_EQ(pair.b_ingress.frames.size(), 1u);
+            EXPECT_EQ((*store)->HighestAccepted({11, 22, 34}), 1u);
+        }
+    }
+}
+
+TEST(BridgePipelineTest, RetiredEpochIsRejectedBeforeUnknownSchemaBuffering) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_retired_schema_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    ASSERT_TRUE((*store)->RetireEpochsThrough({11, 22, 33}).ok());
+    schema::SchemaRegistry registry;
+    SchemaNegotiator negotiator(&registry, nullptr, nullptr);
+    auto pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, &negotiator, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{}, store->get());
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+        return pair.a->session_ready() && pair.b->session_ready();
+    }).ok());
+    ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id, DataFrame(1)).ok());
+    EXPECT_EQ(PumpUntil(&pair, [] { return false; }).code(), StatusCode::kPermissionDenied);
+    EXPECT_EQ(negotiator.buffered_frames(), 0u);
+    EXPECT_TRUE(pair.b_ingress.frames.empty());
+}
+
+TEST(BridgePipelineTest, FailedPipelineCreationReleasesMaintenanceGuard) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_attach_failure_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    ASSERT_TRUE((*store)->RecordAccepted({11, 22, 33}, 1).ok());
+    auto pair = MakePipelines();
+    ASSERT_NE(pair.b, nullptr);
+    pair.b.reset();
+    BridgePipelineOptions options;
+    options.local_session_epoch = 202;
+    options.remote_session_epoch = 101;
+    options.dedup_store = store->get();
+    // Pass initial validation but fail when Hello includes the seeded source.
+    options.max_control_bytes = kSessionHelloHeaderWireSize;
+    auto failed = BridgePipeline::Create(options, pair.b_driver, pair.b_connection.id,
+        nullptr, &pair.b_ingress);
+    EXPECT_FALSE(failed.ok());
+    EXPECT_TRUE((*store)->RetireEpochsThrough({11, 22, 33}).ok());
+}
+
+TEST(BridgePipelineTest, PersistenceFailureRetriesBeforeAckWithoutRepublishing) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_failure_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    auto pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{},
+        store->get());
+    ASSERT_NE(pair.a, nullptr);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+        return pair.a->session_ready() && pair.b->session_ready();
+    }).ok());
+
+    // An unrenameable destination deterministically fails persistence even
+    // when tests run as root. No privilege-dependent chmod fault injection.
+    ASSERT_TRUE(std::filesystem::create_directory(path));
+    pair.a_egress.frames.push_back(EncodedOutboundFrame{
+        .frame = DataFrame(1),
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+        .schema_identity = std::nullopt,
+        .descriptor_artifact = {},
+    });
+    EXPECT_FALSE(PumpUntil(&pair, [&] {
+        return !pair.b_ingress.frames.empty();
+    }).ok());
+    ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
+    for (size_t i = 0; i < 10; ++i) {
+        EXPECT_FALSE(pair.b->Pump({}).ok());
+        ASSERT_TRUE(pair.a->Pump({}).ok());
+        EXPECT_EQ(pair.a->retransmit_entries(), 1u);
+    }
+    EXPECT_EQ((*store)->size(), 0u);
+    // A normal reconnect must not advertise the unpersisted in-memory HWM
+    // through SessionHello either (Hello also retires the sender's window).
+    EXPECT_FALSE(Reconnect(&pair, 505, 606, false, 0).ok());
+    ASSERT_TRUE(std::filesystem::remove(path));
+    ASSERT_TRUE(Reconnect(&pair, 707, 808, false, 0).ok());
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+        return pair.a->retransmit_entries() == 0;
+    }).ok());
+    EXPECT_EQ(pair.b_ingress.frames.size(), 1u);
+    pair.b.reset();
+    store->reset();
+    auto reopened = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(reopened.ok());
+    auto snapshot = (*reopened)->Load();
+    ASSERT_TRUE(snapshot.ok());
+    ASSERT_EQ(snapshot->size(), 1u);
+    EXPECT_EQ(snapshot->front().highest_contiguous_sequence, 1u);
+}
+
+TEST(BridgePipelineTest, DurablePrefixSurvivesWindowAgeAndCapacityEviction) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_eviction_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    const SourceIdentity first{11, 22, 33};
+    const SourceIdentity second{11, 23, 33};
+    ASSERT_TRUE((*store)->RecordAccepted(first, 5000).ok());
+    ASSERT_TRUE((*store)->RecordAccepted(second, 5000).ok());
+    DedupWindowOptions options;
+    options.max_sources = 1;
+    options.max_source_age_ns = 1'000'000; // force age eviction after handshake
+    auto pair = MakePipelines(
+        RetransmitWindowOptions{}.max_age_ns,
+        RetransmitWindowOptions{}.max_entries, nullptr, nullptr, 0, 1,
+        BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{},
+        store->get(), options);
+    ASSERT_NE(pair.b, nullptr);
+    ASSERT_TRUE(PumpUntil(&pair, [&] {
+        return pair.a->session_ready() && pair.b->session_ready();
+    }).ok());
+    uint64_t now = 1'000'000'000;
+    size_t delivered = 0;
+    for (const auto source : {first, second, first, first}) {
+        auto duplicate = DataFrame(5000);
+        SetSource(&duplicate, source);
+        ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id, duplicate).ok());
+        const auto duplicates = pair.b->dedup_stats().duplicate_checks;
+        for (size_t i = 0; i < 1000 && pair.b->dedup_stats().duplicate_checks == duplicates; ++i) {
+            ASSERT_TRUE(pair.b->Pump({.now_ns = now}).ok());
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_GT(pair.b->dedup_stats().duplicate_checks, duplicates);
+        EXPECT_TRUE(pair.b_ingress.frames.empty());
+        if (++delivered == 3) now += 2'000'000;
+    }
+    // Restoring the prefix must also allow forward progress beyond the default
+    // sequence-distance bound, instead of repeatedly NACKing with HWM zero.
+    ASSERT_TRUE(SendFrame(pair.a_driver, pair.a_connection.id, DataFrame(5001)).ok());
+    for (size_t i = 0; i < 1000 && pair.b_ingress.frames.empty(); ++i) {
+        ASSERT_TRUE(pair.b->Pump({.now_ns = now}).ok());
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_EQ(pair.b_ingress.frames.size(), 1u);
+    EXPECT_EQ((*store)->HighestAccepted(first), 5001u);
+}
+
+TEST(BridgePipelineTest, SharedPersistentStoreRestoresOnlyMatchingLane) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_lanes_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    for (uint16_t lane = 0; lane < 2; ++lane) {
+        ASSERT_TRUE((*store)->RecordAccepted(SourceForLane(lane, 2), 1).ok());
+    }
+    store->reset();
+    store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    for (uint16_t lane = 0; lane < 2; ++lane) {
+        auto pair = MakePipelines(
+            RetransmitWindowOptions{}.max_age_ns,
+            RetransmitWindowOptions{}.max_entries, nullptr, nullptr, lane, 2,
+            BridgePipelineOptions{}.max_control_frames, nullptr, NodeId{},
+            store->get());
+        ASSERT_NE(pair.a, nullptr);
+        ASSERT_NE(pair.b, nullptr);
+        ASSERT_TRUE(PumpUntil(&pair, [&] {
+            return pair.a->session_ready() && pair.b->session_ready();
+        }).ok());
+        ASSERT_TRUE(Reconnect(&pair, 505, 606, true, 0).ok());
+        ASSERT_TRUE(PumpUntil(&pair, [&] {
+            return pair.a->session_ready() && pair.b->session_ready();
+        }).ok());
+        auto frame = DataFrame(1);
+        SetSource(&frame, SourceForLane(lane, 2));
+        pair.a_egress.frames.push_back(EncodedOutboundFrame{
+            .frame = std::move(frame),
+            .reliability = registry::Reliability::kReliableOrdered,
+            .allow_drop = false,
+            .schema_identity = std::nullopt,
+            .descriptor_artifact = {},
+        });
+        ASSERT_TRUE(PumpUntil(&pair, [&] {
+            return pair.a_egress.frames.empty() &&
+                   pair.a->retransmit_entries() == 0;
+        }).ok());
+        EXPECT_TRUE(pair.b_ingress.frames.empty());
+    }
 }
 
 TEST(BridgePipelineTest, PersistentDedupStoreAvoidsDegradedOnReceiverRestart) {

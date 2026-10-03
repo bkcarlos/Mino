@@ -176,15 +176,18 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
         dedup->BeginSession(options.remote_session_epoch, 0);
         retransmit->BeginSession(options.local_session_epoch,
                                  options.remote_session_epoch, 0);
-        if (options.dedup_store != nullptr) {
-            MINO_RETURN_IF_ERROR(SeedDedupWindowFromStore(
-                dedup.get(), options.dedup_store,
-                options.remote_session_epoch, 0));
-            options.local_dedup_state_lost = false;
-        }
         auto pipeline = std::unique_ptr<BridgePipeline>(new BridgePipeline(
             options, std::move(driver), connection_id, egress, ingress,
             schema_negotiator, std::move(dedup), std::move(retransmit)));
+        if (options.dedup_store != nullptr) {
+            MINO_RETURN_IF_ERROR(options.dedup_store->AttachPipeline());
+            pipeline->store_attached_ = true;
+            MINO_RETURN_IF_ERROR(SeedDedupWindowFromStore(
+                pipeline->dedup_.get(), options.dedup_store,
+                options.remote_session_epoch, 0,
+                options.lane_index, options.lane_count));
+            pipeline->options_.local_dedup_state_lost = false;
+        }
         pipeline->attempt_operations_.reserve(
             options.retransmit.max_entries);
         pipeline->pending_reliable_.reserve(options.retransmit.max_entries);
@@ -236,6 +239,7 @@ Status BridgePipeline::reliability_status() const {
 
 
 BridgePipeline::~BridgePipeline() {
+    if (store_attached_) options_.dedup_store->DetachPipeline();
     volatile std::byte* psk = options_.aead_psk.data();
     for (size_t i = 0; i < options_.aead_psk.size(); ++i) {
         psk[i] = std::byte{0};
@@ -247,16 +251,8 @@ BridgePipeline::~BridgePipeline() {
 Status BridgePipeline::RestoreDedupFromStore(uint64_t now_ns) noexcept {
     if (options_.dedup_store == nullptr) return Status::Ok();
     return SeedDedupWindowFromStore(dedup_.get(), options_.dedup_store,
-                                    options_.remote_session_epoch, now_ns);
-}
-
-Status BridgePipeline::PersistDedupAccepted(
-    const SourceIdentity& source,
-    uint64_t highest_contiguous_sequence) noexcept {
-    if (options_.dedup_store == nullptr) return Status::Ok();
-    if (highest_contiguous_sequence == 0) return Status::Ok();
-    return options_.dedup_store->RecordAccepted(source,
-                                                highest_contiguous_sequence);
+                                    options_.remote_session_epoch, now_ns,
+                                    options_.lane_index, options_.lane_count);
 }
 
 Status BridgePipeline::QueueControl(const WireFrame& frame) noexcept {
@@ -332,6 +328,15 @@ Status BridgePipeline::AdmitNegotiatedControls() noexcept {
 Status BridgePipeline::QueueSessionHello() noexcept {
     try {
         MINO_ASSIGN_OR_RETURN(auto snapshot, dedup_->SnapshotAccepted());
+        // A reconnect Hello retires the peer's reliable frames just like ACKs.
+        // Flush accepted memory state before advertising it as resumable.
+        if (options_.dedup_store != nullptr) {
+            auto durable = snapshot;
+            std::erase_if(durable, [](const DedupResumeEntry& entry) {
+                return entry.highest_contiguous_sequence == 0;
+            });
+            MINO_RETURN_IF_ERROR(options_.dedup_store->RecordAcceptedBatch(durable));
+        }
         std::vector<SessionHelloSource> sources;
         sources.reserve(snapshot.size());
         for (const DedupResumeEntry& entry : snapshot) {
@@ -691,6 +696,21 @@ void BridgePipeline::RemovePendingAck(
 
 Status BridgePipeline::FlushAcks(BridgePumpBudget budget,
                                  BridgePumpResult* result) noexcept {
+    // Group commit the coalesced HWMs from this receive batch before any ACK
+    // leaves the process. Failed commits retain the queue for the next Pump.
+    if (options_.dedup_store != nullptr && !pending_acks_.empty()) {
+        try {
+            std::vector<DedupResumeEntry> updates;
+            updates.reserve(pending_acks_.size());
+            for (const auto& ack : pending_acks_) {
+                const uint64_t highest = ack.highest_contiguous_sequence.value_or(0);
+                if (highest != 0) updates.push_back({ack.source, highest});
+            }
+            MINO_RETURN_IF_ERROR(options_.dedup_store->RecordAcceptedBatch(updates));
+        } catch (const std::bad_alloc&) {
+            return AllocationFailure();
+        }
+    }
     while (!pending_acks_.empty() &&
            result->outbound_frames < budget.max_outbound_frames) {
         MINO_ASSIGN_OR_RETURN(
@@ -1041,6 +1061,9 @@ Status BridgePipeline::HandleFrame(const WireFrameHeader& header,
                                  options_.lane_count)) {
             return Corruption("bridge data source belongs to another lane");
         }
+        if (options_.dedup_store != nullptr && options_.dedup_store->IsRetired(source)) {
+            return Status::Error(StatusCode::kPermissionDenied, "publisher epoch is retired");
+        }
         if (schema_negotiator_ == nullptr) {
             return HandleData(header, payload, now_ns);
         }
@@ -1115,13 +1138,21 @@ Status BridgePipeline::HandleData(const WireFrameHeader& header,
                              options_.lane_count)) {
         return Corruption("bridge data source belongs to another lane");
     }
+    if (options_.dedup_store != nullptr && options_.dedup_store->IsRetired(source)) {
+        return Status::Error(StatusCode::kPermissionDenied, "publisher epoch is retired");
+    }
+    // Supply the durable prefix so Check can restore after its age/capacity
+    // eviction without a second scan of the window or a filesystem read.
+    const uint64_t durable_highest = options_.dedup_store == nullptr ? 0 :
+        options_.dedup_store->HighestAccepted(source);
     auto checked = dedup_->Check(options_.remote_session_epoch, source,
-                                 header.sequence_num, now_ns);
+                                 header.sequence_num, now_ns, durable_highest);
     if (!checked.ok()) return checked.status();
     if (checked->decision == DedupDecision::kStaleSession) {
         return Corruption("bridge data belongs to a stale session");
     }
     if (checked->decision == DedupDecision::kDuplicateAccepted) {
+        // FlushAcks gates duplicate ACKs on durable state too.
         return EmitAck(header, *checked, AckDisposition::kAccepted);
     }
     const bool degraded_baseline =
@@ -1168,10 +1199,6 @@ Status BridgePipeline::HandleData(const WireFrameHeader& header,
     auto committed = dedup_->Check(options_.remote_session_epoch, source,
                                    header.sequence_num, now_ns);
     if (!committed.ok()) return committed.status();
-    if (committed->highest_contiguous_sequence.has_value()) {
-        MINO_RETURN_IF_ERROR(PersistDedupAccepted(
-            source, *committed->highest_contiguous_sequence));
-    }
     return EmitAck(header, *committed, AckDisposition::kAccepted);
 }
 

@@ -5,6 +5,7 @@
 #include "mino/runtime/deployment/monitoring.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -52,6 +53,16 @@ Status Validate(const MonitoringConfig& config,
 }
 
 Status ValidateSources(const MonitoringSources& sources) {
+    for (size_t i = 0; i < sources.dedup_stores.size(); ++i) {
+        if (sources.dedup_stores[i] == nullptr) {
+            return Status::Error(StatusCode::kInvalidArgument, "monitoring dedup source is null");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (sources.dedup_stores[i] == sources.dedup_stores[j]) {
+                return Status::Error(StatusCode::kInvalidArgument, "monitoring dedup source is duplicated");
+            }
+        }
+    }
     for (const CentralSlabAllocator* allocator : sources.slab_allocators) {
         if (allocator == nullptr) {
             return Status::Error(StatusCode::kInvalidArgument,
@@ -210,6 +221,10 @@ private:
         uint64_t bridge_reconnects = 0;
         uint64_t bridge_reconnect_failures = 0;
         uint64_t bridge_protocol_failures = 0;
+        uint64_t dedup_persistence_total = 0;
+        uint64_t dedup_persistence_failures_total = 0;
+        uint64_t dedup_capacity_rejections_total = 0;
+        uint64_t dedup_persistence_nanoseconds_total = 0;
         uint64_t storage_writes = 0;
         uint64_t storage_syncs = 0;
         uint64_t storage_write_failures = 0;
@@ -291,6 +306,33 @@ private:
             AddDelta(metrics_.acl_denied_total, stats.acl_denials,
                      &source_totals_.acl_denials);
         }
+
+        bridge::DedupStoreStats dedup;
+        uint64_t max_utilization = 0;
+        for (const auto* store : sources_.dedup_stores) {
+            const auto stats = store->stats();
+            dedup.sources = SaturatingAdd(dedup.sources, stats.sources);
+            dedup.retired_publishers = SaturatingAdd(dedup.retired_publishers, stats.retired_publishers);
+            dedup.capacity = SaturatingAdd(dedup.capacity, stats.capacity);
+            dedup.persistence_count = SaturatingAdd(dedup.persistence_count, stats.persistence_count);
+            dedup.persistence_failures = SaturatingAdd(dedup.persistence_failures, stats.persistence_failures);
+            dedup.capacity_rejections = SaturatingAdd(dedup.capacity_rejections, stats.capacity_rejections);
+            dedup.persistence_total_ns = SaturatingAdd(dedup.persistence_total_ns, stats.persistence_total_ns);
+            max_utilization = std::max(max_utilization,
+                static_cast<uint64_t>(stats.sources) * 1000 / stats.capacity);
+        }
+        Set(metrics_.dedup_sources, dedup.sources);
+        Set(metrics_.dedup_retired_publishers, dedup.retired_publishers);
+        Set(metrics_.dedup_capacity, dedup.capacity);
+        Set(metrics_.dedup_max_utilization_permille, max_utilization);
+        AddDelta(metrics_.dedup_persistence_total, dedup.persistence_count,
+                 &source_totals_.dedup_persistence_total);
+        AddDelta(metrics_.dedup_persistence_failures_total, dedup.persistence_failures,
+                 &source_totals_.dedup_persistence_failures_total);
+        AddDelta(metrics_.dedup_capacity_rejections_total, dedup.capacity_rejections,
+                 &source_totals_.dedup_capacity_rejections_total);
+        AddDelta(metrics_.dedup_persistence_nanoseconds_total, dedup.persistence_total_ns,
+                 &source_totals_.dedup_persistence_nanoseconds_total);
 
         if (sources_.recorder != nullptr) {
             const storage::RecorderMetrics stats = sources_.recorder->metrics();

@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "mino/common/result.h"
+#include "mino/security/socket_ipsec.h"
 #include "mino/transport/transport_driver.h"
 
 namespace mino::transport {
@@ -42,6 +43,9 @@ struct UdpDriverOptions {
     uint32_t reassembly_timeout_ms = 5000;
     size_t socket_receive_buffer_bytes = 4u * 1024u * 1024u;
     uint32_t io_poll_max_ms = 50;
+    // Installed before bind/connect/listen; TCP accepted sockets inherit it.
+    // Failure closes the socket. Configure matching encrypting transport SAs.
+    std::optional<security::SocketIpsecPolicy> ipsec_policy = std::nullopt;
 };
 
 Status ValidateUdpDriverOptions(const UdpDriverOptions& options);
@@ -76,6 +80,9 @@ public:
     }
     TransportCapabilities capabilities() const noexcept override;
     UdpDriverStats stats() const noexcept;
+    std::optional<security::SocketIpsecPolicy> MandatoryIpsecSocketPolicy() const noexcept override {
+        return options_.ipsec_policy;
+    }
 
 protected:
     Status DoStart(const DriverConfig& config) override;
