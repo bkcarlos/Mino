@@ -18,9 +18,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <new>
 #include <set>
 #include <thread>
@@ -379,6 +381,64 @@ TEST(MpscChannelTest, MultiProducerConcurrentConservation) {
     }
     EXPECT_EQ(consumed, kTotal);
     EXPECT_EQ(produced.load(), kTotal);
+    EXPECT_TRUE(ch->IsEmpty());
+}
+
+TEST(MpscChannelTest, TryReserveReturnsWhileAnotherProducerOwnsClaim) {
+    ChannelFixture<64> fixture;
+    auto ch = MpscChannel::Init(fixture.storage, 64);
+    ASSERT_TRUE(ch.ok());
+    struct PausedClaim {
+        std::promise<void> entered;
+        std::atomic<bool> release{false};
+    } paused;
+    auto entered = paused.entered.get_future();
+    ch->SetPersistenceHook(
+        [](MpscChannel::PersistencePoint point, uint64_t sequence,
+           void* context) noexcept {
+            if (point != MpscChannel::PersistencePoint::kClaimTagged ||
+                sequence != 0) return;
+            auto* paused = static_cast<PausedClaim*>(context);
+            paused->entered.set_value();
+            paused->release.wait(false, std::memory_order_acquire);
+        },
+        &paused);
+
+    bool owner_ok = false;
+    std::thread owner([&] {
+        auto reserved = ch->TryReserve(MakeIdentity(1));
+        if (!reserved.ok()) return;
+        FillSlot(*reserved, 1);
+        owner_ok = std::move(*reserved).Commit().ok();
+    });
+    const bool claim_entered =
+        entered.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    std::promise<StatusCode> probe_result;
+    auto result = probe_result.get_future();
+    std::thread contender([&] {
+        auto reserved = ch->TryReserve(MakeIdentity(2));
+        probe_result.set_value(reserved.ok() ? StatusCode::kOk
+                                            : reserved.status().code());
+    });
+    const bool returned_while_paused =
+        result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    // Always release/join before assertions, including when the regression
+    // spins until the owner resumes. The test must fail without hanging CI.
+    paused.release.store(true, std::memory_order_release);
+    paused.release.notify_all();
+    owner.join();
+    contender.join();
+    ch->SetPersistenceHook(nullptr, nullptr);
+
+    ASSERT_TRUE(claim_entered);
+    EXPECT_TRUE(returned_while_paused);
+    EXPECT_EQ(result.get(), StatusCode::kWouldBlock);
+    ASSERT_TRUE(owner_ok);
+    EXPECT_EQ(ch->next_sequence(), 1u);
+    auto borrow = ch->Poll();
+    ASSERT_TRUE(borrow.ok());
+    EXPECT_EQ(borrow->slot()->sequence_num, 0u);
+    EXPECT_TRUE(std::move(*borrow).Ack().ok());
     EXPECT_TRUE(ch->IsEmpty());
 }
 
