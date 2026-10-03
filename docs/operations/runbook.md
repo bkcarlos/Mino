@@ -16,6 +16,7 @@
 | Queue/slab | `MinoQueueNearCapacity`, `MinoQueueDrops`, `MinoSlabAllocationFailures`, `MinoSlabCorruption` | `capacity-rejection`（slab corruption 只做契约测试，不自动制造生产式损坏） |
 | Lease | `MinoLeaseExpirations`, `MinoLeaseHeartbeatStale` | `subscriber-lease-expired` |
 | Bridge | `MinoBridgeDisconnected`, `MinoBridgeReconnectFailures` | `bridge-disconnect-reconnect`, `schema-mismatch` |
+| Durable dedup | `MinoDedupCapacityNearLimit`, `MinoDedupPersistenceFailure` | 去重故障测试（见下）；尚未纳入自动演练 manifest |
 | Storage | `MinoStorageWriteFailures`, `MinoStorageBacklog` | `storage-paused-enospc` |
 | Exporter | `MinoOtlpQueueNearCapacity`, `MinoOtlpDropsOrFailures` | `exporter-failure` |
 | Capacity | `MinoCapacityHeadroomLow`, `MinoCapacityRejections` | `capacity-rejection` |
@@ -141,6 +142,47 @@ openssl s_client -connect peer.example:7443 -CAfile /run/secrets/mino/ca.pem -ve
 **验证**：两端 active；epoch 已更新；reconnect counter 有界增加后稳定；pending/retransmit 清零；测试消息恰好一次到达或符合声明的 Topic reliability；无 duplicate/unexplained loss。
 
 **升级条件**：可靠消息守恒无法证明、stale epoch 被接受、跨域 peer 被接受为 SEV-1；双向断链 >5 分钟、reconnect storm 或 backlog 达容量门限为 SEV-2。
+
+## Durable dedup failure
+
+**检测指标/告警**：`MinoDedupCapacityNearLimit`、`MinoDedupPersistenceFailure`；检查
+`mino_dedup_sources`、`mino_dedup_retired_publishers`、`mino_dedup_capacity`、
+`mino_dedup_max_utilization_permille`、持久化失败/容量拒绝增量及可靠发送 backlog。
+
+**确认命令**：
+
+```sh
+curl --fail --silent http://127.0.0.1:9464/metrics
+# 按实际 DedupStore.path 填写父目录；检查磁盘、inode、权限及已有锁文件。
+dedup_dir=/var/lib/mino/bridge
+df -Pk "$dedup_dir"
+df -Pi "$dedup_dir"
+ls -ld "$dedup_dir"
+ls -l "$dedup_dir"
+```
+
+区分记录容量耗尽、ENOSPC/权限/只读文件系统、重复打开及快照损坏。记录具体错误和
+部署 revision；退休边界同样占用容量，不能只按活跃 publisher 数估计。
+
+**止损**：限制新发布，保留可靠重传和去重状态。不得删除快照或 `.lock` 文件、移除退休
+边界、将持久化失败伪装成成功 ACK，或在另一个进程中并发重建同一快照。
+
+**恢复**：修复磁盘/权限后按错误语义重试；容量不足时评估内存及快照成本，在受控重启中
+提高 max_sources。若执行离线退休，先停止所选 epoch 范围的发布并排空重传，再销毁所有
+共享 store 的 pipeline，调用 `RetireEpochsThrough`。退休落盘失败后必须关闭并重开 store，
+确认/重试退休结果再恢复服务。v2 快照不能通过删除边界退回旧版；损坏时先保全副本并升级处理。
+详细限制见 [Durable dedup](monitoring.md#durable-dedup)。
+
+**验证**：ACK 与重传恢复推进、失败计数停止增长、容量低于告警阈值；重开后原有 HWM
+及退休边界保持，旧 epoch 被拒收，新 epoch 正常交付。以下测试在隔离测试目录执行故障注入，
+不操作生产快照；测试通过不能代替现场磁盘恢复验证：
+
+```sh
+bazel test //mino/bridge:dedup_store_test //mino/bridge:bridge_pipeline_test --test_output=errors
+```
+
+**升级条件**：无法证明 HWM/退休边界完整、旧 epoch 被重新接受或数据守恒异常为 SEV-1；
+持久化持续失败、可靠 backlog 接近上限或所需容量超过节点预算为 SEV-2。
 
 ## Subscriber lease expiration
 

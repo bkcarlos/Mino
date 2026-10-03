@@ -3,6 +3,7 @@
 #include "mino/bridge/dedup_store.h"
 #include "mino/bridge/crc32c.h"
 
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -405,12 +406,19 @@ TEST_F(DedupStoreTest, ProcessDeathReleasesLockAndPreservesCommittedSnapshot) {
         (void)::close(ready[0]);
         auto store = DedupStore::Open(Options());
         const char result = store.ok() && (*store)->RecordAccepted(kSource, 9).ok() ? 'y' : 'n';
-        (void)::write(ready[1], &result, 1);
+        ssize_t written;
+        do {
+            written = ::write(ready[1], &result, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) ::_exit(98);
         for (;;) ::pause();
     }
     (void)::close(ready[1]);
     char result = 'n';
-    const auto count = ::read(ready[0], &result, 1);
+    ssize_t count;
+    do {
+        count = ::read(ready[0], &result, 1);
+    } while (count < 0 && errno == EINTR);
     (void)::close(ready[0]);
     EXPECT_EQ(::kill(child, SIGKILL), 0);
     int status = 0;

@@ -1,7 +1,7 @@
 # 优化状态（以 master 代码为准）
 
 - 代码基线：master `77f30da`；下表记录 2026-10-03 在该基线上的修订
-- 更新日期：2026-10-03（Asia/Shanghai）
+- 更新日期：2026-10-04（Asia/Shanghai）
 - 方法：只认 `.h/.cc`；不发明新测量数字。完整中文清单见仓库外
   `/workspace/mino-results/OPTIMIZATION.md`（若你本机有该目录）。
 - 仍 incomplete 总表（代码缺口 / 硬件资格 / intentional KEEP）：见
@@ -21,7 +21,7 @@
 | IPsec 内核 CI | 独立网络命名空间执行，必需模式禁止权限不足时跳过；归档 XML、日志和内核信息 | `.github/workflows/ci.yml`：ipsec-kernel；`tools/ci/run_ipsec_kernel_test.sh` |
 | 持久去重成本 | `RecordAcceptedBatch` 一次提交多个 HWM；无退休记录时保留 v1，首次退休升级 v2；基准输出提交次数、吞吐和提交 P99 | `//benchmarks/bridge:dedup_store_benchmark`；不是生产磁盘资格 |
 | IPsec 接入 | 强制策略与加密 SA 关联；可选 socket ESP 保护覆盖后台发送；双向 SPI 固定时后台复验，过期返回 WouldBlock；普通 socket 逐次复验 | `//mino/security:ipsec_test`、`//mino/transport:ipsec_transport_test`；有权限的内核测试与无权限解析测试分别计数 |
-| ZMQ TSan 超时 | 六个顺序多进程 profile 的 Bazel 总预算改为 medium（300s）；保留子进程期限 | `//mino/runtime:zmq_ipc_business_mp_stress_test`；需 Linux x86-64 TSan 复验 |
+| ZMQ TSan 超时 | 六个顺序多进程 profile 的 Bazel 总预算改为 medium（300s）；保留子进程期限 | `//mino/runtime:zmq_ipc_business_mp_stress_test`；原生 CI 结果见 PR #1 |
 | RDMA verbs 参考插件 | MR-only；非零传输 limits 在 Start 明确拒绝；QP/CM/CQ 仍需外部完整插件 | `//mino/platform:rdma_plugin_load_test`；不算 NIC 资格 |
 
 验证应绑定实际源码和环境；取消、跳过、未执行不能计为通过。
@@ -119,6 +119,20 @@
   TSan 4 目标、77 用例通过（dedup store、bridge pipeline/connection manager、monitoring），
   两者零失败、零跳过。包含退休写入 8 个进程中断点及 4 类 I/O 故障；不代表物理断电资格。
   GitHub x86-64 CI 尚未执行。
+
+## 第六批：原生 x86-64 CI 与 release 构建修复
+
+- 在独立分支创建 [PR #1](https://github.com/bkcarlos/Mino/pull/1)，执行 GitHub ubuntu-22.04
+  原生 x86-64 的 debug/release/ASan/UBSan/TSan 全量矩阵、LLVM 和强制内核 IPsec 测试。
+  各历史批次中的“x86 CI 尚未运行”记录对应当时状态；当前提交结果以 PR checks 为准。
+- 第一轮原生 release 暴露 `_FORTIFY_SOURCE` 下被忽略的 pipe `write()` 返回值，
+  `-Werror=unused-result` 导致编译失败。进程死亡恢复测试现在检查单字节通知结果，
+  读写均重试 `EINTR`，写失败时子进程明确退出。保留严格编译警告设置。
+- 全量运维契约测试发现新增去重告警未绑定统一手册；补齐六阶段处置条目、索引和契约要求。
+  告警链接改为仓库实际存在的 master 分支，修正原 main 分支链接失效。
+- 同时校正 ZMQ 压测说明：当前有六个顺序 profile，medium 预算为 300 秒。
+- 首轮原生内核 IPsec 作业的 XML 确认 26 用例通过、零失败/跳过；修正后的完整矩阵结果
+  及 ZMQ TSan 压测证据记录于 PR。此次运行不包含物理 RDMA 或原生 ARM64 硬件资格测试。
 
 ## 已关闭（opt-complete / a1b76c3 + opt-closeout + tip）
 

@@ -53,6 +53,7 @@ class OperationsContractTest(unittest.TestCase):
             "certificate-rotation",
             "region-and-acl-denial",
             "bridge-disconnection",
+            "durable-dedup-failure",
             "subscriber-lease-expiration",
             "schema-incident",
             "storage-disk-failure",
