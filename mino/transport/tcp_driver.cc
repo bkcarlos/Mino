@@ -2979,6 +2979,16 @@ private:
         size_t budget = options_.max_receive_bytes_per_turn;
         std::array<std::byte, kTcpReadChunkBytes> plaintext_chunk{};
         while (budget != 0) {
+            // A successful TLS read consumes its readiness. Starting another
+            // read on an empty socket creates a WANT_READ dependency that can
+            // block a later send (notably after a write-credit heartbeat).
+            // Recheck before each fresh read; an existing WANT_* still retries
+            // the exact operation and buffer when its required event arrives.
+            if (connection.tls && !TlsPendingRead(connection) &&
+                !connection.tls->has_buffered_read() &&
+                !SocketReadableNow(connection.fd)) {
+                return Status::Ok();
+            }
             CompactConnectionReceiveBufferLocked(connection);
             const size_t max_buffered =
                 static_cast<size_t>(options_.max_frame_body_bytes) +

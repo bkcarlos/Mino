@@ -140,6 +140,17 @@
 - 首轮原生内核 IPsec 作业的 XML 确认 26 用例通过、零失败/跳过；修正后的完整矩阵结果
   及 ZMQ TSan 压测证据记录于 PR。此次运行不包含物理 RDMA 或原生 ARM64 硬件资格测试。
 
+## 第七批：TLS 心跳后的发送停滞
+
+- 第二轮原生 x86-64 的 debug/ASan/UBSan/TSan/LLVM 均为 159 目标通过；release 编译通过，
+  但单向 TLS 突发测试在第二帧超时。这一轮绑定 `b187efd`，不替代后续修订的验证。
+- 收到额度心跳后，接收循环可能在 socket 已空时继续发起新的 SSL_read，进入 WANT_READ，
+  从而阻塞稍后入队的发送。每次新 TLS 读取现在重新检查已解密缓冲和 socket 可读性；
+  已有 WANT_* 仍按原参数重试，不能交叉执行另一种 TLS 操作。
+- 可控心跳回归在旧实现上失败，修复后通过；本地 AArch64 release 的完整 TCP 套件通过。
+  可控心跳与真实 OpenSSL 单向突发两项测试各重复 200 次通过。
+- 最新原生全量矩阵结果以 [PR #1 checks](https://github.com/bkcarlos/Mino/pull/1/checks) 为准。
+
 ## 已关闭（opt-complete / a1b76c3 + opt-closeout + tip）
 
 | 项 | 状态 | 代码入口 |
