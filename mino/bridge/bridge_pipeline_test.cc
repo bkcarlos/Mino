@@ -18,6 +18,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -1224,6 +1225,34 @@ TEST(BridgePipelineTest, FailedPipelineCreationReleasesMaintenanceGuard) {
         nullptr, &pair.b_ingress);
     EXPECT_FALSE(failed.ok());
     EXPECT_TRUE((*store)->RetireEpochsThrough({11, 22, 33}).ok());
+}
+
+TEST(BridgePipelineTest, UnaddressableQueueLimitReleasesMaintenanceGuard) {
+    const char* tmp = std::getenv("TEST_TMPDIR");
+    ASSERT_NE(tmp, nullptr);
+    const auto path = std::filesystem::path(tmp) /
+        ("dedup_queue_limit_" + std::to_string(::getpid()) + ".snap");
+    auto store = DedupStore::Open({.path = path.string()});
+    ASSERT_TRUE(store.ok());
+    auto pair = MakePipelines();
+    ASSERT_NE(pair.b, nullptr);
+    pair.b.reset();
+    BridgePipelineOptions options;
+    options.local_session_epoch = 202;
+    options.remote_session_epoch = 101;
+    options.dedup_store = store->get();
+    options.max_pending_inbound_frames = std::numeric_limits<size_t>::max();
+    auto failed = BridgePipeline::Create(options, pair.b_driver,
+        pair.b_connection.id, nullptr, &pair.b_ingress);
+    EXPECT_EQ(failed.status().code(), StatusCode::kResourceExhausted);
+    // The failed allocation occurs after attachment. Unwinding must release
+    // the pipeline lease, so maintenance and a subsequent create still work.
+    EXPECT_TRUE((*store)->RetireEpochsThrough({11, 22, 33}).ok());
+    options.max_pending_inbound_frames =
+        BridgePipelineOptions{}.max_pending_inbound_frames;
+    auto recovered = BridgePipeline::Create(options, pair.b_driver,
+        pair.b_connection.id, nullptr, &pair.b_ingress);
+    EXPECT_TRUE(recovered.ok()) << recovered.status().ToString();
 }
 
 TEST(BridgePipelineTest, PersistenceFailureRetriesBeforeAckWithoutRepublishing) {

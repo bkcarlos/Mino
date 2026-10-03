@@ -8,6 +8,7 @@
 #include <iterator>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <utility>
 
 namespace mino::bridge {
@@ -210,6 +211,8 @@ Result<std::unique_ptr<BridgePipeline>> BridgePipeline::Create(
         }
         return pipeline;
     } catch (const std::bad_alloc&) {
+        return AllocationFailure();
+    } catch (const std::length_error&) {
         return AllocationFailure();
     }
 }

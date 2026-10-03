@@ -1047,6 +1047,8 @@ BridgeRuntimeDispatcher::Create(
                                         max_route_bindings));
     } catch (const std::bad_alloc&) {
         return Exhausted("bridge dispatcher allocation failed");
+    } catch (const std::length_error&) {
+        return Exhausted("bridge dispatcher allocation failed");
     }
 }
 

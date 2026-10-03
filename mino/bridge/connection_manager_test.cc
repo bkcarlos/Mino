@@ -30,6 +30,12 @@ namespace {
 
 using namespace std::chrono_literals;
 
+TEST(BridgeRuntimeDispatcherTest, RejectsUnaddressableRouteBindingLimit) {
+    auto result = BridgeRuntimeDispatcher::Create(
+        1, {}, std::numeric_limits<size_t>::max());
+    EXPECT_EQ(result.status().code(), StatusCode::kResourceExhausted);
+}
+
 uint16_t FreePort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) return 0;
