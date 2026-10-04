@@ -26,6 +26,14 @@
 #include "mino/transport/tcp_driver.h"
 
 namespace mino::bridge {
+
+struct BridgeRuntimeDispatcherTestAccess {
+    static void FailEgressCopy(BridgeRuntimeDispatcher& dispatcher,
+                               size_t destination) {
+        dispatcher.fail_egress_copy_for_testing_.store(destination);
+    }
+};
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -1061,6 +1069,92 @@ TEST(BridgeRuntimeDispatcherTest,
         EXPECT_TRUE(dispatch(topic, Schema(topic), first_target, 0).ok())
             << "full table rejected existing topic " << topic;
     }
+}
+
+TEST(BridgeRuntimeDispatcherTest, AllocationFailureRollsBackOnlyCurrentFanout) {
+    auto created = transport::TcpDriver::Create(TcpOptions());
+    ASSERT_TRUE(created.ok());
+    auto driver = std::shared_ptr<transport::TcpDriver>(std::move(*created));
+    ASSERT_TRUE(driver->Start(transport::DriverConfig{
+        .max_connections = 8, .max_listeners = 1, .max_queued_sends = 128,
+    }).ok());
+    CollectingIngress ingress;
+    auto dispatcher_created = BridgeRuntimeDispatcher::Create(3);
+    ASSERT_TRUE(dispatcher_created.ok());
+    auto dispatcher = *dispatcher_created;
+    std::vector<std::shared_ptr<BridgeConnectionPool>> pools;
+    std::vector<transport::TargetRoute> targets;
+    for (uint64_t index = 0; index < 3; ++index) {
+        const auto endpoint = Loopback(FreePort());
+        const auto peer = Fence(NodeId{402 + index}, 6 + index);
+        auto options = ManagerOptions(BridgeConnectionMode::kConnect, endpoint,
+            Fence(NodeId{401}, 5), peer, false);
+        options.max_egress_frames = 2;
+        auto manager = BridgeConnectionManager::Create(options, driver, &ingress);
+        ASSERT_TRUE(manager.ok());
+        auto pool = BridgeConnectionPool::Create(
+            {std::shared_ptr<BridgeConnectionManager>(std::move(*manager))},
+            2, options.max_egress_bytes);
+        ASSERT_TRUE(pool.ok());
+        ASSERT_TRUE((*pool)->Start(1).ok());
+        ASSERT_TRUE(dispatcher->RegisterPeer(peer.node_id, *pool).ok());
+        pools.push_back(*pool);
+        targets.push_back({.target_node = peer.node_id,
+            .transport = transport::RemoteTargetRoute{
+                .endpoint = endpoint,
+                .node_config_version = peer.node_config_version,
+                .process_identity = peer.process_identity,
+                .lease_epoch = peer.lease_epoch,
+                .driver_id = options.route_driver_id,
+                .driver_generation = options.route_driver_generation,
+                .capabilities = driver->capabilities(), .driver = driver,
+            }});
+    }
+    const std::vector<std::byte> payload(16, std::byte{0x5a});
+    BridgeDispatchRequest request{
+        .topic_id = TopicId{77}, .schema = Schema(0x7788),
+        .publication = LocalPublication{
+            .source = {101, 102, 103}, .sequence_num = 1,
+            .timestamp_ns = 700, .message_type = 8,
+        },
+        .priority = 3, .canonical_payload = payload, .route = {},
+    };
+    const auto route = RouteContract(request, registry::DeliveryPolicy{
+        .reliability = registry::Reliability::kReliableOrdered,
+        .allow_drop = false,
+    });
+    for (size_t failure_destination = 1; failure_destination <= 3;
+         ++failure_destination) {
+        SCOPED_TRACE(failure_destination);
+        request.publication.sequence_num = 1;
+        ASSERT_TRUE(dispatcher->DispatchTargets(request, targets, route).ok());
+        const size_t original_bytes = pools.front()->queued_egress_bytes();
+        request.publication.sequence_num = 2;
+        BridgeRuntimeDispatcherTestAccess::FailEgressCopy(
+            *dispatcher, failure_destination);
+        EXPECT_EQ(dispatcher->DispatchTargets(request, targets, route).code(),
+                  StatusCode::kResourceExhausted);
+        for (const auto& pool : pools) {
+            EXPECT_EQ(pool->queued_egress_frames(), 1u);
+            EXPECT_EQ(pool->queued_egress_bytes(), original_bytes);
+            EXPECT_EQ(pool->manager(0).queued_egress_frames(), 1u);
+        }
+        // With capacity two, this also proves aggregate quota was released.
+        request.publication.sequence_num = 3;
+        ASSERT_TRUE(dispatcher->DispatchTargets(request, targets, route).ok());
+        for (const auto& pool : pools) {
+            for (uint64_t sequence : {1u, 3u}) {
+                auto frame = pool->manager(0).TryPeekAndEncode();
+                ASSERT_TRUE(frame.ok()) << frame.status().ToString();
+                EXPECT_EQ(frame->frame.header.sequence_num, sequence);
+                pool->manager(0).CommitPolled();
+            }
+            EXPECT_EQ(pool->queued_egress_frames(), 0u);
+            EXPECT_EQ(pool->queued_egress_bytes(), 0u);
+        }
+    }
+    for (const auto& pool : pools) EXPECT_TRUE(pool->Shutdown().ok());
+    EXPECT_TRUE(driver->Shutdown().ok());
 }
 
 TEST(BridgeRuntimeDispatcherTest,

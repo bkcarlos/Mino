@@ -1301,19 +1301,41 @@ Status BridgeRuntimeDispatcher::DispatchTargets(
         auto admission = std::make_shared<BridgeEgressAdmission>();
         std::vector<Reservation> reservations;
         reservations.reserve(destinations.size());
-        for (const Destination& destination : destinations) {
-            auto reserved = destination.pool->ReserveEgress(outbound, admission);
-            if (!reserved.ok()) {
-                admission->RollBack();
-                for (const Reservation& prior : reservations) {
-                    prior.pool->CancelEgressReservation(prior.token);
-                }
-                return reserved.status();
+        const auto rollback = [&]() noexcept {
+            // Publish rollback before removing reservations so a concurrent
+            // consumer can discard them too. Cancellation tolerates entries
+            // already removed by that consumer.
+            admission->RollBack();
+            for (const Reservation& prior : reservations) {
+                prior.pool->CancelEgressReservation(prior.token);
             }
-            reservations.push_back(Reservation{
-                .pool = destination.pool,
-                .token = *reserved,
-            });
+        };
+        try {
+            for (const Destination& destination : destinations) {
+                size_t failure_destination = reservations.size() + 1;
+                if (fail_egress_copy_for_testing_.load(std::memory_order_relaxed) ==
+                        failure_destination &&
+                    fail_egress_copy_for_testing_.compare_exchange_strong(
+                        failure_destination, 0, std::memory_order_relaxed)) {
+                    throw std::bad_alloc();
+                }
+                // The by-value frame copy can throw before ReserveEgress's
+                // own exception handler is entered.
+                auto reserved = destination.pool->ReserveEgress(outbound, admission);
+                if (!reserved.ok()) {
+                    rollback();
+                    return reserved.status();
+                }
+                // Capacity is reserved before any admission; moving the token
+                // and copying the shared_ptr cannot allocate here.
+                reservations.push_back(Reservation{
+                    .pool = destination.pool,
+                    .token = *reserved,
+                });
+            }
+        } catch (...) {
+            rollback();
+            throw;
         }
         admission->Commit();
         return Status::Ok();

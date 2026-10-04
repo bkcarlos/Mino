@@ -322,6 +322,12 @@ public:
     size_t peer_count() const noexcept;
 
 private:
+    friend struct BridgeRuntimeDispatcherTestAccess;
+    // One-based destination whose frame copy should fail once. Test-only,
+    // private injection seam; zero disables it. Atomic because Dispatch is
+    // called by concurrent publishers.
+    std::atomic<size_t> fail_egress_copy_for_testing_{0};
+
     struct Peer {
         NodeId node;
         std::shared_ptr<BridgeConnectionPool> pool;
