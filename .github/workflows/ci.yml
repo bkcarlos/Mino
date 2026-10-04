@@ -164,6 +164,47 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+  ipsec-kernel:
+    name: Required IPsec kernel tests (x86-64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CC: gcc-12
+      CXX: g++-12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-12 g++-12 libatomic1 iproute2
+
+      - name: Setup Bazelisk
+        uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - name: Build kernel test
+        run: |
+          bazel build --lockfile_mode=error --config=gcc12 --config=debug \
+            //mino/security:ipsec_test
+
+      # Separate network namespace prevents the test installer from touching
+      # runner/host XFRM policy. Root provides CAP_NET_ADMIN only for this run.
+      - name: Run real kernel tests without skips
+        run: |
+          bash tools/ci/run_ipsec_kernel_test.sh \
+            "$(realpath bazel-bin/mino/security/ipsec_test)" \
+            "$PWD/ipsec-kernel-evidence"
+
+      - name: Upload kernel test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ipsec-kernel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ipsec-kernel-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
   tooling-smoke:
     name: Extended CI tooling smoke
     runs-on: ubuntu-22.04
@@ -176,6 +217,7 @@ jobs:
         run: |
           python3 -m compileall -q tools/ci
           bash -n tools/ci/run_schema_codegen_environment.sh
+          bash -n tools/ci/run_ipsec_kernel_test.sh
 
       - name: Runner self-tests
         run: |

@@ -258,6 +258,7 @@ cc_test(
     name = "dedup_store_test",
     srcs = ["dedup_store_test.cc"],
     deps = [
+        ":crc32c",
         ":reliability",
         "//mino/common:status",
         "@googletest//:gtest_main",

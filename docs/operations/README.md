@@ -12,6 +12,7 @@
 | IPsec 传输（内核 XFRM） | [IPsec transport](ipsec.md) | 架构 §14.2；`IpsecTransportDriver` |
 | Region / ACL 拒绝 | [Region and ACL denial](runbook.md#region-and-acl-denial) | [monitoring.md](monitoring.md#tls-and-acl) |
 | Bridge 断链 | [Bridge disconnection](runbook.md#bridge-disconnection) | [monitoring.md](monitoring.md#bridge-disconnected) |
+| 持久去重失败 | [Durable dedup failure](runbook.md#durable-dedup-failure) | [monitoring.md](monitoring.md#durable-dedup) |
 | Subscriber lease 过期 | [Subscriber lease expiration](runbook.md#subscriber-lease-expiration) | [monitoring.md](monitoring.md#lease-expiration) |
 | Schema | [Schema incident](runbook.md#schema-incident) | [rolling_upgrade.md](rolling_upgrade.md#1-安全与一致性原则) |
 | Storage 磁盘故障 | [Storage disk failure](runbook.md#storage-disk-failure) | [monitoring.md](monitoring.md#storage-failure) |

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 
 #include "mino/common/status.h"
@@ -16,6 +17,13 @@ namespace {
 
 constexpr SourceIdentity kSource{1, 2, 3};
 constexpr SourceIdentity kOtherSource{4, 5, 6};
+
+TEST(RetransmitWindowTest, RejectsUnaddressableEntryLimit) {
+    auto result = RetransmitWindow::Create({
+        .max_entries = std::numeric_limits<size_t>::max(),
+    });
+    EXPECT_EQ(result.status().code(), StatusCode::kResourceExhausted);
+}
 
 std::unique_ptr<RetransmitWindow> MakeWindow(
     RetransmitWindowOptions options = {}) {

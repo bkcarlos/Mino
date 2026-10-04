@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <new>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -43,6 +44,8 @@ Result<std::unique_ptr<RetransmitWindow>> RetransmitWindow::Create(
         window->source_index_.reserve(options.max_entries);
         return window;
     } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
 }

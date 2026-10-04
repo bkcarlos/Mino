@@ -11,6 +11,7 @@ cc_library(
     deps = [
         ":local_bus",
         ":remote_bridge",
+        "//mino/bridge:reliability",
         "//mino/capacity",
         "//mino/common:result",
         "//mino/common:status",

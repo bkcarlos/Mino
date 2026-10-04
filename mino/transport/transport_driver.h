@@ -21,6 +21,7 @@
 #include "mino/common/status.h"
 #include "mino/runtime/delivery_receipt.h"
 #include "mino/security/tls.h"
+#include "mino/security/socket_ipsec.h"
 
 namespace mino::transport {
 
@@ -437,6 +438,11 @@ public:
     }
     virtual HealthState health() const noexcept = 0;
     virtual TransportCapabilities capabilities() const noexcept = 0;
+    // True only when every socket is kernel-guarded before any network I/O,
+    // including listeners, accepted sockets, queued writes and heartbeats.
+    virtual std::optional<security::SocketIpsecPolicy> MandatoryIpsecSocketPolicy() const noexcept {
+        return std::nullopt;
+    }
 
 protected:
     virtual Status DoStart(const DriverConfig& config) = 0;

@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -218,7 +219,7 @@ DriverConfig TestConfig() {
     };
 }
 
-enum class ScriptedTlsMode { kWriteWantsRead, kReadWantsWrite };
+enum class ScriptedTlsMode { kWriteWantsRead, kReadWantsWrite, kReadHeartbeat };
 
 class ScriptedTlsState final {
 public:
@@ -291,17 +292,33 @@ private:
 
 class ScriptedTlsChannel final : public security::TlsChannel {
 public:
-    explicit ScriptedTlsChannel(std::shared_ptr<ScriptedTlsState> state)
-        : state_(std::move(state)) {}
+    ScriptedTlsChannel(std::shared_ptr<ScriptedTlsState> state, int fd)
+        : state_(std::move(state)), fd_(fd) {}
 
     Result<security::TlsIoResult> Handshake() noexcept override {
         return security::TlsIoResult{};
     }
 
     Result<security::TlsIoResult> Read(
-        std::span<std::byte>) noexcept override {
+        std::span<std::byte> output) noexcept override {
         state_->Record('R');
         if (pending_ == 'W') return Crossed();
+        if (state_->mode == ScriptedTlsMode::kReadHeartbeat) {
+            ssize_t count;
+            do {
+                count = ::recv(fd_, output.data(), output.size(), 0);
+            } while (count < 0 && errno == EINTR);
+            if (count > 0) {
+                pending_ = 0;
+                return security::TlsIoResult{.bytes = static_cast<size_t>(count)};
+            }
+            if (count == 0) return security::TlsIoResult{.peer_closed = true};
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                return Status::Error(StatusCode::kUnavailable, "fake TLS recv failed");
+            }
+            pending_ = 'R';
+            return security::TlsIoResult{.need = security::TlsIoNeed::kRead};
+        }
         if (pending_ == 'R') {
             state_->WaitOnReadRetryIfRequested();
             pending_ = 0;
@@ -362,6 +379,7 @@ private:
     }
 
     std::shared_ptr<ScriptedTlsState> state_;
+    int fd_;
     char pending_ = 0;
 };
 
@@ -545,12 +563,12 @@ public:
     Status Prepare() override { return Status::Ok(); }
 
     Result<std::unique_ptr<security::TlsChannel>> Create(
-        int, security::TlsRole role) override {
+        int fd, security::TlsRole role) override {
         if (role == security::TlsRole::kServer && state_->block_server_create) {
             state_->EnterCreateAndWait();
         }
         return std::unique_ptr<security::TlsChannel>(
-            new ScriptedTlsChannel(state_));
+            new ScriptedTlsChannel(state_, fd));
     }
 
 private:
@@ -800,6 +818,45 @@ TEST(TcpDriverTest, TlsWriteWantReadRetriesWriteBeforeAnyRead) {
     ASSERT_GE(calls.size(), 2u);
     EXPECT_EQ(calls[0], 'W');
     EXPECT_EQ(calls[1], 'W');
+    EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
+}
+
+TEST(TcpDriverTest, TlsDoesNotStartEmptyReadAfterCreditHeartbeat) {
+    RawListener listener = ListenRaw();
+    auto state = std::make_shared<ScriptedTlsState>(ScriptedTlsMode::kReadHeartbeat);
+    TcpDriverOptions options = TestOptions();
+    options.heartbeat_interval_ms = 30'000;
+    options.idle_timeout_ms = 60'000;
+    options.tls_factory = std::make_shared<ScriptedTlsFactory>(state);
+    auto created = TcpDriver::Create(options);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto driver = std::move(*created);
+    ASSERT_TRUE(driver->Start(TestConfig()).ok());
+    auto connected = driver->Connect({
+        .remote_endpoint = listener.endpoint, .local_bind = std::nullopt,
+        .timeout_ms = 1000});
+    ASSERT_TRUE(connected.ok()) << connected.status().ToString();
+    ScopedFd peer = AcceptRaw(listener);
+    const auto body = FrameBody(64, 8100);
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id, .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData}).ok());
+    ASSERT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+    ASSERT_EQ(state->Calls(), std::vector<char>({'W'}));
+
+    // Return the spent write credit without queuing the next application
+    // frame yet. The driver must finish this read and remain able to write.
+    const auto heartbeat = Prefix(HeartbeatBody());
+    ASSERT_EQ(SendRawNoSignal(peer.get(), heartbeat),
+              static_cast<ssize_t>(heartbeat.size()));
+    ASSERT_TRUE(state->WaitForCalls(2));
+    EXPECT_FALSE(state->WaitForCalls(3, 100ms));
+    EXPECT_EQ(state->Calls(), std::vector<char>({'W', 'R'}));
+    ASSERT_TRUE(driver->SendUntracked({
+        .connection_id = connected->id, .payload = body,
+        .traffic_class = UntrackedTrafficClass::kData}).ok());
+    EXPECT_TRUE(WaitForQueuedSendBytes(*driver, 0));
+    EXPECT_EQ(state->Calls(), std::vector<char>({'W', 'R', 'W'}));
     EXPECT_FALSE(state->crossed_operations.load(std::memory_order_acquire));
 }
 

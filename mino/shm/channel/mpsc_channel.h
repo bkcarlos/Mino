@@ -464,7 +464,8 @@ public:
     }
 
     // Non-blocking reservation attempt. Returns kResourceExhausted if the
-    // queue is full, kWouldBlock if wedged on a stalled slot/tombstone.
+    // queue is full, kWouldBlock if a claim is busy/contended or a slot is
+    // unfinished. Claim contention returns to the caller for backoff/recovery.
     Result<Reservation> TryReserve(const ProducerIdentity& owner) noexcept {
         return TryReserveAfterSpaceCheck(owner);
     }
@@ -1006,6 +1007,16 @@ private:
             // sequence-tagged CAS closes the old cursor-advanced/slot-unowned
             // crash window and arbitrates every producer for this era.
             MpscReservationMeta& meta = metas_[phys];
+            // An occupied sidecar may belong to a paused producer or to the
+            // consumer that has published the free turn but has not released
+            // the previous claim yet. Do not spin on failed RMWs: TryReserve
+            // must let its caller back off, enforce a deadline or run recovery.
+            // A read probe also avoids starving the retiring consumer under
+            // TSan's atomic-operation locks when many publishers contend.
+            if (meta.claim_control.load(std::memory_order_acquire) != 0) {
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "MPSC reservation claim is busy");
+            }
             uint64_t no_claim = 0;
             uint32_t token = static_cast<uint32_t>(
                 control_->reserved2.fetch_add(1, std::memory_order_relaxed) + 1);
@@ -1019,11 +1030,8 @@ private:
             if (!meta.claim_control.compare_exchange_strong(
                     no_claim, initializing, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
-                // Another producer is finishing the same cursor era. This is
-                // arbitration, not queue fullness; re-read the cursor rather
-                // than surfacing a spurious kFail to the caller.
-                detail::SpinPause();
-                continue;
+                return Status::Error(StatusCode::kWouldBlock,
+                                     "MPSC reservation claim was contended");
             }
             InvokePersistenceHook(PersistencePoint::kClaimTagged, res);
             meta.claim_sequence.store(res, std::memory_order_relaxed);

@@ -37,6 +37,15 @@ struct OperationalMetrics {
     CounterMetric* bridge_reconnect_failures_total = nullptr;
     CounterMetric* bridge_protocol_failures_total = nullptr;
 
+    CounterMetric* dedup_persistence_total = nullptr;
+    CounterMetric* dedup_persistence_failures_total = nullptr;
+    CounterMetric* dedup_capacity_rejections_total = nullptr;
+    CounterMetric* dedup_persistence_nanoseconds_total = nullptr;
+    GaugeMetric* dedup_sources = nullptr;
+    GaugeMetric* dedup_retired_publishers = nullptr;
+    GaugeMetric* dedup_capacity = nullptr;
+    GaugeMetric* dedup_max_utilization_permille = nullptr;
+
     CounterMetric* storage_writes_total = nullptr;
     CounterMetric* storage_syncs_total = nullptr;
     CounterMetric* storage_write_failures_total = nullptr;

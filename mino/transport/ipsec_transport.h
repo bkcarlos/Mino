@@ -6,8 +6,13 @@
 #define MINO_TRANSPORT_IPSEC_TRANSPORT_H_
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "mino/common/result.h"
@@ -19,7 +24,7 @@ namespace mino::transport {
 // How IpsecTransportDriver enforces kernel IPsec coverage.
 enum class IpsecEnforcement : uint8_t {
     // Default. Connect/Listen/Accept/Send fail-closed unless IpsecSaProbe
-    // reports a covering SA (and optional policy) for the peer endpoint.
+    // reports a mandatory ESP policy bound to a covering encrypting SA.
     kRequireKernelSa = 0,
     // Operator asserts the socket path is already IPsec-protected (external
     // XFRM/strongSwan/VTI). The driver still binds to an ordinary TCP/UDP
@@ -42,6 +47,14 @@ struct IpsecTransportOptions {
     // endpoint once the peer is known (Accept) or the listen address (Listen
     // with require_inbound_on_listen).
     bool require_inbound_on_listen = false;
+    // Only used when the inner driver installs mandatory socket policies with
+    // both SPIs pinned. Key rotation then requires reconnection with new SPIs.
+    // Admission always probes; zero retains per-operation verification. Ordinary
+    // drivers always verify per operation, regardless of this value. For pinned
+    // sockets a worker refreshes at half this interval. Expired results return
+    // kWouldBlock without probing on the I/O thread; failed checks return
+    // kUnavailable until a background retry succeeds.
+    uint32_t protected_socket_recheck_ms = 1000;
 };
 
 Status ValidateIpsecTransportOptions(const IpsecTransportOptions& options);
@@ -102,11 +115,30 @@ private:
         bool require_inbound) const;
     Result<security::IpsecEndpoint> ToIpsecEndpoint(
         const EndpointDescriptor& endpoint) const;
+    Result<ConnectionInfo> AdmitConnection(ConnectionInfo info);
+    Status RequireForConnection(ConnectionId connection_id);
+    void VerificationLoop() noexcept;
+    void StopVerifier() noexcept;
 
     std::unique_ptr<TransportDriver> inner_;
     std::shared_ptr<security::IpsecSaProbe> probe_;
     IpsecEnforcement enforcement_ = IpsecEnforcement::kRequireKernelSa;
     bool require_inbound_on_listen_ = false;
+    mutable std::mutex connections_mutex_;
+    struct AdmittedConnection {
+        ConnectionInfo info;
+        std::chrono::steady_clock::time_point valid_until;
+        std::chrono::steady_clock::time_point refresh_at;
+        uint64_t generation = 0;
+        bool verified = true;
+    };
+    std::map<ConnectionId, AdmittedConnection> connections_;
+    uint32_t protected_socket_recheck_ms_ = 0;
+    uint32_t max_connections_ = 0;
+    uint64_t next_generation_ = 0;
+    std::condition_variable verification_cv_;
+    bool verifier_stopping_ = true;
+    std::thread verifier_;
 };
 
 }  // namespace mino::transport

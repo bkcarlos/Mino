@@ -55,6 +55,14 @@ Status RegisterOperationalMetrics(MetricRegistry& registry,
                           "mino_bridge_reconnect_failures_total");
     MINO_REGISTER_COUNTER(bridge_protocol_failures_total,
                           "mino_bridge_protocol_failures_total");
+    MINO_REGISTER_COUNTER(dedup_persistence_total, "mino_dedup_persistence_total");
+    MINO_REGISTER_COUNTER(dedup_persistence_failures_total, "mino_dedup_persistence_failures_total");
+    MINO_REGISTER_COUNTER(dedup_capacity_rejections_total, "mino_dedup_capacity_rejections_total");
+    MINO_REGISTER_COUNTER(dedup_persistence_nanoseconds_total, "mino_dedup_persistence_nanoseconds_total");
+    MINO_REGISTER_GAUGE(dedup_sources, "mino_dedup_sources");
+    MINO_REGISTER_GAUGE(dedup_retired_publishers, "mino_dedup_retired_publishers");
+    MINO_REGISTER_GAUGE(dedup_capacity, "mino_dedup_capacity");
+    MINO_REGISTER_GAUGE(dedup_max_utilization_permille, "mino_dedup_max_utilization_permille");
     MINO_REGISTER_COUNTER(storage_writes_total, "mino_storage_writes_total");
     MINO_REGISTER_COUNTER(storage_syncs_total, "mino_storage_syncs_total");
     MINO_REGISTER_COUNTER(storage_write_failures_total,

@@ -25,7 +25,8 @@ namespace mino::platform {
 namespace rdma_verbs_plugin {
 
 constexpr const char* kProvenance =
-    "mino-rdma-verbs-reference/v1;requires-libibverbs;NOT-AUTO-QUALIFIED";
+    "mino-rdma-verbs-reference/v1;requires-libibverbs;MR-ONLY;"
+    "QP-CM-CQ-NOT-IMPLEMENTED;NOT-QUALIFICATION-ELIGIBLE";
 
 #if defined(MINO_HAVE_IBVERBS)
 
@@ -99,8 +100,18 @@ public:
         return MemoryRegistrationRecoveryResult{};
     }
 
-    Status Start(const RdmaProviderLimits&) override {
+    Status Start(const RdmaProviderLimits& limits) override {
+        // Memory registration users may start with empty transport limits.
+        // Fail before a transport driver advertises this MR-only reference as
+        // an active network provider; QP/CM/CQ require an external full plugin.
+        if (limits.max_connections != 0 || limits.max_listeners != 0 ||
+            limits.send_queue_depth != 0 || limits.receive_queue_depth != 0 ||
+            limits.completion_queue_depth != 0 || limits.max_message_bytes != 0) {
+            return Status::Error(StatusCode::kUnsupported,
+                                 "verbs reference is MR-only; QP/CM/CQ not implemented");
+        }
         std::lock_guard lock(mutex_);
+        stop_requested_ = false;
         started_ = true;
         return Status::Ok();
     }

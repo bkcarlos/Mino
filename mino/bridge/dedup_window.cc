@@ -166,7 +166,7 @@ DedupCheckResult DedupWindow::Classify(const SourceState& state,
 
 Result<DedupCheckResult> DedupWindow::Check(
     uint64_t peer_session_epoch, const SourceIdentity& source,
-    uint64_t sequence, uint64_t now_ns) noexcept {
+    uint64_t sequence, uint64_t now_ns, uint64_t durable_highest) noexcept {
     try {
         if (!session_active_ || peer_session_epoch != peer_session_epoch_) {
             ++stats_.stale_session_checks;
@@ -175,6 +175,10 @@ Result<DedupCheckResult> DedupWindow::Check(
         if (sequence == 0) return Invalid("sequence zero is not reliable data");
         PurgeExpired(now_ns);
         SourceState* state = Find(source);
+        if (state == nullptr && durable_highest != 0) {
+            MINO_RETURN_IF_ERROR(AddSource(source, durable_highest, now_ns));
+            state = Find(source);
+        }
         if (state == nullptr) {
             if (sequence > options_.max_sequence_distance) {
                 ++stats_.nack_checks;

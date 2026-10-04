@@ -373,7 +373,9 @@ cc_test(
 
 cc_test(
     name = "zmq_ipc_business_mp_stress_test",
-    size = "small",
+    # Six sequential multi-process profiles exceed 60s under TSan. Keep the
+    # worker deadlines; allow the suite the same 300s budget as the SHM peer.
+    size = "medium",
     srcs = ["zmq_ipc_business_mp_stress_test.cc"],
     data = ["//examples:zmq_ipc_business_stress"],
     target_compatible_with = LINUX_ONLY,

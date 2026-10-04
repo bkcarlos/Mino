@@ -79,7 +79,7 @@ struct BridgePipelineOptions {
     bool local_dedup_state_lost = false;
     // Optional durable HWM store. Ownership remains with the caller for the
     // pipeline lifetime. When set, Create/Rebind seed DedupWindow from it and
-    // HandleData persists accepted HWMs before emitting ACK.
+    // FlushAcks group-commits accepted HWMs before emitting ACK.
     DedupStore* dedup_store = nullptr;
     size_t max_control_frames = 1024;
     size_t max_control_bytes = 256u * 1024u;
@@ -268,8 +268,7 @@ private:
                    std::unique_ptr<RetransmitWindow> retransmit) noexcept;
 
     Status RestoreDedupFromStore(uint64_t now_ns) noexcept;
-    Status PersistDedupAccepted(const SourceIdentity& source,
-                                uint64_t highest_contiguous_sequence) noexcept;
+
 
     Status QueueControl(const WireFrame& frame) noexcept;
     Status QueueNegotiatedControls(
@@ -345,6 +344,7 @@ private:
     BridgeIngressPort* ingress_;
     SchemaNegotiator* schema_negotiator_;
     std::unique_ptr<DedupWindow> dedup_;
+    bool store_attached_ = false;
     std::unique_ptr<RetransmitWindow> retransmit_;
     std::deque<std::vector<std::byte>> control_queue_;
     size_t control_bytes_ = 0;

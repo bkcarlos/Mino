@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -18,6 +19,7 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -28,7 +30,8 @@ namespace mino::bridge {
 namespace {
 
 constexpr char kMagic[8] = {'M', 'I', 'N', 'O', 'D', 'E', 'D', 'U'};
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kLegacyFormatVersion = 1;
+constexpr uint32_t kRetirementFormatVersion = 2;
 constexpr size_t kHeaderBytes = 16;  // magic(8) + version(4) + count(4)
 constexpr size_t kEntryBytes = 32;   // 3x u64 identity + u64 hwm
 constexpr size_t kCrcBytes = 4;
@@ -46,6 +49,17 @@ Status Resource(std::string_view message) {
 bool ValidSource(const SourceIdentity& source) noexcept {
     return source.node_id != 0 && source.publisher_id != 0 &&
            source.publisher_epoch != 0;
+}
+
+using SourceMap = std::unordered_map<SourceIdentity, uint64_t, SourceIdentityHash>;
+
+SourceIdentity PublisherKey(const SourceIdentity& source) noexcept {
+    return {source.node_id, source.publisher_id, 0};
+}
+
+bool Retired(const SourceMap& retired, const SourceIdentity& source) noexcept {
+    const auto it = retired.find(PublisherKey(source));
+    return it != retired.end() && source.publisher_epoch <= it->second;
 }
 
 bool SourceLess(const SourceIdentity& left,
@@ -107,6 +121,7 @@ public:
     }
 
     int get() const { return fd_; }
+    int release() noexcept { return std::exchange(fd_, -1); }
 
 private:
     int fd_;
@@ -183,38 +198,32 @@ Status SyncDirectory(const std::filesystem::path& directory) {
 }
 
 Status EnsureParentDirectory(const std::filesystem::path& file_path) {
-    const std::filesystem::path directory = file_path.parent_path();
+    auto directory = file_path.parent_path();
     if (directory.empty()) return Status::Ok();
+    std::vector<std::filesystem::path> missing;
     std::error_code error;
-    const bool existed = std::filesystem::exists(directory, error);
-    if (error) {
-        return Status::Error(StatusCode::kInternal,
-                             "cannot inspect dedup store directory '" +
-                                 directory.string() + "': " + error.message());
+    while (!std::filesystem::exists(directory, error)) {
+        if (error) return ErrnoStatus("inspect(dedup directory) failed", directory.string(), error.value());
+        missing.push_back(directory);
+        directory = directory.parent_path();
+        if (directory.empty()) directory = ".";
     }
-    if (!existed) {
-        const bool created =
-            std::filesystem::create_directories(directory, error);
-        if (error ||
-            (!created && !std::filesystem::is_directory(directory, error))) {
-            return Status::Error(StatusCode::kInternal,
-                                 "cannot create dedup store directory '" +
-                                     directory.string() + "': " +
-                                     error.message());
+    if (error || !std::filesystem::is_directory(directory, error) || error) {
+        return Invalid("dedup store parent path is not a directory");
+    }
+    // Persist each newly created directory entry in its parent. Syncing only
+    // the leaf and its immediate parent can lose ancestors after a power cut.
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        const bool created = std::filesystem::create_directory(*it, error);
+        if (error || (!created && !std::filesystem::is_directory(*it, error))) {
+            return Status::Error(StatusCode::kInternal, "cannot create dedup store directory");
         }
-        if (created) {
-            if (::chmod(directory.c_str(), 0700) != 0) {
-                return ErrnoStatus("chmod(dedup store directory) failed",
-                                   directory.string());
-            }
-            MINO_RETURN_IF_ERROR(SyncDirectory(directory));
-            const std::filesystem::path parent = directory.parent_path();
-            if (!parent.empty()) MINO_RETURN_IF_ERROR(SyncDirectory(parent));
+        if (created && ::chmod(it->c_str(), 0700) != 0) {
+            return ErrnoStatus("chmod(dedup directory) failed", it->string());
         }
-    } else if (!std::filesystem::is_directory(directory, error) || error) {
-        return Status::Error(StatusCode::kInvalidArgument,
-                             "dedup store parent path is not a directory: '" +
-                                 directory.string() + "'");
+        MINO_RETURN_IF_ERROR(SyncDirectory(*it));
+        const auto parent = it->parent_path();
+        MINO_RETURN_IF_ERROR(SyncDirectory(parent.empty() ? "." : parent));
     }
     return Status::Ok();
 }
@@ -259,7 +268,7 @@ Status ReadAll(int fd, std::vector<std::byte>* out, const std::string& path,
 
 Status DecodeSnapshot(
     std::span<const std::byte> bytes, size_t max_sources,
-    std::unordered_map<SourceIdentity, uint64_t, SourceIdentityHash>* out) {
+    SourceMap* out, SourceMap* retired) {
     if (bytes.size() < kHeaderBytes + kCrcBytes) {
         return Corruption("dedup store snapshot is truncated");
     }
@@ -269,7 +278,7 @@ Status DecodeSnapshot(
         }
     }
     const uint32_t version = ReadBe32(bytes, 8);
-    if (version != kFormatVersion) {
+    if (version != kLegacyFormatVersion && version != kRetirementFormatVersion) {
         return Corruption("dedup store version unsupported");
     }
     const uint32_t count = ReadBe32(bytes, 12);
@@ -289,6 +298,7 @@ Status DecodeSnapshot(
     }
 
     out->clear();
+    retired->clear();
     out->reserve(count);
     SourceIdentity previous{};
     bool have_previous = false;
@@ -300,18 +310,26 @@ Status DecodeSnapshot(
             .publisher_epoch = ReadBe64(bytes, offset + 16),
         };
         const uint64_t highest = ReadBe64(bytes, offset + 24);
-        if (!ValidSource(source) || highest == 0) {
+        if (!ValidSource(source) || (highest == 0 && version == kLegacyFormatVersion)) {
             return Corruption("dedup store contains an invalid entry");
         }
         if (have_previous && !SourceLess(previous, source)) {
             return Corruption("dedup store entries are not strictly ordered");
         }
-        const auto inserted = out->emplace(source, highest);
-        if (!inserted.second) {
-            return Corruption("dedup store contains a duplicate source");
+        const bool inserted = highest == 0 ?
+            retired->emplace(PublisherKey(source), source.publisher_epoch).second :
+            out->emplace(source, highest).second;
+        if (!inserted) {
+            return Corruption("dedup store contains a duplicate source or retirement boundary");
         }
         previous = source;
         have_previous = true;
+    }
+    for (const auto& [source, highest] : *out) {
+        (void)highest;
+        if (Retired(*retired, source)) {
+            return Corruption("dedup store contains an HWM within a retired epoch range");
+        }
     }
     return Status::Ok();
 }
@@ -319,21 +337,24 @@ Status DecodeSnapshot(
 Result<std::vector<std::byte>> EncodeSnapshot(
     const std::unordered_map<SourceIdentity, uint64_t, SourceIdentityHash>&
         entries,
-    size_t max_sources) {
+    const SourceMap& retired, size_t max_sources) {
     try {
-        if (entries.size() > max_sources) {
+        if (entries.size() > max_sources || retired.size() > max_sources - entries.size()) {
             return Resource("dedup store would exceed max_sources");
         }
-        if (entries.size() > std::numeric_limits<uint32_t>::max()) {
+        if (entries.size() + retired.size() > std::numeric_limits<uint32_t>::max()) {
             return Resource("dedup store entry count overflows");
         }
         std::vector<DedupResumeEntry> ordered;
-        ordered.reserve(entries.size());
+        ordered.reserve(entries.size() + retired.size());
         for (const auto& [source, highest] : entries) {
             ordered.push_back(DedupResumeEntry{
                 .source = source,
                 .highest_contiguous_sequence = highest,
             });
+        }
+        for (const auto& [publisher, epoch] : retired) {
+            ordered.push_back({{publisher.node_id, publisher.publisher_id, epoch}, 0});
         }
         std::sort(ordered.begin(), ordered.end(),
                   [](const DedupResumeEntry& left,
@@ -344,7 +365,7 @@ Result<std::vector<std::byte>> EncodeSnapshot(
         std::vector<std::byte> bytes;
         bytes.reserve(kHeaderBytes + ordered.size() * kEntryBytes + kCrcBytes);
         for (char c : kMagic) bytes.push_back(static_cast<std::byte>(c));
-        WriteBe32(&bytes, kFormatVersion);
+        WriteBe32(&bytes, retired.empty() ? kLegacyFormatVersion : kRetirementFormatVersion);
         WriteBe32(&bytes, static_cast<uint32_t>(ordered.size()));
         for (const DedupResumeEntry& entry : ordered) {
             WriteBe64(&bytes, entry.source.node_id);
@@ -363,7 +384,11 @@ Result<std::vector<std::byte>> EncodeSnapshot(
 }
 
 Status AtomicPublish(const std::filesystem::path& path,
-                     std::span<const std::byte> bytes) {
+                     std::span<const std::byte> bytes,
+                     const DedupStoreTestHooks* hooks) {
+    const auto checkpoint = [hooks](DedupStoreIoStage stage, bool after) {
+        return hooks == nullptr ? Status::Ok() : hooks->Checkpoint(stage, after);
+    };
     MINO_RETURN_IF_ERROR(EnsureParentDirectory(path));
     const std::filesystem::path tmp_path =
         path.string() + ".tmp." + std::to_string(static_cast<uint64_t>(::getpid()));
@@ -378,22 +403,28 @@ Status AtomicPublish(const std::filesystem::path& path,
     if (raw_fd < 0) return ErrnoStatus("open(dedup store tmp) failed", tmp);
     ScopedFd fd(raw_fd);
     MINO_RETURN_IF_ERROR(SetCloseOnExec(fd.get(), tmp));
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kWrite, false));
     MINO_RETURN_IF_ERROR(WriteExact(fd.get(), bytes.data(), bytes.size(), tmp));
     if (::ftruncate(fd.get(), static_cast<off_t>(bytes.size())) != 0) {
         return ErrnoStatus("ftruncate(dedup store tmp) failed", tmp);
     }
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kWrite, true));
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kFileSync, false));
     MINO_RETURN_IF_ERROR(SyncFile(fd.get(), tmp));
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kFileSync, true));
     fd = ScopedFd();  // close before rename
 
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kRename, false));
     while (::rename(tmp.c_str(), final_path.c_str()) != 0) {
         if (errno == EINTR) continue;
         (void)::unlink(tmp.c_str());
         return ErrnoStatus("rename(dedup store) failed", final_path);
     }
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kRename, true));
     const std::filesystem::path parent = path.parent_path();
-    if (!parent.empty()) {
-        MINO_RETURN_IF_ERROR(SyncDirectory(parent));
-    }
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kDirectorySync, false));
+    MINO_RETURN_IF_ERROR(SyncDirectory(parent.empty() ? "." : parent));
+    MINO_RETURN_IF_ERROR(checkpoint(DedupStoreIoStage::kDirectorySync, true));
     return Status::Ok();
 }
 #endif  // unix
@@ -403,18 +434,58 @@ Status AtomicPublish(const std::filesystem::path& path,
 DedupStore::DedupStore(std::string path, size_t max_sources) noexcept
     : path_(std::move(path)), max_sources_(max_sources) {}
 
+DedupStore::~DedupStore() {
+#if defined(__unix__) || defined(__APPLE__)
+    if (lock_fd_ >= 0) (void)::close(lock_fd_);
+#endif
+}
+
+Status DedupStore::AcquireLock() {
+#if defined(__unix__) || defined(__APPLE__)
+    MINO_RETURN_IF_ERROR(EnsureParentDirectory(std::filesystem::path(path_)));
+    const std::string lock_path = path_ + ".lock";
+    int flags = O_RDWR | O_CREAT | CloseOnExecFlag();
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int raw_fd = ::open(lock_path.c_str(), flags, 0600);
+    if (raw_fd < 0) return ErrnoStatus("open(dedup lock) failed", lock_path);
+    ScopedFd fd(raw_fd);
+    MINO_RETURN_IF_ERROR(SetCloseOnExec(fd.get(), lock_path));
+    struct stat info {};
+    if (::fstat(fd.get(), &info) != 0) return ErrnoStatus("stat(dedup lock) failed", lock_path);
+    if (!S_ISREG(info.st_mode)) return Invalid("dedup lock must be a regular file");
+    while (::flock(fd.get(), LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EINTR) continue;
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            return Status::Error(StatusCode::kAlreadyExists,
+                                 "dedup snapshot already has an owner");
+        }
+        return ErrnoStatus("flock(dedup lock) failed", lock_path);
+    }
+    lock_fd_ = fd.release();
+    return Status::Ok();
+#else
+    return Status::Error(StatusCode::kUnsupported);
+#endif
+}
+
 Result<std::unique_ptr<DedupStore>> DedupStore::Open(
     DedupStoreOptions options) noexcept {
     try {
         if (options.path.empty()) {
             return Invalid("dedup store path must be non-empty");
         }
-        if (options.max_sources == 0) {
-            return Invalid("dedup store max_sources must be nonzero");
+        if (options.max_sources == 0 ||
+            options.max_sources > std::numeric_limits<uint32_t>::max() ||
+            options.max_sources > (std::numeric_limits<size_t>::max() - kHeaderBytes - kCrcBytes) / kEntryBytes) {
+            return Invalid("dedup store max_sources is outside snapshot bounds");
         }
 #if defined(__unix__) || defined(__APPLE__)
         auto store = std::unique_ptr<DedupStore>(
             new DedupStore(std::move(options.path), options.max_sources));
+        store->test_hooks_ = options.test_hooks;
+        MINO_RETURN_IF_ERROR(store->AcquireLock());
         MINO_RETURN_IF_ERROR(store->LoadFromDisk());
         return store;
 #else
@@ -423,6 +494,10 @@ Result<std::unique_ptr<DedupStore>> DedupStore::Open(
 #endif
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::filesystem::filesystem_error&) {
+        return Status::Error(StatusCode::kInternal, "dedup store open filesystem failure");
     }
 }
 
@@ -458,7 +533,22 @@ Status DedupStore::LoadFromDisk() noexcept {
             // but operators may create empty placeholders).
             return Corruption("dedup store file is empty");
         }
-        return DecodeSnapshot(bytes, max_sources_, &entries_);
+        MINO_RETURN_IF_ERROR(DecodeSnapshot(bytes, max_sources_, &entries_, &retired_));
+        // A previous owner may have renamed successfully and then failed or
+        // died before directory fsync. Do not advertise that visible HWM as
+        // durable on reopen until the rename is committed (even for a no-op
+        // RecordAcceptedBatch or SessionHello).
+        if (test_hooks_ != nullptr) {
+            MINO_RETURN_IF_ERROR(test_hooks_->Checkpoint(
+                DedupStoreIoStage::kRecoveryDirectorySync, false));
+        }
+        const auto parent = path.parent_path();
+        MINO_RETURN_IF_ERROR(SyncDirectory(parent.empty() ? "." : parent));
+        if (test_hooks_ != nullptr) {
+            MINO_RETURN_IF_ERROR(test_hooks_->Checkpoint(
+                DedupStoreIoStage::kRecoveryDirectorySync, true));
+        }
+        return Status::Ok();
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     } catch (const std::length_error&) {
@@ -471,6 +561,8 @@ Status DedupStore::LoadFromDisk() noexcept {
 }
 
 Result<std::vector<DedupResumeEntry>> DedupStore::Load() const noexcept {
+    std::lock_guard lock(mutex_);
+    if (retirement_failed_) return Status::Error(StatusCode::kUnavailable);
     try {
         std::vector<DedupResumeEntry> snapshot;
         snapshot.reserve(entries_.size());
@@ -493,50 +585,94 @@ Result<std::vector<DedupResumeEntry>> DedupStore::Load() const noexcept {
     }
 }
 
+uint64_t DedupStore::HighestAccepted(const SourceIdentity& source) const noexcept {
+    std::lock_guard lock(mutex_);
+    const auto found = entries_.find(source);
+    return found == entries_.end() ? 0 : found->second;
+}
+
+DedupStoreStats DedupStore::stats() const noexcept {
+    std::lock_guard lock(mutex_);
+    auto result = stats_;
+    result.sources = entries_.size() + retired_.size();
+    result.retired_publishers = retired_.size();
+    result.capacity = max_sources_;
+    result.persistence_count = persistence_count_;
+    return result;
+}
+
 Status DedupStore::PersistLocked() noexcept {
+    const auto begin = std::chrono::steady_clock::now();
+    const Status status = [this]() noexcept -> Status {
 #if defined(__unix__) || defined(__APPLE__)
-    MINO_ASSIGN_OR_RETURN(auto bytes, EncodeSnapshot(entries_, max_sources_));
-    return AtomicPublish(std::filesystem::path(path_), bytes);
+        try {
+            MINO_ASSIGN_OR_RETURN(auto bytes, EncodeSnapshot(entries_, retired_, max_sources_));
+            return AtomicPublish(std::filesystem::path(path_), bytes, test_hooks_);
+        } catch (const std::bad_alloc&) {
+            return Status::Error(StatusCode::kResourceExhausted);
+        } catch (const std::length_error&) {
+            return Status::Error(StatusCode::kResourceExhausted);
+        } catch (const std::filesystem::filesystem_error&) {
+            return Status::Error(StatusCode::kInternal, "dedup store filesystem failure");
+        }
 #else
-    return Status::Error(StatusCode::kUnsupported,
-                         "dedup store requires durable POSIX file I/O");
+        return Status::Error(StatusCode::kUnsupported,
+                             "dedup store requires durable POSIX file I/O");
 #endif
+    }();
+    const auto elapsed = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+    stats_.persistence_total_ns += elapsed;
+    stats_.persistence_max_ns = std::max(stats_.persistence_max_ns, elapsed);
+    if (status.ok()) ++persistence_count_;
+    else ++stats_.persistence_failures;
+    return status;
 }
 
 Status DedupStore::RecordAccepted(
     const SourceIdentity& source,
     uint64_t highest_contiguous_sequence) noexcept {
+    const DedupResumeEntry entry{source, highest_contiguous_sequence};
+    return RecordAcceptedBatch(std::span(&entry, 1));
+}
+
+Status DedupStore::RecordAcceptedBatch(
+    std::span<const DedupResumeEntry> updates) noexcept {
+    std::lock_guard lock(mutex_);
+    if (retirement_failed_) return Status::Error(StatusCode::kUnavailable);
     try {
-        if (!ValidSource(source)) {
-            return Invalid("dedup store source identity is incomplete");
-        }
-        if (highest_contiguous_sequence == 0) {
-            return Invalid("dedup store rejects sequence zero");
-        }
-        const auto it = entries_.find(source);
-        if (it != entries_.end()) {
-            if (highest_contiguous_sequence <= it->second) {
-                return Status::Ok();
+        bool changed = false;
+        for (const auto& entry : updates) {
+            if (!ValidSource(entry.source) || entry.highest_contiguous_sequence == 0) {
+                return Invalid("dedup store update identity/sequence is invalid");
             }
-            const uint64_t previous = it->second;
-            it->second = highest_contiguous_sequence;
-            const Status persisted = PersistLocked();
-            if (!persisted.ok()) {
-                it->second = previous;
-                return persisted;
+            if (Retired(retired_, entry.source)) {
+                return Status::Error(StatusCode::kPermissionDenied, "publisher epoch is retired");
             }
-            return Status::Ok();
+            const auto it = entries_.find(entry.source);
+            changed |= it == entries_.end() ||
+                entry.highest_contiguous_sequence > it->second;
         }
-        if (entries_.size() >= max_sources_) {
-            return Resource("dedup store is full");
+        if (!changed) return Status::Ok();
+        // Build before swapping so allocation/capacity failures are atomic too.
+        auto replacement = entries_;
+        for (const auto& entry : updates) {
+            auto it = replacement.find(entry.source);
+            if (it == replacement.end()) {
+                if (replacement.size() + retired_.size() >= max_sources_) {
+                    ++stats_.capacity_rejections;
+                    return Resource("dedup store is full; increase capacity or retire fenced sources offline");
+                }
+                replacement.emplace(entry.source, entry.highest_contiguous_sequence);
+            } else {
+                it->second = std::max(it->second, entry.highest_contiguous_sequence);
+            }
         }
-        entries_.emplace(source, highest_contiguous_sequence);
+        entries_.swap(replacement);
         const Status persisted = PersistLocked();
-        if (!persisted.ok()) {
-            entries_.erase(source);
-            return persisted;
-        }
-        return Status::Ok();
+        if (!persisted.ok()) entries_.swap(replacement);
+        return persisted;
     } catch (const std::bad_alloc&) {
         return Status::Error(StatusCode::kResourceExhausted);
     }
@@ -544,8 +680,13 @@ Status DedupStore::RecordAccepted(
 
 Status DedupStore::ReplaceAll(
     const std::vector<DedupResumeEntry>& entries) noexcept {
+    std::lock_guard lock(mutex_);
+    if (retirement_failed_ || attached_pipelines_ != 0) {
+        return Status::Error(StatusCode::kUnavailable);
+    }
     try {
-        if (entries.size() > max_sources_) {
+        if (entries.size() > max_sources_ - retired_.size()) {
+            ++stats_.capacity_rejections;
             return Resource("dedup store replace exceeds max_sources");
         }
         std::unordered_map<SourceIdentity, uint64_t, SourceIdentityHash>
@@ -555,6 +696,9 @@ Status DedupStore::ReplaceAll(
             if (!ValidSource(entry.source) ||
                 entry.highest_contiguous_sequence == 0) {
                 return Invalid("dedup store replace entry is invalid");
+            }
+            if (Retired(retired_, entry.source)) {
+                return Status::Error(StatusCode::kPermissionDenied, "publisher epoch is retired");
             }
             const auto inserted = replacement.emplace(
                 entry.source, entry.highest_contiguous_sequence);
@@ -575,14 +719,78 @@ Status DedupStore::ReplaceAll(
     }
 }
 
+bool DedupStore::IsRetired(const SourceIdentity& source) const noexcept {
+    std::lock_guard lock(mutex_);
+    // An uncertain commit cannot authorize traffic; callers must reopen.
+    return retirement_failed_ || Retired(retired_, source);
+}
+
+Status DedupStore::AttachPipeline() noexcept {
+    std::lock_guard lock(mutex_);
+    if (retirement_failed_) return Status::Error(StatusCode::kUnavailable);
+    if (attached_pipelines_ == std::numeric_limits<size_t>::max()) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+    ++attached_pipelines_;
+    return Status::Ok();
+}
+
+void DedupStore::DetachPipeline() noexcept {
+    std::lock_guard lock(mutex_);
+    --attached_pipelines_;
+}
+
+Status DedupStore::RetireEpochsThrough(const SourceIdentity& last_retired) noexcept {
+    std::lock_guard lock(mutex_);
+    if (retirement_failed_ || attached_pipelines_ != 0) {
+        return Status::Error(StatusCode::kUnavailable);
+    }
+    try {
+        if (!ValidSource(last_retired)) return Invalid("retirement identity must be nonzero");
+        if (Retired(retired_, last_retired)) return Status::Ok();
+        auto replacement = entries_;
+        auto boundaries = retired_;
+        boundaries.insert_or_assign(PublisherKey(last_retired), last_retired.publisher_epoch);
+        std::erase_if(replacement, [&](const auto& entry) {
+            return Retired(boundaries, entry.first);
+        });
+        if (replacement.size() > max_sources_ ||
+            boundaries.size() > max_sources_ - replacement.size()) {
+            ++stats_.capacity_rejections;
+            return Resource("dedup store has no capacity for retirement boundary");
+        }
+        entries_.swap(replacement);
+        retired_.swap(boundaries);
+        const Status persisted = PersistLocked();
+        if (!persisted.ok()) {
+            entries_.swap(replacement);
+            retired_.swap(boundaries);
+            // In particular, directory-sync failure can leave the NEW boundary
+            // on disk. Do not allow another write to resurrect its retired HWMs.
+            retirement_failed_ = true;
+        }
+        return persisted;
+    } catch (const std::bad_alloc&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    } catch (const std::length_error&) {
+        return Status::Error(StatusCode::kResourceExhausted);
+    }
+}
+
 Status SeedDedupWindowFromStore(DedupWindow* window, DedupStore* store,
                                 uint64_t peer_session_epoch,
-                                uint64_t now_ns) noexcept {
+                                uint64_t now_ns, uint16_t lane_index,
+                                uint16_t lane_count) noexcept {
     if (window == nullptr || store == nullptr) {
         return Invalid("dedup store seed requires window and store");
     }
+    if (lane_count == 0 || lane_count > kMaxBridgeLaneCount ||
+        lane_index >= lane_count) {
+        return Invalid("dedup store seed lane is invalid");
+    }
     MINO_ASSIGN_OR_RETURN(auto snapshot, store->Load());
     for (const DedupResumeEntry& entry : snapshot) {
+        if (BridgeLaneFor(entry.source, lane_count) != lane_index) continue;
         MINO_RETURN_IF_ERROR(window->SeedAccepted(
             peer_session_epoch, entry.source,
             entry.highest_contiguous_sequence, now_ns));

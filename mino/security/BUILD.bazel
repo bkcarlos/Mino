@@ -43,13 +43,20 @@ cc_test(
 
 cc_library(
     name = "ipsec",
-    srcs = ["ipsec.cc"],
-    hdrs = ["ipsec.h"],
+    srcs = [
+        "ipsec.cc",
+        "ipsec_policy.cc",
+    ],
+    hdrs = [
+        "ipsec.h",
+        "ipsec_policy.h",
+    ],
     target_compatible_with = select({
         "@platforms//os:linux": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
+        ":socket_ipsec",
         "//mino/common:result",
         "//mino/common:status",
     ],
@@ -57,13 +64,29 @@ cc_library(
 
 cc_test(
     name = "ipsec_test",
-    srcs = ["ipsec_test.cc"],
+    srcs = [
+        "ipsec_policy_test.cc",
+        "ipsec_test.cc",
+        "socket_ipsec_test.cc",
+    ],
     target_compatible_with = select({
         "@platforms//os:linux": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
         ":ipsec",
+        ":socket_ipsec",
+        "//mino/bridge:wire_frame",
+        "//mino/transport:ipsec_transport",
+        "//mino/transport:tcp_driver",
+        "//mino/transport:udp_driver",
         "@googletest//:gtest_main",
     ],
+)
+
+cc_library(
+    name = "socket_ipsec",
+    srcs = ["socket_ipsec.cc"],
+    hdrs = ["socket_ipsec.h"],
+    deps = ["//mino/common:status"],
 )

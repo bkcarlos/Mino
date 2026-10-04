@@ -9,6 +9,7 @@ cc_library(
         "//mino/common:result",
         "//mino/common:status",
         "//mino/runtime:delivery_receipt",
+        "//mino/security:socket_ipsec",
         "//mino/security:tls",
     ],
 )
@@ -22,6 +23,7 @@ cc_library(
         "//mino/bridge:wire_frame",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/security:socket_ipsec",
         "//mino/security:tls",
     ],
 )
@@ -34,6 +36,7 @@ cc_library(
         ":transport_driver",
         "//mino/common:result",
         "//mino/common:status",
+        "//mino/security:socket_ipsec",
     ],
 )
 

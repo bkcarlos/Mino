@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "mino/common/result.h"
+#include "mino/security/socket_ipsec.h"
 #include "mino/security/tls.h"
 #include "mino/transport/transport_driver.h"
 
@@ -20,7 +21,8 @@ namespace mino::transport {
 struct TcpDriverOptions {
     uint32_t max_frame_body_bytes = 16u * 1024u * 1024u;
     size_t max_total_send_buffer_bytes = 64u * 1024u * 1024u;
-    size_t max_connection_send_buffer_bytes = 16u * 1024u * 1024u;
+    // Include the four-byte stream prefix of one maximum-sized frame.
+    size_t max_connection_send_buffer_bytes = 16u * 1024u * 1024u + 4u;
     size_t max_ready_receive_bytes = 64u * 1024u * 1024u;
     uint32_t max_ready_receive_messages = 4096;
     uint32_t max_pending_accepts = 1024;
@@ -41,6 +43,9 @@ struct TcpDriverOptions {
     // ACK traffic can still make progress when the tracked data quota is full.
     size_t max_control_send_buffer_bytes = 16u * 1024u * 1024u + 4u;
     uint32_t max_control_send_messages = 1024;
+    // Installed before bind/connect/listen; TCP accepted sockets inherit it.
+    // Failure closes the socket. Configure matching encrypting transport SAs.
+    std::optional<security::SocketIpsecPolicy> ipsec_policy = std::nullopt;
 };
 
 Status ValidateTcpDriverOptions(const TcpDriverOptions& options);
@@ -75,6 +80,9 @@ public:
     }
     TransportCapabilities capabilities() const noexcept override;
     TcpDriverStats stats() const noexcept;
+    std::optional<security::SocketIpsecPolicy> MandatoryIpsecSocketPolicy() const noexcept override {
+        return options_.ipsec_policy;
+    }
 
 protected:
     Status DoStart(const DriverConfig& config) override;
